@@ -47,6 +47,13 @@ export const Rating = {
 
 export type Rating = (typeof Rating)[keyof typeof Rating];
 
+export type GradeCtx = {
+  responseTimeMs: number;
+  priorReps: number;
+};
+
+export type RatingPolicy = (verdict: Verdict, ctx: GradeCtx) => Rating;
+
 export type ScheduleState = Omit<Card, 'due' | 'last_review'> & {
   due: number;
   last_review: number | null;
