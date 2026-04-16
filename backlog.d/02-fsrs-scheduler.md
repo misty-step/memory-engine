@@ -2,7 +2,7 @@
 shaping: true
 ticket: 02-fsrs-scheduler
 slice: 1
-status: blocked
+status: ready
 priority: high
 estimate: S
 depends_on: [01-canonical-types]

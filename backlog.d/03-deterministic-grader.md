@@ -2,7 +2,7 @@
 shaping: true
 ticket: 03-deterministic-grader
 slice: 1
-status: blocked
+status: ready
 priority: high
 estimate: M
 depends_on: [01-canonical-types]
