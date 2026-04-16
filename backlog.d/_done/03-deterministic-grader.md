@@ -2,7 +2,7 @@
 shaping: true
 ticket: 03-deterministic-grader
 slice: 1
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [01-canonical-types]
@@ -36,14 +36,16 @@ fast+reps≥3 heuristic).
 ## Oracle
 
 - [ ] `bun test tests/grader/parity.test.ts` passes. Corpus: the four
-      deterministic fixture sets from
+      deterministic fixture behaviors lifted from
       `/Users/phaedrus/Documents/daybook/tools/vault-srs/tests/grading.test.ts`
+      plus the corresponding deterministic branches in
+      `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/grading.ts`
       (exclude `short-answer-rubric` entries — slice 3). For each
       fixture: call `Grader.grade(prompt, submitted, ctx)`; assert the
-      resulting `GradeResult` matches Vault's expected output modulo
-      documented renames (`outcome` → `verdict`). Comparison fields like
-      `graderKind`, `isCorrect`, `expected`, and the comparison envelope
-      must be byte-identical.
+      resulting `GradeResult` matches the canonical kernel envelope
+      byte-for-byte (`verdict`, `rating`, `isCorrect`, `submittedAnswer`,
+      `expectedAnswer`, `graderKind`, `graderModel`,
+      `graderConfidence`, `feedback`).
 - [ ] `bun test tests/grader/rating-policy.test.ts` passes. Table test:
       all combinations of `verdict ∈ {correct, close, wrong, revealed}`
       × `fast ∈ {responseTimeMs=3000, responseTimeMs=10000}` ×
@@ -69,8 +71,12 @@ fast+reps≥3 heuristic).
 - Policy injection: constructor `new Grader({ ratingPolicy?:
   RatingPolicy })`. Default constructor wires `defaultRatingPolicy`.
 - Dispatcher: `switch (prompt.kind)` with `assertNever(prompt)` in
-  `default`. Each arm calls a small per-form helper
-  (`gradeMcq`, `gradeBoolean`, `gradeCloze`, `gradeShortAnswer`).
+  `default`. Each arm calls a small per-form helper or the shared exact
+  grader for `cloze` / `shortAnswer`.
+- Canonical slice-1 output shape comes from ticket 01: `expectedAnswer`
+  is the public field name and there is no comparison envelope in
+  `GradeResult`. Earlier shaping text that mentioned those fields was
+  superseded when 01 landed.
 - Study (and lift from)
   `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/grading.ts`:
   - `normalize(answer: string): string` — lowercase, strip diacritics,
@@ -94,3 +100,7 @@ fast+reps≥3 heuristic).
 ## Parallelism
 
 Can proceed in parallel with 02 once 01 is merged. No cross-dependency.
+
+## What Was Built (cycle 01KPC6Z342T1YT2T2GYVJMK5B0)
+- Branch: feat/03-deterministic-grader
+- Evidence: backlog.d/_cycles/01KPC6Z342T1YT2T2GYVJMK5B0/evidence/
