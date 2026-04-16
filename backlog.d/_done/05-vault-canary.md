@@ -2,7 +2,7 @@
 shaping: true
 ticket: 05-vault-canary
 slice: 1
-status: blocked
+status: shipped
 priority: high
 estimate: M
 depends_on: [02-fsrs-scheduler, 03-deterministic-grader]
@@ -47,9 +47,10 @@ canary is red, slice 1 is not done.
       of its local `ts-fsrs` wrapper (if any dedicated wrapper exists;
       otherwise, the raw ts-fsrs calls in review application code move
       behind `next()`).
-- [ ] `package.json` of Vault contains `"memory-engine": "file:../../../
+- [ ] `package.json` of Vault contains `"memory-engine": "file:../../../../
       Development/memory-engine"` (path from vault-srs to memory-engine
-      root).
+      root). The original shaped path was one directory short from
+      Vault's actual location under `Documents/daybook/tools/`.
 - [ ] `bun run ci` in memory-engine still exits 0 after any fixture/impl
       tweaks made during canary iteration.
 
@@ -82,3 +83,11 @@ canary is red, slice 1 is not done.
   and requires re-install on every memory-engine change. Bun workspace
   uses a symlink but requires a root-level workspace declaration. Start
   with `file:`; upgrade to workspace if iteration friction bites.
+
+## What Was Built (cycle 01KPC7DWMSE46G8R5KQ3BEHA4N)
+- Branch: feat/05-vault-canary
+- Vault branch: memory-engine-canary
+- Evidence: backlog.d/_cycles/01KPC7DWMSE46G8R5KQ3BEHA4N/evidence/
+- Canary result: Vault imports `Grader` and `next()` from `memory-engine`,
+  Vault's `bun test` is green on `memory-engine-canary`, and
+  `memory-engine` still passes `bun run ci`.

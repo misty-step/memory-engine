@@ -2,7 +2,7 @@
 shaping: true
 ticket: 04-testkit-fixtures
 slice: 1
-status: blocked
+status: ready
 priority: medium
 estimate: S
 depends_on: [02-fsrs-scheduler, 03-deterministic-grader]
