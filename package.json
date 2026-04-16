@@ -2,6 +2,7 @@
   "name": "memory-engine",
   "version": "0.0.0",
   "description": "Shared learning engine kernel: canonical types, FSRS reference scheduler, deterministic grading.",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "exports": {
