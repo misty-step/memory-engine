@@ -2,7 +2,7 @@
 shaping: true
 ticket: 04-testkit-fixtures
 slice: 1
-status: ready
+status: shipped
 priority: medium
 estimate: S
 depends_on: [02-fsrs-scheduler, 03-deterministic-grader]
@@ -63,3 +63,11 @@ can run contract tests against the kernel from their own test suites.
   `"./testkit": "./testkit/index.ts"`. No manifest change needed.
 - If a fixture disagrees with live behavior, the live code is the
   source of truth — update the fixture, not the code.
+
+## What Was Built (cycle 01KPC7WNNAEP7SFCK7FNQQX613)
+- Branch: feat/04-testkit-fixtures
+- Evidence: backlog.d/_cycles/01KPC7WNNAEP7SFCK7FNQQX613/evidence/
+- Result: `memory-engine/testkit` now exports the grading and scheduler
+  fixture corpora, the grader parity suite consumes the public subpath
+  instead of a private copy, and the new testkit contract test keeps the
+  exported data pinned to live runtime behavior.
