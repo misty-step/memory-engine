@@ -2,7 +2,7 @@
 shaping: true
 ticket: 01-canonical-types
 slice: 1
-status: ready
+status: shipped
 priority: high
 estimate: S
 depends_on: []
@@ -58,3 +58,7 @@ slice-1 module consumes.
   \${JSON.stringify(value)}\`)`. No side channels, no logging — pure throw.
 - Every downstream slice-1 ticket's dispatcher uses `assertNever`. This
   ticket is the blocker for 02 and 03.
+
+## What Was Built (cycle 01KPBNKJ1T9M4BSJH4JSW3RW9P)
+- Branch: feat/01-canonical-types
+- Evidence: backlog.d/_cycles/01KPBNKJ1T9M4BSJH4JSW3RW9P/evidence/
