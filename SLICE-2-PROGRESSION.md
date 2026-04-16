@@ -117,5 +117,5 @@ Six to eight tickets, roughly:
 
 ## Depends on
 
-Slice 1 complete and merged. Vault canary green and promoted to main
+Slice 1 complete and merged. Vault canary green and promoted to master
 migration PR.

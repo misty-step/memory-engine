@@ -24,7 +24,7 @@ container. Useful for reproducing CI failures locally.
 
 ## Change discipline
 
-- One ticket → one branch → one PR. Branch from `main`.
+- One ticket → one branch → one PR. Branch from `master`.
 - TDD default. Write the failing test first, commit it, then implement.
 - Commit in small logical chunks. Each commit should leave CI green.
 - Never add a runtime dependency without updating `SLICE-1-KERNEL.md`'s

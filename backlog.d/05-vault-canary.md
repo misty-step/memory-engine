@@ -27,7 +27,7 @@ canary is red, slice 1 is not done.
   fail, the kernel is wrong — fix the kernel in a separate commit.
 - Do NOT replace Vault's `short-answer-rubric` path. It stays on Vault's
   current code until slice 3 merges.
-- Do NOT merge the canary branch to Vault's main. Land as draft PR only.
+- Do NOT merge the canary branch to Vault's master. Land as draft PR only.
 - Do NOT publish memory-engine to npm. Use `file:` path dependency or a
   Bun workspace reference.
 - Do NOT remove Vault's `src/grading.ts` or FSRS wrapper — keep them as
@@ -38,7 +38,7 @@ canary is red, slice 1 is not done.
 
 - [ ] `cd /Users/phaedrus/Documents/daybook/tools/vault-srs && git switch
       memory-engine-canary && bun test` exits 0. Every Vault test that
-      was green on `main` stays green on this branch.
+      was green on `master` stays green on this branch.
 - [ ] Vault's `src/grading.ts` imports `Grader` (or its `grade` helper)
       from `memory-engine` and routes the four deterministic
       `ItemType`s (`mcq`, `boolean`, `cloze-exact`, `short-answer-exact`)

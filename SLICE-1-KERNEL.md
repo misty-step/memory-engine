@@ -196,7 +196,7 @@ If any oracle command exits non-zero, slice 1 is not done.
 
 - Kernel ships as a path dependency (Bun workspace or relative import)
   before any npm publish. No registry publication in slice 1.
-- Vault's canary lands as a PR, not a merge-to-main, until slice 2 confirms
+- Vault's canary lands as a PR, not a merge-to-master, until slice 2 confirms
   the boundary holds.
 - Zero production migration in slice 1. No persisted data shape changes;
   `ScheduleState` is JSON-compatible with Vault's existing `FsrsCardState`.
