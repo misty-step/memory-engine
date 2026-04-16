@@ -1,4 +1,4 @@
-import type { Card, Rating as FsrsRating } from 'ts-fsrs';
+import { type Card, Rating as FsrsRating } from 'ts-fsrs';
 
 declare const reviewUnitIdBrand: unique symbol;
 
@@ -38,7 +38,14 @@ export type Prompt = McqPrompt | BooleanPrompt | ClozePrompt | ShortAnswerPrompt
 
 export type Verdict = 'correct' | 'close' | 'wrong' | 'revealed';
 
-export type Rating = Exclude<FsrsRating, FsrsRating.Manual>;
+export const Rating = {
+  Again: FsrsRating.Again,
+  Hard: FsrsRating.Hard,
+  Good: FsrsRating.Good,
+  Easy: FsrsRating.Easy,
+} as const;
+
+export type Rating = (typeof Rating)[keyof typeof Rating];
 
 export type ScheduleState = Omit<Card, 'due' | 'last_review'> & {
   due: number;

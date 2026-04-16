@@ -1,4 +1,6 @@
 export { assertNever } from './assert';
+export { next } from './scheduler';
+export { Rating } from './types';
 export type {
   BooleanPrompt,
   ClozePrompt,
@@ -6,7 +8,6 @@ export type {
   GraderKind,
   McqPrompt,
   Prompt,
-  Rating,
   ReviewUnitId,
   ScheduleState,
   ShortAnswerPrompt,
