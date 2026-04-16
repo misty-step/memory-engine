@@ -2,7 +2,7 @@
 shaping: true
 ticket: 02-fsrs-scheduler
 slice: 1
-status: ready
+status: shipped
 priority: high
 estimate: S
 depends_on: [01-canonical-types]
@@ -51,8 +51,10 @@ round-trip byte-identically.
   Rating, now: number): ScheduleState`.
 - When `state === null`: call `createEmptyCard(new Date(now))` to produce
   the initial card.
-- When `state !== null`: pass it directly to `scheduler.repeat` — because
-  `ScheduleState === Card` (ticket 01), no translation.
+- When `state !== null`: normalize numeric `due` / `last_review` back to
+  `Date`s before calling `scheduler.repeat`. `ts-fsrs` treats
+  `last_review: 0` as missing on its `CardInput` path, so direct
+  pass-through breaks JSON round-trip parity.
 - Instantiate the scheduler once at module scope: `const scheduler =
   fsrs({ request_retention: 0.9, maximum_interval: 36500 });`.
 - Return value: `scheduler.repeat(card, new Date(now))[rating].card`.
@@ -65,3 +67,7 @@ round-trip byte-identically.
 ## Parallelism
 
 Can proceed in parallel with 03 once 01 is merged. No cross-dependency.
+
+## What Was Built (cycle 01KPC62BE4VNGK6NVYSEAE6003)
+- Branch: feat/02-fsrs-scheduler
+- Evidence: backlog.d/_cycles/01KPC62BE4VNGK6NVYSEAE6003/evidence/
