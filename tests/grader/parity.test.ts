@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { gradingFixtures } from 'memory-engine/testkit';
 import { Grader } from '../../src';
-import { gradingFixtures } from './fixtures';
 
 describe('Grader parity', () => {
   const grader = new Grader();

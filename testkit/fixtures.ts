@@ -1,4 +1,12 @@
-import { type GradeCtx, type GradeResult, type Prompt, Rating, type ReviewUnitId } from '../../src';
+import {
+  type GradeCtx,
+  type GradeResult,
+  type Prompt,
+  Rating,
+  type ReviewUnitId,
+  type ScheduleState,
+} from '../src';
+import type { Rating as ScheduleRating } from '../src/types';
 
 function reviewUnitId(value: string): ReviewUnitId {
   return value as ReviewUnitId;
@@ -30,6 +38,14 @@ export type GradingFixture = {
   submitted: string;
   ctx: GradeCtx;
   expected: GradeResult;
+};
+
+export type SchedulerFixture = {
+  name: string;
+  initialState: ScheduleState | null;
+  rating: ScheduleRating;
+  now: number;
+  expected: ScheduleState;
 };
 
 export const gradingFixtures: GradingFixture[] = [
@@ -132,5 +148,124 @@ export const gradingFixtures: GradingFixture[] = [
     submitted: 'Quebecc',
     ctx: { responseTimeMs: 5_100, priorReps: 0 },
     expected: deterministicGrade('close', Rating.Hard, 'Quebecc', 'Q / Quebec', false),
+  },
+];
+
+export const schedulerFixtures: SchedulerFixture[] = [
+  {
+    name: 'new',
+    initialState: {
+      due: 0,
+      stability: 0,
+      difficulty: 0,
+      elapsed_days: 0,
+      scheduled_days: 0,
+      reps: 0,
+      lapses: 0,
+      learning_steps: 0,
+      state: 0,
+      last_review: null,
+    },
+    rating: Rating.Good,
+    now: 0,
+    expected: {
+      due: 600_000,
+      stability: 2.3065,
+      difficulty: 2.11810397,
+      elapsed_days: 0,
+      scheduled_days: 0,
+      reps: 1,
+      lapses: 0,
+      learning_steps: 1,
+      state: 1,
+      last_review: 0,
+    },
+  },
+  {
+    name: 'learning',
+    initialState: {
+      due: 600_000,
+      stability: 2.3065,
+      difficulty: 2.11810397,
+      elapsed_days: 0,
+      scheduled_days: 0,
+      reps: 1,
+      lapses: 0,
+      learning_steps: 1,
+      state: 1,
+      last_review: 0,
+    },
+    rating: Rating.Good,
+    now: 600_000,
+    expected: {
+      due: 173_400_000,
+      stability: 2.3065,
+      difficulty: 2.11121424,
+      elapsed_days: 0,
+      scheduled_days: 2,
+      learning_steps: 0,
+      reps: 2,
+      lapses: 0,
+      state: 2,
+      last_review: 600_000,
+    },
+  },
+  {
+    name: 'review',
+    initialState: {
+      due: 173_400_000,
+      stability: 2.3065,
+      difficulty: 2.11121424,
+      elapsed_days: 0,
+      scheduled_days: 2,
+      reps: 2,
+      lapses: 0,
+      learning_steps: 0,
+      state: 2,
+      last_review: 600_000,
+    },
+    rating: Rating.Again,
+    now: 173_400_000,
+    expected: {
+      due: 174_000_000,
+      stability: 0.60770166,
+      difficulty: 7.39223814,
+      elapsed_days: 2,
+      scheduled_days: 0,
+      learning_steps: 0,
+      reps: 3,
+      lapses: 1,
+      state: 3,
+      last_review: 173_400_000,
+    },
+  },
+  {
+    name: 'relearning',
+    initialState: {
+      due: 174_000_000,
+      stability: 0.60770166,
+      difficulty: 7.39223814,
+      elapsed_days: 2,
+      scheduled_days: 0,
+      learning_steps: 0,
+      reps: 3,
+      lapses: 1,
+      state: 3,
+      last_review: 173_400_000,
+    },
+    rating: Rating.Good,
+    now: 174_000_000,
+    expected: {
+      due: 260_400_000,
+      stability: 0.65979762,
+      difficulty: 7.38007427,
+      elapsed_days: 0,
+      scheduled_days: 1,
+      learning_steps: 0,
+      reps: 4,
+      lapses: 1,
+      state: 2,
+      last_review: 174_000_000,
+    },
   },
 ];
