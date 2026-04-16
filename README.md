@@ -24,8 +24,19 @@ It is **not** meant to own UI, auth, billing, content taxonomy, copy, or app-spe
 
 ## Status
 
-This directory currently contains the shaping/specification packet only.
+Scaffolded. Slice 1 (canonical types + FSRS scheduler + deterministic
+grader) is ready for `/deliver`.
 
-- Main brief: [SPEC.md](./SPEC.md)
-- Recommendation: library-first, service-later only if the evidence earns it
-- Scope: shared learning semantics, not a new workflow or product shell
+- Strategic brief: [SPEC.md](./SPEC.md)
+- Slice-1 context packet: [SLICE-1-KERNEL.md](./SLICE-1-KERNEL.md)
+- Agent conventions: [CLAUDE.md](./CLAUDE.md), [AGENTS.md](./AGENTS.md)
+- External patterns to lift: [exemplars.md](./exemplars.md)
+- Backlog: `backlog.d/` (populated by `/groom`)
+
+## Running locally
+
+```sh
+bun install
+bun run ci          # typecheck + lint/format + test
+dagger call ci --source=.   # same gate, in a container
+```
