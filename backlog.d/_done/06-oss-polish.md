@@ -2,7 +2,7 @@
 shaping: true
 ticket: 06-oss-polish
 slice: 1
-status: ready
+status: shipped
 priority: medium
 estimate: S
 depends_on: []
@@ -69,3 +69,12 @@ is fine for a private repo and embarrassing for a public one.
   surface better in search than a grab-bag.
 - This ticket is independent of 02/03/04/05. Can ship any time; a good
   candidate for a short session between kernel tickets.
+
+## What Was Built (cycle 01KPC83VHNBRF8T89P4YFCC4EE)
+- Branch: feat/06-oss-polish
+- Evidence: backlog.d/_cycles/01KPC83VHNBRF8T89P4YFCC4EE/evidence/
+- Result: `README.md` now explains the package to a cold TypeScript
+  reader, includes a real CI badge, local-path install snippet, minimal
+  usage examples, roadmap links, and license; live repo topics now
+  include `spaced-repetition`, `fsrs`, `typescript`, `learning`, and
+  `memorization`.
