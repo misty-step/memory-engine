@@ -1,0 +1,8 @@
+{
+  "name": "memory-engine",
+  "engineVersion": "v0.20.5",
+  "sdk": {
+    "source": "typescript"
+  },
+  "source": ".dagger"
+}

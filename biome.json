@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "ignore": ["node_modules", "dist", "coverage", ".dagger/sdk"]
+    "ignore": ["node_modules", "dist", "coverage", ".dagger"]
   },
   "organizeImports": { "enabled": true },
   "linter": {
