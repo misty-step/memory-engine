@@ -2,7 +2,7 @@
 shaping: true
 ticket: 09-recitation-and-slice2-fixtures
 slice: 2
-status: ready
+status: shipped
 priority: medium
 estimate: M
 depends_on: [07-progression-primitives, 08-queue-primitives]
@@ -46,3 +46,12 @@ fixture corpora for progression, queue, and recitation through
   - `/Users/phaedrus/Development/ruminatio/convex/lib/grading.ts`
   - `/Users/phaedrus/Development/ruminatio/apps/web/app/study-system.test.ts`
   - `testkit/fixtures.ts`
+
+## What Was Built
+
+- Branch: `feat/09-recitation-and-slice2-fixtures`
+- Result: added the deterministic `recitation` prompt arm to the canonical
+  grader surface, exported slice-2 progression, queue, and recitation fixture
+  corpora through `memory-engine/testkit`, updated exhaustiveness guards so the
+  new prompt kind stays load-bearing, and locked the behavior with recitation
+  grader oracles plus live-kernel fixture contract tests.

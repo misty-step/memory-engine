@@ -8,6 +8,7 @@ import type {
   Prompt,
   Rating,
   RatingPolicy,
+  RecitationPrompt,
   ShortAnswerPrompt,
   Verdict,
 } from './types';
@@ -52,6 +53,8 @@ export class Grader {
         return this.gradeExact(prompt, submittedAnswer, ctx);
       case 'shortAnswer':
         return this.gradeExact(prompt, submittedAnswer, ctx);
+      case 'recitation':
+        return this.gradeExact(prompt, submittedAnswer, ctx);
       default:
         return assertNever(prompt);
     }
@@ -85,7 +88,7 @@ export class Grader {
   }
 
   private gradeExact(
-    prompt: ClozePrompt | ShortAnswerPrompt,
+    prompt: ClozePrompt | ShortAnswerPrompt | RecitationPrompt,
     submittedAnswer: string,
     ctx: GradeCtx,
   ): GradeResult {
@@ -129,7 +132,7 @@ export class Grader {
   }
 }
 
-function expectedAnswer(prompt: ClozePrompt | ShortAnswerPrompt): string {
+function expectedAnswer(prompt: ClozePrompt | ShortAnswerPrompt | RecitationPrompt): string {
   return prompt.acceptedAnswers.join(' / ');
 }
 

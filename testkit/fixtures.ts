@@ -1,12 +1,63 @@
 import {
   type GradeCtx,
   type GradeResult,
+  type ProgressionCandidate,
   type Prompt,
+  type QueueCandidate,
   Rating,
+  type RecitationPrompt,
   type ReviewUnitId,
   type ScheduleState,
 } from '../src';
 import type { Rating as ScheduleRating } from '../src/types';
+
+type ProgressionFixtureReview = {
+  reps: number;
+  state: number;
+};
+
+export type Slice2MasteryPolicy = 'ruminatio' | 'vault';
+
+export type GradingFixture = {
+  name: string;
+  prompt: Prompt;
+  submitted: string;
+  ctx: GradeCtx;
+  expected: GradeResult;
+};
+
+export type RecitationFixture = GradingFixture & {
+  prompt: RecitationPrompt;
+};
+
+export type SchedulerFixture = {
+  name: string;
+  initialState: ScheduleState | null;
+  rating: ScheduleRating;
+  now: number;
+  expected: ScheduleState;
+};
+
+export type ProgressionFixture = {
+  name: string;
+  mode: 'strict' | 'fallback';
+  masteryPolicy: Slice2MasteryPolicy;
+  candidates: ProgressionCandidate<ProgressionFixtureReview>[];
+  population?: ProgressionCandidate<ProgressionFixtureReview>[];
+  expectedAvailableReviewUnitIds: ReviewUnitId[];
+  expectedLockedFreshCount: number;
+};
+
+export type QueueFixture = {
+  name: string;
+  masteryPolicy: Extract<Slice2MasteryPolicy, 'vault'>;
+  candidates: QueueCandidate[];
+  now: number;
+  recentCandidates?: QueueCandidate[];
+  population?: QueueCandidate[];
+  recentSourceWindow?: number;
+  expectedNextReviewUnitId: ReviewUnitId | null;
+};
 
 function reviewUnitId(value: string): ReviewUnitId {
   return value as ReviewUnitId;
@@ -32,23 +83,55 @@ function deterministicGrade(
   };
 }
 
-export type GradingFixture = {
-  name: string;
-  prompt: Prompt;
-  submitted: string;
-  ctx: GradeCtx;
-  expected: GradeResult;
-};
+function scheduleState(overrides: Partial<ScheduleState> = {}): ScheduleState {
+  return {
+    due: 0,
+    stability: 0,
+    difficulty: 0,
+    elapsed_days: 0,
+    scheduled_days: 0,
+    learning_steps: 0,
+    reps: 0,
+    lapses: 0,
+    state: 0,
+    last_review: null,
+    ...overrides,
+  };
+}
 
-export type SchedulerFixture = {
-  name: string;
-  initialState: ScheduleState | null;
-  rating: ScheduleRating;
-  now: number;
-  expected: ScheduleState;
-};
+function progressionCandidate(
+  overrides: Partial<ProgressionCandidate<ProgressionFixtureReview>> &
+    Pick<ProgressionCandidate<ProgressionFixtureReview>, 'reviewUnitId'>,
+): ProgressionCandidate<ProgressionFixtureReview> {
+  return {
+    reviewUnitId: overrides.reviewUnitId,
+    review: overrides.review ?? null,
+    progression: overrides.progression ?? {
+      progressionGroup: null,
+      stageOrder: 1,
+      requires: [],
+      supersedes: [],
+    },
+  };
+}
 
-export const gradingFixtures: GradingFixture[] = [
+function queueCandidate(
+  overrides: Partial<QueueCandidate> & Pick<QueueCandidate, 'reviewUnitId'>,
+): QueueCandidate {
+  const currentScheduleState = overrides.scheduleState ?? null;
+
+  return {
+    reviewUnitId: overrides.reviewUnitId,
+    scheduleState: currentScheduleState,
+    due: overrides.due ?? currentScheduleState?.due ?? 0,
+    progression: overrides.progression ?? null,
+    conceptKey: overrides.conceptKey ?? null,
+    sourceKey: overrides.sourceKey ?? null,
+    domainKey: overrides.domainKey ?? null,
+  };
+}
+
+const baseGradingFixtures: GradingFixture[] = [
   {
     name: 'mcq trims the submission and grades the correct choice',
     prompt: {
@@ -150,6 +233,31 @@ export const gradingFixtures: GradingFixture[] = [
     expected: deterministicGrade('close', Rating.Hard, 'Quebecc', 'Q / Quebec', false),
   },
 ];
+
+export const recitationFixtures: RecitationFixture[] = [
+  {
+    name: 'recitation grades long-form deterministic recall from the Ruminatio study oracle',
+    prompt: {
+      kind: 'recitation',
+      reviewUnitId: reviewUnitId('recitation-glory-be'),
+      prompt: 'Recite the prayer.',
+      acceptedAnswers: ['Glory be to the Father, and to the Son, and to the Holy Spirit.'],
+      equivalenceGroups: [],
+      ignoredTokens: [],
+    },
+    submitted: 'Glory be to the Father and to the Son and to the Holy Spirit',
+    ctx: { responseTimeMs: 3_200, priorReps: 1 },
+    expected: deterministicGrade(
+      'correct',
+      Rating.Good,
+      'Glory be to the Father and to the Son and to the Holy Spirit',
+      'Glory be to the Father, and to the Son, and to the Holy Spirit.',
+      true,
+    ),
+  },
+];
+
+export const gradingFixtures: GradingFixture[] = [...baseGradingFixtures, ...recitationFixtures];
 
 export const schedulerFixtures: SchedulerFixture[] = [
   {
@@ -267,5 +375,234 @@ export const schedulerFixtures: SchedulerFixture[] = [
       state: 2,
       last_review: 174_000_000,
     },
+  },
+];
+
+export const progressionFixtures: ProgressionFixture[] = [
+  {
+    name: 'progression unlocks a later stage using the wider population',
+    mode: 'strict',
+    masteryPolicy: 'ruminatio',
+    candidates: [
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('a-stage-2'),
+        progression: {
+          progressionGroup: ' concept-a ',
+          stageOrder: 2,
+          requires: [],
+          supersedes: [],
+        },
+      }),
+    ],
+    population: [
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('a-stage-1'),
+        review: { state: 2, reps: 2 },
+        progression: {
+          progressionGroup: 'Concept-A',
+          stageOrder: 1,
+          requires: [],
+          supersedes: [],
+        },
+      }),
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('a-stage-2'),
+        progression: {
+          progressionGroup: ' concept-a ',
+          stageOrder: 2,
+          requires: [],
+          supersedes: [],
+        },
+      }),
+    ],
+    expectedAvailableReviewUnitIds: [reviewUnitId('a-stage-2')],
+    expectedLockedFreshCount: 0,
+  },
+  {
+    name: 'progression suppresses superseded units once a harder stage is mastered',
+    mode: 'strict',
+    masteryPolicy: 'vault',
+    candidates: [
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('st-michael-01'),
+        progression: {
+          progressionGroup: 'st-michael-prayer',
+          stageOrder: 1,
+          requires: [],
+          supersedes: [],
+        },
+      }),
+    ],
+    population: [
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('st-michael-01'),
+        progression: {
+          progressionGroup: 'st-michael-prayer',
+          stageOrder: 1,
+          requires: [],
+          supersedes: [],
+        },
+      }),
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('st-michael-03'),
+        review: { state: 2, reps: 4 },
+        progression: {
+          progressionGroup: 'st-michael-prayer',
+          stageOrder: 3,
+          requires: [],
+          supersedes: [reviewUnitId('st-michael-01')],
+        },
+      }),
+    ],
+    expectedAvailableReviewUnitIds: [],
+    expectedLockedFreshCount: 1,
+  },
+  {
+    name: 'progression fallback returns the locked stage when nothing else is available',
+    mode: 'fallback',
+    masteryPolicy: 'vault',
+    candidates: [
+      progressionCandidate({
+        reviewUnitId: reviewUnitId('creed-02'),
+        progression: {
+          progressionGroup: 'nicene-creed',
+          stageOrder: 2,
+          requires: [reviewUnitId('missing-prereq')],
+          supersedes: [],
+        },
+      }),
+    ],
+    expectedAvailableReviewUnitIds: [reviewUnitId('creed-02')],
+    expectedLockedFreshCount: 1,
+  },
+];
+
+const queueNow = Date.UTC(2026, 3, 8, 16, 0, 0);
+
+export const queueFixtures: QueueFixture[] = [
+  {
+    name: 'queue prefers review candidates over fresh ones when both are due',
+    masteryPolicy: 'vault',
+    now: queueNow,
+    candidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('latin-01'),
+        due: queueNow - 60_000,
+        sourceKey: 'mass-core',
+      }),
+      queueCandidate({
+        reviewUnitId: reviewUnitId('mass-01'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 4,
+          scheduled_days: 5,
+          due: queueNow - 3_600_000,
+        }),
+        due: queueNow - 3_600_000,
+        sourceKey: 'mass-core',
+      }),
+    ],
+    expectedNextReviewUnitId: reviewUnitId('mass-01'),
+  },
+  {
+    name: 'queue avoids immediate same-source clumps when an alternative exists',
+    masteryPolicy: 'vault',
+    now: queueNow,
+    candidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('abolition-11'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+          due: queueNow - 120_000,
+        }),
+        due: queueNow - 120_000,
+        sourceKey: 'abolition-of-man',
+      }),
+      queueCandidate({
+        reviewUnitId: reviewUnitId('nato-01'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+          due: queueNow - 100_000,
+        }),
+        due: queueNow - 100_000,
+        sourceKey: 'nato-phonetic',
+      }),
+    ],
+    recentCandidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('abolition-10'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+        }),
+        sourceKey: 'abolition-of-man',
+      }),
+    ],
+    expectedNextReviewUnitId: reviewUnitId('nato-01'),
+  },
+  {
+    name: 'queue allows callers to disable source clumping with a zero source window',
+    masteryPolicy: 'vault',
+    now: queueNow,
+    candidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('abolition-11'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+          due: queueNow - 120_000,
+        }),
+        due: queueNow - 120_000,
+        sourceKey: 'abolition-of-man',
+      }),
+      queueCandidate({
+        reviewUnitId: reviewUnitId('nato-01'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+          due: queueNow - 100_000,
+        }),
+        due: queueNow - 100_000,
+        sourceKey: 'nato-phonetic',
+      }),
+    ],
+    recentCandidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('abolition-10'),
+        scheduleState: scheduleState({
+          state: 2,
+          reps: 3,
+          scheduled_days: 8,
+        }),
+        sourceKey: 'abolition-of-man',
+      }),
+    ],
+    recentSourceWindow: 0,
+    expectedNextReviewUnitId: reviewUnitId('abolition-11'),
+  },
+  {
+    name: 'queue falls back to an unsatisfied stage instead of hiding it forever',
+    masteryPolicy: 'vault',
+    now: queueNow,
+    candidates: [
+      queueCandidate({
+        reviewUnitId: reviewUnitId('creed-02'),
+        due: queueNow - 60_000,
+        progression: {
+          progressionGroup: 'nicene-creed',
+          stageOrder: 2,
+          requires: [reviewUnitId('missing-prereq')],
+          supersedes: [],
+        },
+      }),
+    ],
+    expectedNextReviewUnitId: reviewUnitId('creed-02'),
   },
 ];

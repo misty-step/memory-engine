@@ -34,7 +34,11 @@ export type ShortAnswerPrompt = ExactPromptBase & {
   kind: 'shortAnswer';
 };
 
-export type Prompt = McqPrompt | BooleanPrompt | ClozePrompt | ShortAnswerPrompt;
+export type RecitationPrompt = ExactPromptBase & {
+  kind: 'recitation';
+};
+
+export type Prompt = McqPrompt | BooleanPrompt | ClozePrompt | ShortAnswerPrompt | RecitationPrompt;
 
 export type Verdict = 'correct' | 'close' | 'wrong' | 'revealed';
 

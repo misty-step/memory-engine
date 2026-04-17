@@ -27,6 +27,7 @@ export type {
   QueueCandidate,
   QueueSelectionOptions,
   QueueSeparationPass,
+  RecitationPrompt,
   RatingPolicy,
   ReviewUnitId,
   ScheduleState,

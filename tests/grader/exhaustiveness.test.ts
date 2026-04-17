@@ -12,20 +12,22 @@ function gradeablePromptKind(prompt: Prompt): Prompt['kind'] {
     case 'boolean':
     case 'cloze':
     case 'shortAnswer':
+    case 'recitation':
       return prompt.kind;
     default:
       return assertNever(prompt);
   }
 }
 
-function missingShortAnswerArm(prompt: Prompt): Prompt['kind'] {
+function missingRecitationArm(prompt: Prompt): Prompt['kind'] {
   switch (prompt.kind) {
     case 'mcq':
     case 'boolean':
     case 'cloze':
+    case 'shortAnswer':
       return prompt.kind;
     default:
-      // @ts-expect-error Prompt is not exhaustive without the shortAnswer arm.
+      // @ts-expect-error Prompt is not exhaustive without the recitation arm.
       return assertNever(prompt);
   }
 }
@@ -41,6 +43,6 @@ describe('grader exhaustiveness', () => {
     };
 
     expect(gradeablePromptKind(prompt)).toBe('mcq');
-    expect(missingShortAnswerArm(prompt)).toBe('mcq');
+    expect(missingRecitationArm(prompt)).toBe('mcq');
   });
 });

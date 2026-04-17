@@ -16,19 +16,22 @@ function promptLabel(prompt: Prompt): string {
       return prompt.acceptedAnswers.join(' / ');
     case 'shortAnswer':
       return prompt.acceptedAnswers.join(' / ');
+    case 'recitation':
+      return prompt.acceptedAnswers.join(' / ');
     default:
       return assertNever(prompt);
   }
 }
 
-function missingShortAnswerArm(prompt: Prompt): string {
+function missingRecitationArm(prompt: Prompt): string {
   switch (prompt.kind) {
     case 'mcq':
     case 'boolean':
     case 'cloze':
+    case 'shortAnswer':
       return prompt.kind;
     default:
-      // @ts-expect-error Prompt is not exhaustive without the shortAnswer arm.
+      // @ts-expect-error Prompt is not exhaustive without the recitation arm.
       return assertNever(prompt);
   }
 }
@@ -44,6 +47,6 @@ describe('assertNever', () => {
     };
 
     expect(promptLabel(prompt)).toBe('A');
-    expect(missingShortAnswerArm(prompt)).toBe('mcq');
+    expect(missingRecitationArm(prompt)).toBe('mcq');
   });
 });

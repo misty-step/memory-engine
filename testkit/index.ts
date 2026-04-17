@@ -1,2 +1,15 @@
-export { gradingFixtures, schedulerFixtures } from './fixtures';
-export type { GradingFixture, SchedulerFixture } from './fixtures';
+export {
+  gradingFixtures,
+  progressionFixtures,
+  queueFixtures,
+  recitationFixtures,
+  schedulerFixtures,
+} from './fixtures';
+export type {
+  GradingFixture,
+  ProgressionFixture,
+  QueueFixture,
+  RecitationFixture,
+  SchedulerFixture,
+  Slice2MasteryPolicy,
+} from './fixtures';
