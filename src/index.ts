@@ -5,6 +5,11 @@ export {
   filterEligibleCandidatesWithFallback,
   isMastered,
 } from './progression';
+export {
+  compareQueuePriority,
+  pickNextQueueCandidate,
+  reviewableQueueCandidates,
+} from './queue';
 export { next } from './scheduler';
 export { Rating } from './types';
 export type {
@@ -19,6 +24,9 @@ export type {
   ProgressionCandidate,
   ProgressionFilterResult,
   ProgressionMetadata,
+  QueueCandidate,
+  QueueSelectionOptions,
+  QueueSeparationPass,
   RatingPolicy,
   ReviewUnitId,
   ScheduleState,

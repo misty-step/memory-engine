@@ -137,6 +137,36 @@ describe('filterEligibleCandidates', () => {
     expect(result.lockedFreshCount).toBe(0);
   });
 
+  test('treats progression-group keys case-insensitively across population checks', () => {
+    const stageOne = candidate({
+      reviewUnitId: reviewUnitId('a-stage-1'),
+      review: { state: State.Review, reps: 2 },
+      progression: {
+        progressionGroup: 'Concept-A',
+        stageOrder: 1,
+        requires: [],
+        supersedes: [],
+      },
+    });
+    const stageTwo = candidate({
+      reviewUnitId: reviewUnitId('a-stage-2'),
+      progression: {
+        progressionGroup: ' concept-a ',
+        stageOrder: 2,
+        requires: [],
+        supersedes: [],
+      },
+    });
+
+    const result = filterEligibleCandidates([stageTwo], ruminatioMastery, {
+      population: [stageOne, stageTwo],
+    });
+
+    expect(result.available.map((entry) => entry.reviewUnitId)).toEqual([
+      reviewUnitId('a-stage-2'),
+    ]);
+  });
+
   test('suppresses superseded units once a harder stage is mastered', () => {
     const easierStage = candidate({
       reviewUnitId: reviewUnitId('st-michael-01'),

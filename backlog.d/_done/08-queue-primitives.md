@@ -2,7 +2,7 @@
 shaping: true
 ticket: 08-queue-primitives
 slice: 2
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [07-progression-primitives]
@@ -50,3 +50,13 @@ leaving app-owned burst/session choreography outside core.
   - `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/queue.ts`
   - `/Users/phaedrus/Documents/daybook/tools/vault-srs/tests/queue.test.ts`
   - `/Users/phaedrus/Development/ruminatio/convex/scheduler.ts`
+
+## What Was Built
+
+- Branch: `feat/08-queue-primitives`
+- Result: added canonical queue-selection helpers in `src/queue.ts`,
+  exported the new queue surface from the package root, centralized
+  progression-metadata normalization so eligibility and ordering agree on the
+  same keys, documented the queue contract around canonical `due` timestamps
+  and recent-history ordering, and locked the behavior with Vault-derived
+  queue oracle tests plus queue-option edge-case coverage.

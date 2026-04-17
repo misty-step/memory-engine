@@ -1,8 +1,8 @@
+import { normalizeProgressionMetadata } from './progression-metadata';
 import type {
   MasteryPolicy,
   ProgressionCandidate,
   ProgressionFilterResult,
-  ProgressionMetadata,
   ReviewUnitId,
 } from './types';
 
@@ -15,13 +15,6 @@ type ProgressionContext = {
   masteredIds: Set<ReviewUnitId>;
   knownStagesByGroup: Map<string, number[]>;
   masteredStagesByGroup: Map<string, Set<number>>;
-};
-
-const defaultProgression: ProgressionMetadata = {
-  progressionGroup: null,
-  stageOrder: 1,
-  requires: [],
-  supersedes: [],
 };
 
 export function isMastered<TReview>(
@@ -89,7 +82,7 @@ function buildContext<TReview, TCandidate extends ProgressionCandidate<TReview>>
   const masteredStagesByGroup = new Map<string, Set<number>>();
 
   for (const candidate of population) {
-    const progression = normalizeProgression(candidate.progression);
+    const progression = normalizeProgressionMetadata(candidate.progression);
 
     if (progression.progressionGroup !== null) {
       const knownStages = knownStagesByGroup.get(progression.progressionGroup) ?? [];
@@ -130,7 +123,7 @@ function isEligible<TReview>(
   candidate: ProgressionCandidate<TReview>,
   context: ProgressionContext,
 ): boolean {
-  const progression = normalizeProgression(candidate.progression);
+  const progression = normalizeProgressionMetadata(candidate.progression);
   if (context.buriedIds.has(candidate.reviewUnitId)) {
     return false;
   }
@@ -164,35 +157,4 @@ function countLockedFreshCandidates<TReview, TCandidate extends ProgressionCandi
   const totalFreshCount = candidates.filter((candidate) => candidate.review === null).length;
 
   return Math.max(0, totalFreshCount - availableFreshCount);
-}
-
-function normalizeProgression(progression: ProgressionMetadata | null): ProgressionMetadata {
-  if (progression === null) {
-    return defaultProgression;
-  }
-
-  return {
-    progressionGroup: normalizeGroup(progression.progressionGroup),
-    stageOrder: normalizeStageOrder(progression.stageOrder),
-    requires: dedupeIds(progression.requires),
-    supersedes: dedupeIds(progression.supersedes),
-  };
-}
-
-function normalizeGroup(value: string | null): string | null {
-  const normalized = value?.trim();
-
-  return normalized ? normalized : null;
-}
-
-function normalizeStageOrder(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 1;
-  }
-
-  return Math.max(1, Math.trunc(value));
-}
-
-function dedupeIds(values: readonly ReviewUnitId[]): ReviewUnitId[] {
-  return Array.from(new Set(values));
 }
