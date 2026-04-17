@@ -494,6 +494,12 @@ This should stay shallow enough that apps can compose their own flows.
 
 ## Package Topology
 
+These are **logical surfaces first, physical packages second**. The current
+repo can stay a single package with subpath exports as long as the boundaries
+remain clean. Do not split the filesystem just to satisfy the diagram; promote a
+surface into its own package only when adapter/runtime/versioning pressure is
+real.
+
 ### `packages/contracts`
 
 Owns:
@@ -725,14 +731,18 @@ Pause or cut back extraction if:
 
 ## Immediate Next Work
 
-1. Turn this spec into a repository scaffold with `packages/contracts`, `packages/core`, `packages/adapters`, and `packages/testkit`.
-2. Write the initial canonical domain types.
-3. Build a first cross-app fixture corpus from the four audited systems.
-4. Extract one tiny vertical slice:
-   - deterministic grading contract
-   - FSRS scheduler interface
-   - schedule-state serialization
-5. Prove one canary integration before broadening scope.
+1. Finish slice 2 in the current package:
+   - progression metadata and injected-policy eligibility helpers
+   - queue primitives
+   - deterministic recitation
+   - exported slice-2 fixture corpus
+   - Scry canary
+2. Finish slice 3 with additive async rubric support:
+   - shared rubric contract
+   - vendor-neutral adapter surface
+   - Vault rubric canary
+3. Re-evaluate a physical package split only after slice 3 proves that
+   `adapters` is a durable surface rather than a speculative one.
 
 ## Appendix: Research Notes And References
 

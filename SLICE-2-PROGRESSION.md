@@ -1,121 +1,171 @@
 ---
-shaping: stub
+shaping: true
 slice: 2
 parent: SPEC.md
-status: awaiting-slice-1-completion
+date: 2026-04-17
+status: ready-for-implement
 ---
 
-# Context Packet Stub: Memory Engine — Slice 2 (Progression + Queue + Adapter split)
-
-**This is a strategic stub, not a shaped packet.** Full shaping happens
-after slice 1 merges. `/groom` runs again at that point to decompose this
-into tickets.
+# Context Packet: Memory Engine — Slice 2 (Progression + Queue + Recitation)
 
 ## Goal
 
-Add progression-aware eligibility and queue-selection primitives to the
-kernel, and split the single-package topology into `packages/{contracts,
-core, adapters, testkit}` once the adapter boundary is concrete.
-
-## Why this slice exists
-
-Slice 1 proved the kernel's grading + scheduling boundary holds against
-one consumer (Vault SRS). Slice 2 earns two things:
-
-1. The richer semantics that make the kernel worth extracting in the
-   first place — `requires`, `supersedes`, `stageOrder`, queue pacing.
-   Without these, any app with real pedagogy has to reimplement them
-   locally, and duplication reappears.
-2. A second consumer. Slice 1 with one consumer is a library for one
-   caller. Slice 2 proves the boundary is shared, not private.
+Add shared progression metadata, progression-aware queue primitives, and the
+remaining deterministic `recitation` prompt to the kernel, while proving the
+boundary against a second consumer without forcing a package split.
 
 ## Non-Goals
 
-- Rubric or AI-assisted grading (slice 3).
-- Session choreography — stays app-owned forever.
-- Content authoring pipelines.
-- npm publish — defer until all three slices ship.
-- Replace the slice-1 public API. Slice 1 stays backward compatible.
-
-## Scope
-
-### Progression primitives
-
-- `ProgressionEdge` type (requires / supersedes / stageOrder).
-- Eligibility computation: `isEligible(unit, graph, state) → boolean`.
-- Mastery predicate: `isMastered(state) → boolean` (lifted from Ruminatio).
-- No authoring concerns — the graph is given, not constructed.
-
-### Queue primitives
-
-- `pickNext(candidates, now, policy) → Candidate | null` — minimum
-  useful queue primitive.
-- Anti-clumping policy as injected function (lesson from bench: don't
-  pre-abstract policies).
-- Progression-aware eligibility gating (via slice-2 progression module).
-- **Open:** does "select a burst" belong in core or in a consumer
-  helper?
-
-### Adapter split
-
-- `packages/contracts` — pure types, no logic.
-- `packages/core` — slice-1 logic (scheduler, grader) + slice-2 logic
-  (progression, queue).
-- `packages/adapters` — storage adapter interface + reference
-  implementations (at least: in-memory; optionally: SQLite for Vault).
-- `packages/testkit` — migrates out of the single package.
-- Bun workspace as the monorepo driver. Top-level `package.json`
-  becomes a workspace manifest.
+- No rubric or AI-assisted grading. That is slice 3.
+- No storage adapters. Consumer persistence stays consumer-owned.
+- No monorepo/package split. Keep the current single package and use subpath
+  exports only if a new surface needs them.
+- No session choreography. Ruminatio's `selectBurst()` and Caesar's session
+  builder remain app-owned unless a later canary proves they are truly shared.
+- No content parser or authoring pipeline work.
 
 ## Constraints / Invariants
 
-- Slice-1 public API stays backward compatible. Consumer imports do not
-  change. Package split is transparent to the import path via workspace
-  re-exports where needed.
-- Progression fields do NOT live inside `Prompt`. They attach to the
-  `ReviewUnit` via a separate graph structure (preserves `Prompt` as
-  presentation-layer metadata only).
-- Queue primitives work for BOTH concept-level (Scry) and
-  phrasing-level (Ruminatio) consumers via `ReviewUnitId` opacity.
-- Adapter interface MUST NOT force event sourcing. Mutable-snapshot is
-  the default model (per SPEC.md §Storage And Adapter Model).
+- **Core stays pure.** No framework, storage, network, or SDK imports in `src/`.
+- **`ReviewUnitId` stays opaque.** Concept-level and phrasing-level consumers
+  both map into the same core identifiers; the kernel never inspects what a
+  unit "really" is.
+- **Progression metadata stays outside `Prompt`.** Prompt is presentation; stage
+  ladders, prerequisites, and supersession live in separate queue/progression
+  inputs.
+- **Mastery is policy, not dogma.** Vault, Ruminatio, and Scry use different
+  mastery thresholds. Progression helpers must accept an injected mastery
+  predicate rather than hardcoding one global rule.
+- **Queue primitives stay shallow.** They operate on canonical candidate data
+  and recent-history keys, not consumer ORM documents.
+- **`recitation` is deterministic.** It reuses the exact-answer/accepted-variant
+  grading path and is explicitly not part of slice 3's rubric surface.
 
-## Second-consumer question
+## Authority Order
 
-Pick during shaping:
-- **Caesar in a Year** — sentence-level, no progression today. Clean
-  smoke test of queue primitives alone. Low risk.
-- **Scry** — concept-level. Forces the opacity of `ReviewUnitId` to hold
-  under review. Higher risk, higher confidence if it passes.
+tests > type system > code > docs > lore
 
-Recommend Caesar as the adoption path and Scry as the opacity stress
-test. But real decision waits for shaping.
+## Repo Anchors
 
-## Open Questions (resolved during slice-2 shaping)
+- `src/types.ts` — current canonical substrate for prompt/result/schedule types.
+- `src/grader.ts` — existing deterministic grading surface that `recitation`
+  extends.
+- `src/scheduler.ts` — current pure FSRS wrapper and the shape slice 2 must
+  preserve.
+- `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/queue.ts` — strongest
+  current queue semantics: due-first, anti-clumping, prerequisites, supersession.
+- `/Users/phaedrus/Documents/daybook/tools/vault-srs/tests/queue.test.ts` —
+  executable queue oracle corpus to lift into kernel tests.
+- `/Users/phaedrus/Development/ruminatio/convex/lib/progression.ts` — stage
+  unlock logic and `lockedFreshCount` behavior for staged memorization.
+- `/Users/phaedrus/Development/ruminatio/convex/scheduler.ts` — due-first burst
+  selection and fresh round-robin that should remain app-owned unless proven
+  otherwise.
+- `/Users/phaedrus/Development/ruminatio/apps/web/app/study-system.test.ts` —
+  recitation grading and stage-unlock fixtures.
+- `/Users/phaedrus/Development/scry/convex/fsrs/engine.ts` — concept-level
+  consumer mapping layer and proof that opaque review-unit identity matters.
 
-- Exact shape of `ProgressionEdge` — typed relations vs typed edge list?
-- Anti-clumping: core primitive with injected policy, or consumer-owned
-  entirely?
-- Does Scry's concept-level consumer need the queue primitive at all, or
-  does it just use `scheduler.next` + custom eligibility?
-- How does adapter storage-shape compose with slice-1's
-  consumer-owns-persistence rule? (Adapter doesn't change the rule; it
-  gives consumers a reusable implementation option.)
-- ts-fsrs version bump policy once multiple consumers depend.
+## Prior Art
 
-## Rough Implementation Sketch
+- Vault SRS queue semantics are the primary exemplar for progression-aware
+  eligibility and next-card choice.
+- Ruminatio is the primary exemplar for staged fresh-item unlocking and
+  deterministic recitation grading.
+- Scry is the primary exemplar for concept-level consumers that should still
+  fit the same scheduler/progression substrate.
 
-Six to eight tickets, roughly:
-1. Progression types (`ProgressionEdge`, `isMastered`, `isEligible`).
-2. Queue primitives (`pickNext`, anti-clumping hooks).
-3. Second-consumer canary (Caesar): smoke test of queue primitives.
-4. Package split: workspace manifest, move files, redirect exports.
-5. Storage adapter interface + in-memory reference.
-6. Second-consumer canary (Scry) against progression + adapter.
-7. Slice-2 testkit additions (progression/queue fixtures).
-8. Documentation + migration guide for existing Vault adoption.
+## Exemplar Techniques
 
-## Depends on
+- **Progression as data, not prompt shape** — Vault's `progressionGroup`,
+  `requires`, and `supersedes` fields in
+  `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/types.ts`.
+- **Conservative unlock gating with explicit user-facing counts** —
+  Ruminatio's `filterUnlockedCandidates()` in
+  `/Users/phaedrus/Development/ruminatio/convex/lib/progression.ts`.
+- **Consumer-owned mapping layer at the boundary** — Scry's `stateToCard` /
+  `cardToState` pair in
+  `/Users/phaedrus/Development/scry/convex/fsrs/engine.ts`.
 
-Slice 1 complete and merged. Vault canary green and promoted to master
-migration PR.
+## Oracle (Definition of Done)
+
+1. **Progression helpers reproduce both Vault and Ruminatio semantics via
+   injected policy.**
+   ```
+   cd memory-engine && bun test tests/progression/
+   ```
+   This suite must cover:
+   - Vault-style `requires` gating and `supersedes` burial.
+   - Ruminatio-style later-stage lock/unlock behavior.
+   - At least two distinct mastery predicates proving the API does not bake in
+     one app's threshold.
+
+2. **Queue primitives reproduce Vault's next-card behavior without absorbing
+   session choreography.**
+   ```
+   cd memory-engine && bun test tests/queue/
+   ```
+   This suite must cover:
+   - review-before-new ordering
+   - same-source anti-clumping with graceful fallback
+   - progression-aware suppression/unlock behavior
+   - "show the locked thing rather than hide it forever" fallback
+
+3. **Deterministic recitation grading lands as an additive prompt arm.**
+   ```
+   cd memory-engine && bun test tests/grader/recitation.test.ts
+   ```
+   The cases come from Ruminatio's existing recitation tests and must grade via
+   the deterministic path, not a rubric adapter.
+
+4. **Slice-2 fixtures are published through the public testkit surface.**
+   ```
+   cd memory-engine && bun test tests/testkit/slice2-fixtures.test.ts
+   ```
+   The exported corpora must include non-empty progression, queue, and
+   recitation fixtures and run against live kernel behavior.
+
+5. **Concept-level consumer canary stays green.**
+   ```
+   cd /Users/phaedrus/Development/scry && git switch memory-engine-canary && bun test
+   ```
+   The canary keeps Scry's own persisted state shape and maps to/from
+   `ScheduleState` at the edge.
+
+6. **Gate stays green.**
+   ```
+   cd memory-engine && bun run ci
+   ```
+
+## Implementation Sequence
+
+1. Extend `src/types.ts` with progression and queue candidate metadata that is
+   separate from `Prompt`.
+2. Add `src/progression.ts` with injected-policy mastery/eligibility helpers and
+   tests lifted from Vault + Ruminatio.
+3. Add `src/queue.ts` with canonical next-card primitives and tests lifted from
+   Vault's queue corpus.
+4. Extend `Prompt`/`Grader` with a deterministic `recitation` arm and pin it
+   with Ruminatio-derived fixtures.
+5. Promote progression/queue/recitation corpora into `memory-engine/testkit`.
+6. Wire a Scry canary branch through the kernel behind a consumer-owned mapping
+   layer and iterate on the kernel until the canary is green.
+
+## Risk + Rollout
+
+- **Risk: queue primitives overfit Vault.** Mitigation: keep burst/session
+  planning out of core, and validate against both Vault and Ruminatio fixtures.
+- **Risk: mastery semantics drift between apps.** Mitigation: require injected
+  mastery policy and test at least Vault + Ruminatio thresholds explicitly.
+- **Risk: concept-level consumers pressure the type model.** Mitigation: make
+  Scry the slice-2 canary and reject any design that inspects concept-specific
+  fields inside core logic.
+- **Risk: topology work crowds out semantics.** Mitigation: defer physical
+  package split until slice 3 proves `adapters` is a real, durable surface.
+
+Rollout:
+
+- Ship slice 2 in the current single-package repo.
+- Land the Scry canary as a branch/PR, not a forced migration.
+- Revisit physical package split only after slice 3 if subpath exports start to
+  creak under real adapter/versioning pressure.
