@@ -18,4 +18,4 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run Dagger CI pipeline
-        run: dagger call ci --source=.
+        run: dagger call check --source=.

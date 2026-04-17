@@ -15,12 +15,14 @@ builder subagents) operating in this repo. Claude Code also reads
 
 ## Feedback loop
 
-`bun run ci` is the gate — typecheck, lint/format, test, in that order.
-Run it locally before and after every change. If CI fails, fix the
-underlying issue; never bypass (`--no-verify`, `|| true`, etc.).
+`bun run ci` is the gate. It shells out to
+`dagger call check --source=.` and runs typecheck, lint/format,
+coverage-enforced tests, then secrets scan. Run it locally before and
+after every change. If CI fails, fix the underlying issue; never bypass
+(`--no-verify`, `|| true`, etc.).
 
-Dagger parity: `dagger call ci --source=.` runs the same gate in a
-container. Useful for reproducing CI failures locally.
+`bun run ci:local` is the faster inner-loop subset (same gate minus the
+containerized secrets scan), but delivery requires a green `bun run ci`.
 
 ## Change discipline
 

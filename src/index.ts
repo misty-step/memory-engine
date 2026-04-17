@@ -1,5 +1,10 @@
 export { assertNever } from './assert';
 export { defaultRatingPolicy, Grader } from './grader';
+export {
+  filterEligibleCandidates,
+  filterEligibleCandidatesWithFallback,
+  isMastered,
+} from './progression';
 export { next } from './scheduler';
 export { Rating } from './types';
 export type {
@@ -8,8 +13,12 @@ export type {
   GradeCtx,
   GradeResult,
   GraderKind,
+  MasteryPolicy,
   McqPrompt,
   Prompt,
+  ProgressionCandidate,
+  ProgressionFilterResult,
+  ProgressionMetadata,
   RatingPolicy,
   ReviewUnitId,
   ScheduleState,

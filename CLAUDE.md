@@ -14,10 +14,14 @@ See `SPEC.md` for strategy, `SLICE-1-KERNEL.md` for the first buildable slice.
 
 ## Gate
 
-`bun run ci` is the canonical gate. Equivalent to `dagger call ci --source=.`.
-Both run, in order: `tsc --noEmit` → `biome check .` → `bun test`. All three
-must exit 0. Agents should run `bun run ci` locally before proposing any
-change — faster than waiting for CI.
+`bun run ci` is the canonical gate. It shells out to
+`dagger call check --source=.` and runs, in order:
+`tsc --noEmit` → `biome check .` → coverage-enforced tests →
+`gitleaks dir`. All four must exit 0.
+
+`bun run ci:local` is the faster inner-loop variant:
+`tsc --noEmit` → `biome check .` → coverage-enforced tests. Use it while
+iterating, but never hand off without a green `bun run ci`.
 
 ## Invariants (load-bearing, do not violate)
 

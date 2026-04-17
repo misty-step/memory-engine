@@ -2,7 +2,7 @@
 shaping: true
 ticket: 07-progression-primitives
 slice: 2
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: []
@@ -49,3 +49,12 @@ without hardcoding any single app's mastery threshold.
   - `/Users/phaedrus/Documents/daybook/tools/vault-srs/tests/queue.test.ts`
   - `/Users/phaedrus/Development/ruminatio/convex/lib/progression.ts`
   - `/Users/phaedrus/Development/ruminatio/apps/web/app/study-system.test.ts`
+
+## What Was Built
+
+- Branch: `feat/07-progression-primitives`
+- Result: added canonical progression metadata plus pure mastery and
+  eligibility helpers in `src/progression.ts`, exported the new surface from
+  the package root, locked the behavior with progression oracle tests, and
+  hardened the repo's authoritative Dagger gate with coverage enforcement,
+  Gitleaks scanning, and a tracked pre-push hook.

@@ -85,8 +85,10 @@ import { gradingFixtures, schedulerFixtures } from 'memory-engine/testkit';
 
 ```sh
 bun install
+git config core.hooksPath .githooks
+bun run ci:local
 bun run ci
-dagger call ci --source=.
+dagger call check --source=.
 ```
 
 ## License

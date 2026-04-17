@@ -59,6 +59,26 @@ export type ScheduleState = Omit<Card, 'due' | 'last_review'> & {
   last_review: number | null;
 };
 
+export type ProgressionMetadata = {
+  progressionGroup: string | null;
+  stageOrder: number;
+  requires: ReviewUnitId[];
+  supersedes: ReviewUnitId[];
+};
+
+export type ProgressionCandidate<TReview> = {
+  reviewUnitId: ReviewUnitId;
+  review: TReview | null;
+  progression: ProgressionMetadata | null;
+};
+
+export type MasteryPolicy<TReview> = (review: TReview) => boolean;
+
+export type ProgressionFilterResult<TCandidate> = {
+  available: TCandidate[];
+  lockedFreshCount: number;
+};
+
 export type GraderKind = 'deterministic' | 'rubric-llm';
 
 export type GradeResult = {
