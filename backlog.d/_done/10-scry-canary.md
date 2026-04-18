@@ -8,7 +8,7 @@ estimate: M
 depends_on: [07-progression-primitives, 08-queue-primitives, 09-recitation-and-slice2-fixtures]
 oracles:
   - bun run ci
-  - (cd /Users/phaedrus/Development/scry && git switch memory-engine-canary && bun test)
+  - (cd /Users/phaedrus/Development/scry && git switch memory-engine-canary && corepack pnpm@10.12.1 tsc --noEmit && corepack pnpm@10.12.1 exec vitest --run tests/convex/memory-engine-adapter.test.ts tests/convex/fsrs.test.ts convex/fsrs/conceptScheduler.test.ts)
 ---
 
 # Scry concept-level canary — slice-2 acceptance gate
@@ -29,7 +29,11 @@ without forcing concept-specific assumptions into core.
 ## Oracle
 
 - [ ] `cd /Users/phaedrus/Development/scry && git switch
-      memory-engine-canary && bun test` exits 0.
+      memory-engine-canary && corepack pnpm@10.12.1 tsc --noEmit &&
+      corepack pnpm@10.12.1 exec vitest --run
+      tests/convex/memory-engine-adapter.test.ts
+      tests/convex/fsrs.test.ts
+      convex/fsrs/conceptScheduler.test.ts` exits 0.
 - [ ] Scry keeps its own persisted FSRS state shape and maps to/from
       `ScheduleState` at the consumer edge.
 - [ ] Any adopted progression or queue helper imports come from

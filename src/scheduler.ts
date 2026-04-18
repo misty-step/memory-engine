@@ -8,8 +8,10 @@ const scheduler = fsrs({
 });
 
 function toScheduleState(card: Card): ScheduleState {
+  const { learning_steps: _learningSteps, ...rest } = card;
+
   return {
-    ...card,
+    ...rest,
     due: card.due.getTime(),
     last_review: card.last_review?.getTime() ?? null,
   };
@@ -22,6 +24,7 @@ function toCard(state: ScheduleState): Card {
     return {
       ...rest,
       due: new Date(state.due),
+      learning_steps: 0,
     };
   }
 
@@ -29,11 +32,12 @@ function toCard(state: ScheduleState): Card {
     ...rest,
     due: new Date(state.due),
     last_review: new Date(last_review),
+    learning_steps: 0,
   };
 }
 
 export function next(state: ScheduleState | null, rating: Rating, now: number): ScheduleState {
   const currentCard = state === null ? createEmptyCard(new Date(now)) : toCard(state);
 
-  return toScheduleState(scheduler.repeat(currentCard, new Date(now))[rating].card);
+  return toScheduleState(scheduler.next(currentCard, new Date(now), rating).card);
 }

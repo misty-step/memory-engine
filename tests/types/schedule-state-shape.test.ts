@@ -10,7 +10,7 @@ type Equal<Left, Right> = (<Value>() => Value extends Left ? 1 : 2) extends <
   ? true
   : false;
 
-type SharedCardFields = Omit<Card, 'due' | 'last_review'>;
+type SharedCardFields = Omit<Card, 'due' | 'last_review' | 'learning_steps'>;
 type _ScheduleStatePreservesTsFsrsCardFields = Assert<
   Equal<Omit<ScheduleState, 'due' | 'last_review'>, SharedCardFields>
 >;
@@ -22,21 +22,20 @@ type _ScheduleStateUsesNullableNumericLastReview = Assert<
 function acceptsCardInput(_state: CardInput): void {}
 
 describe('ScheduleState', () => {
-  test('is the JSON-safe ts-fsrs card shape', () => {
+  test('is the JSON-safe ts-fsrs card shape without transient learning steps', () => {
     const state: ScheduleState = {
       due: 0,
       stability: 0,
       difficulty: 0,
       elapsed_days: 0,
       scheduled_days: 0,
-      learning_steps: 0,
       reps: 0,
       lapses: 0,
       state: State.New,
       last_review: null,
     };
 
-    acceptsCardInput(state);
+    acceptsCardInput({ ...state, learning_steps: 0 });
 
     expect(state.due).toBe(0);
     expect(state.last_review).toBeNull();

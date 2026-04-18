@@ -16,8 +16,10 @@ const scheduler = fsrs({
 });
 
 function toScheduleState(card: Card): ScheduleState {
+  const { learning_steps: _learningSteps, ...rest } = card;
+
   return {
-    ...card,
+    ...rest,
     due: card.due.getTime(),
     last_review: card.last_review?.getTime() ?? null,
   };
@@ -25,23 +27,25 @@ function toScheduleState(card: Card): ScheduleState {
 
 function buildFixtures(): SchedulerFixture[] {
   const newState = toScheduleState(createEmptyCard(new Date(0)));
-  const learning = toScheduleState(
-    scheduler.repeat(createEmptyCard(new Date(0)), new Date(0))[Rating.Good].card,
-  );
+  const learningCard = scheduler.next(createEmptyCard(new Date(0)), new Date(0), Rating.Good).card;
+  const learning = toScheduleState(learningCard);
   const review = toScheduleState(
-    scheduler.repeat(
-      scheduler.repeat(createEmptyCard(new Date(0)), new Date(0))[Rating.Good].card,
-      new Date(learning.due),
-    )[Rating.Good].card,
+    scheduler.next({ ...learningCard, learning_steps: 0 }, new Date(learning.due), Rating.Good)
+      .card,
   );
   const relearning = toScheduleState(
-    scheduler.repeat(
-      scheduler.repeat(
-        scheduler.repeat(createEmptyCard(new Date(0)), new Date(0))[Rating.Good].card,
-        new Date(learning.due),
-      )[Rating.Good].card,
+    scheduler.next(
+      {
+        ...scheduler.next(
+          { ...learningCard, learning_steps: 0 },
+          new Date(learning.due),
+          Rating.Good,
+        ).card,
+        learning_steps: 0,
+      },
       new Date(review.due),
-    )[Rating.Again].card,
+      Rating.Again,
+    ).card,
   );
 
   return [

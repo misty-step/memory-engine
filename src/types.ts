@@ -58,7 +58,7 @@ export type GradeCtx = {
 
 export type RatingPolicy = (verdict: Verdict, ctx: GradeCtx) => Rating;
 
-export type ScheduleState = Omit<Card, 'due' | 'last_review'> & {
+export type ScheduleState = Omit<Card, 'due' | 'last_review' | 'learning_steps'> & {
   due: number;
   last_review: number | null;
 };
