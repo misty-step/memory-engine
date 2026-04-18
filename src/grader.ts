@@ -265,5 +265,6 @@ function deterministicGrade(
     graderModel: null,
     graderConfidence: null,
     feedback: '',
+    criterionResults: [],
   };
 }

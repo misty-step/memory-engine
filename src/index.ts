@@ -1,4 +1,5 @@
 export { assertNever } from './assert';
+export { AsyncGrader, DEFAULT_RUBRIC_CONFIDENCE_FLOOR, resolveRubricGrade } from './async-grader';
 export { defaultRatingPolicy, Grader } from './grader';
 export {
   filterEligibleCandidates,
@@ -30,6 +31,12 @@ export type {
   RecitationPrompt,
   RatingPolicy,
   ReviewUnitId,
+  RubricAssessment,
+  RubricCriterion,
+  RubricCriterionResult,
+  RubricCriterionVerdict,
+  RubricDefinition,
+  RubricPrompt,
   ScheduleState,
   ShortAnswerPrompt,
   Verdict,

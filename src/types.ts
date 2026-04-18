@@ -40,6 +40,38 @@ export type RecitationPrompt = ExactPromptBase & {
 
 export type Prompt = McqPrompt | BooleanPrompt | ClozePrompt | ShortAnswerPrompt | RecitationPrompt;
 
+export type RubricCriterionVerdict = 'pass' | 'fail';
+
+export type RubricCriterion = {
+  name: string;
+  description: string;
+  required: boolean;
+};
+
+export type RubricDefinition = {
+  answerGuide: string[];
+  passingScore: number;
+  criteria: RubricCriterion[];
+};
+
+export type RubricPrompt = PromptBase & {
+  kind: 'rubric';
+  rubric: RubricDefinition;
+};
+
+export type RubricCriterionResult = {
+  name: string;
+  verdict: RubricCriterionVerdict;
+  evidence: string;
+};
+
+export type RubricAssessment = {
+  model: string | null;
+  confidence: number;
+  feedback: string;
+  criterionResults: RubricCriterionResult[];
+};
+
 export type Verdict = 'correct' | 'close' | 'wrong' | 'revealed';
 
 export const Rating = {
@@ -129,4 +161,5 @@ export type GradeResult = {
   graderModel: string | null;
   graderConfidence: number | null;
   feedback: string;
+  criterionResults: RubricCriterionResult[];
 };
