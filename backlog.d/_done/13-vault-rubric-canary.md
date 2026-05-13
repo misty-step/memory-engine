@@ -2,7 +2,7 @@
 shaping: true
 ticket: 13-vault-rubric-canary
 slice: 3
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [11-rubric-grading-contract, 12-adapter-surface]
@@ -43,6 +43,8 @@ LLM implementation and tests green.
   contract reuse, not vendor abstraction theater.
 - If the canary exposes missing fields or ergonomics problems, fix the kernel
   contract first rather than patching around them in Vault.
+- Re-certified on 2026-05-13 from a temporary clean worktree on the
+  `memory-engine-rubric-canary` branch: `bun test` passed.
 - Study:
   - `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/grading.ts`
   - `/Users/phaedrus/Documents/daybook/tools/vault-srs/src/rubric-grader.ts`

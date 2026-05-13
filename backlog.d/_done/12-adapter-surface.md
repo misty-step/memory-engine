@@ -2,7 +2,7 @@
 shaping: true
 ticket: 12-adapter-surface
 slice: 3
-status: ready
+status: shipped
 priority: high
 estimate: S
 depends_on: [11-rubric-grading-contract]

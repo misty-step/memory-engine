@@ -2,33 +2,49 @@
 
 [![CI](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml)
 
-`memory-engine` is a framework-free TypeScript kernel for spaced repetition and answer grading.
+`memory-engine` is a TypeScript learning engine workspace for spaced repetition, answer grading, and service-interface experiments.
 
-Extracted from four learning apps:
+It started as a framework-free kernel extracted from four learning apps:
 
 - Ruminatio
 - Scry
 - Caesar in a Year
 - Vault SRS
 
+Scry and the Vault FSRS app are now decommission targets. The next product
+direction is a focused dedicated microservice: prototype the service contracts
+and interface form factors here, then extract the chosen service/application
+into its own repository when the design is stable.
+
 ## What It Owns
 
 - Canonical learning-domain types
 - FSRS state transitions
 - Deterministic grading
-- Consumer fixture corpora for contract tests
+- Progression and queue primitives
+- Recitation grading
+- Async rubric grading contracts
+- Vendor-neutral rubric adapter interfaces
+- Fixture corpora for contract and interface tests
 
-It does not own UI, storage, auth, billing, content authoring, or app-specific session choreography.
+The core runtime under `src/` stays framework-free. Service, storage, UI, auth,
+and deployment experiments must live outside that pure kernel until a focused
+microservice shape is selected.
 
 ## Status
 
-Slice 1 is in place:
+Slices 1 through 3 are in place:
 
 - canonical types
 - FSRS scheduler wrapper
 - deterministic grader
+- progression metadata and eligibility helpers
+- queue candidate filtering and selection
+- deterministic recitation grading
+- async rubric grading surface
+- dedicated `memory-engine/adapters` rubric adapter subpath
 - exported test fixtures
-- Vault SRS canary integration
+- historical Scry and Vault SRS canary branches
 
 Roadmap and shaping docs:
 
@@ -36,6 +52,7 @@ Roadmap and shaping docs:
 - [SLICE-1-KERNEL.md](./SLICE-1-KERNEL.md)
 - [SLICE-2-PROGRESSION.md](./SLICE-2-PROGRESSION.md)
 - [SLICE-3-RUBRIC.md](./SLICE-3-RUBRIC.md)
+- [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
 
 ## Install
 
@@ -75,10 +92,22 @@ const grade = grader.grade(
 const nextState = next(null, grade.rating, Date.now());
 ```
 
-Test fixtures for consumer contract tests:
+Test fixtures for contract and interface tests:
 
 ```ts
-import { gradingFixtures, schedulerFixtures } from 'memory-engine/testkit';
+import {
+  gradingFixtures,
+  progressionFixtures,
+  queueFixtures,
+  recitationFixtures,
+  schedulerFixtures,
+} from 'memory-engine/testkit';
+```
+
+Rubric adapters live on a separate subpath:
+
+```ts
+import { StaticRubricGrader } from 'memory-engine/adapters';
 ```
 
 ## Development

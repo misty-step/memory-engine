@@ -2,7 +2,7 @@
 shaping: true
 ticket: 11-rubric-grading-contract
 slice: 3
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [10-scry-canary]

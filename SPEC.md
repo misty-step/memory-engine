@@ -1,21 +1,35 @@
 # Memory Engine Spec
 
-Status: shaping / pre-build  
-Date: 2026-04-16
+Status: service-prototype shaping  
+Date: 2026-05-13
 
 ## Executive Summary
 
-`Memory Engine` is the proposed shared learning core for four related applications:
+`Memory Engine` is the learning-kernel and service-prototype workspace for a
+focused dedicated memory microservice.
+
+The original extraction was grounded in four related applications:
 
 - `../ruminatio`
 - `../scry`
 - `../caesar-in-a-year`
 - `../../Documents/daybook/tools/vault-srs`
 
-The recommendation from the code audit, architecture debate bench, and external research is:
+The strategic direction changed on 2026-05-13:
 
-1. Extract a **shared learning engine**.
-2. Start it as a **library/package**, not a remote service.
+1. Decommission Scry and the Vault FSRS app instead of merging their canary
+   branches as long-lived consumers.
+2. Build a **focused dedicated microservice** around the proven learning
+   semantics.
+3. Prototype service contracts and interface form factors in this repository
+   while the kernel is still easy to reshape.
+4. Extract the selected service/application into its own repository only after
+   the form factor and operational boundary are proven.
+
+The current recommendation is:
+
+1. Keep the existing TypeScript kernel as the semantic core.
+2. Add service/interface experiments beside, not inside, the pure runtime.
 3. Keep the shared core narrow and semantic:
    - canonical domain types
    - scheduling contracts and reference implementations
@@ -23,7 +37,7 @@ The recommendation from the code audit, architecture debate bench, and external 
    - progression graph semantics
    - queue selection primitives
    - evaluation fixtures and contract tests
-4. Keep product-specific pedagogy and UX outside the core:
+4. Keep interface and product-specific choices outside the core until selected:
    - content taxonomy
    - UI and copy
    - auth, billing, entitlements
@@ -31,18 +45,21 @@ The recommendation from the code audit, architecture debate bench, and external 
    - app-specific analytics and gamification
    - vendor-specific tutor prompts
 
-This is worth doing because the current duplication is already real and expensive, but a networked microservice would lock unstable semantics too early and add a distributed-systems tax before the domain has stabilized.
+This is worth doing because the kernel semantics are now concrete enough to
+support service experiments, while the user-facing shape is still unresolved.
+The repo should be the proving ground, not the permanent service home.
 
 ## Problem Statement
 
-We now have multiple learning products that rely on overlapping SRS and assessment capabilities:
+We had multiple learning products that relied on overlapping SRS and assessment
+capabilities:
 
 - Ruminatio
 - Vault SRS
 - Scry
 - Caesar in a Year
 
-Each application currently carries its own version of:
+Those systems demonstrated recurring needs:
 
 - scheduler state and rescheduling logic
 - attempt capture and review history
@@ -51,19 +68,28 @@ Each application currently carries its own version of:
 - progression and mastery logic
 - study-session advancement
 
-That duplication is already producing semantic drift. The same underlying ideas are being modeled differently, tested differently, and evolved separately.
+The immediate problem is no longer multi-consumer package adoption. Scry and
+Vault FSRS are decommission targets, so their canaries are evidence for the
+kernel boundary rather than branches to merge.
 
-The goal is not to centralize all learning-product logic. The goal is to extract the **stable substrate** so each product can build distinct pedagogy on top of one rigorous core.
+The goal is to turn the stable substrate into a focused service experiment:
+canonical learning semantics first, interface/form-factor exploration second,
+separate application repository third.
 
 ## Why Now
 
-Three things are simultaneously true:
+Four things are simultaneously true:
 
-1. The overlap is no longer hypothetical.
-2. The differences between the products are now clear enough to draw a boundary.
-3. A service-first move would be premature.
+1. The kernel is no longer hypothetical; slices 1 through 3 exist.
+2. The consumer-canary branches proved useful boundaries but are not the future
+   adoption path.
+3. The next uncertainty is product and service form factor, not package
+   extraction.
+4. Keeping experiments in this repo temporarily lowers coordination cost while
+   preserving the option to extract the chosen service later.
 
-This is the right time to extract a package because the shared kernel is visible, but the deployment topology question is still downstream.
+This is the right time to prototype service interfaces because the semantic core
+is visible, but the final application boundary is still downstream.
 
 ## Source Systems Audited
 
@@ -655,42 +681,46 @@ Likely strongest precedents:
 - Vault SRS for progression and queue semantics
 - Ruminatio/Caesar/Scry for integration realities
 
-### Phase 2: First consumer canary
+### Phase 2: Historical consumer canaries
 
-Preferred first candidate: Vault SRS or another least-coupled consumer of the core semantics.
+Completed canaries:
 
-Reason:
+- Scry `memory-engine-canary`
+- Vault `memory-engine-rubric-canary`
 
-- it already looks closest to an engine
-- it has rich progression semantics
-- lower risk of UI/product breakage than Ruminatio
+These are retained as boundary evidence. They are not the next adoption path
+because Scry and the Vault FSRS app are being decommissioned.
 
-### Phase 3: Broaden consumers
+### Phase 3: Service/interface prototype
 
-Probable order:
+Prototype the dedicated service shape inside this repo:
 
-1. Vault SRS
-2. Scry
-3. Caesar in a Year
-4. Ruminatio
+- HTTP or RPC command contract
+- durable state boundary
+- import/export story for authored learning material
+- review-session interaction model
+- evaluation fixtures for interface-level behavior
 
-Ruminatio likely comes last because its staged memorization flow and content model are the most visibly product-shaped right now.
+Keep experiments outside `src/` unless they are pure reusable kernel code.
 
-### Phase 4: Evaluate need for service wrapper
+### Phase 4: Extract selected service/app
 
-Only after the package has stable contracts and real multi-consumer usage.
+Once the service contract and interface form factor are selected, extract the
+application/service into its own repository. Leave this repo as the kernel,
+testkit, and possibly protocol package if that split remains useful.
 
-## Promotion Criteria For A Future Service
+## Extraction Criteria For The Dedicated Service
 
-Consider an internal HTTP service only if at least two or three of these become true:
+Extract the service/application only after these are true:
 
-- non-TypeScript clients need the engine
-- independent scaling is required
-- release cadence conflicts make package adoption painful
-- centralized audit/policy becomes materially valuable
-- version skew repeatedly harms behavior
+- the command/API surface has survived at least one interface prototype
+- the persistence boundary is explicit
+- review-session UX constraints are known
+- import/export fixtures exist for representative authored material
+- the kernel/service split does not require consumer-specific flags
+- the extraction plan names which code stays here and which code moves
 
-Do not promote to service form just because “shared code” exists.
+Do not extract a separate repo while the form factor is still churning.
 
 ## Risks, Failure Modes, And Kill Criteria
 
@@ -699,23 +729,23 @@ Do not promote to service form just because “shared code” exists.
 - the boundary is drawn too wide and absorbs app-specific policy
 - the boundary is drawn too narrow and fails to reduce duplication
 - concept-level and phrasing-level systems normalize poorly
-- migration corrupts schedule state
+- service prototypes leak framework/runtime coupling into `src/`
 - AI-assisted grading pushes unstable semantics into core
 
 ### Failure modes
 
-- “one true queue” API that cannot express app differences
-- adapter sprawl caused by weak core design
-- version churn that slows every consumer
+- “one true queue” API that cannot express the chosen product interaction
+- adapter sprawl caused by weak service boundaries
+- prototype code masquerading as a stable package API
 - regression in learner outcomes despite cleaner architecture
 
 ### Kill criteria
 
 Pause or cut back extraction if:
 
-- a proposed shared module has only one real consumer after a quarter
-- the shared API needs frequent product-specific flags
-- cross-app velocity drops for two consecutive sprints
+- the service prototype cannot define one narrow user or workflow
+- the API needs frequent product-specific flags
+- interface experiments keep changing kernel contracts instead of using them
 - more than 20% of core API surface is effectively single-app
 - learning behavior degrades without compensating product gains
 
@@ -727,22 +757,17 @@ Pause or cut back extraction if:
 - Should progression be represented as direct edges, typed relations, or both?
 - What migration order minimizes schedule-state risk?
 - What learner-outcome metrics will prove the extraction was worth doing?
-- Is TypeScript-only the right medium-term constraint, or do we expect polyglot consumers soon?
+- What is the smallest dedicated service surface worth extracting?
+- Which interface should be proven first: CLI, HTTP API, local web app, or
+  hosted service shell?
 
 ## Immediate Next Work
 
-1. Finish slice 2 in the current package:
-   - progression metadata and injected-policy eligibility helpers
-   - queue primitives
-   - deterministic recitation
-   - exported slice-2 fixture corpus
-   - Scry canary
-2. Finish slice 3 with additive async rubric support:
-   - shared rubric contract
-   - vendor-neutral adapter surface
-   - Vault rubric canary
-3. Re-evaluate a physical package split only after slice 3 proves that
-   `adapters` is a durable surface rather than a speculative one.
+1. Shape and implement the first service/interface prototype in this repo.
+2. Keep prototype code outside the pure `src/` kernel unless it is reusable
+   domain logic.
+3. Use fixtures and executable interface tests to decide whether the form
+   factor is worth extracting into a separate service/application repository.
 
 ## Appendix: Research Notes And References
 
@@ -764,9 +789,10 @@ Pause or cut back extraction if:
 Consensus:
 
 - shared kernel: yes
-- remote microservice now: no
-- strongest current form: versioned package with adapters
+- focused dedicated microservice: yes, but prototype here first
+- strongest current form: kernel plus explicit service/interface experiment
 
 Main reason:
 
-The current portfolio’s biggest problem is duplicated learning semantics, not deployment topology.
+The canaries proved enough semantic stability to move from package adoption to
+service form-factor discovery.

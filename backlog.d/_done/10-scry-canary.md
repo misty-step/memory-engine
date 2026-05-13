@@ -2,7 +2,7 @@
 shaping: true
 ticket: 10-scry-canary
 slice: 2
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [07-progression-primitives, 08-queue-primitives, 09-recitation-and-slice2-fixtures]
@@ -47,6 +47,9 @@ without forcing concept-specific assumptions into core.
   fields to core types to make the canary easier.
 - If Scry only adopts scheduler/progression in the canary, that is acceptable.
   The canary exists to prove the boundary, not to inflate scope.
+- Re-certified on 2026-05-13 from the `memory-engine-canary` branch with
+  `ASDF_NODEJS_VERSION=22.22.0`: `tsc --noEmit` and the targeted Vitest
+  canary files passed.
 - Study:
   - `/Users/phaedrus/Development/scry/convex/fsrs/engine.ts`
   - `src/scheduler.ts`
