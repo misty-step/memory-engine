@@ -7,7 +7,17 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "ignore": ["node_modules", "dist", "coverage", ".dagger", "backlog.d/_cycles"]
+    "ignore": [
+      "node_modules",
+      "dist",
+      "coverage",
+      ".dagger",
+      ".agent",
+      ".claude",
+      ".codex",
+      ".pi",
+      "backlog.d/_cycles"
+    ]
   },
   "organizeImports": { "enabled": true },
   "linter": {

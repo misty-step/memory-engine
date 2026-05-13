@@ -1,0 +1,6 @@
+[skills]
+paths = [".agent/skills"]
+
+[commands]
+ci = "bun run ci"
+ci_local = "bun run ci:local"

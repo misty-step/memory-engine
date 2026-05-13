@@ -1,0 +1,9 @@
+{
+  "skills": [
+    ".agent/skills/*"
+  ],
+  "commands": {
+    "ci": "bun run ci",
+    "ciLocal": "bun run ci:local"
+  }
+}

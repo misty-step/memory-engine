@@ -29,4 +29,6 @@ bun-debug.log*
 
 # Flywheel / deliver state
 .spellbook/
+!.spellbook/
+!.spellbook/repo-brief.md
 backlog.d/_cycles/
