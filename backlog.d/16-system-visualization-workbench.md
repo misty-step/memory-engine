@@ -5,7 +5,7 @@ slice: 4
 status: ready
 priority: medium
 estimate: M
-depends_on: [15-service-interface-prototype]
+depends_on: [17-service-scenario-fixtures]
 oracles:
   - bun run ci
   - test -f docs/architecture/memory-engine.map.json
@@ -46,8 +46,8 @@ workflow paths, state transitions, and extraction candidates.
 
 ## Notes
 
-- Sequence this after ticket 15. The service command envelope should exist
-  before the workbench tries to visualize it.
+- Sequence this after ticket 17. The service command envelope and first
+  scenario fixtures should exist before the workbench tries to visualize them.
 - Use the workbench as a decision aid for extraction, onboarding, and review,
   not as a second source of truth for runtime behavior.
 - A thin JSON graph plus static HTML is the preferred first pass. It keeps the
