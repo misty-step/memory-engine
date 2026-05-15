@@ -11,12 +11,20 @@
   "exports": {
     ".": "./src/index.ts",
     "./adapters": "./src/adapters/index.ts",
-    "./testkit": "./testkit/index.ts"
+    "./grading": "./src/grading.ts",
+    "./progression": "./src/progression-api.ts",
+    "./queue": "./src/queue-api.ts",
+    "./scheduling": "./src/scheduling.ts",
+    "./testkit": "./testkit/index.ts",
+    "./types": "./src/types.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:watch": "bun test --watch",
+    "bench": "bun run scripts/bench.ts",
+    "experiments:cli-review": "bun run experiments/cli-review/index.ts",
+    "experiments:import-probe": "bun run experiments/import-probe/index.ts",
     "coverage": "bun run scripts/check-coverage.ts",
     "lint": "biome lint .",
     "format": "biome format --write .",

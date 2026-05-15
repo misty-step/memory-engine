@@ -2,7 +2,7 @@
 shaping: true
 ticket: 15-service-interface-prototype
 slice: 4
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [14-consumer-canary-recertification]
@@ -30,13 +30,13 @@ can guide a later extraction into a separate service/application repository.
 
 ## Oracle
 
-- [ ] `tests/service/interface-contract.test.ts` pins the service command
+- [x] `tests/service/interface-contract.test.ts` pins the service command
       envelope for at least record-attempt, grade/apply-review, and next-queue
       behavior.
-- [ ] `tests/service/persistence-boundary.test.ts` proves the prototype keeps
+- [x] `tests/service/persistence-boundary.test.ts` proves the prototype keeps
       storage concerns outside the pure kernel.
-- [ ] `bun run ci` exits 0.
-- [ ] The implementation notes name what should stay in this repo versus what
+- [x] `bun run ci` exits 0.
+- [x] The implementation notes name what should stay in this repo versus what
       should move when the service/app is extracted.
 
 ## Notes
@@ -46,3 +46,7 @@ can guide a later extraction into a separate service/application repository.
 - Use the historical Scry and Vault canaries as boundary evidence only.
 - Prefer a thin prototype surface over a generic workflow engine. The goal is to
   discover the dedicated service shape, not to invent a broad orchestration DSL.
+- 2026-05-14: Verified on `cx/deliver-15-service-interface-prototype-verified`.
+  `bun test tests/service/interface-contract.test.ts`,
+  `bun test tests/service/persistence-boundary.test.ts`, and `bun run ci`
+  exited 0.

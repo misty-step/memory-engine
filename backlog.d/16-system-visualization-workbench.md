@@ -2,10 +2,10 @@
 shaping: true
 ticket: 16-system-visualization-workbench
 slice: 4
-status: ready
+status: later
 priority: medium
 estimate: M
-depends_on: [17-service-scenario-fixtures]
+depends_on: [18-modular-api-surface, 19-service-boundary-failure-semantics, 21-cli-review-loop-dogfood]
 oracles:
   - bun run ci
   - test -f docs/architecture/memory-engine.map.json
@@ -46,8 +46,9 @@ workflow paths, state transitions, and extraction candidates.
 
 ## Notes
 
-- Sequence this after ticket 17. The service command envelope and first
-  scenario fixtures should exist before the workbench tries to visualize them.
+- Sequence this after the modular API surface, service failure semantics, and
+  first dogfood client exist. The workbench should visualize stable evidence,
+  not substitute for it.
 - Use the workbench as a decision aid for extraction, onboarding, and review,
   not as a second source of truth for runtime behavior.
 - A thin JSON graph plus static HTML is the preferred first pass. It keeps the

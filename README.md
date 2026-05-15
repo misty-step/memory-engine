@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml)
 
-`memory-engine` is a TypeScript learning engine workspace for spaced repetition, answer grading, and service-interface experiments.
+`memory-engine` is a TypeScript learning engine workspace for spaced
+repetition, answer grading, modular API design, and dogfood client experiments.
 
 It started as a framework-free kernel extracted from four learning apps:
 
@@ -11,10 +12,10 @@ It started as a framework-free kernel extracted from four learning apps:
 - Caesar in a Year
 - Vault SRS
 
-Scry and the Vault FSRS app are now decommission targets. The next product
-direction is a focused dedicated microservice: prototype the service contracts
-and interface form factors here, then extract the chosen service/application
-into its own repository when the design is stable.
+Scry and the Vault FSRS app are now decommission targets. The current product
+direction is a world-class modular API for building learning and memorization
+applications, plus experimental clients that dogfood the API. Winning clients
+can be extracted into their own repositories after executable evidence.
 
 ## What It Owns
 
@@ -26,10 +27,12 @@ into its own repository when the design is stable.
 - Async rubric grading contracts
 - Vendor-neutral rubric adapter interfaces
 - Fixture corpora for contract and interface tests
+- Evals and benchmarks for learning-behavior regressions
+- Experimental clients that consume the API from outside `src/`
 
 The core runtime under `src/` stays framework-free. Service, storage, UI, auth,
-and deployment experiments must live outside that pure kernel until a focused
-microservice shape is selected.
+content parsing, and deployment experiments must live outside that pure kernel
+until dogfood evidence proves a stable boundary.
 
 ## Status
 
@@ -54,6 +57,10 @@ Roadmap and shaping docs:
 - [SLICE-3-RUBRIC.md](./SLICE-3-RUBRIC.md)
 - [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
 
+Active backlog now tracks Slice 5: modular API entrypoints, service-boundary
+failure semantics, evals/benchmarks, CLI dogfood, import probes, web-shell
+dogfood, and extraction gates.
+
 ## Install
 
 Local path dependency:
@@ -71,7 +78,9 @@ Workspace-style usage also works as long as the package is linked into the consu
 ## Usage
 
 ```ts
-import { Grader, type ReviewUnitId, next } from 'memory-engine';
+import { Grader } from 'memory-engine/grading';
+import { next } from 'memory-engine/scheduling';
+import type { ReviewUnitId } from 'memory-engine/types';
 
 const grader = new Grader();
 const reviewUnitId = 'latin-1' as ReviewUnitId;

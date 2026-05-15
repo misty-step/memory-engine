@@ -2,16 +2,18 @@
 
 ## Vision & Purpose
 
-`memory-engine` is a framework-free TypeScript learning kernel shared by
-Ruminatio, Scry, Caesar in a Year, and Vault SRS. It extracts the stable
-substrate of spaced repetition and answer grading into one importable package:
-canonical study-domain types, FSRS scheduling, deterministic grading,
+`memory-engine` is a framework-free TypeScript learning kernel and modular API
+workspace for learning and memorization applications. It extracts the stable
+substrate of spaced repetition and answer grading into composable package
+surfaces: canonical study-domain types, FSRS scheduling, deterministic grading,
 progression helpers, queue primitives, rubric contracts, adapter interfaces,
-and fixture corpora for consumer contract tests.
+fixture corpora, evals, benchmarks, and dogfood clients.
 
-This is deliberately a package, not a service. Consumers keep storage, UI,
-session choreography, content authoring, auth, analytics, vendor SDKs, and
-product-specific pedagogy outside the kernel.
+The API is the primary product surface. Experimental clients live beside the
+kernel to dogfood the API, then winners may be extracted into their own apps.
+Consumers and experiments keep storage, UI, session choreography, content
+authoring, auth, analytics, vendor SDKs, and product-specific pedagogy outside
+the kernel.
 
 ## Stack & Boundaries
 
@@ -23,6 +25,8 @@ product-specific pedagogy outside the kernel.
 - Testkit: `testkit/` publishes fixtures through `memory-engine/testkit`.
 - Adapter surface: `src/adapters/` publishes vendor-neutral contracts and test
   doubles through `memory-engine/adapters`; real model clients stay in consumers.
+- Experiments: future `experiments/` clients consume public API surfaces and the
+  repo-local service prototype from outside `src/`.
 - CI: `.dagger/src/index.ts` owns the containerized gate.
 - Tracker: active tickets live in `backlog.d/`; closed tickets live in
   `backlog.d/_done/`.
@@ -61,9 +65,9 @@ evidence. Delivery requires a green `bun run ci`.
 
 ## Known Debts
 
-- `SPEC.md` still says the immediate next work is finishing slices 2 and 3, but
-  the code has implemented progression, queue, recitation, rubric contracts, and
-  adapters. The roadmap/status docs need reconciliation.
+- Slice 5 backlog now prioritizes modular API subpaths, service failure
+  semantics, evals/benchmarks, and dogfood clients before visualization or
+  extraction.
 - `backlog.d/_done/10-scry-canary.md`,
   `backlog.d/_done/11-rubric-grading-contract.md`,
   `backlog.d/_done/12-adapter-surface.md`, and
@@ -117,3 +121,5 @@ Validated patterns:
 - The codebase benefits from small pure modules with simple public functions:
   `next`, `Grader.grade`, progression filters, queue selectors, and async rubric
   adapters.
+- Dogfood clients should produce executable receipts under `docs/dogfood/`
+  before any client or service shape is extracted.

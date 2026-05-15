@@ -1,12 +1,12 @@
 # Memory Engine Spec
 
-Status: service-prototype shaping  
-Date: 2026-05-13
+Status: modular API and dogfood shaping
+Date: 2026-05-14
 
 ## Executive Summary
 
-`Memory Engine` is the learning-kernel and service-prototype workspace for a
-focused dedicated memory microservice.
+`Memory Engine` is the modular learning API and dogfood workspace for building
+learning and memorization applications.
 
 The original extraction was grounded in four related applications:
 
@@ -15,29 +15,30 @@ The original extraction was grounded in four related applications:
 - `../caesar-in-a-year`
 - `../../Documents/daybook/tools/vault-srs`
 
-The strategic direction changed on 2026-05-13:
+The strategic direction changed on 2026-05-14:
 
-1. Decommission Scry and the Vault FSRS app instead of merging their canary
-   branches as long-lived consumers.
-2. Build a **focused dedicated microservice** around the proven learning
-   semantics.
-3. Prototype service contracts and interface form factors in this repository
-   while the kernel is still easy to reshape.
-4. Extract the selected service/application into its own repository only after
-   the form factor and operational boundary are proven.
+1. Keep the package/API as the primary product surface.
+2. Make the API modular enough for multiple learning and memorization apps to
+   compose scheduling, grading, progression, queue planning, fixtures, evals,
+   and adapters without reaching into internals.
+3. Build a stable of experimental interfaces and clients beside the API to
+   dogfood it.
+4. Use dogfood receipts, evals, and benchmarks to identify winners and extract
+   them into their own application repositories.
 
 The current recommendation is:
 
 1. Keep the existing TypeScript kernel as the semantic core.
-2. Add service/interface experiments beside, not inside, the pure runtime.
-3. Keep the shared core narrow and semantic:
+2. Add modular package entrypoints for stable API surfaces.
+3. Add experiments beside, not inside, the pure runtime.
+4. Keep the shared core narrow and semantic:
    - canonical domain types
    - scheduling contracts and reference implementations
    - grading contracts
    - progression graph semantics
    - queue selection primitives
    - evaluation fixtures and contract tests
-4. Keep interface and product-specific choices outside the core until selected:
+5. Keep interface and product-specific choices outside the core until selected:
    - content taxonomy
    - UI and copy
    - auth, billing, entitlements
@@ -46,8 +47,9 @@ The current recommendation is:
    - vendor-specific tutor prompts
 
 This is worth doing because the kernel semantics are now concrete enough to
-support service experiments, while the user-facing shape is still unresolved.
-The repo should be the proving ground, not the permanent service home.
+support real client experiments, while the winning product/interface shape is
+still unresolved. The repo should be the proving ground, not the permanent home
+for every client.
 
 ## Problem Statement
 
@@ -68,13 +70,13 @@ Those systems demonstrated recurring needs:
 - progression and mastery logic
 - study-session advancement
 
-The immediate problem is no longer multi-consumer package adoption. Scry and
-Vault FSRS are decommission targets, so their canaries are evidence for the
+The immediate problem is no longer only multi-consumer package adoption. Scry
+and Vault FSRS are decommission targets, so their canaries are evidence for the
 kernel boundary rather than branches to merge.
 
-The goal is to turn the stable substrate into a focused service experiment:
-canonical learning semantics first, interface/form-factor exploration second,
-separate application repository third.
+The goal is to turn the stable substrate into a world-class modular API:
+canonical learning semantics first, executable evals and benchmarks second,
+dogfood interfaces third, separate application repositories after evidence.
 
 ## Why Now
 
@@ -83,13 +85,14 @@ Four things are simultaneously true:
 1. The kernel is no longer hypothetical; slices 1 through 3 exist.
 2. The consumer-canary branches proved useful boundaries but are not the future
    adoption path.
-3. The next uncertainty is product and service form factor, not package
-   extraction.
+3. The next uncertainty is API ergonomics and client form factor, not whether
+   the kernel primitives are useful.
 4. Keeping experiments in this repo temporarily lowers coordination cost while
-   preserving the option to extract the chosen service later.
+   preserving the option to extract winning clients later.
 
-This is the right time to prototype service interfaces because the semantic core
-is visible, but the final application boundary is still downstream.
+This is the right time to modularize the API and dogfood it because the
+semantic core is visible, but the final application boundary is still
+downstream.
 
 ## Source Systems Audited
 
@@ -268,6 +271,8 @@ Decks, concepts, passages, prayers, mass responses, language drills, and knowled
 - Support both flat SRS and progression-graph learning.
 - Make learning behavior easier to test, simulate, and compare.
 - Create a stable integration point for multiple apps without forcing a service too early.
+- Dogfood the API through experimental clients before extracting winners.
+- Add evals and benchmarks so API changes are judged by behavior and speed.
 
 ## Non-Goals
 
@@ -277,17 +282,24 @@ Decks, concepts, passages, prayers, mass responses, language drills, and knowled
 - Standardizing all pedagogy into one queue policy
 - Forcing every app onto identical session flow
 - Solving content authoring and canonical corpora inside this project
+- Extracting an app before at least two dogfood experiments expose repeated
+  boundary pressure
 
 ## Core Recommendation
 
-Build `Memory Engine` as a **TypeScript-first shared package** with four planned surfaces:
+Build `Memory Engine` as a **TypeScript-first modular API** with stable logical
+surfaces:
 
-1. `packages/contracts`
-2. `packages/core`
-3. `packages/adapters`
-4. `packages/testkit`
+1. `memory-engine/types`
+2. `memory-engine/scheduling`
+3. `memory-engine/grading`
+4. `memory-engine/progression`
+5. `memory-engine/queue`
+6. `memory-engine/adapters`
+7. `memory-engine/testkit`
 
-Defer any HTTP or daemon form until the package proves that the boundary is real.
+Keep the root `memory-engine` export as a compatibility barrel. Defer any HTTP,
+daemon, or extracted app form until experiments prove that the boundary is real.
 
 ## Architecture Options Considered
 

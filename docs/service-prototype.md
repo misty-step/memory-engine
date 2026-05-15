@@ -43,3 +43,19 @@ network clients, or product workflow policy.
 `grade/apply-review` hands the graded attempt and the new schedule state to the
 store through one `applyReview` boundary method so a future repository can make
 that write transactional.
+
+## Failure Semantics
+
+Service commands report success only after the injected store operation
+resolves. Store rejections propagate to the caller; the prototype does not
+swallow persistence failures, remap them to grading verdicts, retry them, or
+pretend a partial write succeeded.
+
+Validation also belongs at the store boundary. A production store or realistic
+fake should reject unknown review units, blank submitted answers, invalid
+response times, mismatched applied review units, and schedule writes whose
+`last_review` does not match the persisted attempt timestamp.
+
+`applyReview` is the transaction seam. Consumers that need durable persistence
+must commit the graded attempt and next `ScheduleState` together, or reject the
+command so clients can treat the review as unapplied.
