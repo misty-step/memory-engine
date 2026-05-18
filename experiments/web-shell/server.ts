@@ -29,7 +29,10 @@ const server = Bun.serve({
     }
 
     if (request.method === 'POST' && url.pathname === '/answer') {
-      const payload = readAnswerPayload(await request.json());
+      const payload = await readAnswerRequest(request);
+      if (payload instanceof AnswerPayloadError) {
+        return json({ error: payload.message }, 400);
+      }
       return json(await shell.submitAnswer(payload.answer, payload.responseTimeMs));
     }
 
@@ -44,10 +47,20 @@ const server = Bun.serve({
 console.log(`Web shell listening on http://localhost:${server.port}`);
 setInterval(() => {}, 60_000);
 
-function json(value: unknown): Response {
+function json(value: unknown, status = 200): Response {
   return Response.json(value, {
+    status,
     headers: { 'cache-control': 'no-store' },
   });
+}
+
+async function readAnswerRequest(request: Request): Promise<AnswerPayload | AnswerPayloadError> {
+  try {
+    return readAnswerPayload(await request.json());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Invalid answer payload';
+    return new AnswerPayloadError(message);
+  }
 }
 
 function readAnswerPayload(value: unknown): AnswerPayload {
@@ -63,9 +76,15 @@ function readAnswerPayload(value: unknown): AnswerPayload {
     throw new Error('Answer payload requires a string answer');
   }
 
-  if (typeof responseTimeMs !== 'number' || !Number.isFinite(responseTimeMs)) {
-    throw new Error('Answer payload requires a numeric responseTimeMs');
+  if (
+    typeof responseTimeMs !== 'number' ||
+    !Number.isFinite(responseTimeMs) ||
+    responseTimeMs < 0
+  ) {
+    throw new Error('Answer payload requires a non-negative numeric responseTimeMs');
   }
 
   return { answer, responseTimeMs };
 }
+
+class AnswerPayloadError extends Error {}

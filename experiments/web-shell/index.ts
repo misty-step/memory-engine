@@ -191,7 +191,7 @@ export async function runWebShellFlow(
 
   return {
     fixture: reviewed.fixture,
-    commands: ['next-queue', 'reveal', 'grade/apply-review', 'next-queue'],
+    commands: next.commands ?? [],
     submittedAnswer: 'I believe in one God',
     gradedVerdict: requireCurrentView(reviewed).grade?.verdict ?? 'wrong',
     gradedRating: requireCurrentView(reviewed).grade?.rating ?? 1,
