@@ -1,0 +1,61 @@
+# Web Shell Dogfood
+
+Refs-backlog: 23
+
+## Purpose
+
+`experiments/web-shell/` is a local interface experiment for the memory-engine
+API. It renders a study loop over the import-probe dogfood fixture, then drives
+answer submission, reveal, review-state visibility, and queue transitions
+through the repo-local service prototype from outside `src/`.
+
+## Commands
+
+```sh
+bun test experiments/web-shell/web-shell.test.ts
+bun run experiments:web-shell
+```
+
+The server listens on `http://localhost:4173` unless `PORT` is set.
+
+## Fixture
+
+Fixture name: `latin-prayer-authored-v1`
+
+The shell reuses the import-probe compiler output for two review units:
+
+- `import-credo-in-unum-deum`
+- `import-pater-noster`
+
+The first review unit starts with a review schedule. A correct answer updates
+that schedule and moves the queue to the second, unscheduled unit.
+
+## Service Commands Exercised
+
+- `next-queue`
+- `grade/apply-review`
+
+Reveal is intentionally UI-owned in this experiment. The service has no
+first-class revealed-review command, and the ticket did not add one.
+
+## Interface Pressure
+
+- Review-state visibility needs a compact DTO. Raw `ScheduleState` is useful
+  engine state but too engine-shaped for learner-facing copy.
+- Reveal is a real interaction path, but today it is client-owned. Promoting it
+  would require a shaped service command and a scheduler policy for revealed
+  attempts.
+- Prompt copy, confidence copy, answer draft state, and layout state stay
+  outside the kernel.
+- The web shell did not require a UI framework dependency or changes under
+  `src/`.
+
+## Extraction Recommendation
+
+Keep experimenting.
+
+The CLI review, import probe, and web shell now show repeated pressure around
+client-owned session choreography and review-state presentation. They do not yet
+justify extracting a standalone application repository or promoting web-shell
+helpers to `testkit`. A future extraction gate should compare whether a second
+interactive client needs the same view DTO and reveal semantics.

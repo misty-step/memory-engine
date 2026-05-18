@@ -45,3 +45,5 @@ if (functionCoverage < COVERAGE_FLOOR || lineCoverage < COVERAGE_FLOOR) {
 console.log(
   `Coverage floor ${COVERAGE_FLOOR}% met (funcs=${functionCoverage.toFixed(2)}%, lines=${lineCoverage.toFixed(2)}%).`,
 );
+
+export {};
