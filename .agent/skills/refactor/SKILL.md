@@ -19,4 +19,4 @@ Keep tests behavior-focused and do not mock internal collaborators. Preserve `Sc
 
 ## Verification
 
-Run the focused tests for touched behavior, then `bun run ci`. If refactoring changes exports or fixtures, run /qa and any required canary.
+Run the focused tests for touched behavior, then `bun run ci`. If refactoring changes exports or fixtures, run /qa and any ticket-required current proof oracle.

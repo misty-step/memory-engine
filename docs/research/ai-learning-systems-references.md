@@ -10,6 +10,11 @@ Refs-backlog: 21
 Refs-backlog: 22
 Refs-backlog: 23
 Refs-backlog: 24
+Refs-backlog: 26
+Refs-backlog: 27
+Refs-backlog: 28
+Refs-backlog: 29
+Refs-backlog: 31
 
 ## Core Findings
 
@@ -70,6 +75,60 @@ disagreement escalation, reference answers, evidence citations, and regression
 tracking. Do not use one LLM judge as the only quality gate.
 
 ## API And Experiment Implications
+
+## Evidence Matrix
+
+This matrix records which AI-system findings should shape the beta interface
+and which should stay out of the pure kernel until proven by dogfood evidence.
+
+| Evidence | What it supports | Product/API consequence |
+| --- | --- | --- |
+| OpenAI embeddings guidance, MTEB, BEIR, and Sentence-Transformers examples frame embeddings as retrieval, clustering, classification, and similarity tools. | Semantic similarity can help de-duplicate, cluster, recommend, and find reference context, but it is not truth. | Beta can maintain a client-owned embedding/index layer for content organization; correctness still comes from deterministic grading, rubric contracts, or evaluated model graders. |
+| TREC RAG and retrieval benchmark practice separate retrieval quality from answer generation quality. | RAG needs separate retrieval and generation evals. | Content generation should store source passages, retrieval receipts, model/version metadata, and unsupported-claim checks before generated quizzes enter the review queue. |
+| ReAct, Reflexion, and Self-Refine show agent loops can improve task execution when observations and feedback are explicit. | Agents need explicit workflow state, not free-form hidden autonomy. | Beta generation should use structured states such as ingest -> normalize -> retrieve -> draft prompts -> critique -> approve/save, with validated outputs at each step. |
+| VanLehn's tutoring-systems review and newer AutoTutor/LLM tutoring work suggest tutoring quality comes from scaffolded pedagogy, not generic chat. | A learning agent should produce hints, worked examples, Socratic probes, and repair material under policy. | The interface should offer narrow tutor actions from a review item; the kernel should not embed tutor prompts. |
+| Tutor CoPilot and Socratic tutoring work point toward AI assisting high-context pedagogical decisions. | AI can help select next intervention when user state and content evidence are available. | Store attempt history, struggle patterns, concept/source metadata, and reference links so future agents can diagnose failure loops. |
+| LLM-judge reliability literature and production grader guidance show model judgments have bias and drift. | Model grading is useful but cannot be the only gate. | Rubric/model graders need golden examples, disagreement handling, confidence, evidence citations, and regression tracking. |
+| NIST AI TEVV and GenAI evaluation guidance emphasize test, evaluation, validation, and verification as ongoing governance. | AI behavior must be measured over time. | Add evals for duplicate detection, retrieval Recall@k, hint leakage, unsupported claims, judge agreement, latency, and cost before promoting AI contracts. |
+| Prompt-injection and data-control guidance make source permissions part of product design. | User-owned content and web/file ingestion require explicit safety boundaries. | Beta persistence must track source provenance, permission labels, model-send eligibility, and generated-content provenance. |
+
+## Beta AI Workflow Requirements
+
+The beta interface may need a database immediately. That does not imply the
+published `src/` kernel should own one. The product shell should persist enough
+state to make AI-assisted learning usable and auditable:
+
+- `SourceDocument`: user-entered text, uploaded file metadata, link metadata,
+  image/video transcript references, source permissions, and freshness.
+- `ReferenceSpan`: cited excerpts or ranges used to generate or explain a
+  prompt.
+- `GeneratedPromptDraft`: model/provider/version, input source ids, prompt
+  text, accepted answers, rubric criteria, confidence, and critique status.
+- `ReviewUnitRecord`: canonical prompt plus learner-owned schedule state,
+  concept/source/domain keys, references, and supersession/progression metadata.
+- `AttemptRecord`: answer, latency, confidence, reveal state, verdict, rating,
+  feedback, schedule update, and repair hints shown.
+- `GenerationRun`: structured agent run receipts, tool inputs, validation
+  failures, cost/latency, and final saved artifacts.
+
+Keep these records in the beta application layer until repeated clients need
+the same contract. Promote only stable, provider-neutral contracts back into
+`memory-engine`.
+
+## Ticket Mapping
+
+- `26-beta-persistence-spine`: stores source, draft, attempt, schedule,
+  reference, and generation-run records so AI output remains auditable.
+- `27-ai-content-generation-probe`: proves source-grounded prompt generation,
+  critique, rejection, approval, and provenance before model output reaches the
+  review queue.
+- `28-mobile-beta-study-interface`: tests whether AI-generated content improves
+  an actual review loop instead of producing disconnected artifacts.
+- `29-service-contract-v0-hardening`: decides which DTOs, reveal semantics, and
+  error/idempotency contracts are stable enough to survive durable AI-assisted
+  workflows.
+- `31-beta-extraction-decision`: uses beta evidence to decide whether any AI
+  adapters or helpers deserve promotion.
 
 ### Candidate Adapter Contracts
 

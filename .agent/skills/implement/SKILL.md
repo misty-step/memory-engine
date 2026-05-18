@@ -21,6 +21,6 @@ Preserve invariants: `ScheduleState` is ts-fsrs-native and JSON-safe; prompt uni
 
 ## Verification
 
-Run the ticket's exact oracles. Use focused suites while iterating, then finish with `bun run ci`. If the ticket names canaries, run them exactly in Scry or Vault SRS and report them separately.
+Run the ticket's exact oracles. Use focused suites while iterating, then finish with `bun run ci`. If the ticket names current dogfood, beta, or external proof commands, run them exactly and report them separately. Historical Scry and Vault canaries are deprecated and are not required unless a future ticket explicitly replaces them with a current oracle.
 
-Close with ticket ID, changed surfaces, exact commands run, canary evidence if applicable, and residual unverified paths.
+Close with ticket ID, changed surfaces, exact commands run, proof evidence if applicable, and residual unverified paths.

@@ -28,7 +28,7 @@ Run the correctness gate for `memory-engine`, a pure TypeScript learning kernel.
 
 ## Boundaries
 
-Do not deploy from this skill; this repo has no deploy target. Do not run consumer canaries unless the active ticket names them. Scry and Vault SRS canaries are product proof, reported separately from CI.
+Do not deploy from this skill; this repo has no deploy target. Do not run external proof commands unless the active ticket names them. Historical Scry and Vault canaries are deprecated and are not part of current CI proof.
 
 ## Output
 

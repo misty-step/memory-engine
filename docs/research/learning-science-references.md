@@ -8,6 +8,11 @@ Refs-backlog: 20
 Refs-backlog: 21
 Refs-backlog: 22
 Refs-backlog: 23
+Refs-backlog: 26
+Refs-backlog: 27
+Refs-backlog: 28
+Refs-backlog: 29
+Refs-backlog: 31
 
 ## Core Findings
 
@@ -102,6 +107,62 @@ own stage relationships and mastery gates, not product-specific lesson copy.
   due, filtered, locked, buried, anti-clumped, or selected?
 - Dogfood clients should measure whole review loops, not isolated helpers:
   attempt -> grade/feedback -> schedule update -> next queue -> reflection.
+
+## Evidence Matrix
+
+This matrix is the durable design context for backlog shaping. It does not make
+every finding a kernel feature. It records what the product should test before
+promoting new API surface.
+
+| Evidence | What it supports | Product/API consequence |
+| --- | --- | --- |
+| Dunlosky et al. (2013) rate practice testing and distributed practice as high utility across many learners and domains. | Active recall and spacing should be first-order product loops. | The beta interface should optimize for fast retrieval attempts, not passive reading or card management. |
+| Roediger and Karpicke (2006) show test-enhanced learning improves delayed retention relative to repeated study. | Quiz/retrieval loops are a better default than review-only flashcards. | `memory-engine` attempts are the canonical learning event; reveal without attempt should be tracked differently from graded retrieval. |
+| Karpicke and Roediger (2008) argue retrieval itself is critical, not merely an assessment proxy. | Correctness is not the only signal; the act of recall matters. | Store attempts, latency, confidence, reveal state, and retry/repair metadata so future evals can reason about learning behavior. |
+| Cepeda et al. (2006, 2008) support distributed practice and show gap timing depends on retention interval. | Scheduling policy must be explicit and replayable. | Keep persisted schedule state JSON-safe and version future scheduler policies rather than hiding schedule mutations in UI code. |
+| Rowland (2014) meta-analysis supports testing over restudy for retention. | Beta success should include retention-oriented behavior, not just completion. | Add evals or receipts for repeated retrieval over time once a persisted beta exists. |
+| Agarwal, Nunes, and Blunt (2021) reinforce retrieval practice benefits in educational contexts. | Product should make retrieval low-friction and frequent. | Mobile-first interface should reduce time-to-first-attempt and keep answer entry ergonomic. |
+| Brunmair and Richter (2019) show interleaving helps, especially where discrimination between similar categories matters. | Queue policy should mix intentionally, not randomly. | Use concept/source/domain metadata for confusable contrast and anti-clumping; add queue explanation before adding opaque AI queueing. |
+| Hattie and Timperley (2007), Wisniewski et al. (2019) show feedback effects depend on content, level, and timing. | Feedback is a policy and pedagogy layer, not a binary correct/incorrect decoration. | Keep grade details rich enough for clients to implement immediate feedback, delayed feedback, hints, and repair loops. |
+| Butler, Karpicke, and Roediger (2008) connect feedback and confidence after testing. | Calibration can be a learning signal. | Experiments should capture predicted confidence versus actual outcome before promoting confidence fields to core. |
+| MIT Teaching + Learning Lab metacognition guidance emphasizes monitoring and regulation. | Learners need visibility into what they think they know versus what they can retrieve. | Beta should include lightweight calibration and review-state explanations, not only due counts. |
+| Kalyuga (2007) expertise reversal effect warns that high guidance can become counterproductive. | Worked examples and hints should fade as mastery grows. | Progression metadata can represent worked example -> cued attempt -> cloze -> free recall -> transfer, while copy and lesson flow stay client-owned. |
+
+## Beta Interface Research Requirements
+
+The next usable interface needs persistence, but persistence should live outside
+`src/` until repeated experiments prove a stable package contract. For beta
+work, the application layer should own:
+
+- local database tables or files for learner-owned content, generated prompts,
+  attempts, schedules, sources, references, and generation provenance;
+- import/generation workflows for typed text, pasted documents, uploaded files,
+  images, links, and eventually video transcripts;
+- reference links and source passages attached to generated prompts;
+- review-session state, UI copy, hints, feedback timing, confidence prompts,
+  and repair flows;
+- privacy policy for what source material may be sent to model providers.
+
+The shared kernel should remain responsible for:
+
+- canonical prompt, grade, schedule, progression, and queue types;
+- pure grading, scheduling, progression, and queue primitives;
+- eval fixtures that replay learning semantics;
+- adapter contracts only after at least two clients show repeated pressure.
+
+## Ticket Mapping
+
+- `26-beta-persistence-spine`: durable attempts and schedule state make
+  retrieval practice and spacing auditable across sessions.
+- `27-ai-content-generation-probe`: generated quizzes must be grounded in
+  sources and approved before they become retrieval prompts.
+- `28-mobile-beta-study-interface`: phone-first answer entry and review flow
+  test whether retrieval practice is actually low friction.
+- `29-service-contract-v0-hardening`: reveal, feedback, retry, and typed
+  failure semantics decide whether review events are trustworthy learning
+  evidence.
+- `31-beta-extraction-decision`: extraction waits until beta evidence shows
+  which learning workflow contracts are stable.
 
 ## Kernel Vs Client Boundary
 

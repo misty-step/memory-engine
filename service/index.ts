@@ -17,6 +17,7 @@ export type ServiceAttemptRecord = {
   submittedAnswer: string;
   responseTimeMs: number;
   occurredAt: number;
+  idempotencyKey?: string;
   grade?: GradeResult;
 };
 
@@ -27,6 +28,7 @@ export type MemoryServiceStore = {
     reviewUnitId: ReviewUnitId,
     attempt: ServiceAttemptRecord,
     scheduleState: ScheduleState,
+    expectedPriorScheduleState: ScheduleState | null,
   ): Promise<void>;
   listQueueCandidates(): Promise<QueueCandidate[]>;
 };
@@ -39,6 +41,7 @@ export type RecordAttemptCommand = {
     submittedAnswer: string;
     responseTimeMs: number;
     occurredAt?: number;
+    idempotencyKey?: string;
   };
 };
 
@@ -49,6 +52,7 @@ export type GradeApplyReviewCommand = {
   responseTimeMs: number;
   promptId?: string | null;
   occurredAt?: number;
+  idempotencyKey?: string;
 };
 
 export type NextQueueCommand = {
@@ -126,6 +130,9 @@ async function recordAttempt(
     submittedAnswer: command.attempt.submittedAnswer,
     responseTimeMs: command.attempt.responseTimeMs,
     occurredAt: command.attempt.occurredAt ?? defaultOccurredAt,
+    ...(command.attempt.idempotencyKey === undefined
+      ? {}
+      : { idempotencyKey: command.attempt.idempotencyKey }),
   };
 
   await store.recordAttempt(attempt);
@@ -153,11 +160,12 @@ async function gradeAndApplyReview(
     submittedAnswer: command.submittedAnswer,
     responseTimeMs: command.responseTimeMs,
     occurredAt: command.occurredAt ?? defaultOccurredAt,
+    ...(command.idempotencyKey === undefined ? {} : { idempotencyKey: command.idempotencyKey }),
     grade,
   };
   const scheduleState = next(priorSchedule, grade.rating, attempt.occurredAt);
 
-  await store.applyReview(command.prompt.reviewUnitId, attempt, scheduleState);
+  await store.applyReview(command.prompt.reviewUnitId, attempt, scheduleState, priorSchedule);
 
   return {
     kind: 'review-applied',

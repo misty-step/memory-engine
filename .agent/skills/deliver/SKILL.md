@@ -18,7 +18,7 @@ Read `.spellbook/repo-brief.md`, the ticket, relevant slice docs, and shipped pr
 3. Run /ci until `bun run ci` is green.
 4. Run /code-review and fix blocking findings.
 5. Run /refactor only for simplification that preserves the ticket scope.
-6. Run /qa for package surfaces and any named canaries.
+6. Run /qa for package surfaces and any named current proof oracles.
 
 `bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
 
@@ -26,4 +26,4 @@ Lifecycle contract: active work lives in `backlog.d/`, closed work lives in `bac
 
 ## Output
 
-Report ticket ID, branch, changed surfaces, commands run, canary evidence, and what remains for /yeet, /settle, or /ship.
+Report ticket ID, branch, changed surfaces, commands run, proof evidence, and what remains for /yeet, /settle, or /ship.

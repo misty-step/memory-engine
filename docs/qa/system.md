@@ -78,7 +78,8 @@ bun test tests/api/module-exports.test.ts tests/api/compatibility.test.ts
 ```
 
 Report QA evidence with exact commands, final status, surfaces exercised, and
-any unrun consumer canary. Do not claim consumer proof from local package tests.
+any unrun ticket-required proof oracle. Do not claim beta/product proof from
+local package tests alone.
 
 ## Improvement Review
 

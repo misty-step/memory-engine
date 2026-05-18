@@ -2,7 +2,7 @@
 shaping: true
 ticket: 24-extraction-decision-gate
 slice: 5
-status: ready
+status: shipped
 priority: medium
 estimate: S
 depends_on: [20-evals-and-benchmarks-baseline, 21-cli-review-loop-dogfood, 23-web-study-shell-dogfood]
@@ -28,13 +28,13 @@ belong in `testkit`, and which service/API contracts should remain private.
 
 ## Oracle
 
-- [ ] `docs/dogfood/extraction-decision.md` compares CLI, import, and web-shell
+- [x] `docs/dogfood/extraction-decision.md` compares CLI, import, and web-shell
       evidence against API ergonomics, repeated boundary needs, eval coverage,
       and benchmark receipts.
-- [ ] The decision names one of: extract a client, keep experimenting, promote a
+- [x] The decision names one of: extract a client, keep experimenting, promote a
       helper to testkit, or reshape the API.
-- [ ] Follow-up tickets are created for any selected extraction or API change.
-- [ ] `bun run ci` exits 0.
+- [x] Follow-up tickets are created for any selected extraction or API change.
+- [x] `bun run ci` exits 0.
 
 ## Notes
 

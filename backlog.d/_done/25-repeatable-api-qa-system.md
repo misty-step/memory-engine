@@ -2,7 +2,7 @@
 shaping: true
 ticket: 25-repeatable-api-qa-system
 slice: 5
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [18-modular-api-surface, 20-evals-and-benchmarks-baseline, 21-cli-review-loop-dogfood, 22-content-normalization-probe, 23-web-study-shell-dogfood]
@@ -34,14 +34,14 @@ benchmarks, dogfood evidence, and consumer proof.
 
 ## Oracle
 
-- [ ] `bun run qa:local` runs the repeatable local QA harness and exits 0.
-- [ ] `bun run qa` runs the full QA harness, including the canonical CI gate,
+- [x] `bun run qa:local` runs the repeatable local QA harness and exits 0.
+- [x] `bun run qa` runs the full QA harness, including the canonical CI gate,
       and exits 0.
-- [ ] `docs/qa/system.md` documents the QA lanes, quality model, commands, and
+- [x] `docs/qa/system.md` documents the QA lanes, quality model, commands, and
       when to use local versus full QA.
-- [ ] `docs/qa/quality-register.md` records quality-improvement findings that
+- [x] `docs/qa/quality-register.md` records quality-improvement findings that
       are not necessarily bugs.
-- [ ] `bun run ci` exits 0.
+- [x] `bun run ci` exits 0.
 
 ## Notes
 

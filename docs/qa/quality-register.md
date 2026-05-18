@@ -4,21 +4,22 @@ Refs-backlog: 25
 
 This register records quality opportunities found by QA. These are not all
 bugs. Promote an item to `backlog.d/` when it becomes necessary for delivery,
-consumer proof, or a shaped extraction decision.
+beta/product proof, or a shaped extraction decision.
 
 ## Active Opportunities
 
-### QI-001: Consumer canary recertification is separate from package QA
+### QI-001: Product proof is separate from package QA
 
-- Dimension: consumer proof.
+- Dimension: beta/product proof.
 - Current evidence: `bun run qa` proves package behavior, service prototype
-  behavior, dogfood experiments, and Dagger CI. It does not run Scry or Vault
-  canary branches.
-- Improvement: define a canary lane only when a ticket changes an exported
-  contract used by Scry or Vault, with exact commands recorded beside the
-  ticket.
+  behavior, dogfood experiments, and Dagger CI. Historical Scry and Vault
+  canaries are deprecated and are not part of current harness proof.
+- Improvement: define extra proof lanes only when a ticket changes behavior
+  that must be validated through a current beta shell or active external app,
+  with exact commands recorded beside the ticket.
 - Promote when: exports, scheduling, grading, adapters, fixtures, progression,
-  or queue semantics change in a way that claims consumer compatibility.
+  or queue semantics change in a way that claims beta/application
+  compatibility beyond repo-local dogfood coverage.
 
 ### QI-002: Benchmark receipts are non-gating
 
@@ -39,7 +40,7 @@ consumer proof, or a shaped extraction decision.
   model-quality corpus.
 - Improvement: add a small rubric eval corpus that records expected criterion
   outcomes and confidence handling for adapter implementations.
-- Promote when: a real model-backed rubric adapter or consumer canary depends on
+- Promote when: a real model-backed rubric adapter or current proof oracle depends on
   rubric quality beyond the current static contract.
 
 ### QI-004: Dogfood clients expose repeated view-state pressure

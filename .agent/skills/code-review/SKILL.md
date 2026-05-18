@@ -1,7 +1,7 @@
 ---
 name: code-review
 description: |
-  Repo-specific review workflow for memory-engine. Use for PR, branch, or diff review against the shaped ticket, kernel invariants, tests, and consumer canary evidence. Trigger: /code-review, /review, /critique.
+  Repo-specific review workflow for memory-engine. Use for PR, branch, or diff review against the shaped ticket, kernel invariants, tests, dogfood evidence, and shaped proof evidence. Trigger: /code-review, /review, /critique.
 argument-hint: "[branch|diff|files]"
 ---
 
@@ -17,7 +17,7 @@ Read `.spellbook/repo-brief.md`, `AGENTS.md`, `CLAUDE.md`, the active `backlog.d
 - `ScheduleState`: snake_case ts-fsrs-native JSON shape, `state: 0 | 1 | 2 | 3`, `last_review: number | null`; no camelCase translation or hidden Date objects.
 - One-envelope grader: no public verdict-then-rating two-step protocol; verdicts stay fixed.
 - Exhaustiveness: any `Prompt` union change updates grader dispatch and `assertNever` tests.
-- Consumer proof: local tests are not consumer proof when exports, scheduling, grading, adapters, or fixtures move. Require the relevant Scry or Vault canary or call out the gap.
+- Product proof: local package tests are not product proof when the work claims beta/application behavior. Require the ticket's current dogfood, beta, or external proof oracle, or call out the gap. Historical Scry and Vault canaries are deprecated.
 - Strict TS/Biome: no `any`, non-null assertions, `@ts-ignore`, unused imports, or value imports used only as types.
 - Tests mock only true external boundaries; do not mock repo-owned pure modules or `ts-fsrs`.
 
@@ -27,4 +27,4 @@ Delivery-ready review requires `bun run ci`. `bun run ci:local` is inner-loop ev
 
 ## Output
 
-Return findings first, ordered by severity, with file/line references. If there are no findings, say so and list residual risk, especially any canary not run.
+Return findings first, ordered by severity, with file/line references. If there are no findings, say so and list residual risk, especially any ticket-required proof oracle not run.

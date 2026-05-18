@@ -67,13 +67,14 @@ Review verdict helpers live in `scripts/lib/verdicts.sh`.
 
 ## Known Debt
 
-- `SPEC.md` still describes slices 2 and 3 as immediate next work even though
-  code for progression, queue, recitation, rubric contracts, and adapters is on
-  `master`.
-- Tickets `10` through `13` are archived under `_done/` but still carry
+- Slice 6 now aims at a usable beta interface: durable beta persistence outside
+  `src`, source-grounded AI generation, mobile study dogfood, service-contract
+  hardening, backlog/QA hygiene, and a later extraction decision.
+- Tickets `18` through `22` are archived under `_done/` but still carry
   `status: ready` in frontmatter.
-- External canary branches exist for Scry and Vault SRS; re-run or record their
-  oracles before claiming consumer adoption is complete.
+- Historical Scry and Vault canary branches are deprecated. Do not require or
+  run them as current harness proof. Use repo-local dogfood lanes and any
+  explicitly shaped current external proof instead.
 
 ## Harness Index
 
@@ -82,8 +83,8 @@ Review verdict helpers live in `scripts/lib/verdicts.sh`.
 | `/shape` | Creates slice packets and atomic `backlog.d/` tickets with executable oracles. |
 | `/implement` | Executes one shaped ticket with TDD and pure-kernel discipline. |
 | `/ci` | Runs or diagnoses the Dagger-backed `bun run ci` gate. |
-| `/code-review` | Reviews diffs against kernel invariants and canary evidence. |
-| `/qa` | Verifies package exports, fixtures, focused tests, and named consumer canaries. |
+| `/code-review` | Reviews diffs against kernel invariants, tests, and shaped proof evidence. |
+| `/qa` | Verifies package exports, fixtures, focused tests, dogfood lanes, and named current proof oracles. |
 | `/refactor` | Simplifies without widening kernel scope or inventing package splits. |
 | `/groom` | Reconciles backlog status, roadmap drift, and next shaped work. |
 | `/deliver` | Drives one ticket to merge-ready code; does not ship. |
@@ -93,7 +94,7 @@ Review verdict helpers live in `scripts/lib/verdicts.sh`.
 | `/flywheel` | Composes pick → shape → implement → yeet → settle → ship; no deploy leaf here. |
 | `/diagnose` | Reproduces failing oracles and fixes root causes. |
 | `/research` | Grounds shaping in official docs, consumer exemplars, and prior art. |
-| `/demo` | Produces command, API, fixture, or canary evidence for reviewers. |
+| `/demo` | Produces command, API, fixture, dogfood, or shaped proof evidence for reviewers. |
 | `/office-hours` | Interrogates raw ideas before shaping. |
 | `/ceo-review` | Challenges plans and context packets before convergence. |
 | `/reflect` | Captures learnings and harness follow-ups after shipping. |

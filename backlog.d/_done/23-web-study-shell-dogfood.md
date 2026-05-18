@@ -2,7 +2,7 @@
 shaping: true
 ticket: 23-web-study-shell-dogfood
 slice: 5
-status: ready
+status: shipped
 priority: medium
 estimate: M
 depends_on: [21-cli-review-loop-dogfood, 22-content-normalization-probe]
@@ -30,13 +30,13 @@ reveal, queue transitions, and review-state visibility.
 
 ## Oracle
 
-- [ ] `experiments/web-shell/` renders a local study loop over the dogfood
+- [x] `experiments/web-shell/` renders a local study loop over the dogfood
       fixture without importing private `src` internals.
-- [ ] `bun test experiments/web-shell/web-shell.test.ts` exercises the core
+- [x] `bun test experiments/web-shell/web-shell.test.ts` exercises the core
       interaction flow through code-level tests.
-- [ ] `docs/dogfood/web-shell.md` records the interface pressure, API friction,
+- [x] `docs/dogfood/web-shell.md` records the interface pressure, API friction,
       and extraction recommendation.
-- [ ] `bun run ci` exits 0.
+- [x] `bun run ci` exits 0.
 
 ## Notes
 

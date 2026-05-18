@@ -1,7 +1,7 @@
 ---
 name: shape
 description: |
-  Shape memory-engine work into a repo-specific context packet and backlog ticket before implementation. Use when a feature, boundary change, consumer adoption step, or canary needs definition before code. Trigger: /shape, /spec, /plan.
+  Shape memory-engine work into a repo-specific context packet and backlog ticket before implementation. Use when a feature, boundary change, beta/application adoption step, or proof oracle needs definition before code. Trigger: /shape, /spec, /plan.
 argument-hint: "[idea|ticket|slice]"
 ---
 
@@ -9,11 +9,11 @@ argument-hint: "[idea|ticket|slice]"
 
 Shape first. In `memory-engine`, feature work starts only after there is a shaped `backlog.d/` ticket; slice-sized work also gets a context packet in the local `SLICE-*.md` style. This protects the pure kernel boundary from product-specific drift.
 
-Read `.spellbook/repo-brief.md`, `SPEC.md`, current `SLICE-*.md`, `exemplars.md`, nearby tickets in `backlog.d/` and `backlog.d/_done/`, and any consumer files named by the work. If the user asks for implementation with no ticket, stop and shape.
+Read `.spellbook/repo-brief.md`, `SPEC.md`, current `SLICE-*.md`, `exemplars.md`, nearby tickets in `backlog.d/` and `backlog.d/_done/`, and any beta/application files named by the work. If the user asks for implementation with no ticket, stop and shape.
 
 ## Problem Diamond
 
-Name the user outcome and boundary pressure before proposing code. Ask which consumer proves the behavior is shared; whether it is a stable primitive or app-owned pedagogy/session choreography; whether a shallow canonical input/output is enough; and what canary would falsify the boundary. Produce at least two approaches: a minimal kernel change and a stricter consumer-owned alternative.
+Name the user outcome and boundary pressure before proposing code. Ask what current dogfood, beta, or application path proves the behavior is shared; whether it is a stable primitive or app-owned pedagogy/session choreography; whether a shallow canonical input/output is enough; and what proof command would falsify the boundary. Produce at least two approaches: a minimal kernel change and a stricter application-owned alternative.
 
 ## Output
 
@@ -27,4 +27,4 @@ Core stays pure; consumers own persistence, time, identity mapping, sessions, pa
 
 ## Oracles
 
-Every shaped item needs commands, not prose. Include focused Bun tests, `bun run ci`, and any consumer canary needed to prove the boundary. If no canary is needed, state why fixtures or testkit contracts are enough.
+Every shaped item needs commands, not prose. Include focused Bun tests, `bun run ci`, and any current dogfood, beta, or external proof command needed to prove the boundary. If no extra proof is needed, state why fixtures, testkit contracts, or repo-local dogfood lanes are enough.

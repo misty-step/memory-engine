@@ -235,7 +235,12 @@ describe('memory service failure semantics', () => {
     };
 
     await expect(
-      store.applyReview(reviewUnitId('other-unit'), attempt, scheduleState({ last_review: now })),
+      store.applyReview(
+        reviewUnitId('other-unit'),
+        attempt,
+        scheduleState({ last_review: now }),
+        null,
+      ),
     ).rejects.toThrow('Unknown review unit: other-unit');
 
     await expect(
@@ -246,6 +251,7 @@ describe('memory service failure semantics', () => {
           reviewUnitId: reviewUnitId('other-unit'),
         },
         scheduleState({ last_review: now }),
+        null,
       ),
     ).rejects.toThrow('Applied review unit must match the attempt review unit');
   });
