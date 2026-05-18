@@ -22,5 +22,12 @@
 
     "types": ["bun-types"]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "testkit/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "testkit/**/*.ts",
+    "scripts/**/*.ts",
+    "service/**/*.ts",
+    "experiments/**/*.ts"
+  ]
 }
