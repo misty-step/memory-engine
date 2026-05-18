@@ -8,8 +8,10 @@ type AnswerPayload = {
 const shell = createWebShellSession();
 await shell.start();
 
+const hostname = Bun.env.HOST ?? '127.0.0.1';
+
 const server = Bun.serve({
-  hostname: '0.0.0.0',
+  hostname,
   port: Number(Bun.env.PORT ?? 4173),
   async fetch(request) {
     const url = new URL(request.url);
@@ -44,7 +46,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`Web shell listening on http://localhost:${server.port}`);
+console.log(`Web shell listening on http://${hostname}:${server.port}`);
 setInterval(() => {}, 60_000);
 
 function json(value: unknown, status = 200): Response {

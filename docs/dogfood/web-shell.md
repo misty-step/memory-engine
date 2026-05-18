@@ -16,7 +16,12 @@ bun test experiments/web-shell/web-shell.test.ts
 bun run experiments:web-shell
 ```
 
-The server listens on `http://localhost:4173` unless `PORT` is set.
+The server listens on `http://127.0.0.1:4173` unless `HOST` or `PORT` is set.
+For phone testing over a trusted Tailscale tailnet, run:
+
+```sh
+HOST=0.0.0.0 bun run experiments:web-shell
+```
 
 ## Fixture
 
