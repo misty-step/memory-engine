@@ -39,6 +39,8 @@ export type GeneratedPromptModel = {
   version: string;
 };
 
+export type GeneratedLearningActivityKind = 'quiz' | 'exercise';
+
 export type PersistedQueueCandidate = Omit<QueueCandidate, 'scheduleState'>;
 
 export type GeneratedPromptDraft = {
@@ -50,6 +52,9 @@ export type GeneratedPromptDraft = {
   promptId: string;
   prompt: Prompt;
   queue: PersistedQueueCandidate;
+  activityKind: GeneratedLearningActivityKind;
+  activityStage: string;
+  workedSolution: string | null;
   model: GeneratedPromptModel;
   validation: GeneratedPromptValidation;
   critiqueNotes: string[];
@@ -382,6 +387,7 @@ function assertAttemptContract(snapshot: BetaStoreSnapshot, attempt: ServiceAtte
 function assertDraftContract(snapshot: BetaStoreSnapshot, draft: GeneratedPromptDraft): void {
   assertNonBlank(draft.id, 'Generated prompt draft id');
   assertNonBlank(draft.promptId, 'Generated prompt draft prompt id');
+  assertNonBlank(draft.activityStage, 'Generated prompt draft activity stage');
   assertNonBlank(draft.model.provider, 'Generated prompt draft provider');
   assertNonBlank(draft.model.name, 'Generated prompt draft model');
   assertNonBlank(draft.model.version, 'Generated prompt draft model version');

@@ -92,6 +92,9 @@ describe('beta persistence store', () => {
           sourceKey: 'latin-prayer-note',
           domainKey: 'latin',
         },
+        activityKind: 'quiz',
+        activityStage: 'free-recall',
+        workedSolution: null,
         model: {
           provider: 'fixture',
           name: 'deterministic-draft',
@@ -436,6 +439,9 @@ describe('beta persistence store', () => {
           sourceKey: 'source',
           domainKey: 'qa',
         },
+        activityKind: 'quiz',
+        activityStage: 'free-recall',
+        workedSolution: null,
         model: {
           provider: 'fixture',
           name: 'deterministic-draft',

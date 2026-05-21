@@ -91,6 +91,27 @@ Design consequence: progression metadata can represent stages such as worked
 example, cued attempt, cloze, free recall, and transfer prompt. The core should
 own stage relationships and mastery gates, not product-specific lesson copy.
 
+### Variation And Exercises Drive Transfer
+
+Repeatedly asking the same card can build recall of the card rather than
+understanding of the underlying concept. Varied practice, interleaving, and
+problem-solving exercises are the path from recognition to transfer. The beta
+should treat "quiz" and "exercise" as related but distinct activity shapes:
+quizzes test retrieval; exercises make the learner choose, compute, explain,
+or compose under changing conditions.
+
+Design consequence: represent a concept as a ladder of activity variants rather
+than one static prompt. A NATO alphabet concept can move from 3-choice
+recognition, to 5-choice recognition, to typed recall, to composing "CAT" over
+the phone. An options concept can move from defining Gamma, to interpreting a
+position's Gamma, to scenario exercises about hedging and payoff changes.
+
+The first implementation should be deterministic and narrow: stable concept
+keys, variant metadata, progression gates, shuffled answer choices, and saved
+attempt evidence. Generative exercises should come later, after the beta can
+prove that simpler variants improve learning without corrupting schedule or
+queue behavior.
+
 ## API Implications
 
 - Keep `AttemptEvent` or service attempt records central. Retrieval attempts,
@@ -127,6 +148,9 @@ promoting new API surface.
 | Butler, Karpicke, and Roediger (2008) connect feedback and confidence after testing. | Calibration can be a learning signal. | Experiments should capture predicted confidence versus actual outcome before promoting confidence fields to core. |
 | MIT Teaching + Learning Lab metacognition guidance emphasizes monitoring and regulation. | Learners need visibility into what they think they know versus what they can retrieve. | Beta should include lightweight calibration and review-state explanations, not only due counts. |
 | Kalyuga (2007) expertise reversal effect warns that high guidance can become counterproductive. | Worked examples and hints should fade as mastery grows. | Progression metadata can represent worked example -> cued attempt -> cloze -> free recall -> transfer, while copy and lesson flow stay client-owned. |
+| Paas and van Merrienboer (2020) summarize cognitive-load methods including worked examples and guidance fading for complex tasks. | Novices need support; advanced learners need less guidance and more independent problem solving. | The beta should graduate activities from recognition and worked examples toward free recall and scenario exercises. |
+| Interleaved-practice research in physics and systematic reviews shows value for discrimination and problem-solving transfer, with boundary conditions. | Variation is useful when learners must choose between confusable concepts or strategies. | Queue/activity generation should use concept/source/domain metadata for intentional variation, not indiscriminate randomization. |
+| Teaching-science-of-learning guidance summarizes retrieval, spacing, interleaving, elaboration, concrete examples, and dual coding as evidence-backed strategies. | Retrieval is necessary but not sufficient for deep conceptual use. | The interface should support typed recall, explanation, concrete examples, and exercises as activity variants over the same concept. |
 
 ## Beta Interface Research Requirements
 
@@ -155,12 +179,15 @@ The shared kernel should remain responsible for:
 - `26-beta-persistence-spine`: durable attempts and schedule state make
   retrieval practice and spacing auditable across sessions.
 - `27-ai-content-generation-probe`: generated quizzes must be grounded in
-  sources and approved before they become retrieval prompts.
+  sources and approved before they become retrieval prompts or exercises.
 - `28-mobile-beta-study-interface`: phone-first answer entry and review flow
-  test whether retrieval practice is actually low friction.
+  test whether retrieval practice and simple exercises are actually low
+  friction.
 - `29-service-contract-v0-hardening`: reveal, feedback, retry, and typed
-  failure semantics decide whether review events are trustworthy learning
-  evidence.
+  failure semantics decide whether review and exercise events are trustworthy
+  learning evidence.
+- `32-graduated-activity-ladder`: adds deterministic variant ladders and
+  transfer-oriented exercises after the basic beta loop works.
 - `31-beta-extraction-decision`: extraction waits until beta evidence shows
   which learning workflow contracts are stable.
 
@@ -210,6 +237,19 @@ Belongs in clients/experiments:
   https://tll.mit.edu/teaching-resources/how-people-learn/metacognition/
 - Kalyuga. "Expertise Reversal Effect and Its Implications" (2007).
   https://link.springer.com/article/10.1007/s10648-007-9054-3
+- Paas and van Merrienboer. "Cognitive-Load Theory: Methods to Manage Working
+  Memory Load in the Learning of Complex Tasks" (2020).
+  https://journals.sagepub.com/doi/10.1177/0963721420922183
+- Carvalho and Goldstone. "Putting category learning in order: Category
+  structure and temporal arrangement affect the benefit of interleaved over
+  blocked study" and related interleaving literature summarized in Brunmair and
+  Richter (2019) and later systematic reviews.
+  https://link.springer.com/article/10.1007/s10648-021-09613-w
+- Sana, Yan, Kim, Bjork. "Interleaved practice enhances memory and
+  problem-solving ability in undergraduate physics" (2021).
+  https://www.nature.com/articles/s41539-021-00110-x
+- Weinstein, Madan, Sumeracki. "Teaching the science of learning" (2018).
+  https://link.springer.com/article/10.1186/s41235-017-0087-y
 
 ### Primary Studies And Classic Sources
 

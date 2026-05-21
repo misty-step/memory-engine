@@ -33,7 +33,8 @@ service behavior.
 - [ ] Service-facing tests use public package subpaths where possible instead
       of private `src` imports.
 - [ ] A documented service contract names the command lifecycle, learner-facing
-      DTO decision, reveal policy, and typed failure envelope.
+      DTO decision, reveal policy, activity-kind metadata decision, and typed
+      failure envelope.
 - [ ] Reveal is explicitly classified as either display-only UI state or a
       review event with scheduling consequences, with tests proving the chosen
       behavior.
@@ -53,3 +54,6 @@ service behavior.
   and reveal semantics, but one client is insufficient for promotion.
 - Keep the module deep: stable commands should hide engine-shaped details from
   product UI without hiding schedule/review evidence from tests.
+- Treat activity kind, ladder stage, variant group, worked solution, and
+  exercise-specific feedback as beta pressure until the graduated ladder proves
+  a provider-neutral service shape.

@@ -15,8 +15,8 @@ Belongs to the beta store:
 
 - source documents and source permissions;
 - reference spans used to justify generated prompts;
-- generated prompt drafts, critique notes, validation status, and model
-  metadata;
+- generated learning drafts, including prompt or exercise drafts, critique
+  notes, validation status, and model metadata;
 - generation run receipts;
 - approved review units and their queue metadata;
 - learner attempts and schedule records;
@@ -45,9 +45,10 @@ Snapshot collections:
   body or URI, permission label, freshness, and creation time.
 - `referenceSpans`: cited source ranges or excerpts linked to a source
   document.
-- `generatedPromptDrafts`: canonical prompt draft, source ids, reference span
-  ids, generation run id, provider/model/version, validation status, and
-  critique notes.
+- `generatedPromptDrafts`: current storage name for beta-generated learning
+  drafts. Today these are canonical prompt drafts; future beta work may add
+  exercise drafts with worked solutions, activity kind, ladder stage, scoring
+  rubric, and validation status before anything enters review.
 - `generationRuns`: provider/model run receipts and validation failures.
 - `reviewUnits`: approved prompt, prompt id, reference links, queue metadata,
   and generated-draft linkage.
@@ -110,6 +111,9 @@ true:
 - the beta needs a real database with migration and indexing semantics;
 - service DTOs, idempotency keys, queue hydration, and generated-content
   provenance stabilize across more than one workflow.
+- graduated activity metadata, quiz/exercise drafts, and worked-solution
+  records prove reusable across multiple beta workflows without importing
+  provider, UI, or persistence concepts into `src/`.
 
 Until then, `experiments/beta-store/` is a dogfood spine, not the memory-engine
 database.

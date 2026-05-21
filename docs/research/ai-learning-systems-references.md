@@ -63,6 +63,18 @@ Design consequence: dogfood clients should be narrow tutoring workflows, not a
 generic chat box. The model should propose hints, repairs, examples, or
 diagnoses that are checked against learning-state contracts.
 
+### Generated Exercises Need Validation, Not Just Variety
+
+Generative practice is most valuable when it creates fresh problems that train
+the same underlying concept under varied conditions. It is also risky: a model
+can produce ambiguous questions, wrong worked solutions, answer leakage, or
+problems that do not actually test the intended concept.
+
+Design consequence: exercise generation must persist activity kind, concept
+target, difficulty/stage, source or rule provenance, expected solution, grading
+rubric, validation status, and critique notes. Keep generation and validation
+in the beta layer until repeated dogfood evidence proves a stable contract.
+
 ### LLM Judges Are Useful But Not Ground Truth
 
 Model graders can scale rubric evaluation, but research and practice show
@@ -86,7 +98,8 @@ and which should stay out of the pure kernel until proven by dogfood evidence.
 | OpenAI embeddings guidance, MTEB, BEIR, and Sentence-Transformers examples frame embeddings as retrieval, clustering, classification, and similarity tools. | Semantic similarity can help de-duplicate, cluster, recommend, and find reference context, but it is not truth. | Beta can maintain a client-owned embedding/index layer for content organization; correctness still comes from deterministic grading, rubric contracts, or evaluated model graders. |
 | TREC RAG and retrieval benchmark practice separate retrieval quality from answer generation quality. | RAG needs separate retrieval and generation evals. | Content generation should store source passages, retrieval receipts, model/version metadata, and unsupported-claim checks before generated quizzes enter the review queue. |
 | ReAct, Reflexion, and Self-Refine show agent loops can improve task execution when observations and feedback are explicit. | Agents need explicit workflow state, not free-form hidden autonomy. | Beta generation should use structured states such as ingest -> normalize -> retrieve -> draft prompts -> critique -> approve/save, with validated outputs at each step. |
-| VanLehn's tutoring-systems review and newer AutoTutor/LLM tutoring work suggest tutoring quality comes from scaffolded pedagogy, not generic chat. | A learning agent should produce hints, worked examples, Socratic probes, and repair material under policy. | The interface should offer narrow tutor actions from a review item; the kernel should not embed tutor prompts. |
+| VanLehn's tutoring-systems review and newer AutoTutor/LLM tutoring work suggest tutoring quality comes from scaffolded pedagogy, not generic chat. | A learning agent should produce hints, worked examples, Socratic probes, exercises, and repair material under policy. | The interface should offer narrow tutor actions from a review item; the kernel should not embed tutor prompts. |
+| Cognitive-load and interleaving research suggest worked examples, faded guidance, and varied problem solving support transfer. | Generated exercises should be staged and validated, not sprayed randomly. | Beta generation should start with deterministic exercise templates and only then add model-generated scenario variants with stored worked solutions and evals. |
 | Tutor CoPilot and Socratic tutoring work point toward AI assisting high-context pedagogical decisions. | AI can help select next intervention when user state and content evidence are available. | Store attempt history, struggle patterns, concept/source metadata, and reference links so future agents can diagnose failure loops. |
 | LLM-judge reliability literature and production grader guidance show model judgments have bias and drift. | Model grading is useful but cannot be the only gate. | Rubric/model graders need golden examples, disagreement handling, confidence, evidence citations, and regression tracking. |
 | NIST AI TEVV and GenAI evaluation guidance emphasize test, evaluation, validation, and verification as ongoing governance. | AI behavior must be measured over time. | Add evals for duplicate detection, retrieval Recall@k, hint leakage, unsupported claims, judge agreement, latency, and cost before promoting AI contracts. |
@@ -103,7 +116,11 @@ state to make AI-assisted learning usable and auditable:
 - `ReferenceSpan`: cited excerpts or ranges used to generate or explain a
   prompt.
 - `GeneratedPromptDraft`: model/provider/version, input source ids, prompt
-  text, accepted answers, rubric criteria, confidence, and critique status.
+  text, accepted answers, rubric criteria, confidence, activity kind, ladder
+  stage, and critique status.
+- `GeneratedExerciseDraft`: concept target, difficulty/stage, prompt, worked
+  solution, scoring rubric, source/rule provenance, validation status, and
+  critique notes.
 - `ReviewUnitRecord`: canonical prompt plus learner-owned schedule state,
   concept/source/domain keys, references, and supersession/progression metadata.
 - `AttemptRecord`: answer, latency, confidence, reveal state, verdict, rating,
@@ -120,10 +137,10 @@ the same contract. Promote only stable, provider-neutral contracts back into
 - `26-beta-persistence-spine`: stores source, draft, attempt, schedule,
   reference, and generation-run records so AI output remains auditable.
 - `27-ai-content-generation-probe`: proves source-grounded prompt generation,
-  critique, rejection, approval, and provenance before model output reaches the
-  review queue.
+  exercise generation, critique, rejection, approval, and provenance before
+  model output reaches the review queue.
 - `28-mobile-beta-study-interface`: tests whether AI-generated content improves
-  an actual review loop instead of producing disconnected artifacts.
+  an actual review/practice loop instead of producing disconnected artifacts.
 - `29-service-contract-v0-hardening`: decides which DTOs, reveal semantics, and
   error/idempotency contracts are stable enough to survive durable AI-assisted
   workflows.
@@ -151,6 +168,9 @@ Only shape these after dogfood pressure:
 - misconception diagnosis precision
 - hint helpfulness and answer leakage rate
 - unsupported-claim rate in model feedback
+- generated exercise solvability and solution correctness
+- activity-stage calibration: whether generated problems match intended
+  difficulty
 - judge agreement against deterministic/human gold labels
 - queue diversity and confusable-item contrast
 - model cost/latency per whole review loop
