@@ -92,14 +92,15 @@ Present the feature table and ask:
 > Which features are must-demo (shown every time)?
 > Which are situational (shown for specific PRs only)?
 
-### 4. Upload Strategy
+### 4. Storage and Publish Strategy
 
 Recommend based on project context:
 
-- **PR evidence:** Draft GitHub release + PR comment (default)
+- **Durable evidence:** `.evidence/<branch-slug>/<date>/` committed on the feature branch (default)
+- **PR publishing:** Optional draft GitHub release + PR comment when hosted URLs are useful
 - **README/docs:** Committed GIF in `docs/` or repo root
 - **External:** S3, Cloudflare R2, or hosted service
-- **None:** `/tmp/demo-evidence/` only
+- **No artifact:** A committed no-artifact note in `.evidence/<branch-slug>/<date>/`
 
 ## Generated Skill Template
 
@@ -149,9 +150,9 @@ Rules:
 - GIFs need real browser recording (not slideshow)
 - Target: GIFs < 5MB, PNGs < 500KB
 
-### Upload
+### Storage / Publish
 
-[Upload strategy from design phase]
+[Storage and optional publishing strategy from design phase]
 
 ## FFmpeg Quick Reference
 
@@ -169,7 +170,7 @@ ffmpeg -y -i input.webm \
 - GIFs must have >10 frames (not a slideshow) and be < 5MB
 - Self-grading is worthless — critic must inspect artifacts cold
 - WebM doesn't render in PR comments — convert to GIF
-- Never commit binary artifacts to the repo
+- Commit binary evidence under `.evidence/` so LFS attributes apply
 ```
 
 ### references/capture-plan.md Structure

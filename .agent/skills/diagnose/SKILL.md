@@ -7,8 +7,12 @@ argument-hint: "[symptom|command|proof]"
 
 # /diagnose
 
-Start from a reproduced failure, not a theory. Re-run or inspect the exact failing command: `bun run ci`, a Dagger lane, a focused `bun test`, a dogfood lane, or the ticket-named current proof command. After two failures on the same thing, stop and read the error and current file in full before opening more files.
+Start from a reproduced failure, not a theory. Re-run or inspect the exact failing command: `bun run ci`, `bun run qa`, a focused `bun test`, typecheck, Biome, coverage, Gitleaks, package export smoke, dogfood lane, beta test, or ticket-named external proof.
 
-Classify failures by surface: type system, Biome, coverage/test behavior, secret scan, package export, scheduler/grader/progression/queue contract, adapter contract, dogfood path, or external proof command. Fix the root cause; never lower a gate.
+After two failures on the same command, stop and read the error plus the current file(s) in full before opening more surfaces.
 
-For external proof commands, remember that applications own persistence and mapping. Fix the kernel only when the shared contract is wrong; otherwise record the application-side issue. Finish with the exact command that proves the fix, usually `bun run ci` plus the failing proof command.
+Classify by surface: install/lockfile, type system, Biome, coverage/test behavior, secret scan, package export, scheduler/grader/progression/queue contract, adapter/testkit contract, service prototype, dogfood path, beta proof, or harness lifecycle. Fix the root cause; do not lower gates.
+
+For application-facing proof, fix the kernel only when the shared contract is wrong. If the beta or consumer owns the behavior, record or shape that issue outside `src/`.
+
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

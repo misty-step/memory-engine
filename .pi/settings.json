@@ -4,6 +4,8 @@
   ],
   "commands": {
     "ci": "bun run ci",
-    "ciLocal": "bun run ci:local"
+    "ciLocal": "bun run ci:local",
+    "qa": "bun run qa",
+    "qaLocal": "bun run qa:local"
   }
 }

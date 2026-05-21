@@ -7,8 +7,10 @@ argument-hint: "[ticket|surface|PR]"
 
 # /demo
 
-This repo's demo is not a screenshot. It is evidence that a library behavior exists and can be consumed. Pick the smallest useful format: focused test output, `bun run ci` receipt, package import snippet, fixture corpus example, dogfood receipt, or ticket-required current proof receipt.
+This repo's demo is usually evidence that a library behavior can be consumed. Pick the smallest truthful format: command receipt, package import snippet, fixture output, dogfood receipt, beta receipt, or a concise PR evidence note.
 
-For API changes, show a short TypeScript usage example importing from `memory-engine`, `memory-engine/testkit`, or `memory-engine/adapters`. For internal changes, name the touched module and oracle. For beta/application-facing contract changes, include the dogfood or ticket-required proof command.
+For API changes, show imports from `memory-engine`, `memory-engine/testkit`, `memory-engine/adapters`, or the relevant modular subpath. For internal kernel changes, name the touched module and focused oracle. For beta/application-facing work, include the ticket-named dogfood or beta proof command and any doc receipt under `docs/dogfood/` or `docs/beta/`.
 
-A good demo answers: what moved, how to call it, what command proved it, and what consumer path remains unverified if any.
+A demo answers: what moved, how a consumer calls it, what exact command proved it, and what remains unverified.
+
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

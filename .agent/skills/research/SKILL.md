@@ -7,8 +7,16 @@ argument-hint: "[query|docs|prior-art|consumer]"
 
 # /research
 
-Use research when a design decision depends on facts outside the current repo or on unfamiliar beta/application behavior. Prefer primary sources: official TypeScript, Bun, Dagger, Biome, and `ts-fsrs` docs; current beta/dogfood code; active application code named by the ticket; and existing `exemplars.md`.
+Use research when a memory-engine decision depends on external facts, unfamiliar consumer behavior, or current library semantics. The result must feed `/shape`, `/groom`, `/code-review`, or a ticket oracle; it is not permission to add abstractions.
 
-Research output must feed a shaped ticket or context packet. Summarize what evidence changes about kernel scope, application ownership, or proof design. Do not use research as permission to add abstractions; use it to decide the smallest stable contract.
+## Repo Anchors
 
-For changing OpenAI or other vendor behavior, keep SDK details out of core and shape adapter contracts only.
+Start with `.spellbook/repo-brief.md`, `SPEC.md`, `SLICE-*.md`, `exemplars.md`, `package.json`, `.dagger/src/index.ts`, and the active `backlog.d/` ticket. For beta/application pressure, read `docs/research/`, `docs/dogfood/`, `docs/beta/`, `experiments/`, and `service/` before looking outside.
+
+Use primary sources for Bun, TypeScript, Biome, Dagger, and `ts-fsrs`. For learning-science decisions, prefer durable papers and the existing research notes under `docs/research/`. For model/provider behavior, keep SDK details out of `src/` and shape only adapter or beta-layer contracts.
+
+## Output
+
+Name the decision, sources, what changed about kernel scope, what stays application-owned, and the executable proof command. If the research cannot identify a stable shared contract, recommend a beta or dogfood probe instead of a package change.
+
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

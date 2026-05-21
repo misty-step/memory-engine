@@ -60,6 +60,7 @@ synthesis output so it stays auditable.
 Only agents that exist in `spellbook/agents/` may appear:
 
 - `critic`, `ousterhout`, `carmack`, `grug`, `beck`
+- `a11y-auditor` (web UI accessibility)
 
 If you want a new specialty (e.g. security, performance), add the agent
 first, then reference it here.

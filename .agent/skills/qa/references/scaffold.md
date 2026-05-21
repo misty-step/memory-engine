@@ -169,7 +169,7 @@ argument-hint: "[url|route|PR-number]"
 
 [Evidence strategy from design phase]
 
-Evidence goes to \`/tmp/qa-[project-slug]/\`.
+Evidence goes to \`.evidence/<branch-slug>/<date>/\`.
 
 ## Output
 

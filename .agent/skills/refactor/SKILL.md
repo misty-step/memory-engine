@@ -7,16 +7,12 @@ argument-hint: "[--base master] [--scope path] [--report-only|--apply]"
 
 # /refactor
 
-Refactor to reduce states and clarify invariants, not to invent architecture. In this repo, the danger signs are speculative package splits, service drift, pass-through wrappers around simple functions, hidden ScheduleState translation, and consumer-specific flags leaking into core.
+Reduce states and clarify invariants without changing the product promise. On feature branches, compare against `master` and simplify the diff unless the ticket explicitly scopes broader cleanup. On `master`, report opportunities and shape a ticket before editing.
 
-On feature branches, compare against `master` and simplify only the diff unless the active ticket explicitly allows broader cleanup. On `master`, report opportunities and shape a ticket before editing.
+Good targets: duplicated fixture setup, unclear type boundaries, shallow wrappers, confusing queue/progression conditionals, stale docs next to touched behavior, Dagger duplication, and harness drift. Bad targets: moving app-owned policy into `src/`, speculative package splits, hidden `ScheduleState` translation, public export churn without proof, or refactoring untouched working code for style.
 
-## Targets
+Preserve pure core, behavior tests, package exports, fixture contracts, and dogfood proof. Use `ousterhout` for module-depth disputes, `grug` or `carmack` for scope cuts, and `beck`/`cooper` for test-design drift when needed.
 
-Good targets: duplicated fixture setup, unclear type boundaries, shallow wrappers, confusing queue/progression conditionals, stale docs next to touched behavior, and Dagger/harness duplication. Bad targets: changing behavior without oracle updates, moving app-owned policy into core, package splitting before a shaped need, or refactoring untouched working code because it looks different.
+Run focused tests for touched behavior, then `bun run ci`. If exports, fixtures, service, dogfood, or beta paths moved, run `/qa` and the ticket proof.
 
-Keep tests behavior-focused and do not mock internal collaborators. Preserve `ScheduleState`, prompt/grader exhaustiveness, one-envelope grading, and pure `src/`.
-
-## Verification
-
-Run the focused tests for touched behavior, then `bun run ci`. If refactoring changes exports or fixtures, run /qa and any ticket-required current proof oracle.
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

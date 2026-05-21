@@ -7,20 +7,21 @@ argument-hint: "[ticket|surface|proof]"
 
 # /qa
 
-This is a library package, not a deployed browser app. QA means exercising the package surfaces, repo-local dogfood clients, and any current proof oracle named by the ticket.
+QA for `memory-engine` means executable package and dogfood evidence, not a deployed-browser checklist. Start from the active ticket and affected surface: public exports, scheduler, grader, progression, queue, testkit, adapters, service prototype, dogfood clients, beta experiments, Dagger, or harness docs.
 
-Start from the active ticket and affected surface: `memory-engine`, `memory-engine/testkit`, `memory-engine/adapters`, scheduler, grader, progression, queue, Dagger, or harness docs. If there is no ticket for feature work, stop and shape/groom first.
+## Standard Paths
 
-## QA Paths
-
+- Local QA: `bun run qa:local`.
+- Full QA: `bun run qa`.
 - Kernel smoke: `bun test tests/smoke.test.ts`.
-- Exported package behavior: tests under `tests/testkit/`, `tests/adapters/`, and focused source suites.
-- Scheduler/grader/progression/queue: run the relevant focused `bun test tests/<surface>/` command.
-- Whole package confidence: `bun run ci:local` while iterating and `bun run ci` before handoff.
-- Product proof: run current dogfood/beta/external proof commands only when the ticket explicitly lists them. Historical Scry and Vault canaries are deprecated and are not required harness proof.
+- Package exports: `bun test tests/api/module-exports.test.ts tests/api/compatibility.test.ts`.
+- Focused surfaces: `bun test tests/grader/`, `bun test tests/queue/`, `bun test tests/progression/`, `bun test tests/service/`, `bun test experiments/<name>/`.
+- Canonical gate: `bun run ci`.
+
+`bun run qa` exercises package exports, types/scheduler, grading, progression/queue, testkit/adapters, service prototype, regression corpus, dogfood experiments, coverage, benchmarks, and then the canonical Dagger gate.
 
 `bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
 
 ## Evidence
 
-A QA pass names exact commands, package surfaces exercised, fixture corpus exercised, dogfood lanes, and any required current proof oracle. A QA pass without `bun run ci` is not delivery evidence. A QA pass without a ticket-required proof oracle must call that path unverified.
+Report exact commands, pass/fail status, surfaces exercised, fixture corpus touched, dogfood/beta receipts, and ticket-required proof oracles. Historical Scry/Vault canaries are deprecated; do not claim them as current proof.

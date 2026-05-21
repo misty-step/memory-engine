@@ -22,6 +22,13 @@ Every finding becomes one of three things:
 - a concrete coaching note
 - an explicit justification for not codifying
 
+## Work Ledger
+
+Consume the current work-ledger summary before proposing harness/backlog
+mutations. Emit a `work.phase` event with `phase=reflect` with evidence refs, proposed mutations
+as next action, blockers if evidence is missing, and `/trace` refs when
+available.
+
 ## Routing
 
 | Mode | Intent | Reference |
@@ -80,6 +87,27 @@ When encoding knowledge, always target the highest-leverage mechanism:
 ```
 Type system > Lint rule > Hook > Test > CI > Skill/reference > AGENTS.md > Memory
 ```
+
+## Review Score Feedback
+
+When `.groom/review-scores.ndjson` exists and
+`scripts/lib/review_scores.py` is available, run:
+
+```sh
+python3 scripts/lib/review_scores.py report --file .groom/review-scores.ndjson
+```
+
+If the report has 5+ entries and emits `Reflect Skill-Tuning Signals`, turn each
+pattern into a concrete proposed skill/reference edit. Examples:
+
+- declining correctness -> sharpen `/code-review` oracle or executable-path
+  verification instructions
+- low depth -> add deep-module / hidden-coupling examples to the relevant lens
+- low simplicity -> add a deletion-first review prompt
+- high false positive rate -> tighten severity labels so non-issues become
+  advisory notes or are dropped
+
+Reflect proposes these changes only; it does not mutate skills automatically.
 
 ## Cycle Mode Authority (outer-loop only)
 

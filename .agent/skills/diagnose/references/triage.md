@@ -161,7 +161,7 @@ When incident-platform observability is configured, use these sources per phase:
 |-------|------|-----|
 | Audit | Issue search, timeline API, or alert feed | Find fresh incident classes and regressions |
 | Investigate | Full issue details, traces, webhook payloads | Recover stack trace, breadcrumbs, and correlated context |
-| Verify | Post-deploy issue search plus production smoke checks | Confirm the failing flow is now healthy |
+| Verify | Post-release issue search plus current proof checks | Confirm the failing flow is now healthy |
 | Manage | Incident workflow | Resolve, suppress, classify, or assign incidents |
 
 Include the incident link in the PR for traceability. If the platform supports

@@ -73,7 +73,7 @@ await page.screenshot({ path: 'screenshot.png', fullPage: true });
 
 // Video recording (set in context)
 const context = await browser.newContext({
-  recordVideo: { dir: '/tmp/qa-videos/' }
+  recordVideo: { dir: process.env.EVIDENCE_DIR }
 });
 
 // Trace (includes screenshots, DOM snapshots, network)
@@ -157,10 +157,10 @@ agent-browser navigate https://localhost:3000
 agent-browser snapshot
 
 # Annotated screenshot (labels on interactive elements)
-agent-browser screenshot --annotate /tmp/qa-slug/annotated.png
+agent-browser screenshot --annotate "$EVIDENCE_DIR/annotated.png"
 
 # Video recording
-agent-browser record start /tmp/qa-slug/walkthrough.webm
+agent-browser record start "$EVIDENCE_DIR/walkthrough.webm"
 # ... interact with the page ...
 agent-browser record stop
 

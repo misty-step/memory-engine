@@ -1,6 +1,13 @@
+# Codex per-repo config for memory-engine.
+# Command authorization is intentionally absent: Codex per-repo [permissions]
+# is filesystem-scoped TOML, not a command allowlist. Commands are controlled
+# by the user's top-level Codex approval_policy and sandbox_mode.
+
 [skills]
 paths = [".agent/skills"]
 
 [commands]
 ci = "bun run ci"
 ci_local = "bun run ci:local"
+qa = "bun run qa"
+qa_local = "bun run qa:local"

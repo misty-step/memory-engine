@@ -7,8 +7,12 @@ argument-hint: "[branch|PR]"
 
 # /settle
 
-Settle takes a branch that already has code and makes it merge-ready. It does not merge, archive tickets, or reflect; /ship owns the final mile.
+Settle takes a branch that already has code and makes it ship-ready. It does not merge, archive tickets, write final trace, deploy, or reflect; `/ship` owns the final mile.
 
-Loop: /ci, /code-review, /refactor, /qa, then one final diff read. The loop exits only when `bun run ci` is green, blocking review findings are fixed, unnecessary complexity is removed, and ticket-required proof evidence is present or explicitly marked missing.
+Loop: `/ci` -> `/code-review` -> `/refactor` -> `/qa` -> final diff read. Exit only when `bun run ci` is green, blocking review findings are fixed, unnecessary complexity is removed, and ticket-required proof evidence is present or explicitly marked missing.
 
-Lifecycle contract: active work lives in `backlog.d/`, closed work lives in `backlog.d/_done/`, closure trailers are `Closes-backlog:` or `Ships-backlog:`, references use `Refs-backlog:`, and archival uses `scripts/lib/backlog.sh` (`backlog_archive`). Before declaring ship-ready, verify the branch has a resolvable backlog ID through branch name, PR body, or trailers. If the repo's detector cannot connect the work to `backlog.d/`, do not hand off to /ship as ready.
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
+
+Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work references use `Refs-backlog: NN`; closure uses `Closes-backlog: NN` or `Ships-backlog: NN`. Archive by sourcing `scripts/lib/backlog.sh` and using `backlog_archive`.
+
+Before declaring ship-ready, verify the branch has a resolvable backlog ID through branch name, PR body, or trailers. If `/ship` cannot connect the work to `backlog.d/`, the branch is not settled.

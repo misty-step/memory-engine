@@ -7,24 +7,22 @@ argument-hint: "[idea|ticket|slice]"
 
 # /shape
 
-Shape first. In `memory-engine`, feature work starts only after there is a shaped `backlog.d/` ticket; slice-sized work also gets a context packet in the local `SLICE-*.md` style. This protects the pure kernel boundary from product-specific drift.
+Shape before implementation. In `memory-engine`, feature work starts from a shaped `backlog.d/` ticket; larger direction can also update `SLICE-*.md` or docs under `docs/research/`, `docs/beta/`, or `docs/dogfood/`.
 
-Read `.spellbook/repo-brief.md`, `SPEC.md`, current `SLICE-*.md`, `exemplars.md`, nearby tickets in `backlog.d/` and `backlog.d/_done/`, and any beta/application files named by the work. If the user asks for implementation with no ticket, stop and shape.
+Read `.spellbook/repo-brief.md`, `SPEC.md`, relevant `SLICE-*.md`, `exemplars.md`, nearby active and archived tickets, touched package exports, and current beta/dogfood evidence.
 
 ## Problem Diamond
 
-Name the user outcome and boundary pressure before proposing code. Ask what current dogfood, beta, or application path proves the behavior is shared; whether it is a stable primitive or app-owned pedagogy/session choreography; whether a shallow canonical input/output is enough; and what proof command would falsify the boundary. Produce at least two approaches: a minimal kernel change and a stricter application-owned alternative.
+Name the user outcome and the boundary pressure. Ask whether the behavior belongs in the pure kernel, service prototype, beta experiment, testkit fixture, adapter contract, or consumer app. Produce at least two approaches: the smallest stable shared contract and an application-owned probe that keeps `src/` narrower.
 
-## Output
+## Ticket Shape
 
-Slice packets use: frontmatter, Goal, Non-Goals, Constraints / Invariants, Authority Order, Repo Anchors, Prior Art or Exemplar Techniques, executable Oracle, Implementation Sequence, Risk + Rollout.
+Use `backlog.d/NN-slug.md` with frontmatter: `shaping`, `ticket`, `slice`, `status`, `priority`, `estimate`, `depends_on`, and `oracles`. Body sections: Goal, Non-Goals, Oracle, Notes, and Study when useful. Each ticket must be small enough for one branch and one PR.
 
-Tickets use `backlog.d/NN-name.md` with frontmatter fields `shaping`, `ticket`, `slice`, `status: ready`, `priority`, `estimate`, `depends_on`, and `oracles`, followed by Goal, Non-Goals, Oracle, Notes, and Study. Tickets must be atomic enough for one branch and one PR.
+Oracles must be executable: focused `bun test ...`, `bun run qa`, `bun run ci`, beta/dogfood proof commands, and docs existence checks when documentation is part of the behavior. Prose-only proof is not enough.
 
-## Required Invariants
+## Invariants
 
-Core stays pure; consumers own persistence, time, identity mapping, sessions, parsing, SDKs, and pedagogy. `ScheduleState` remains ts-fsrs-native. `ReviewUnitId` remains opaque. `Grader.grade()` keeps one result envelope. Runtime dependencies require shaped scope. `bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
+Core stays pure. `ScheduleState`, `ReviewUnitId`, prompt/grader exhaustiveness, one-envelope grading, verdict vocabulary, and runtime dependency discipline remain load-bearing.
 
-## Oracles
-
-Every shaped item needs commands, not prose. Include focused Bun tests, `bun run ci`, and any current dogfood, beta, or external proof command needed to prove the boundary. If no extra proof is needed, state why fixtures, testkit contracts, or repo-local dogfood lanes are enough.
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

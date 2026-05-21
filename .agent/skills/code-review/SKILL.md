@@ -7,24 +7,21 @@ argument-hint: "[branch|diff|files]"
 
 # /code-review
 
-Review `memory-engine`, a pure TypeScript learning kernel for scheduling, grading, progression, queue selection, adapter contracts, and test fixtures. Review the diff against `master` by default. Findings lead; summaries are secondary.
+Review `memory-engine` against `master` by default. Findings lead, ordered by severity, with file/line references. Summaries are secondary.
 
-Read `.spellbook/repo-brief.md`, `AGENTS.md`, `CLAUDE.md`, the active `backlog.d/` ticket, and touched source/tests. If feature work has no shaped ticket, that is a blocking process finding.
+Read `.spellbook/repo-brief.md`, `AGENTS.md`, the active ticket, touched source/tests/docs, and proof receipts. Feature work without a shaped active ticket is a blocking process finding.
 
 ## Review Lenses
 
-- Pure core boundary: no framework, storage, network, filesystem, logging, auth, UI, product choreography, or vendor SDK imports in `src/`.
-- `ScheduleState`: snake_case ts-fsrs-native JSON shape, `state: 0 | 1 | 2 | 3`, `last_review: number | null`; no camelCase translation or hidden Date objects.
-- One-envelope grader: no public verdict-then-rating two-step protocol; verdicts stay fixed.
-- Exhaustiveness: any `Prompt` union change updates grader dispatch and `assertNever` tests.
-- Product proof: local package tests are not product proof when the work claims beta/application behavior. Require the ticket's current dogfood, beta, or external proof oracle, or call out the gap. Historical Scry and Vault canaries are deprecated.
-- Strict TS/Biome: no `any`, non-null assertions, `@ts-ignore`, unused imports, or value imports used only as types.
-- Tests mock only true external boundaries; do not mock repo-owned pure modules or `ts-fsrs`.
+- Pure core boundary: no framework, storage, network, filesystem, logging, auth, UI, analytics, product choreography, or provider SDK imports in `src/`.
+- `ScheduleState`: snake_case `ts-fsrs` shape with `state: 0 | 1 | 2 | 3` and `last_review: number | null`.
+- `ReviewUnitId` remains opaque.
+- Prompt union changes update grader dispatch and `assertNever` tests.
+- `Grader.grade()` remains one envelope with populated `rating`; verdicts stay fixed.
+- Tests mock external boundaries only; do not mock repo-owned pure collaborators.
+- Strict TS/Biome: no `any`, non-null assertions, `@ts-ignore`, stale value imports, or unused code.
+- Product claims require ticket-named dogfood, beta, or external proof. Historical Scry/Vault canaries are deprecated.
 
-## Verification
+`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
 
-Delivery-ready review requires `bun run ci`. `bun run ci:local` is inner-loop evidence only. For any changed executable path, name the exact command or Dagger gate that exercised it.
-
-## Output
-
-Return findings first, ordered by severity, with file/line references. If there are no findings, say so and list residual risk, especially any ticket-required proof oracle not run.
+If no issues are found, say so and name residual risks, especially unrun ticket proof.

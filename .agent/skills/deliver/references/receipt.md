@@ -31,10 +31,11 @@ The entire `.spellbook/` tree is gitignored.
     {"name": "qa",        "status": "p1", "findings": 1}
   ],
   "evidence": {
-    "review_dir": "<state-dir>/review/",
+    "review_dir": ".evidence/<branch-slug>/<date>/",
     "ci_dir": "<state-dir>/ci/",
-    "qa_dir": "/tmp/qa-<slug>/",
-    "demo_release": "https://github.com/org/repo/releases/tag/qa-evidence-..."
+    "qa_dir": ".evidence/<branch-slug>/<date>/",
+    "demo_dir": ".evidence/<branch-slug>/<date>/",
+    "demo_release": "optional fallback URL when published"
   },
   "remaining_work": ["review: 2 blocking findings in auth.py"],
   "recommended_next": "fix-and-resume | abandon | human-review",

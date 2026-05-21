@@ -146,7 +146,7 @@ Report candidates for `/guardrail`. Do not generate the rules here.
 
 Assess whether the repo needs project-specific skills:
 
-- unique build/deploy workflow
+- unique build/release workflow
 - repeated multi-step maintenance rituals
 - domain workflows general skills do not cover
 

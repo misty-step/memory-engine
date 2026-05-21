@@ -7,14 +7,16 @@ argument-hint: "[--emphasis tidy|shape|rethink]"
 
 # /groom
 
-Grooming keeps `backlog.d/` truthful. Every run tidies before strategy: compare active tickets, `backlog.d/_done/`, `SPEC.md`, slice docs, recent git history, and current dogfood/proof receipts.
+Every run starts with tracker truth before strategy. Compare `backlog.d/`, `backlog.d/_done/`, recent git trailers, `SPEC.md`, slice docs, QA/dogfood receipts, and current code. Do not treat a stale active ticket as real priority just because the file is still under `backlog.d/`.
 
-Lifecycle contract: active work lives in `backlog.d/`, closed work lives in `backlog.d/_done/`, closure trailers are `Closes-backlog:` or `Ships-backlog:`, references use `Refs-backlog:`, and archival uses `scripts/lib/backlog.sh` (`backlog_archive`). The detector is `scripts/lib/backlog.sh`: use `backlog_ids_from_commit`, `backlog_ids_from_range`, and `backlog_archive` when reconciling closure trailers against active files. If a shipped ticket remains active, archive it. If an archived ticket still says `status: ready`, fix the status or shape a hygiene ticket.
+Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work references use `Refs-backlog: NN`; closure uses `Closes-backlog: NN` or `Ships-backlog: NN`. Archive by sourcing `scripts/lib/backlog.sh` and using `backlog_archive`.
 
-## Strategic Work
+Use `backlog_ids_from_commit`, `backlog_ids_from_range`, `backlog_file_for_id`, and `backlog_archive` from `scripts/lib/backlog.sh` when reconciling closure. If a shipped ticket remains active, archive it. If an archived ticket still says `status: ready`, fix it only under backlog hygiene scope or shape a concrete hygiene item.
 
-After tidy, challenge whether the next item belongs in the kernel or the beta/application layer. Require a current proof story for shared behavior. Update `SPEC.md` when roadmap status drifts from code. Shape atomic tickets with executable oracles and dogfood/beta/external proof commands where needed.
+## Current Strategy
 
-Current known grooming targets: keep Slice 6 focused on beta usefulness; fix stale archived frontmatter; remove deprecated Scry/Vault canary requirements from active harness surfaces.
+Slice 6 is the active pressure path: beta persistence, source-grounded quiz/exercise generation, mobile study dogfood, service-contract hardening, graduated activity ladders, backlog/QA hygiene, and extraction decision work. Keep `backlog.d/16-system-visualization-workbench.md` later unless architecture confusion is causing repeated defects.
+
+Reject stale Scry/Vault canary requirements. Current proof is repo-local dogfood lanes, beta receipts, package tests, and explicitly shaped external proof.
 
 `bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.

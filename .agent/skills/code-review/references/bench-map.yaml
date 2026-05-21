@@ -16,6 +16,25 @@
 default: [critic, ousterhout, grug]
 
 rules:
+  # --- Web UI / accessibility -----------------------------------------------
+  - name: react-components
+    paths: ["**/*.tsx", "**/*.jsx"]
+    add: [a11y-auditor]
+
+  - name: web-surfaces
+    paths:
+      - "**/pages/**"
+      - "**/app/**/page.*"
+      - "**/routes/**"
+      - "**/components/**"
+      - "**/*.vue"
+      - "**/*.svelte"
+    add: [a11y-auditor, carmack]
+
+  - name: styles-and-markup
+    paths: ["**/*.html", "**/*.css", "**/*.scss"]
+    add: [a11y-auditor]
+
   # --- Typed languages ------------------------------------------------------
   - name: typescript
     paths: ["**/*.ts", "**/*.tsx"]

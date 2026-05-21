@@ -9,21 +9,20 @@ argument-hint: "[backlog.d/NN-slug.md]"
 
 One active `backlog.d/` ticket becomes merge-ready code. Delivered is not shipped: this skill does not push, merge, archive, deploy, or reflect.
 
-Read `.spellbook/repo-brief.md`, the ticket, relevant slice docs, and shipped precedents in `backlog.d/_done/`. If the ticket is missing or unshaped, run /shape first. Create or use one branch from `master` with `cx/...` naming unless directed otherwise.
+If no ticket is specified, select the highest-priority ready active ticket by reading `backlog.d/` and dependencies. If the tracker is contradictory, run `/groom` first instead of guessing.
 
 ## Loop
 
-1. Confirm the ticket's Goal, Non-Goals, and executable Oracle.
-2. Run /implement with TDD and `Refs-backlog: NN` recorded for later closure.
-3. Run /ci until `bun run ci` is green.
-4. Run /code-review and fix blocking findings.
-5. Run /refactor only for simplification that preserves the ticket scope.
-6. Run /qa for package surfaces and any named current proof oracles.
+1. Confirm the ticket Goal, Non-Goals, and executable Oracle.
+2. Run `/shape` first if the work is unshaped or too broad.
+3. Run `/implement` with TDD and `Refs-backlog: NN` recorded.
+4. Run `/ci` until `bun run ci` is green.
+5. Run `/code-review` and fix blocking findings.
+6. Run `/refactor` only for simplification inside ticket scope.
+7. Run `/qa` for package surfaces and ticket-named dogfood/beta/external proof.
 
 `bun run ci` IS the gate. It shells out to `dagger call check --source=.` and runs install, typecheck, Biome check, coverage-enforced tests, and Gitleaks.
 
-Lifecycle contract: active work lives in `backlog.d/`, closed work lives in `backlog.d/_done/`, closure trailers are `Closes-backlog:` or `Ships-backlog:`, references use `Refs-backlog:`, and archival uses `scripts/lib/backlog.sh` (`backlog_archive`). /deliver only prepares the branch; /ship performs archival and closing trailers.
+Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work references use `Refs-backlog: NN`; closure uses `Closes-backlog: NN` or `Ships-backlog: NN`. Archive by sourcing `scripts/lib/backlog.sh` and using `backlog_archive`.
 
-## Output
-
-Report ticket ID, branch, changed surfaces, commands run, proof evidence, and what remains for /yeet, /settle, or /ship.
+Output ticket ID, branch, changed surfaces, commands run, proof evidence, and what remains for `/yeet`, `/settle`, or `/ship`.
