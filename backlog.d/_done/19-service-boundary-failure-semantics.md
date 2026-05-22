@@ -2,7 +2,7 @@
 shaping: true
 ticket: 19-service-boundary-failure-semantics
 slice: 5
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [15-service-interface-prototype, 17-service-scenario-fixtures]

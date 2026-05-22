@@ -2,7 +2,7 @@
 shaping: true
 ticket: 26-beta-persistence-spine
 slice: 6
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [24-extraction-decision-gate]
@@ -66,3 +66,11 @@ shared service contract.
   in-memory fixture is not sufficient for this ticket.
 - This ticket is the bridge between "pure kernel" and "actually usable beta":
   the database exists, but it is owned by the beta shell, not the package core.
+
+## Closure Evidence
+
+- Implemented in `experiments/beta-store/` with durable beta-owned persistence
+  and no runtime persistence under `src/`.
+- Documented in `docs/beta/persistence-spine.md`.
+- Verified during backlog hygiene with `bun test experiments/beta-store/
+  experiments/beta-generation/`.

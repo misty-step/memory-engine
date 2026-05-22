@@ -2,7 +2,7 @@
 shaping: true
 ticket: 22-content-normalization-probe
 slice: 5
-status: ready
+status: shipped
 priority: medium
 estimate: M
 depends_on: [21-cli-review-loop-dogfood]

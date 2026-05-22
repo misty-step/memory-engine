@@ -2,7 +2,7 @@
 shaping: true
 ticket: 21-cli-review-loop-dogfood
 slice: 5
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [18-modular-api-surface, 19-service-boundary-failure-semantics]

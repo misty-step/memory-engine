@@ -2,7 +2,7 @@
 shaping: true
 ticket: 20-evals-and-benchmarks-baseline
 slice: 5
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [18-modular-api-surface]

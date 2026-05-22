@@ -2,7 +2,7 @@
 shaping: true
 ticket: 30-backlog-hygiene-and-qa-receipts
 slice: 6
-status: ready
+status: shipped
 priority: medium
 estimate: S
 depends_on: [24-extraction-decision-gate]
@@ -45,3 +45,12 @@ compare across longer beta cycles.
 - Product proof remains separate from package QA. Add exact dogfood, beta, or
   external proof lanes only when a ticket changes exported contracts that must
   be validated outside the local package harness.
+
+## Closure Evidence
+
+- Archived completed active tickets `26` and `27` after focused beta-store and
+  beta-generation proof passed.
+- Normalized archived tickets so `_done/` no longer contains `status: ready`.
+- Added `docs/qa/backlog-hygiene.md` to document active/archive invariants,
+  closure evidence expectations, and the stdout-first QA receipt decision.
+- Verified with `bun run qa` and `bun run ci`.

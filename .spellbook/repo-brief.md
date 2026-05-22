@@ -47,9 +47,9 @@ Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work
 
 ## Known Debts
 
-- Slice 6 is now the main product pressure path: durable beta persistence, source-grounded AI generation, mobile study dogfood, service-contract hardening, backlog/QA hygiene, graduated activity ladders, and extraction decision work.
-- Active tickets `26` and `27` appear satisfied by existing `experiments/beta-store/`, `experiments/beta-generation/`, and docs, but they still live in `backlog.d/`. `backlog.d/30-backlog-hygiene-and-qa-receipts.md` should reconcile active-vs-archived state instead of silently treating the tracker as clean.
-- Several archived tickets under `backlog.d/_done/` still carry misleading `status: ready` frontmatter. The cleanup belongs in backlog hygiene, not ad hoc during unrelated feature work.
+- Slice 6 is now the main product pressure path: mobile study dogfood, service-contract hardening, graduated activity ladders, and extraction decision work.
+- `backlog.d/28-mobile-beta-study-interface.md` is the highest-priority active ticket. It is the next product proof because it turns the beta store and generation probe into a local, mobile-first study loop that can be used for real dogfood sessions.
+- Backlog hygiene reconciled stale active tickets `26` and `27`, archived completed `30`, and removed misleading archived `status: ready` frontmatter.
 - Historical Scry and Vault canary branches are deprecated. Current proof comes from package tests, repo-local dogfood lanes, beta receipts, and explicitly shaped current external oracles.
 - There is no deploy target. Monitor CI, QA, dogfood, beta, benchmark, and tracker drift; do not invent production health checks.
 

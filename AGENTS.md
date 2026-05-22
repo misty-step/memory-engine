@@ -46,8 +46,7 @@ Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work
 
 ## Known Debt
 
-- `backlog.d/30-backlog-hygiene-and-qa-receipts.md`: reconcile active tickets whose oracles are already satisfied, including likely stale active `26` and `27`, and clean archived `status: ready` frontmatter.
-- `backlog.d/28-mobile-beta-study-interface.md`: mobile-first beta usefulness is the next high-risk product proof after persistence and generation.
+- `backlog.d/28-mobile-beta-study-interface.md`: highest-priority active work. Mobile-first beta usefulness is the next high-risk product proof after persistence and generation.
 - `backlog.d/29-service-contract-v0-hardening.md`: harden service DTO/reveal/failure semantics after beta pressure exists.
 - `backlog.d/32-graduated-activity-ladder.md`: treat exercises/practice problems as first-class beta activities, not quiz variants only.
 - `backlog.d/31-beta-extraction-decision.md`: decide promote, extract, keep experimenting, or reshape after enough beta ladder evidence.

@@ -2,7 +2,7 @@
 shaping: true
 ticket: 27-ai-content-generation-probe
 slice: 6
-status: ready
+status: shipped
 priority: high
 estimate: M
 depends_on: [26-beta-persistence-spine]
@@ -60,3 +60,11 @@ testable.
   through a procedure, judgment, or problem. For domains like options trading,
   repeated practice problems about Gamma, hedging, payoff curves, or scenario
   analysis may teach more than repeatedly quizzing the definition of Gamma.
+
+## Closure Evidence
+
+- Implemented in `experiments/beta-generation/` with deterministic,
+  source-grounded quiz and exercise draft generation.
+- Documented in `docs/beta/content-generation.md`.
+- Verified during backlog hygiene with `bun test experiments/beta-store/
+  experiments/beta-generation/`.
