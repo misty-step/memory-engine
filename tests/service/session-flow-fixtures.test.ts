@@ -2,18 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import { State } from 'ts-fsrs';
 
 import {
-  type MemoryServiceStore,
-  type ServiceAttemptRecord,
-  createMemoryService,
-} from '../../service';
-import {
   type MasteryPolicy,
   type Prompt,
   type QueueCandidate,
   Rating,
   type ReviewUnitId,
   type ScheduleState,
-} from '../../src';
+} from 'memory-engine';
+import {
+  type MemoryServiceStore,
+  type ServiceAttemptRecord,
+  createMemoryService,
+} from '../../service';
+import { ValidatingMemoryServiceStore } from './validating-store';
 
 const now = Date.UTC(2026, 4, 14, 12, 0, 0);
 
@@ -57,74 +58,33 @@ function createValidatingScenarioStore(fixture: ScenarioFixture): {
   schedules: Map<ReviewUnitId, ScheduleState>;
   store: MemoryServiceStore;
 } {
-  const attempts: ServiceAttemptRecord[] = [];
-  const units = new Map(fixture.units.map((unit) => [unit.reviewUnitId, unit]));
-  const schedules = new Map<ReviewUnitId, ScheduleState>(
+  const knownReviewUnitIds = fixture.units.map((u) => u.reviewUnitId);
+  const initialSchedules = new Map<ReviewUnitId, ScheduleState>(
     fixture.units.flatMap((unit) =>
       unit.scheduleState === undefined ? [] : [[unit.reviewUnitId, unit.scheduleState]],
     ),
   );
+  const initialCandidates = fixture.units.map((unit) => {
+    const currentScheduleState = initialSchedules.get(unit.reviewUnitId) ?? null;
+    return {
+      reviewUnitId: unit.reviewUnitId,
+      scheduleState: currentScheduleState,
+      due: currentScheduleState?.due ?? now - 60_000,
+      ...unit.queue,
+    };
+  });
 
-  function assertKnownReviewUnit(reviewUnitId: ReviewUnitId): void {
-    if (!units.has(reviewUnitId)) {
-      throw new Error(`Unknown review unit: ${reviewUnitId}`);
-    }
-  }
+  const store = new ValidatingMemoryServiceStore({
+    knownReviewUnitIds,
+    initialCandidates,
+    initialSchedules,
+  });
 
-  function assertAttemptContract(attempt: ServiceAttemptRecord): void {
-    assertKnownReviewUnit(attempt.reviewUnitId);
-    if (attempt.submittedAnswer.trim() === '') {
-      throw new Error('Attempt answer must not be blank');
-    }
-    if (!Number.isInteger(attempt.responseTimeMs) || attempt.responseTimeMs <= 0) {
-      throw new Error('Attempt response time must be a positive integer');
-    }
-    if (!Number.isInteger(attempt.occurredAt)) {
-      throw new Error('Attempt timestamp must be an integer epoch millisecond value');
-    }
-  }
-
-  const store: MemoryServiceStore = {
-    async recordAttempt(attempt: ServiceAttemptRecord): Promise<void> {
-      assertAttemptContract(attempt);
-      attempts.push(attempt);
-    },
-    async readScheduleState(unitId: ReviewUnitId): Promise<ScheduleState | null> {
-      assertKnownReviewUnit(unitId);
-      return schedules.get(unitId) ?? null;
-    },
-    async applyReview(
-      unitId: ReviewUnitId,
-      attempt: ServiceAttemptRecord,
-      nextScheduleState: ScheduleState,
-    ): Promise<void> {
-      assertKnownReviewUnit(unitId);
-      if (unitId !== attempt.reviewUnitId) {
-        throw new Error('Applied review unit must match the attempt review unit');
-      }
-      if (nextScheduleState.last_review !== attempt.occurredAt) {
-        throw new Error('Schedule last_review must match the attempt timestamp');
-      }
-
-      assertAttemptContract(attempt);
-      attempts.push(attempt);
-      schedules.set(unitId, nextScheduleState);
-    },
-    async listQueueCandidates(): Promise<QueueCandidate[]> {
-      return fixture.units.map((unit) => {
-        const currentScheduleState = schedules.get(unit.reviewUnitId) ?? null;
-
-        return {
-          reviewUnitId: unit.reviewUnitId,
-          scheduleState: currentScheduleState,
-          due: currentScheduleState?.due ?? now - 60_000,
-          ...unit.queue,
-        };
-      });
-    },
+  return {
+    attempts: store.attempts,
+    schedules: store.schedules,
+    store,
   };
-
-  return { attempts, schedules, store };
 }
 
 describe('memory service scenario fixtures', () => {

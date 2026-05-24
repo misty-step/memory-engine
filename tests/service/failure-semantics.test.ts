@@ -1,12 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { State } from 'ts-fsrs';
 
+import type { ReviewUnitId, ScheduleState, ShortAnswerPrompt } from 'memory-engine/types';
 import {
   type MemoryServiceStore,
   type ServiceAttemptRecord,
   createMemoryService,
 } from '../../service';
-import type { QueueCandidate, ReviewUnitId, ScheduleState, ShortAnswerPrompt } from '../../src';
+import { ValidatingMemoryServiceStore } from './validating-store';
 
 const now = Date.UTC(2026, 4, 15, 12, 0, 0);
 
@@ -52,78 +53,16 @@ function createValidatingStore(
   schedules: Map<ReviewUnitId, ScheduleState>;
   store: MemoryServiceStore;
 } {
-  const knownReviewUnitIds = new Set(options.knownReviewUnitIds ?? [reviewUnitId('known-unit')]);
-  const attempts: ServiceAttemptRecord[] = [];
-  const schedules = new Map<ReviewUnitId, ScheduleState>();
+  const store = new ValidatingMemoryServiceStore({
+    knownReviewUnitIds: options.knownReviewUnitIds ?? [reviewUnitId('known-unit')],
+    failMode: options.fail ?? null,
+  });
 
-  function assertKnownReviewUnit(reviewUnitIdValue: ReviewUnitId): void {
-    if (!knownReviewUnitIds.has(reviewUnitIdValue)) {
-      throw new Error(`Unknown review unit: ${reviewUnitIdValue}`);
-    }
-  }
-
-  function assertAttemptContract(attempt: ServiceAttemptRecord): void {
-    assertKnownReviewUnit(attempt.reviewUnitId);
-
-    if (attempt.submittedAnswer.trim().length === 0) {
-      throw new Error('Attempt answer must not be blank');
-    }
-
-    if (!Number.isInteger(attempt.responseTimeMs) || attempt.responseTimeMs <= 0) {
-      throw new Error('Attempt response time must be a positive integer');
-    }
-
-    if (!Number.isInteger(attempt.occurredAt)) {
-      throw new Error('Attempt timestamp must be an integer epoch millisecond value');
-    }
-  }
-
-  const store: MemoryServiceStore = {
-    async recordAttempt(attempt: ServiceAttemptRecord): Promise<void> {
-      if (options.fail === 'record') {
-        throw new Error('recordAttempt failed');
-      }
-
-      assertAttemptContract(attempt);
-      attempts.push(attempt);
-    },
-    async readScheduleState(reviewUnitIdValue: ReviewUnitId): Promise<ScheduleState | null> {
-      if (options.fail === 'read') {
-        throw new Error('readScheduleState failed');
-      }
-
-      assertKnownReviewUnit(reviewUnitIdValue);
-      return schedules.get(reviewUnitIdValue) ?? null;
-    },
-    async applyReview(
-      reviewUnitIdValue: ReviewUnitId,
-      attempt: ServiceAttemptRecord,
-      nextScheduleState: ScheduleState,
-    ): Promise<void> {
-      if (options.fail === 'apply') {
-        throw new Error('applyReview failed');
-      }
-
-      assertKnownReviewUnit(reviewUnitIdValue);
-
-      if (reviewUnitIdValue !== attempt.reviewUnitId) {
-        throw new Error('Applied review unit must match the attempt review unit');
-      }
-
-      if (nextScheduleState.last_review !== attempt.occurredAt) {
-        throw new Error('Schedule last_review must match the attempt timestamp');
-      }
-
-      assertAttemptContract(attempt);
-      attempts.push(attempt);
-      schedules.set(reviewUnitIdValue, nextScheduleState);
-    },
-    async listQueueCandidates(): Promise<QueueCandidate[]> {
-      return [];
-    },
+  return {
+    attempts: store.attempts,
+    schedules: store.schedules,
+    store,
   };
-
-  return { attempts, schedules, store };
 }
 
 function createTestService(store: MemoryServiceStore) {

@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { State } from 'ts-fsrs';
 
+import type { QueueCandidate, ReviewUnitId, ScheduleState } from 'memory-engine/types';
 import { createMemoryService } from '../../service';
 import type { MemoryServiceStore, ServiceAttemptRecord } from '../../service';
-import type { QueueCandidate, ReviewUnitId, ScheduleState } from '../../src';
 
 const now = Date.UTC(2026, 4, 14, 12, 0, 0);
 
