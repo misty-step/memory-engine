@@ -1,0 +1,59 @@
+# Multi-Client Beta Pressure
+
+Refs-backlog: 33
+
+## Purpose
+
+This receipt pressure-tests the current beta boundaries across two independent
+clients in `experiments/beta-study/`:
+
+- mobile-first study session (`index.ts` + `server.ts` + `index.html`), and
+- command-first coach workflow (`multi-client.ts`).
+
+Both clients use the same persistence spine (`BetaPersistenceStore`) and the
+same service command surface (`next-queue`, `grade/apply-review`) while owning
+client-specific reveal/session choreography.
+
+## Executable Receipt
+
+```sh
+bun test experiments/beta-study/
+```
+
+`multi-client-pressure.test.ts` now proves the second workflow runs source
+ingest, generation, approval, queue selection, reveal, submit, and
+restart/resume, then checks cross-client parity for reveal semantics,
+duplicate-submit handling, and review-state projection.
+
+## Repeated Cross-Client Signals
+
+- Source ingest and generation stay app-owned and persist through the same
+  beta store snapshot model.
+- Draft approval promotes review units through the same store-backed boundary.
+- Queue selection in both clients is driven by service `next-queue`, not
+  client-local queue logic.
+- Reveal is display-only state in both clients; no scheduling write occurs on
+  reveal and attempt count remains unchanged.
+- Submit flows through `grade/apply-review` and projects the same compact
+  review-state DTO (`due`, `reps`, `lapses`, `state`, `last_review`).
+- Duplicate submit after graded state is ignored in both clients; attempts and
+  schedule projection remain stable.
+- Restart/resume in both clients reloads persisted attempts, schedules, and
+  approved units without regenerating content.
+
+## Product-Owned Divergences
+
+- Mobile study uses manual per-draft approval and browser-oriented screen state;
+  coach workflow supports bulk approval for command-line style throughput.
+- Mobile study emphasizes learner-facing composition (prompt pane + side
+  panels); coach workflow emphasizes command traceability via `commands` logs.
+- Both expose schedule-change projection, but each client shapes surrounding
+  view DTOs for its own interaction model.
+
+These divergences are intentional product behavior, not contract drift.
+
+## Boundary Verdict
+
+The current beta boundaries held under repeated pressure: persistence remains in
+`experiments/`, service commands remain stable, reveal remains UI-owned, and no
+new `src/` surface was required.
