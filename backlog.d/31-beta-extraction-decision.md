@@ -30,15 +30,15 @@ promoted, or kept private.
 
 ## Oracle
 
-- [ ] `docs/beta/extraction-decision.md` compares CLI, import, web shell, beta
+- [x] `docs/beta/extraction-decision.md` compares CLI, import, web shell, beta
       persistence, beta generation, mobile study, graduated activity ladder,
       and service-contract evidence.
-- [ ] The decision chooses exactly one primary path: extract a beta app, promote
+- [x] The decision chooses exactly one primary path: extract a beta app, promote
       a helper/API contract, keep experimenting, or reshape the kernel/service
       boundary.
-- [ ] Follow-up tickets are created for the selected path and for any rejected
+- [x] Follow-up tickets are created for the selected path and for any rejected
       high-value alternatives worth revisiting.
-- [ ] `bun run qa` and `bun run ci` exit 0.
+- [x] `bun run qa` and `bun run ci` exit 0.
 
 ## Notes
 
