@@ -1,0 +1,1277 @@
+{
+  "schema": "memory-engine.architecture-map/v1",
+  "mapId": "memory-engine.system-visualization",
+  "title": "Memory Engine System Visualization Workbench Map",
+  "updatedAt": "2026-05-25",
+  "views": [
+    {
+      "id": "architecture-boundary",
+      "label": "Architecture Boundary",
+      "description": "What stays in the pure kernel, what lives in the service prototype, and where boundaries are enforced."
+    },
+    {
+      "id": "service-command-lifecycle",
+      "label": "Service Command Lifecycle",
+      "description": "How each service command travels from input command to store boundary and service result."
+    },
+    {
+      "id": "review-state-flow",
+      "label": "Review State Flow",
+      "description": "How a submitted answer becomes a grade, then a schedule transition, then queue selection."
+    },
+    {
+      "id": "extraction-decision-map",
+      "label": "Extraction Decision Map",
+      "description": "Evidence and boundaries that inform keep-vs-extract decisions for service and clients."
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node.backlog.16",
+      "label": "Ticket 16 Workbench",
+      "kind": "backlog",
+      "summary": "Defines this architecture workbench scope and acceptance criteria.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 70,
+          "y": 60
+        },
+        "extraction-decision-map": {
+          "x": 70,
+          "y": 60
+        }
+      },
+      "refs": [
+        {
+          "kind": "backlog",
+          "path": "backlog.d/16-system-visualization-workbench.md",
+          "label": "backlog.d/16-system-visualization-workbench.md"
+        }
+      ]
+    },
+    {
+      "id": "node.docs.architecture.workbench",
+      "label": "Workbench Artifacts",
+      "kind": "doc",
+      "summary": "Repo-local map JSON and static HTML viewer under docs/architecture.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 340,
+          "y": 60
+        },
+        "extraction-decision-map": {
+          "x": 350,
+          "y": 60
+        }
+      },
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/architecture/memory-engine.map.json",
+          "label": "docs/architecture/memory-engine.map.json"
+        },
+        {
+          "kind": "doc",
+          "path": "docs/architecture/workbench.html",
+          "label": "docs/architecture/workbench.html"
+        }
+      ]
+    },
+    {
+      "id": "node.package.exports",
+      "label": "Published Package Exports",
+      "kind": "kernel",
+      "summary": "Public API subpaths expose kernel modules without shipping service prototype internals.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 640,
+          "y": 60
+        },
+        "extraction-decision-map": {
+          "x": 650,
+          "y": 120
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "package.json",
+          "label": "package.json exports"
+        },
+        {
+          "kind": "test",
+          "path": "tests/api/module-exports.test.ts",
+          "label": "tests/api/module-exports.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.kernel.types",
+      "label": "Kernel Types",
+      "kind": "kernel",
+      "summary": "Canonical Prompt, GradeResult, QueueCandidate, and ScheduleState contracts.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "layout": {
+        "architecture-boundary": {
+          "x": 610,
+          "y": 220
+        },
+        "service-command-lifecycle": {
+          "x": 700,
+          "y": 70
+        },
+        "review-state-flow": {
+          "x": 90,
+          "y": 90
+        },
+        "extraction-decision-map": {
+          "x": 420,
+          "y": 220
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/types.ts",
+          "label": "src/types.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.kernel.grader",
+      "label": "Kernel Grader",
+      "kind": "kernel",
+      "summary": "Deterministic grading and rating mapping from learner answers.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 870,
+          "y": 220
+        },
+        "service-command-lifecycle": {
+          "x": 990,
+          "y": 230
+        },
+        "review-state-flow": {
+          "x": 400,
+          "y": 90
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/grader.ts",
+          "label": "src/grader.ts"
+        },
+        {
+          "kind": "test",
+          "path": "tests/grader/parity.test.ts",
+          "label": "tests/grader/parity.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.kernel.scheduler",
+      "label": "Kernel Scheduler",
+      "kind": "kernel",
+      "summary": "FSRS state transition primitive via next().",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 1130,
+          "y": 220
+        },
+        "service-command-lifecycle": {
+          "x": 990,
+          "y": 360
+        },
+        "review-state-flow": {
+          "x": 690,
+          "y": 90
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/scheduler.ts",
+          "label": "src/scheduler.ts"
+        },
+        {
+          "kind": "test",
+          "path": "tests/scheduler/roundtrip.test.ts",
+          "label": "tests/scheduler/roundtrip.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.kernel.progression",
+      "label": "Kernel Progression",
+      "kind": "kernel",
+      "summary": "Eligibility and mastery gating for staged review units.",
+      "viewTags": ["architecture-boundary", "review-state-flow"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 870,
+          "y": 380
+        },
+        "review-state-flow": {
+          "x": 1110,
+          "y": 250
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/progression.ts",
+          "label": "src/progression.ts"
+        },
+        {
+          "kind": "test",
+          "path": "tests/progression/eligibility.test.ts",
+          "label": "tests/progression/eligibility.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.kernel.queue",
+      "label": "Kernel Queue",
+      "kind": "kernel",
+      "summary": "Queue priority and next-candidate selection primitives.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 1130,
+          "y": 380
+        },
+        "service-command-lifecycle": {
+          "x": 990,
+          "y": 490
+        },
+        "review-state-flow": {
+          "x": 1110,
+          "y": 90
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/queue.ts",
+          "label": "src/queue.ts"
+        },
+        {
+          "kind": "test",
+          "path": "tests/queue/next.test.ts",
+          "label": "tests/queue/next.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.service.prototype",
+      "label": "Service Prototype",
+      "kind": "service",
+      "summary": "Command envelope adapter that orchestrates kernel primitives and store calls.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "layout": {
+        "architecture-boundary": {
+          "x": 340,
+          "y": 220
+        },
+        "service-command-lifecycle": {
+          "x": 390,
+          "y": 230
+        },
+        "review-state-flow": {
+          "x": 390,
+          "y": 250
+        },
+        "extraction-decision-map": {
+          "x": 350,
+          "y": 220
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "service/index.ts"
+        },
+        {
+          "kind": "doc",
+          "path": "docs/service-prototype.md",
+          "label": "docs/service-prototype.md"
+        }
+      ]
+    },
+    {
+      "id": "node.service.store-boundary",
+      "label": "MemoryServiceStore Boundary",
+      "kind": "service-boundary",
+      "summary": "Injected persistence seam for attempts, schedules, and queue candidates.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "layout": {
+        "architecture-boundary": {
+          "x": 340,
+          "y": 380
+        },
+        "service-command-lifecycle": {
+          "x": 390,
+          "y": 490
+        },
+        "review-state-flow": {
+          "x": 690,
+          "y": 250
+        },
+        "extraction-decision-map": {
+          "x": 350,
+          "y": 420
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "MemoryServiceStore in service/index.ts"
+        },
+        {
+          "kind": "test",
+          "path": "tests/service/persistence-boundary.test.ts",
+          "label": "tests/service/persistence-boundary.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.command.record-attempt",
+      "label": "Command: record-attempt",
+      "kind": "command",
+      "summary": "Records learner interaction without grading or scheduling.",
+      "viewTags": ["service-command-lifecycle"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 80,
+          "y": 120
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "RecordAttemptCommand"
+        },
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "records an attempt test"
+        }
+      ]
+    },
+    {
+      "id": "node.command.grade-apply-review",
+      "label": "Command: grade/apply-review",
+      "kind": "command",
+      "summary": "Grades a prompt and applies the resulting schedule transition.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 80,
+          "y": 250
+        },
+        "review-state-flow": {
+          "x": 90,
+          "y": 250
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "GradeApplyReviewCommand"
+        },
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "grades and applies review test"
+        }
+      ]
+    },
+    {
+      "id": "node.command.next-queue",
+      "label": "Command: next-queue",
+      "kind": "command",
+      "summary": "Requests the next review candidate from queue primitives and store data.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 80,
+          "y": 380
+        },
+        "review-state-flow": {
+          "x": 90,
+          "y": 420
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "NextQueueCommand"
+        },
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "selects next queue candidate test"
+        }
+      ]
+    },
+    {
+      "id": "node.result.attempt-recorded",
+      "label": "Result: attempt-recorded",
+      "kind": "result",
+      "summary": "Service confirms attempt persistence.",
+      "viewTags": ["service-command-lifecycle"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 1240,
+          "y": 120
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "AttemptRecordedResult"
+        }
+      ]
+    },
+    {
+      "id": "node.result.review-applied",
+      "label": "Result: review-applied",
+      "kind": "result",
+      "summary": "Service returns grade details plus next schedule state.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 1240,
+          "y": 250
+        },
+        "review-state-flow": {
+          "x": 1110,
+          "y": 420
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "ReviewAppliedResult"
+        }
+      ]
+    },
+    {
+      "id": "node.result.queue-selected",
+      "label": "Result: queue-selected",
+      "kind": "result",
+      "summary": "Service returns next queue candidate or null.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "layout": {
+        "service-command-lifecycle": {
+          "x": 1240,
+          "y": 380
+        },
+        "review-state-flow": {
+          "x": 1360,
+          "y": 250
+        }
+      },
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "QueueSelectedResult"
+        }
+      ]
+    },
+    {
+      "id": "node.tests.service.interface",
+      "label": "Service Interface Contract Tests",
+      "kind": "test",
+      "summary": "Pins command envelopes and happy-path behavior.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 70,
+          "y": 520
+        },
+        "service-command-lifecycle": {
+          "x": 80,
+          "y": 610
+        },
+        "extraction-decision-map": {
+          "x": 70,
+          "y": 420
+        }
+      },
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "tests/service/interface-contract.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.tests.service.failure",
+      "label": "Service Failure Semantics Tests",
+      "kind": "test",
+      "summary": "Validates rejection propagation and store-side validation semantics.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "layout": {
+        "architecture-boundary": {
+          "x": 340,
+          "y": 520
+        },
+        "service-command-lifecycle": {
+          "x": 390,
+          "y": 610
+        },
+        "review-state-flow": {
+          "x": 690,
+          "y": 420
+        },
+        "extraction-decision-map": {
+          "x": 350,
+          "y": 520
+        }
+      },
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/failure-semantics.test.ts",
+          "label": "tests/service/failure-semantics.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.tests.service.fixtures",
+      "label": "Service Session Fixture Tests",
+      "kind": "test",
+      "summary": "Exercises deterministic prompt loop and progression unlock scenario.",
+      "viewTags": ["architecture-boundary", "review-state-flow", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 610,
+          "y": 520
+        },
+        "review-state-flow": {
+          "x": 1110,
+          "y": 420
+        },
+        "extraction-decision-map": {
+          "x": 650,
+          "y": 520
+        }
+      },
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/session-flow-fixtures.test.ts",
+          "label": "tests/service/session-flow-fixtures.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "node.docs.service-prototype",
+      "label": "Service Prototype Notes",
+      "kind": "doc",
+      "summary": "Defines what stays in repo and what moves on extraction.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 870,
+          "y": 520
+        },
+        "extraction-decision-map": {
+          "x": 950,
+          "y": 220
+        }
+      },
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/service-prototype.md",
+          "label": "docs/service-prototype.md"
+        }
+      ]
+    },
+    {
+      "id": "node.docs.service-scenarios",
+      "label": "Service Scenario Notes",
+      "kind": "doc",
+      "summary": "Explains scenario-fixture purpose and app-owned boundaries.",
+      "viewTags": ["architecture-boundary", "review-state-flow", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 1130,
+          "y": 520
+        },
+        "review-state-flow": {
+          "x": 1360,
+          "y": 420
+        },
+        "extraction-decision-map": {
+          "x": 950,
+          "y": 420
+        }
+      },
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/service-scenarios.md",
+          "label": "docs/service-scenarios.md"
+        }
+      ]
+    },
+    {
+      "id": "node.docs.extraction-decision",
+      "label": "Extraction Decision",
+      "kind": "doc",
+      "summary": "Current decision: keep experimenting in-repo and delay extraction.",
+      "viewTags": ["extraction-decision-map"],
+      "layout": {
+        "extraction-decision-map": {
+          "x": 650,
+          "y": 320
+        }
+      },
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/dogfood/extraction-decision.md",
+          "label": "docs/dogfood/extraction-decision.md"
+        },
+        {
+          "kind": "backlog",
+          "path": "backlog.d/_done/24-extraction-decision-gate.md",
+          "label": "backlog 24 closure"
+        }
+      ]
+    },
+    {
+      "id": "node.docs.qa-system",
+      "label": "QA System",
+      "kind": "doc",
+      "summary": "Defines QA lanes and the canonical handoff path to bun run ci.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "layout": {
+        "architecture-boundary": {
+          "x": 1130,
+          "y": 60
+        },
+        "extraction-decision-map": {
+          "x": 650,
+          "y": 520
+        }
+      },
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/qa/system.md",
+          "label": "docs/qa/system.md"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge.backlog16.owns.workbench",
+      "from": "node.backlog.16",
+      "to": "node.docs.architecture.workbench",
+      "label": "Defines artifact scope",
+      "kind": "defines",
+      "summary": "Ticket acceptance explicitly requires map JSON and interactive HTML workbench.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "backlog",
+          "path": "backlog.d/16-system-visualization-workbench.md",
+          "label": "oracle section"
+        }
+      ]
+    },
+    {
+      "id": "edge.exports.publish.kernel",
+      "from": "node.package.exports",
+      "to": "node.kernel.types",
+      "label": "Exports types subpath",
+      "kind": "exports",
+      "summary": "Package exposes kernel types through a dedicated public subpath.",
+      "viewTags": ["architecture-boundary"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "package.json",
+          "label": "exports ./types"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.uses.types",
+      "from": "node.service.prototype",
+      "to": "node.kernel.types",
+      "label": "Consumes kernel contracts",
+      "kind": "uses",
+      "summary": "Service command and result envelopes are typed with kernel contracts.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "imports Prompt, QueueCandidate, ScheduleState"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.uses.grader",
+      "from": "node.service.prototype",
+      "to": "node.kernel.grader",
+      "label": "Delegates grading",
+      "kind": "uses",
+      "summary": "grade/apply-review calls Grader.grade to produce GradeResult.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "gradeAndApplyReview()"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.uses.scheduler",
+      "from": "node.service.prototype",
+      "to": "node.kernel.scheduler",
+      "label": "Applies FSRS transition",
+      "kind": "uses",
+      "summary": "grade/apply-review uses next() with grade.rating and current timestamp.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "next(priorSchedule, grade.rating, occurredAt)"
+        }
+      ]
+    },
+    {
+      "id": "edge.queue.depends.progression",
+      "from": "node.kernel.queue",
+      "to": "node.kernel.progression",
+      "label": "Checks eligibility",
+      "kind": "uses",
+      "summary": "Queue reviewability uses progression fallback filtering before selection.",
+      "viewTags": ["architecture-boundary", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "src/queue.ts",
+          "label": "filterEligibleCandidatesWithFallback"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.uses.queue",
+      "from": "node.service.prototype",
+      "to": "node.kernel.queue",
+      "label": "Selects next candidate",
+      "kind": "uses",
+      "summary": "next-queue delegates candidate choice to queue primitive.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "selectNextQueue()"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.boundary.store",
+      "from": "node.service.prototype",
+      "to": "node.service.store-boundary",
+      "label": "Persistence seam",
+      "kind": "boundary",
+      "summary": "Service only touches storage through MemoryServiceStore methods.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "MemoryServiceStore"
+        },
+        {
+          "kind": "test",
+          "path": "tests/service/persistence-boundary.test.ts",
+          "label": "persistence boundary contract"
+        }
+      ]
+    },
+    {
+      "id": "edge.doc.prototype.describes.boundary",
+      "from": "node.docs.service-prototype",
+      "to": "node.service.store-boundary",
+      "label": "Documents applyReview seam",
+      "kind": "documents",
+      "summary": "Prototype notes pin the transactional applyReview seam and failure semantics.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/service-prototype.md",
+          "label": "Boundary Decision + Failure Semantics"
+        }
+      ]
+    },
+    {
+      "id": "edge.tests.interface.cover.service",
+      "from": "node.tests.service.interface",
+      "to": "node.service.prototype",
+      "label": "Pins command envelope",
+      "kind": "verifies",
+      "summary": "Interface-contract tests prove record-attempt, grade/apply-review, and next-queue happy paths.",
+      "viewTags": ["architecture-boundary", "service-command-lifecycle", "extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "describe memory service command interface"
+        }
+      ]
+    },
+    {
+      "id": "edge.tests.failure.cover.boundary",
+      "from": "node.tests.service.failure",
+      "to": "node.service.store-boundary",
+      "label": "Pins rejection semantics",
+      "kind": "verifies",
+      "summary": "Failure semantics tests require store rejections to propagate and block success results.",
+      "viewTags": [
+        "architecture-boundary",
+        "service-command-lifecycle",
+        "review-state-flow",
+        "extraction-decision-map"
+      ],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/failure-semantics.test.ts",
+          "label": "describe memory service failure semantics"
+        }
+      ]
+    },
+    {
+      "id": "edge.tests.fixtures.cover.flow",
+      "from": "node.tests.service.fixtures",
+      "to": "node.service.prototype",
+      "label": "Pins scenario loops",
+      "kind": "verifies",
+      "summary": "Fixture tests exercise deterministic loop and progression unlock queue transitions.",
+      "viewTags": ["architecture-boundary", "review-state-flow", "extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/session-flow-fixtures.test.ts",
+          "label": "describe memory service scenario fixtures"
+        }
+      ]
+    },
+    {
+      "id": "edge.qa.includes.service-lanes",
+      "from": "node.docs.qa-system",
+      "to": "node.service.prototype",
+      "label": "QA lane includes service prototype",
+      "kind": "verifies",
+      "summary": "QA system names service.prototype as a required lane before canonical CI.",
+      "viewTags": ["architecture-boundary", "extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/qa/system.md",
+          "label": "service.prototype lane"
+        }
+      ]
+    },
+    {
+      "id": "edge.command.record.to.service",
+      "from": "node.command.record-attempt",
+      "to": "node.service.prototype",
+      "label": "execute(record-attempt)",
+      "kind": "command",
+      "summary": "record-attempt enters the service execute switch.",
+      "viewTags": ["service-command-lifecycle"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "execute switch record-attempt"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.record.to.store",
+      "from": "node.service.prototype",
+      "to": "node.service.store-boundary",
+      "label": "recordAttempt(attempt)",
+      "kind": "command",
+      "summary": "recordAttempt command persists only the attempt payload.",
+      "viewTags": ["service-command-lifecycle"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "recordAttempt()"
+        }
+      ]
+    },
+    {
+      "id": "edge.store.to.result.record",
+      "from": "node.service.store-boundary",
+      "to": "node.result.attempt-recorded",
+      "label": "attempt-recorded result",
+      "kind": "result",
+      "summary": "Success result is emitted only after store.recordAttempt resolves.",
+      "viewTags": ["service-command-lifecycle"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "records an attempt without grading"
+        }
+      ]
+    },
+    {
+      "id": "edge.command.grade.to.service",
+      "from": "node.command.grade-apply-review",
+      "to": "node.service.prototype",
+      "label": "execute(grade/apply-review)",
+      "kind": "command",
+      "summary": "grade/apply-review enters service orchestration path.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "execute switch grade/apply-review"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.read-schedule.from.store",
+      "from": "node.service.prototype",
+      "to": "node.service.store-boundary",
+      "label": "readScheduleState(reviewUnitId)",
+      "kind": "command",
+      "summary": "Service reads prior schedule before grading.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "readScheduleState in gradeAndApplyReview"
+        }
+      ]
+    },
+    {
+      "id": "edge.flow.grade.to.scheduler",
+      "from": "node.kernel.grader",
+      "to": "node.kernel.scheduler",
+      "label": "rating drives next()",
+      "kind": "flow",
+      "summary": "Grader verdict/rating feeds scheduler transition to new ScheduleState.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "grade then next"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.apply-review.to.store",
+      "from": "node.service.prototype",
+      "to": "node.service.store-boundary",
+      "label": "applyReview(reviewUnitId, attempt, scheduleState)",
+      "kind": "command",
+      "summary": "Service writes attempt plus schedule together at transaction seam.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "store.applyReview"
+        },
+        {
+          "kind": "doc",
+          "path": "docs/service-prototype.md",
+          "label": "applyReview transaction seam"
+        }
+      ]
+    },
+    {
+      "id": "edge.store.to.result.review",
+      "from": "node.service.store-boundary",
+      "to": "node.result.review-applied",
+      "label": "review-applied result",
+      "kind": "result",
+      "summary": "Success result includes grade and schedule only after applyReview resolves.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "grades an answer and applies review"
+        }
+      ]
+    },
+    {
+      "id": "edge.command.next.to.service",
+      "from": "node.command.next-queue",
+      "to": "node.service.prototype",
+      "label": "execute(next-queue)",
+      "kind": "command",
+      "summary": "next-queue enters service selection path.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "execute switch next-queue"
+        }
+      ]
+    },
+    {
+      "id": "edge.service.list-candidates.from.store",
+      "from": "node.service.prototype",
+      "to": "node.service.store-boundary",
+      "label": "listQueueCandidates()",
+      "kind": "command",
+      "summary": "Service obtains candidate population from store-owned data.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "selectNextQueue"
+        }
+      ]
+    },
+    {
+      "id": "edge.store.population.to.queue",
+      "from": "node.service.store-boundary",
+      "to": "node.kernel.queue",
+      "label": "candidate population",
+      "kind": "flow",
+      "summary": "Queue primitive evaluates store-owned candidates with mastery and progression rules.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "pickNextQueueCandidate(candidates, ...)"
+        }
+      ]
+    },
+    {
+      "id": "edge.queue.to.result.selected",
+      "from": "node.kernel.queue",
+      "to": "node.result.queue-selected",
+      "label": "queue-selected result",
+      "kind": "result",
+      "summary": "Selected candidate is returned as queue-selected service result.",
+      "viewTags": ["service-command-lifecycle", "review-state-flow"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/interface-contract.test.ts",
+          "label": "selects next queue candidate"
+        }
+      ]
+    },
+    {
+      "id": "edge.review-flow.command.to.grade",
+      "from": "node.command.grade-apply-review",
+      "to": "node.kernel.grader",
+      "label": "submitted answer graded",
+      "kind": "flow",
+      "summary": "Review flow starts with submitted answer and prompt grading.",
+      "viewTags": ["review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "grader.grade(...)"
+        }
+      ]
+    },
+    {
+      "id": "edge.review-flow.scheduler.to-store",
+      "from": "node.kernel.scheduler",
+      "to": "node.service.store-boundary",
+      "label": "next ScheduleState persisted",
+      "kind": "flow",
+      "summary": "Computed schedule state is committed via applyReview.",
+      "viewTags": ["review-state-flow"],
+      "refs": [
+        {
+          "kind": "source",
+          "path": "service/index.ts",
+          "label": "store.applyReview(...scheduleState...)"
+        }
+      ]
+    },
+    {
+      "id": "edge.review-flow.store.to-queue",
+      "from": "node.service.store-boundary",
+      "to": "node.command.next-queue",
+      "label": "persisted state influences next request",
+      "kind": "flow",
+      "summary": "A subsequent next-queue command uses updated persisted state.",
+      "viewTags": ["review-state-flow"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/session-flow-fixtures.test.ts",
+          "label": "deterministic prompt loop"
+        }
+      ]
+    },
+    {
+      "id": "edge.review-flow.progression.unlock",
+      "from": "node.kernel.progression",
+      "to": "node.result.queue-selected",
+      "label": "mastery unlock affects next candidate",
+      "kind": "flow",
+      "summary": "Progression gating can unlock later stages for queue selection.",
+      "viewTags": ["review-state-flow"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/session-flow-fixtures.test.ts",
+          "label": "progression-aware queue loop"
+        }
+      ]
+    },
+    {
+      "id": "edge.extraction.doc.to.service",
+      "from": "node.docs.extraction-decision",
+      "to": "node.service.prototype",
+      "label": "Keep service repo-local",
+      "kind": "decision",
+      "summary": "Current decision is to keep experimenting in this repository.",
+      "viewTags": ["extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/dogfood/extraction-decision.md",
+          "label": "Decision section"
+        }
+      ]
+    },
+    {
+      "id": "edge.extraction.doc.to.kernel",
+      "from": "node.docs.extraction-decision",
+      "to": "node.package.exports",
+      "label": "Keep kernel as public surface",
+      "kind": "decision",
+      "summary": "Pure kernel and modular exports remain the stable product interface.",
+      "viewTags": ["extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/dogfood/extraction-decision.md",
+          "label": "What stays in memory-engine"
+        }
+      ]
+    },
+    {
+      "id": "edge.extraction.evidence.tests",
+      "from": "node.tests.service.fixtures",
+      "to": "node.docs.extraction-decision",
+      "label": "Scenario pressure evidence",
+      "kind": "evidence",
+      "summary": "Scenario tests provide reusable proof for extraction conversations.",
+      "viewTags": ["extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "test",
+          "path": "tests/service/session-flow-fixtures.test.ts",
+          "label": "scenario fixture evidence"
+        }
+      ]
+    },
+    {
+      "id": "edge.extraction.evidence.qa",
+      "from": "node.docs.qa-system",
+      "to": "node.docs.extraction-decision",
+      "label": "QA lane evidence",
+      "kind": "evidence",
+      "summary": "Extraction decisions rely on QA receipts, not local intuition.",
+      "viewTags": ["extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "doc",
+          "path": "docs/qa/system.md",
+          "label": "Quality model + lanes"
+        }
+      ]
+    },
+    {
+      "id": "edge.extraction.workbench.supports",
+      "from": "node.docs.architecture.workbench",
+      "to": "node.docs.extraction-decision",
+      "label": "Decision aid",
+      "kind": "supports",
+      "summary": "Workbench visualizes boundaries and evidence used during extraction decisions.",
+      "viewTags": ["extraction-decision-map"],
+      "refs": [
+        {
+          "kind": "backlog",
+          "path": "backlog.d/16-system-visualization-workbench.md",
+          "label": "use as decision aid"
+        }
+      ]
+    }
+  ]
+}

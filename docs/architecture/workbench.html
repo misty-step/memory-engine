@@ -1,0 +1,708 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Memory Engine Architecture Workbench</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f6f8;
+        --panel: #ffffff;
+        --ink: #0f172a;
+        --muted: #475569;
+        --line: #cbd5e1;
+        --focus: #0f766e;
+        --kernel: #0f766e;
+        --service: #0284c7;
+        --serviceBoundary: #0369a1;
+        --command: #b45309;
+        --result: #7c3aed;
+        --doc: #1d4ed8;
+        --test: #dc2626;
+        --backlog: #4d7c0f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+      }
+
+      header {
+        padding: 1rem 1.25rem;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      header h1 {
+        margin: 0;
+        font-size: 1.125rem;
+      }
+
+      header p {
+        margin: 0.3rem 0 0;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 320px minmax(700px, 1fr);
+        min-height: calc(100vh - 78px);
+      }
+
+      aside {
+        border-right: 1px solid var(--line);
+        background: var(--panel);
+        padding: 1rem;
+        overflow: auto;
+      }
+
+      main {
+        padding: 1rem;
+        overflow: auto;
+      }
+
+      label {
+        display: block;
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        color: var(--muted);
+        margin-bottom: 0.35rem;
+      }
+
+      select,
+      input {
+        width: 100%;
+        padding: 0.55rem 0.6rem;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        font-size: 0.95rem;
+      }
+
+      .group {
+        margin-bottom: 1rem;
+      }
+
+      .status {
+        margin-bottom: 0.9rem;
+        padding: 0.7rem;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 0.9rem;
+        background: #f8fafc;
+      }
+
+      .legend {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.35rem;
+        margin-bottom: 1rem;
+      }
+
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.8rem;
+        color: var(--muted);
+      }
+
+      .dot {
+        width: 0.65rem;
+        height: 0.65rem;
+        border-radius: 999px;
+      }
+
+      .list {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        max-height: 230px;
+        overflow: auto;
+        background: #fff;
+      }
+
+      .list button {
+        width: 100%;
+        border: 0;
+        border-bottom: 1px solid #e2e8f0;
+        text-align: left;
+        background: transparent;
+        padding: 0.55rem 0.6rem;
+        font-size: 0.85rem;
+        color: var(--ink);
+        cursor: pointer;
+      }
+
+      .list button:last-child {
+        border-bottom: 0;
+      }
+
+      .list button:hover,
+      .list button:focus-visible {
+        background: #eef2ff;
+        outline: none;
+      }
+
+      .details {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0.7rem;
+        background: #fff;
+        min-height: 180px;
+      }
+
+      .details h2 {
+        margin: 0 0 0.3rem;
+        font-size: 1rem;
+      }
+
+      .details code {
+        font-size: 0.76rem;
+      }
+
+      .details p {
+        margin: 0.35rem 0;
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .details ul {
+        margin: 0.5rem 0 0;
+        padding-left: 1rem;
+      }
+
+      .details li {
+        margin: 0.18rem 0;
+        font-size: 0.85rem;
+      }
+
+      .details a {
+        color: #0f4c81;
+      }
+
+      #graph {
+        width: 100%;
+        min-height: 690px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #fff;
+      }
+
+      .edge {
+        stroke: #94a3b8;
+        stroke-width: 2;
+        fill: none;
+        cursor: pointer;
+      }
+
+      .edge-label {
+        font-size: 11px;
+        fill: #64748b;
+        pointer-events: none;
+      }
+
+      .node {
+        cursor: pointer;
+      }
+
+      .node rect {
+        stroke: #334155;
+        stroke-width: 1.5;
+        rx: 10;
+        ry: 10;
+      }
+
+      .node text {
+        font-size: 12px;
+        fill: #0f172a;
+        pointer-events: none;
+      }
+
+      .active rect,
+      .active.edge {
+        stroke: var(--focus);
+        stroke-width: 3;
+      }
+
+      @media (max-width: 1150px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        aside {
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Memory Engine Architecture Workbench</h1>
+      <p>Local artifact for ticket 16: filter by view, inspect nodes/edges, and jump to linked source, tests, backlog, and docs.</p>
+    </header>
+
+    <div class="layout">
+      <aside>
+        <div class="group">
+          <label for="view-select">View</label>
+          <select id="view-select"></select>
+        </div>
+
+        <div class="group">
+          <label for="search">Filter Nodes</label>
+          <input id="search" type="search" placeholder="search label, kind, summary" />
+        </div>
+
+        <div class="status" id="status">Loading map model...</div>
+
+        <div class="legend" id="legend"></div>
+
+        <div class="group">
+          <label for="node-list">Nodes In View</label>
+          <div class="list" id="node-list"></div>
+        </div>
+
+        <div class="group">
+          <label for="edge-list">Edges In View</label>
+          <div class="list" id="edge-list"></div>
+        </div>
+
+        <div class="group">
+          <label>Selection</label>
+          <div class="details" id="details"></div>
+        </div>
+      </aside>
+
+      <main>
+        <svg id="graph" viewBox="0 0 1480 760" role="img" aria-label="architecture graph"></svg>
+      </main>
+    </div>
+
+    <script>
+      const KIND_COLORS = {
+        kernel: "var(--kernel)",
+        service: "var(--service)",
+        "service-boundary": "var(--serviceBoundary)",
+        command: "var(--command)",
+        result: "var(--result)",
+        doc: "var(--doc)",
+        test: "var(--test)",
+        backlog: "var(--backlog)",
+      };
+
+      const NODE_WIDTH = 178;
+      const NODE_HEIGHT = 58;
+      const NODE_TEXT_WRAP = 24;
+
+      let mapModel = null;
+      let currentViewId = null;
+      let currentSearch = "";
+      let activeSelection = null;
+
+      const viewSelect = document.getElementById("view-select");
+      const searchInput = document.getElementById("search");
+      const statusBox = document.getElementById("status");
+      const legendBox = document.getElementById("legend");
+      const nodeListBox = document.getElementById("node-list");
+      const edgeListBox = document.getElementById("edge-list");
+      const detailsBox = document.getElementById("details");
+      const svg = document.getElementById("graph");
+
+      init();
+
+      async function init() {
+        try {
+          const response = await fetch("./memory-engine.map.json", { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} while loading memory-engine.map.json`);
+          }
+
+          mapModel = await response.json();
+          assertMapShape(mapModel);
+
+          renderLegend();
+          populateViews();
+
+          statusBox.textContent = `Loaded ${mapModel.nodes.length} nodes and ${mapModel.edges.length} edges.`;
+        } catch (error) {
+          statusBox.innerHTML = `Failed to load map JSON. ${escapeHtml(String(error.message || error))}<br/>If opened via file://, run a local server from docs/architecture.`;
+          detailsBox.innerHTML = `<p>Map unavailable until <code>memory-engine.map.json</code> loads.</p>`;
+        }
+      }
+
+      function assertMapShape(model) {
+        if (!model || !Array.isArray(model.views) || !Array.isArray(model.nodes) || !Array.isArray(model.edges)) {
+          throw new Error("Invalid map shape: expected views, nodes, edges arrays.");
+        }
+      }
+
+      function populateViews() {
+        const options = mapModel.views.map((view) => {
+          const option = document.createElement("option");
+          option.value = view.id;
+          option.textContent = view.label;
+          return option;
+        });
+
+        viewSelect.replaceChildren(...options);
+        currentViewId = mapModel.views[0]?.id ?? null;
+        viewSelect.value = currentViewId;
+
+        viewSelect.addEventListener("change", () => {
+          currentViewId = viewSelect.value;
+          activeSelection = null;
+          renderAll();
+        });
+
+        searchInput.addEventListener("input", () => {
+          currentSearch = searchInput.value.trim().toLowerCase();
+          renderAll();
+        });
+
+        renderAll();
+      }
+
+      function renderAll() {
+        if (!currentViewId) {
+          return;
+        }
+
+        const view = mapModel.views.find((entry) => entry.id === currentViewId);
+        const { nodes, edges } = selectViewData(currentViewId, currentSearch);
+
+        statusBox.innerHTML = `<strong>${escapeHtml(view.label)}</strong><br/>${escapeHtml(view.description)}<br/>Showing ${nodes.length} nodes and ${edges.length} edges.`;
+
+        renderNodeList(nodes);
+        renderEdgeList(edges);
+        renderGraph(nodes, edges, currentViewId);
+        renderDetails(nodes, edges);
+      }
+
+      function selectViewData(viewId, search) {
+        const nodes = mapModel.nodes.filter((node) => {
+          if (!Array.isArray(node.viewTags) || !node.viewTags.includes(viewId)) {
+            return false;
+          }
+
+          if (!search) {
+            return true;
+          }
+
+          const haystack = `${node.label} ${node.kind} ${node.summary}`.toLowerCase();
+          return haystack.includes(search);
+        });
+
+        const nodeIds = new Set(nodes.map((node) => node.id));
+        const edges = mapModel.edges.filter((edge) => {
+          const inView = Array.isArray(edge.viewTags) && edge.viewTags.includes(viewId);
+          return inView && nodeIds.has(edge.from) && nodeIds.has(edge.to);
+        });
+
+        return { nodes, edges };
+      }
+
+      function renderLegend() {
+        const chips = Object.entries(KIND_COLORS).map(([kind, color]) => {
+          const chip = document.createElement("div");
+          chip.className = "chip";
+          chip.innerHTML = `<span class="dot" style="background:${color}"></span>${escapeHtml(kind)}`;
+          return chip;
+        });
+
+        legendBox.replaceChildren(...chips);
+      }
+
+      function renderNodeList(nodes) {
+        if (nodes.length === 0) {
+          nodeListBox.innerHTML = `<button type="button" disabled>No nodes for this filter.</button>`;
+          return;
+        }
+
+        const buttons = nodes
+          .slice()
+          .sort((left, right) => left.label.localeCompare(right.label))
+          .map((node) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = `${node.label} [${node.kind}]`;
+            button.addEventListener("click", () => {
+              activeSelection = { type: "node", id: node.id };
+              renderAll();
+            });
+            return button;
+          });
+
+        nodeListBox.replaceChildren(...buttons);
+      }
+
+      function renderEdgeList(edges) {
+        if (edges.length === 0) {
+          edgeListBox.innerHTML = `<button type="button" disabled>No edges for this filter.</button>`;
+          return;
+        }
+
+        const buttons = edges
+          .slice()
+          .sort((left, right) => left.label.localeCompare(right.label))
+          .map((edge) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = `${edge.label}`;
+            button.addEventListener("click", () => {
+              activeSelection = { type: "edge", id: edge.id };
+              renderAll();
+            });
+            return button;
+          });
+
+        edgeListBox.replaceChildren(...buttons);
+      }
+
+      function renderGraph(nodes, edges, viewId) {
+        const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+        const positions = resolvePositions(nodes, viewId);
+
+        const defs = svgElement("defs");
+        const marker = svgElement("marker", {
+          id: "arrow",
+          markerWidth: "10",
+          markerHeight: "10",
+          refX: "8",
+          refY: "3",
+          orient: "auto",
+          markerUnits: "strokeWidth",
+        });
+        marker.appendChild(svgElement("path", { d: "M0,0 L0,6 L9,3 z", fill: "#94a3b8" }));
+        defs.appendChild(marker);
+
+        const edgeLayer = svgElement("g");
+        edges.forEach((edge) => {
+          const from = positions.get(edge.from);
+          const to = positions.get(edge.to);
+          if (!from || !to) {
+            return;
+          }
+
+          const line = svgElement("line", {
+            x1: from.x + NODE_WIDTH / 2,
+            y1: from.y + NODE_HEIGHT / 2,
+            x2: to.x + NODE_WIDTH / 2,
+            y2: to.y + NODE_HEIGHT / 2,
+            class: `edge${isActive("edge", edge.id) ? " active" : ""}`,
+            "marker-end": "url(#arrow)",
+          });
+          line.addEventListener("click", () => {
+            activeSelection = { type: "edge", id: edge.id };
+            renderAll();
+          });
+          edgeLayer.appendChild(line);
+
+          const midX = (from.x + to.x + NODE_WIDTH) / 2;
+          const midY = (from.y + to.y + NODE_HEIGHT) / 2;
+          const edgeLabel = svgElement("text", {
+            x: midX,
+            y: midY - 6,
+            class: "edge-label",
+            "text-anchor": "middle",
+          });
+          edgeLabel.textContent = edge.label;
+          edgeLayer.appendChild(edgeLabel);
+        });
+
+        const nodeLayer = svgElement("g");
+        nodes.forEach((node) => {
+          const pos = positions.get(node.id);
+          if (!pos) {
+            return;
+          }
+
+          const group = svgElement("g", {
+            class: `node${isActive("node", node.id) ? " active" : ""}`,
+          });
+          group.addEventListener("click", () => {
+            activeSelection = { type: "node", id: node.id };
+            renderAll();
+          });
+
+          const fill = KIND_COLORS[node.kind] || "#64748b";
+          group.appendChild(
+            svgElement("rect", {
+              x: pos.x,
+              y: pos.y,
+              width: NODE_WIDTH,
+              height: NODE_HEIGHT,
+              fill: `${fill}22`,
+              stroke: fill,
+            }),
+          );
+
+          const lines = wrapLabel(node.label, NODE_TEXT_WRAP);
+          lines.forEach((line, index) => {
+            const text = svgElement("text", {
+              x: pos.x + 8,
+              y: pos.y + 22 + index * 14,
+            });
+            text.textContent = line;
+            group.appendChild(text);
+          });
+
+          nodeLayer.appendChild(group);
+        });
+
+        svg.replaceChildren(defs, edgeLayer, nodeLayer);
+      }
+
+      function resolvePositions(nodes, viewId) {
+        const positions = new Map();
+        let fallbackIndex = 0;
+
+        nodes.forEach((node) => {
+          const viewLayout = node.layout && node.layout[viewId];
+          if (viewLayout && Number.isFinite(viewLayout.x) && Number.isFinite(viewLayout.y)) {
+            positions.set(node.id, { x: viewLayout.x, y: viewLayout.y });
+            return;
+          }
+
+          const column = fallbackIndex % 6;
+          const row = Math.floor(fallbackIndex / 6);
+          positions.set(node.id, {
+            x: 80 + column * 220,
+            y: 90 + row * 110,
+          });
+          fallbackIndex += 1;
+        });
+
+        return positions;
+      }
+
+      function renderDetails(nodes, edges) {
+        const selected = resolveSelection(nodes, edges);
+        if (!selected) {
+          detailsBox.innerHTML = `<p>Select a node or edge to inspect details and references.</p>`;
+          return;
+        }
+
+        if (selected.type === "node") {
+          const node = selected.value;
+          detailsBox.innerHTML = `
+            <h2>${escapeHtml(node.label)}</h2>
+            <p><code>${escapeHtml(node.id)}</code> | kind: <strong>${escapeHtml(node.kind)}</strong></p>
+            <p>${escapeHtml(node.summary)}</p>
+            <p>Views: ${escapeHtml(node.viewTags.join(", "))}</p>
+            ${renderRefs(node.refs)}
+          `;
+          return;
+        }
+
+        const edge = selected.value;
+        detailsBox.innerHTML = `
+          <h2>${escapeHtml(edge.label)}</h2>
+          <p><code>${escapeHtml(edge.id)}</code> | kind: <strong>${escapeHtml(edge.kind)}</strong></p>
+          <p>From <code>${escapeHtml(edge.from)}</code> to <code>${escapeHtml(edge.to)}</code></p>
+          <p>${escapeHtml(edge.summary || "")}</p>
+          <p>Views: ${escapeHtml(edge.viewTags.join(", "))}</p>
+          ${renderRefs(edge.refs)}
+        `;
+      }
+
+      function resolveSelection(nodes, edges) {
+        if (!activeSelection) {
+          return null;
+        }
+
+        if (activeSelection.type === "node") {
+          const node = nodes.find((entry) => entry.id === activeSelection.id);
+          return node ? { type: "node", value: node } : null;
+        }
+
+        const edge = edges.find((entry) => entry.id === activeSelection.id);
+        return edge ? { type: "edge", value: edge } : null;
+      }
+
+      function renderRefs(refs) {
+        if (!Array.isArray(refs) || refs.length === 0) {
+          return "<p>No references.</p>";
+        }
+
+        const items = refs
+          .map((ref) => {
+            const href = toHref(ref.path);
+            const label = ref.label || ref.path;
+            return `<li>[${escapeHtml(ref.kind)}] <a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a></li>`;
+          })
+          .join("");
+
+        return `<ul>${items}</ul>`;
+      }
+
+      function toHref(path) {
+        if (typeof path !== "string") {
+          return "#";
+        }
+
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+          return path;
+        }
+
+        if (path.startsWith("../") || path.startsWith("./")) {
+          return path;
+        }
+
+        return `../../${path}`;
+      }
+
+      function isActive(type, id) {
+        return activeSelection && activeSelection.type === type && activeSelection.id === id;
+      }
+
+      function wrapLabel(text, width) {
+        const words = String(text).split(/\s+/);
+        const lines = [];
+        let current = "";
+
+        words.forEach((word) => {
+          const next = current ? `${current} ${word}` : word;
+          if (next.length > width && current) {
+            lines.push(current);
+            current = word;
+          } else {
+            current = next;
+          }
+        });
+
+        if (current) {
+          lines.push(current);
+        }
+
+        return lines.slice(0, 3);
+      }
+
+      function svgElement(name, attrs = {}) {
+        const element = document.createElementNS("http://www.w3.org/2000/svg", name);
+        Object.entries(attrs).forEach(([key, value]) => {
+          element.setAttribute(key, String(value));
+        });
+        return element;
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+    </script>
+  </body>
+</html>
