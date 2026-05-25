@@ -55,6 +55,7 @@ export type GeneratedPromptDraft = {
   activityKind: GeneratedLearningActivityKind;
   activityStage: string;
   workedSolution: string | null;
+  scoringRubric: string | null;
   model: GeneratedPromptModel;
   validation: GeneratedPromptValidation;
   critiqueNotes: string[];

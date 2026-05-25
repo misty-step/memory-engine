@@ -95,6 +95,7 @@ describe('beta persistence store', () => {
         activityKind: 'quiz',
         activityStage: 'free-recall',
         workedSolution: null,
+        scoringRubric: null,
         model: {
           provider: 'fixture',
           name: 'deterministic-draft',
@@ -442,6 +443,7 @@ describe('beta persistence store', () => {
         activityKind: 'quiz',
         activityStage: 'free-recall',
         workedSolution: null,
+        scoringRubric: null,
         model: {
           provider: 'fixture',
           name: 'deterministic-draft',

@@ -25,6 +25,7 @@ export type BetaStudyCurrent = {
   prompt: string;
   expectedAnswer: string | null;
   workedSolution: string | null;
+  scoringRubric: string | null;
   grade: Pick<GradeResult, 'verdict' | 'rating' | 'isCorrect'> | null;
   reviewState: ReviewStateProjection | null;
   scheduleChange: ScheduleChange | null;
@@ -57,6 +58,8 @@ export type BetaStudyQueueRow = {
   state: number | null;
   activityKind: GeneratedPromptDraft['activityKind'] | null;
   activityStage: string | null;
+  conceptKey: string | null;
+  progressionGroup: string | null;
 };
 
 export type BetaStudySummary = {
@@ -273,6 +276,8 @@ function queueRow(drafts: GeneratedPromptDraft[], candidate: QueueCandidate): Be
     state: candidate.scheduleState?.state ?? null,
     activityKind: draft?.activityKind ?? null,
     activityStage: draft?.activityStage ?? null,
+    conceptKey: candidate.conceptKey,
+    progressionGroup: candidate.progression?.progressionGroup ?? null,
   };
 }
 
@@ -291,6 +296,7 @@ function currentView(
     prompt: draft.prompt.prompt,
     expectedAnswer: expectedAnswerValue,
     workedSolution: expectedAnswerValue === null ? null : draft.workedSolution,
+    scoringRubric: expectedAnswerValue === null ? null : draft.scoringRubric,
     grade: gradeValue,
     reviewState: projectSchedule(schedule),
     scheduleChange: scheduleChangeValue,

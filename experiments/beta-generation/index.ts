@@ -35,6 +35,7 @@ type ParsedCandidate = {
   reference: string | null;
   distractors: string[];
   workedSolution: string | null;
+  scoringRubric: string | null;
   unsupported: boolean;
 };
 
@@ -70,6 +71,7 @@ export async function runBetaGeneration(
   });
 
   const seenSignatures = new Set(existingDraftSignatures(snapshot.generatedPromptDrafts));
+  const previousUnitByGroup = new Map<string, ReviewUnitId>();
   for (const source of sources) {
     const candidates = parseSourceDocument(source, validationFailures);
     for (const candidate of candidates) {
@@ -92,6 +94,8 @@ export async function runBetaGeneration(
         locator: `block:${candidate.blockIndex}`,
         createdAt: request.startedAt,
       });
+      const progressionGroup = slug(candidate.concept);
+      const requires = previousUnitByGroup.get(progressionGroup);
       const draft = await store.saveGeneratedPromptDraft(
         buildDraft(candidate, {
           runId: request.runId,
@@ -100,8 +104,12 @@ export async function runBetaGeneration(
           due: request.defaultDue,
           createdAt: request.startedAt,
           duplicate,
+          requires: requires === undefined ? [] : [requires],
         }),
       );
+      if (draft.validation.status === 'accepted') {
+        previousUnitByGroup.set(progressionGroup, draft.reviewUnitId);
+      }
 
       draftIds.push(draft.id);
       if (draft.validation.status === 'accepted') {
@@ -183,6 +191,7 @@ function parseCandidateBlock(
     reference: fields.get('reference') ?? null,
     distractors: splitList(fields.get('distractors')),
     workedSolution: fields.get('worked solution') ?? fields.get('worked') ?? null,
+    scoringRubric: fields.get('scoring rubric') ?? fields.get('rubric') ?? null,
     unsupported:
       parseBoolean(fields.get('unsupported')) || parseBoolean(fields.get('supported')) === false,
   };
@@ -245,6 +254,7 @@ function buildDraft(
     due: number;
     createdAt: number;
     duplicate: boolean;
+    requires: ReviewUnitId[];
   },
 ): GeneratedPromptDraft {
   const unitId = reviewUnitId(generatedId('generated', candidate.activityKind, candidate));
@@ -265,7 +275,7 @@ function buildDraft(
       progression: {
         progressionGroup: slug(candidate.concept),
         stageOrder: stageOrder(candidate.activityStage, candidate.activityKind),
-        requires: [],
+        requires: context.requires,
         supersedes: [],
       },
       conceptKey: slug(candidate.concept),
@@ -275,6 +285,7 @@ function buildDraft(
     activityKind: candidate.activityKind,
     activityStage: candidate.activityStage,
     workedSolution: candidate.workedSolution,
+    scoringRubric: candidate.scoringRubric,
     model: context.model,
     validation: {
       status,
@@ -294,7 +305,10 @@ function buildPrompt(candidate: ParsedCandidate, reviewUnitId: ReviewUnitId): Pr
       kind: 'mcq',
       reviewUnitId,
       prompt: candidate.question,
-      choices: unique([candidate.answer, ...candidate.distractors]),
+      choices: shuffleChoices(
+        unique([candidate.answer, ...candidate.distractors]),
+        candidate.answer,
+      ),
       correctChoice: candidate.answer,
     };
   }
@@ -317,8 +331,12 @@ function validationReasons(candidate: ParsedCandidate, duplicate: boolean): stri
   if (duplicate) {
     reasons.push('Duplicate-ish generated draft');
   }
-  if (candidate.activityKind === 'exercise' && candidate.workedSolution === null) {
-    reasons.push('Exercises require a worked solution');
+  if (
+    candidate.activityKind === 'exercise' &&
+    candidate.workedSolution === null &&
+    candidate.scoringRubric === null
+  ) {
+    reasons.push('Exercises require a worked solution or scoring rubric');
   }
   return reasons;
 }
@@ -357,12 +375,13 @@ function expectedAnswer(prompt: Prompt): string {
 function stageOrder(stage: string, activityKind: GeneratedLearningActivityKind): number {
   const normalized = stage.toLowerCase();
   if (normalized.includes('recognition')) {
+    const choiceCount = normalized.match(/(\d+)/)?.[1];
+    if (choiceCount !== undefined && Number.parseInt(choiceCount, 10) >= 5) {
+      return 2;
+    }
     return 1;
   }
-  if (normalized.includes('cued')) {
-    return 2;
-  }
-  if (normalized.includes('free')) {
+  if (normalized.includes('typed') || normalized.includes('cued') || normalized.includes('free')) {
     return 3;
   }
   if (normalized.includes('composition')) {
@@ -401,6 +420,22 @@ function unique(values: string[]): string[] {
     if (!seen.has(key)) {
       seen.add(key);
       result.push(value);
+    }
+  }
+  return result;
+}
+
+function shuffleChoices(values: string[], correctChoice: string): string[] {
+  const result = values.slice().reverse();
+  const correctIndex = result.findIndex(
+    (value) => value.toLowerCase() === correctChoice.toLowerCase(),
+  );
+  if (correctIndex > 0) {
+    const previous = result[correctIndex - 1];
+    const current = result[correctIndex];
+    if (previous !== undefined && current !== undefined) {
+      result[correctIndex - 1] = current;
+      result[correctIndex] = previous;
     }
   }
   return result;

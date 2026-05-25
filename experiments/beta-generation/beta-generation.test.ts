@@ -93,7 +93,7 @@ describe('beta generation probe', () => {
           prompt: {
             kind: 'mcq',
             prompt: 'What is the NATO phonetic alphabet word for A?',
-            choices: ['ALFA', 'BRAVO', 'CHARLIE'],
+            choices: ['CHARLIE', 'ALFA', 'BRAVO'],
             correctChoice: 'ALFA',
           },
           validation: { status: 'accepted', reasons: [] },
@@ -130,6 +130,115 @@ describe('beta generation probe', () => {
           }),
         }),
       );
+    });
+  });
+
+  test('generates a shared NATO activity ladder with shuffled recognition choices and ordered variants', async () => {
+    await withTempStore(async (path) => {
+      const store = await createBetaPersistenceStore(path);
+      await store.saveSourceDocument({
+        id: 'src-nato-ladder',
+        kind: 'text',
+        title: 'NATO ladder notes',
+        body: [
+          'Concept: NATO phonetic alphabet',
+          'Activity: quiz',
+          'Stage: recognition-3',
+          'Question: A is which NATO phonetic alphabet word?',
+          'Answer: ALFA',
+          'Distractors: BRAVO, CHARLIE',
+          'Reference: A is ALFA in the NATO phonetic alphabet.',
+          '',
+          'Concept: NATO phonetic alphabet',
+          'Activity: quiz',
+          'Stage: recognition-5',
+          'Question: A is which NATO phonetic alphabet word among these five choices?',
+          'Answer: ALFA',
+          'Distractors: BRAVO, CHARLIE, DELTA, ECHO',
+          'Reference: A is ALFA in the NATO phonetic alphabet.',
+          '',
+          'Concept: NATO phonetic alphabet',
+          'Activity: quiz',
+          'Stage: typed-recall',
+          'Question: Type the NATO phonetic alphabet word for A.',
+          'Answer: ALFA',
+          'Reference: A is ALFA in the NATO phonetic alphabet.',
+          '',
+          'Concept: NATO phonetic alphabet',
+          'Activity: exercise',
+          'Stage: composition',
+          'Question: Spell CAT over the phone using the NATO phonetic alphabet.',
+          'Answer: CHARLIE ALFA TANGO',
+          'Worked Solution: C is CHARLIE, A is ALFA, and T is TANGO.',
+          'Scoring Rubric: Pass only when each letter is converted to the matching NATO word in order.',
+          'Reference: C is CHARLIE. A is ALFA. T is TANGO.',
+        ].join('\n'),
+        uri: null,
+        permission: 'model-eligible',
+        freshness: now,
+        createdAt: now,
+      });
+
+      const result = await runBetaGeneration(store, {
+        runId: 'run-nato-ladder',
+        sourceDocumentIds: ['src-nato-ladder'],
+        startedAt: now,
+        completedAt: now,
+        defaultDue: now - 60_000,
+      });
+
+      expect(result.acceptedDraftIds).toEqual([
+        'run-nato-ladder-draft-src-nato-ladder-1-nato-phonetic-alphabet',
+        'run-nato-ladder-draft-src-nato-ladder-2-nato-phonetic-alphabet',
+        'run-nato-ladder-draft-src-nato-ladder-3-nato-phonetic-alphabet',
+        'run-nato-ladder-draft-src-nato-ladder-4-nato-phonetic-alphabet',
+      ]);
+
+      const drafts = store.snapshot().generatedPromptDrafts;
+      expect(drafts.map((draft) => draft.queue.conceptKey)).toEqual([
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+      ]);
+      expect(drafts.map((draft) => draft.queue.progression?.progressionGroup)).toEqual([
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+        'nato-phonetic-alphabet',
+      ]);
+      expect(drafts.map((draft) => draft.queue.progression?.stageOrder)).toEqual([1, 2, 3, 4]);
+      expect(drafts.map((draft) => draft.queue.progression?.requires.map(String))).toEqual([
+        [],
+        ['generated-quiz-src-nato-ladder-1-nato-phonetic-alphabet'],
+        ['generated-quiz-src-nato-ladder-2-nato-phonetic-alphabet'],
+        ['generated-quiz-src-nato-ladder-3-nato-phonetic-alphabet'],
+      ]);
+
+      expect(drafts[0]?.prompt).toMatchObject({
+        kind: 'mcq',
+        choices: ['CHARLIE', 'ALFA', 'BRAVO'],
+        correctChoice: 'ALFA',
+      });
+      expect(drafts[1]?.prompt).toMatchObject({
+        kind: 'mcq',
+        choices: ['ECHO', 'DELTA', 'CHARLIE', 'ALFA', 'BRAVO'],
+        correctChoice: 'ALFA',
+      });
+      expect(drafts[2]?.prompt).toMatchObject({
+        kind: 'shortAnswer',
+        acceptedAnswers: ['ALFA'],
+      });
+      expect(drafts[3]).toMatchObject({
+        activityKind: 'exercise',
+        workedSolution: 'C is CHARLIE, A is ALFA, and T is TANGO.',
+        scoringRubric:
+          'Pass only when each letter is converted to the matching NATO word in order.',
+        prompt: {
+          kind: 'recitation',
+          acceptedAnswers: ['CHARLIE ALFA TANGO'],
+        },
+      });
     });
   });
 
