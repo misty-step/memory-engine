@@ -1,5 +1,11 @@
 import { createMemoryService } from '../../service';
-import type { GradeResult, Prompt, ReviewUnitId, ScheduleState } from '../../src';
+import {
+  type ReviewStateProjection,
+  type ReviewStateScheduleChange as ScheduleChange,
+  projectReviewStateChange,
+  projectReviewStateProjection,
+} from '../../service/review-state-projection';
+import type { GradeResult, Prompt, ReviewUnitId } from '../../src';
 import { runBetaGeneration } from '../beta-generation';
 import {
   type GeneratedPromptDraft,
@@ -20,16 +26,6 @@ export type BetaCoachSourceInput = {
   id: string;
   title: string;
   body: string;
-};
-
-export type ReviewStateProjection = Pick<
-  ScheduleState,
-  'due' | 'reps' | 'lapses' | 'state' | 'last_review'
->;
-
-export type ScheduleChange = {
-  before: ReviewStateProjection | null;
-  after: ReviewStateProjection;
 };
 
 export type BetaCoachCurrent = {
@@ -174,7 +170,9 @@ export async function createBetaCoachSession(options: BetaCoachOptions): Promise
               workedSolution: expectedAnswer === null ? null : current.workedSolution,
               scoringRubric: expectedAnswer === null ? null : current.scoringRubric,
               grade,
-              reviewState: projectSchedule(await store.readScheduleState(current.reviewUnitId)),
+              reviewState: projectReviewStateProjection(
+                await store.readScheduleState(current.reviewUnitId),
+              ),
               scheduleChange,
             },
       summary: {
@@ -270,10 +268,7 @@ export async function createBetaCoachSession(options: BetaCoachOptions): Promise
         rating: review.grade.rating,
         isCorrect: review.grade.isCorrect,
       };
-      scheduleChange = {
-        before: projectSchedule(priorSchedule),
-        after: projectRequiredSchedule(review.scheduleState),
-      };
+      scheduleChange = projectReviewStateChange(priorSchedule, review.scheduleState);
       status = 'graded';
       return readView();
     },
@@ -305,24 +300,6 @@ function promptExpectedAnswer(prompt: Prompt): string {
     case 'recitation':
       return prompt.acceptedAnswers.join(' / ');
   }
-}
-
-function projectSchedule(schedule: ScheduleState | null): ReviewStateProjection | null {
-  if (schedule === null) {
-    return null;
-  }
-
-  return projectRequiredSchedule(schedule);
-}
-
-function projectRequiredSchedule(schedule: ScheduleState): ReviewStateProjection {
-  return {
-    due: schedule.due,
-    reps: schedule.reps,
-    lapses: schedule.lapses,
-    state: schedule.state,
-    last_review: schedule.last_review,
-  };
 }
 
 function requireCurrent(current: GeneratedPromptDraft | null): GeneratedPromptDraft {

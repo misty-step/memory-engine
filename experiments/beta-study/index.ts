@@ -1,4 +1,10 @@
 import { createMemoryService } from '../../service';
+import {
+  type ReviewStateProjection,
+  type ReviewStateScheduleChange as ScheduleChange,
+  projectReviewStateChange,
+  projectReviewStateProjection,
+} from '../../service/review-state-projection';
 import type { GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState } from '../../src';
 import { runBetaGeneration } from '../beta-generation';
 import {
@@ -29,16 +35,6 @@ export type BetaStudyCurrent = {
   grade: Pick<GradeResult, 'verdict' | 'rating' | 'isCorrect'> | null;
   reviewState: ReviewStateProjection | null;
   scheduleChange: ScheduleChange | null;
-};
-
-export type ReviewStateProjection = Pick<
-  ScheduleState,
-  'due' | 'reps' | 'lapses' | 'state' | 'last_review'
->;
-
-export type ScheduleChange = {
-  before: ReviewStateProjection | null;
-  after: ReviewStateProjection;
 };
 
 export type BetaStudyDraftRow = {
@@ -237,10 +233,7 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
         rating: review.grade.rating,
         isCorrect: review.grade.isCorrect,
       };
-      scheduleChange = {
-        before: projectSchedule(priorSchedule),
-        after: projectRequiredSchedule(review.scheduleState),
-      };
+      scheduleChange = projectReviewStateChange(priorSchedule, review.scheduleState);
       status = 'graded';
       return readView();
     },
@@ -298,7 +291,7 @@ function currentView(
     workedSolution: expectedAnswerValue === null ? null : draft.workedSolution,
     scoringRubric: expectedAnswerValue === null ? null : draft.scoringRubric,
     grade: gradeValue,
-    reviewState: projectSchedule(schedule),
+    reviewState: projectReviewStateProjection(schedule),
     scheduleChange: scheduleChangeValue,
   };
 }
@@ -335,24 +328,6 @@ function promptExpectedAnswer(prompt: Prompt): string {
     case 'recitation':
       return prompt.acceptedAnswers.join(' / ');
   }
-}
-
-function projectSchedule(schedule: ScheduleState | null): ReviewStateProjection | null {
-  if (schedule === null) {
-    return null;
-  }
-
-  return projectRequiredSchedule(schedule);
-}
-
-function projectRequiredSchedule(schedule: ScheduleState): ReviewStateProjection {
-  return {
-    due: schedule.due,
-    reps: schedule.reps,
-    lapses: schedule.lapses,
-    state: schedule.state,
-    last_review: schedule.last_review,
-  };
 }
 
 function requireCurrent(current: GeneratedPromptDraft | null): GeneratedPromptDraft {
