@@ -3,9 +3,6 @@
 # is filesystem-scoped TOML, not a command allowlist. Commands are controlled
 # by the user's top-level Codex approval_policy and sandbox_mode.
 
-[skills]
-paths = [".agent/skills"]
-
 [commands]
 ci = "bun run ci"
 ci_local = "bun run ci:local"
