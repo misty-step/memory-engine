@@ -1,6 +1,5 @@
 # Agent Operations
 
-Harness-neutral guidance for agents working in `memory-engine`. Claude Code also reads `CLAUDE.md`; Codex, Pi, and other harnesses should treat this file as the router and `.spellbook/repo-brief.md` as the dense project spine.
 
 ## Stack & Boundaries
 
@@ -8,7 +7,6 @@ Harness-neutral guidance for agents working in `memory-engine`. Claude Code also
 
 ## Ground Truth
 
-- `.spellbook/repo-brief.md` is the current tailored repo brief.
 - `SPEC.md` is the strategy document.
 - `SLICE-*.md` files define shaped slice context.
 - `backlog.d/` contains active work; `backlog.d/_done/` contains closed work.
@@ -51,43 +49,3 @@ Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work
 - `backlog.d/32-graduated-activity-ladder.md`: treat exercises/practice problems as first-class beta activities, not quiz variants only.
 - `backlog.d/31-beta-extraction-decision.md`: decide promote, extract, keep experimenting, or reshape after enough beta ladder evidence.
 - `backlog.d/16-system-visualization-workbench.md`: useful later; do not let it displace beta usefulness unless architecture confusion causes repeated defects.
-
-## Harness Index
-
-| Skill | What it does here |
-|---|---|
-| `/research` | Grounds memory-engine shaping in official docs, repo docs, consumer exemplars, and prior art before moving kernel contracts. |
-| `/groom` | Reconciles `backlog.d/` truth, stale archived status, shipped trailers, and Slice 6 priority before strategy. |
-| `/shape` | Creates atomic `backlog.d/` tickets and slice packets with executable oracles and explicit kernel/application boundaries. |
-| `/implement` | Executes one shaped ticket with TDD, pure-kernel discipline, focused tests, and `Refs-backlog` metadata. |
-| `/qa` | Verifies package exports, fixtures, adapters, focused suites, dogfood lanes, beta receipts, and the canonical gate. |
-| `/demo` | Produces reviewer evidence: command receipts, API import snippets, fixture examples, dogfood/beta receipts. |
-| `/code-review` | Reviews diffs against shaped ticket, kernel invariants, no-internal-mock policy, strict TS/Biome, and proof evidence. |
-| `/refactor` | Simplifies touched kernel, service, test, Dagger, or harness surfaces without widening package scope. |
-| `/ci` | Runs or diagnoses the Dagger-backed `bun run ci` gate. |
-| `/diagnose` | Reproduces exact failing oracles across Dagger, Bun tests, Biome, coverage, Gitleaks, exports, dogfood, or beta proof. |
-| `/monitor` | Watches non-deploy signals: CI, QA, coverage, package exports, dogfood/beta evidence, benchmarks, and backlog lifecycle drift. |
-| `/deliver` | Drives one active ticket to merge-ready code and stops before push, merge, archive, deploy, or reflection. |
-| `/settle` | Polishes a branch until CI, review, refactor, QA, and backlog metadata are coherent and ship-ready. |
-| `/ship` | Archives closing tickets, preserves closure trailers, merges to `master`, verifies archive state, traces, and reflects. |
-| `/trace` | Writes local append-only work records under `.spellbook/traces/` with redacted evidence refs and final ship records. |
-| `/yeet` | Slices intentional worktree changes into conventional commits with structured backlog trailers and pushes reviewable branch state. |
-| `/flywheel` | Composes pick -> shape -> implement -> yeet -> settle -> ship -> monitor; `/ship` owns closure and reflection. |
-| `/office-hours` | Interrogates raw ideas before shaping. |
-| `/ceo-review` | Challenges plans and context packets before convergence. |
-| `/reflect` | Captures session and cycle learnings without becoming the work-record store. |
-
-## Agent Index
-
-| Agent | What it does here |
-|---|---|
-| `planner` | Produces bounded implementation or harness plans from the repo brief and active ticket. |
-| `builder` | Implements scoped code changes under the shaped ticket and repo invariants. |
-| `critic` | Reviews acceptance, evidence, and cross-skill cohesion before handoff. |
-| `beck` | Enforces TDD rhythm and behavior-first tests. |
-| `cooper` | Challenges internal mocks and classicist test design. |
-| `ousterhout` | Reviews module depth, information hiding, and shallow wrappers. |
-| `carmack` | Cuts scope and speculative abstraction. |
-| `grug` | Flags avoidable complexity and cleverness. |
-
-Shared skills live in `.agent/skills/`; `.claude/skills/`, `.codex/skills/`, and `.pi/skills/` are bridges back to that root. Installed agents live in `.claude/agents/`.
