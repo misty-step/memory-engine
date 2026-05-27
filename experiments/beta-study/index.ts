@@ -45,6 +45,7 @@ export type BetaStudyDraftRow = {
   validationStatus: GeneratedPromptDraft['validation']['status'];
   validationReasons: string[];
   workedSolution: string | null;
+  approved: boolean;
 };
 
 export type BetaStudyQueueRow = {
@@ -138,7 +139,7 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
         kind: source.kind,
         createdAt: source.createdAt,
       })),
-      drafts: snapshot.generatedPromptDrafts.map(draftRow),
+      drafts: snapshot.generatedPromptDrafts.map((draft) => draftRow(snapshot, draft)),
       queue: queue.map((candidate) => queueRow(snapshot.generatedPromptDrafts, candidate)),
       current:
         current === null
@@ -198,7 +199,15 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
     },
     async approveDraft(draftId: string): Promise<BetaStudyView> {
       await store.approveGeneratedPromptDraft(draftId);
-      await selectNext();
+      if (hasApprovableDrafts(store)) {
+        status = 'drafting';
+        current = null;
+        expectedAnswer = null;
+        grade = null;
+        scheduleChange = null;
+      } else {
+        await selectNext();
+      }
       return readView();
     },
     async reveal(): Promise<BetaStudyView> {
@@ -247,7 +256,10 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
   };
 }
 
-function draftRow(draft: GeneratedPromptDraft): BetaStudyDraftRow {
+function draftRow(
+  snapshot: ReturnType<BetaPersistenceStore['snapshot']>,
+  draft: GeneratedPromptDraft,
+): BetaStudyDraftRow {
   return {
     id: draft.id,
     activityKind: draft.activityKind,
@@ -256,6 +268,7 @@ function draftRow(draft: GeneratedPromptDraft): BetaStudyDraftRow {
     validationStatus: draft.validation.status,
     validationReasons: [...draft.validation.reasons],
     workedSolution: draft.workedSolution,
+    approved: snapshot.reviewUnits.some((unit) => unit.generatedPromptDraftId === draft.id),
   };
 }
 
@@ -314,6 +327,18 @@ function findApprovedDraft(
     snapshot.generatedPromptDrafts.find(
       (draft) => draft.id === reviewUnit.generatedPromptDraftId,
     ) ?? null
+  );
+}
+
+function hasApprovableDrafts(store: BetaPersistenceStore): boolean {
+  const snapshot = store.snapshot();
+  const approvedDraftIds = new Set(
+    snapshot.reviewUnits
+      .map((unit) => unit.generatedPromptDraftId)
+      .filter((id): id is string => id !== null && id !== undefined),
+  );
+  return snapshot.generatedPromptDrafts.some(
+    (draft) => draft.validation.status === 'accepted' && !approvedDraftIds.has(draft.id),
   );
 }
 

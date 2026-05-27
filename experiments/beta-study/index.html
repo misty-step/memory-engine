@@ -26,13 +26,13 @@
       main {
         min-height: 100vh;
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
       }
 
       .study {
         min-width: 0;
         display: grid;
-        grid-template-rows: auto minmax(0, 1fr) auto;
+        grid-template-rows: auto minmax(0, 1fr);
         padding: 24px;
       }
 
@@ -51,10 +51,41 @@
         font-size: 14px;
       }
 
+      .brand {
+        display: grid;
+        gap: 3px;
+      }
+
+      .brand strong {
+        color: #20241f;
+        font-size: 15px;
+      }
+
+      .brand span {
+        color: #586257;
+      }
+
+      .mode {
+        border: 1px solid #b9c4b5;
+        border-radius: 999px;
+        padding: 6px 10px;
+        background: #ffffff;
+        color: #24533d;
+        font-weight: 750;
+      }
+
       .prompt {
         width: min(100%, 760px);
         align-self: center;
         padding: 28px 0;
+      }
+
+      .eyebrow {
+        margin: 0 0 10px;
+        color: #586257;
+        font-size: 14px;
+        font-weight: 750;
+        text-transform: uppercase;
       }
 
       h1 {
@@ -62,6 +93,37 @@
         font-size: 34px;
         line-height: 1.12;
         letter-spacing: 0;
+      }
+
+      .lede {
+        max-width: 680px;
+        margin: -6px 0 20px;
+        color: #455048;
+        font-size: 17px;
+        line-height: 1.45;
+      }
+
+      .steps {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin: 0 0 22px;
+      }
+
+      .step {
+        border: 1px solid #d9ded5;
+        border-radius: 6px;
+        padding: 9px 10px;
+        background: #ffffff;
+        color: #586257;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .step.active {
+        border-color: #24533d;
+        background: #e9f1ea;
+        color: #20241f;
       }
 
       .kind {
@@ -119,6 +181,13 @@
         color: #24533d;
       }
 
+      button:disabled {
+        border-color: #c8cec5;
+        background: #e6e9e3;
+        color: #7b847a;
+        cursor: not-allowed;
+      }
+
       .actions {
         justify-content: flex-start;
         flex-wrap: wrap;
@@ -133,6 +202,19 @@
         overflow-wrap: anywhere;
         font-size: 15px;
         font-weight: 650;
+      }
+
+      .answer:empty,
+      .grade:empty,
+      .solution:empty {
+        display: none;
+      }
+
+      .hint {
+        margin-top: 10px;
+        color: #586257;
+        font-size: 14px;
+        line-height: 1.45;
       }
 
       .answer {
@@ -200,8 +282,17 @@
       .composer {
         display: grid;
         gap: 10px;
-        border-top: 1px solid #d9ded5;
-        padding-top: 16px;
+        margin-top: 22px;
+        border: 1px solid #d9ded5;
+        border-radius: 8px;
+        padding: 16px;
+        background: #ffffff;
+      }
+
+      .composer[hidden],
+      .reviewer[hidden],
+      .panel[hidden] {
+        display: none;
       }
 
       input {
@@ -228,6 +319,10 @@
           font-size: 28px;
         }
 
+        .steps {
+          grid-template-columns: 1fr 1fr;
+        }
+
         aside {
           border-left: 0;
           border-top: 1px solid #d9ded5;
@@ -239,44 +334,65 @@
     <main>
       <section class="study">
         <header>
-          <strong>Beta Study</strong>
-          <span id="status">loading</span>
+          <div class="brand">
+            <strong>Memory Engine</strong>
+            <span>Turn notes into retrieval practice.</span>
+          </div>
+          <span class="mode" id="status">Loading</span>
         </header>
         <div class="prompt">
+          <p class="eyebrow" id="eyebrow">Set up practice</p>
+          <div class="steps" aria-label="Study setup progress">
+            <div class="step" id="step-source">1. Add notes</div>
+            <div class="step" id="step-generate">2. Make cards</div>
+            <div class="step" id="step-approve">3. Approve</div>
+            <div class="step" id="step-study">4. Study</div>
+          </div>
           <div class="kind">
             <span id="activity">activity</span>
             <span id="stage">stage</span>
           </div>
-          <h1 id="prompt">Add source material to begin.</h1>
-          <label for="answer">Answer or worked solution</label>
-          <textarea id="answer" autocomplete="off" spellcheck="false"></textarea>
-          <div class="answer" id="expected"></div>
-          <div class="solution" id="solution"></div>
-          <div class="grade" id="grade"></div>
-          <div class="actions">
-            <button type="button" id="submit">Submit</button>
-            <button type="button" class="secondary" id="reveal">Reveal</button>
-            <button type="button" class="secondary" id="next">Next</button>
+          <h1 id="prompt">Paste something you want to remember.</h1>
+          <p class="lede" id="lede">
+            This local beta turns a short source into practice cards, schedules them with FSRS,
+            and keeps your review history on this machine.
+          </p>
+          <div class="reviewer" id="reviewer" hidden>
+            <label for="answer" id="answer-label">Your answer</label>
+            <textarea id="answer" autocomplete="off" spellcheck="false"></textarea>
+            <div class="answer" id="expected"></div>
+            <div class="solution" id="solution"></div>
+            <div class="grade" id="grade"></div>
+            <p class="hint" id="study-hint"></p>
+            <div class="actions">
+              <button type="button" id="submit">Submit answer</button>
+              <button type="button" class="secondary" id="reveal">Show answer</button>
+              <button type="button" class="secondary" id="next">Next card</button>
+            </div>
           </div>
+          <form class="composer" id="source-form">
+            <label for="source-title">What are these notes about?</label>
+            <input id="source-title" value="NATO practice notes" />
+            <label for="source-body">Paste notes, facts, or worked examples</label>
+            <textarea id="source-body"></textarea>
+            <p class="hint">
+              The sample below is already filled in. Save it, make practice cards, approve them,
+              then answer from memory.
+            </p>
+            <div class="actions">
+              <button type="submit" id="save-source">Save notes</button>
+              <button type="button" class="secondary" id="generate">Make practice cards</button>
+            </div>
+          </form>
         </div>
-        <form class="composer" id="source-form">
-          <label for="source-title">Source title</label>
-          <input id="source-title" value="NATO practice notes" />
-          <label for="source-body">Source blocks</label>
-          <textarea id="source-body"></textarea>
-          <div class="actions">
-            <button type="submit">Save Source</button>
-            <button type="button" class="secondary" id="generate">Generate</button>
-          </div>
-        </form>
       </section>
       <aside>
         <section class="panel">
-          <h2>Review State</h2>
+          <h2>Session</h2>
           <dl>
-            <dt>Reps</dt>
+            <dt>This card seen</dt>
             <dd id="reps">0</dd>
-            <dt>State</dt>
+            <dt>Memory status</dt>
             <dd id="state">new</dd>
             <dt>Attempts</dt>
             <dd id="attempts">0</dd>
@@ -284,12 +400,12 @@
             <dd id="outcome">none</dd>
           </dl>
         </section>
-        <section class="panel">
-          <h2>Drafts</h2>
+        <section class="panel" id="draft-panel">
+          <h2>Practice cards to approve</h2>
           <ul id="drafts"></ul>
         </section>
-        <section class="panel">
-          <h2>Queue</h2>
+        <section class="panel" id="queue-panel">
+          <h2>Coming up</h2>
           <ol id="queue"></ol>
         </section>
       </aside>
@@ -325,9 +441,14 @@
           body: sourceBody.value,
         });
       });
-      document.querySelector("#generate").addEventListener("click", async () => post("/generate", {}));
+      document
+        .querySelector("#generate")
+        .addEventListener("click", async () => post("/generate", {}));
       document.querySelector("#reveal").addEventListener("click", async () => post("/reveal", {}));
-      document.querySelector("#next").addEventListener("click", async () => post("/next", {}));
+      document.querySelector("#next").addEventListener("click", async () => {
+        answer.value = "";
+        await post("/next", {});
+      });
       document.querySelector("#submit").addEventListener("click", async () => {
         await post("/answer", { answer: answer.value, responseTimeMs: 2400 });
       });
@@ -348,14 +469,21 @@
       }
 
       function render(view) {
-        document.querySelector("#status").textContent = view.status;
+        const phase = phaseFor(view);
+        document.querySelector("#status").textContent = phase.status;
+        document.querySelector("#eyebrow").textContent = phase.eyebrow;
+        document.querySelector("#lede").textContent = phase.lede;
         document.querySelector("#attempts").textContent = String(view.summary.attemptCount);
         document.querySelector("#outcome").textContent = view.summary.lastOutcome ?? "none";
 
         const current = view.current;
-        document.querySelector("#prompt").textContent = current?.prompt ?? "Approve a draft to study.";
-        document.querySelector("#activity").textContent = current?.activityKind ?? "no item";
-        document.querySelector("#stage").textContent = current?.activityStage ?? "drafting";
+        document.querySelector("#prompt").textContent = current?.prompt ?? phase.prompt;
+        document.querySelector("#activity").textContent = current
+          ? labelActivity(current.activityKind)
+          : phase.activity;
+        document.querySelector("#stage").textContent = current
+          ? labelStage(current.activityStage)
+          : phase.stage;
         document.querySelector("#expected").textContent = current?.expectedAnswer
           ? `Expected: ${current.expectedAnswer}`
           : "";
@@ -363,39 +491,218 @@
           ? `Worked solution: ${current.workedSolution}`
           : "";
         document.querySelector("#grade").textContent = current?.grade
-          ? `${current.grade.verdict} · rating ${current.grade.rating}`
+          ? `${labelVerdict(current.grade.verdict)} · memory rating ${current.grade.rating}`
           : "";
         document.querySelector("#reps").textContent = String(current?.reviewState?.reps ?? 0);
-        document.querySelector("#state").textContent = String(current?.reviewState?.state ?? "new");
+        document.querySelector("#state").textContent = labelMemoryState(current?.reviewState?.state);
+        document.querySelector("#study-hint").textContent = phase.hint;
+        document.querySelector("#source-form").hidden = phase.hideComposer;
+        document.querySelector("#reviewer").hidden = phase.hideReviewer;
+        document.querySelector("#answer-label").textContent =
+          current?.activityKind === "exercise" ? "Work it out" : "Answer from memory";
+        document.querySelector("#save-source").disabled = phase.disableSave;
+        document.querySelector("#generate").disabled = phase.disableGenerate;
+        document.querySelector("#submit").disabled = phase.disableSubmit || answer.value.trim() === "";
+        document.querySelector("#reveal").disabled = phase.disableReveal;
+        document.querySelector("#next").disabled = phase.disableNext;
+        markStep(phase.step);
 
+        const approvableDrafts = view.drafts.filter(
+          (draft) => draft.validationStatus === "accepted" && !draft.approved,
+        );
         document.querySelector("#drafts").replaceChildren(
-          ...view.drafts.map((draft) => {
+          ...approvableDrafts.map((draft) => {
             const item = document.createElement("li");
             const title = document.createElement("strong");
-            const metadata = document.createTextNode(`${draft.activityKind} · ${draft.activityStage}`);
+            const metadata = document.createTextNode(
+              `${labelActivity(draft.activityKind)} · ${labelStage(draft.activityStage)}`,
+            );
             const button = document.createElement("button");
             button.type = "button";
-            button.textContent = "Approve";
+            button.textContent = "Approve card";
             button.className = "secondary";
             button.addEventListener("click", async () => post("/approve", { draftId: draft.id }));
             title.textContent = draft.prompt;
             item.append(title, metadata);
-            if (draft.validationStatus === "accepted") {
-              item.append(" ", button);
-            }
+            item.append(" ", button);
             return item;
           }),
         );
+        document.querySelector("#draft-panel").hidden = approvableDrafts.length === 0;
 
         document.querySelector("#queue").replaceChildren(
           ...view.queue.map((row) => {
             const item = document.createElement("li");
             const title = document.createElement("strong");
-            title.textContent = row.reviewUnitId;
-            item.append(title, `${row.activityKind ?? "item"} · reps ${row.reps}`);
+            title.textContent = labelActivity(row.activityKind ?? "item");
+            item.append(title, `${labelStage(row.activityStage ?? "practice")} · seen ${row.reps}`);
             return item;
           }),
         );
+        document.querySelector("#queue-panel").hidden = view.queue.length === 0;
+      }
+
+      answer.addEventListener("input", () => {
+        document.querySelector("#submit").disabled = answer.value.trim() === "";
+      });
+
+      function phaseFor(view) {
+        if (view.current) {
+          if (view.status === "graded") {
+            return {
+              step: "study",
+              status: "Result saved",
+              eyebrow: "Review result",
+              prompt: view.current.prompt,
+              lede: "Your answer was graded and the next review was scheduled.",
+              activity: "Study",
+              stage: "Scheduled",
+              hint: "Move to the next card when you are ready.",
+              hideComposer: true,
+              hideReviewer: false,
+              disableSave: true,
+              disableGenerate: true,
+              disableSubmit: true,
+              disableReveal: true,
+              disableNext: false,
+            };
+          }
+
+          if (view.status === "revealed") {
+            return {
+              step: "study",
+              status: "Answer shown",
+              eyebrow: "Check yourself",
+              prompt: view.current.prompt,
+              lede: "Compare the answer, then submit what you remembered so the scheduler can update.",
+              activity: "Study",
+              stage: "Reveal",
+              hint: "Reveal does not count as a review. Submit an answer to save progress.",
+              hideComposer: true,
+              hideReviewer: false,
+              disableSave: true,
+              disableGenerate: true,
+              disableSubmit: false,
+              disableReveal: true,
+              disableNext: true,
+            };
+          }
+
+          return {
+            step: "study",
+            status: "Studying",
+            eyebrow: "Active recall",
+            prompt: view.current.prompt,
+            lede: "Try to answer before revealing. Retrieval practice is the point.",
+            activity: "Study",
+            stage: "Answer",
+            hint: "Submit your answer, or reveal first if you are stuck.",
+            hideComposer: true,
+            hideReviewer: false,
+            disableSave: true,
+            disableGenerate: true,
+            disableSubmit: false,
+            disableReveal: false,
+            disableNext: true,
+          };
+        }
+
+        if (view.drafts.some((draft) => draft.validationStatus === "accepted")) {
+          return {
+            step: "approve",
+            status: "Approve cards",
+            eyebrow: "Cards are ready",
+            prompt: "Approve the cards you want to study.",
+            lede: "Generated cards stay out of your review queue until you approve them.",
+            activity: "Card prep",
+            stage: "Approval",
+            hint: "",
+            hideComposer: true,
+            hideReviewer: true,
+            disableSave: true,
+            disableGenerate: true,
+            disableSubmit: true,
+            disableReveal: true,
+            disableNext: true,
+          };
+        }
+
+        if (view.summary.sourceCount > 0) {
+          return {
+            step: "generate",
+            status: "Make cards",
+            eyebrow: "Notes saved",
+            prompt: "Turn those notes into practice cards.",
+            lede: "Memory Engine will make quiz and exercise drafts from the source you saved.",
+            activity: "Card prep",
+            stage: "Generate",
+            hint: "",
+            hideComposer: false,
+            hideReviewer: true,
+            disableSave: false,
+            disableGenerate: false,
+            disableSubmit: true,
+            disableReveal: true,
+            disableNext: true,
+          };
+        }
+
+        return {
+          step: "source",
+          status: "Start here",
+          eyebrow: "Build a memory",
+          prompt: "Paste something you want to remember.",
+          lede:
+            "Start with a short source. The app will make retrieval-practice cards and schedule reviews.",
+          activity: "Setup",
+          stage: "Notes",
+          hint: "",
+          hideComposer: false,
+          hideReviewer: true,
+          disableSave: false,
+          disableGenerate: true,
+          disableSubmit: true,
+          disableReveal: true,
+          disableNext: true,
+        };
+      }
+
+      function markStep(activeStep) {
+        for (const [id, step] of [
+          ["#step-source", "source"],
+          ["#step-generate", "generate"],
+          ["#step-approve", "approve"],
+          ["#step-study", "study"],
+        ]) {
+          document.querySelector(id).classList.toggle("active", step === activeStep);
+        }
+      }
+
+      function labelActivity(value) {
+        if (value === "quiz") return "Quiz";
+        if (value === "exercise") return "Exercise";
+        return "Practice";
+      }
+
+      function labelStage(value) {
+        return String(value)
+          .replaceAll("-", " ")
+          .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      }
+
+      function labelVerdict(value) {
+        if (value === "correct") return "Correct";
+        if (value === "close") return "Close";
+        if (value === "wrong") return "Needs work";
+        if (value === "revealed") return "Revealed";
+        return String(value);
+      }
+
+      function labelMemoryState(value) {
+        if (value === 1) return "Learning";
+        if (value === 2) return "Review";
+        if (value === 3) return "Relearning";
+        return "New";
       }
 
       fetchJson("/state").then(render);

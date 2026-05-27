@@ -40,6 +40,18 @@ function sourceBody(): string {
   ].join('\n');
 }
 
+function quizOnlySourceBody(): string {
+  return [
+    'Concept: NATO letter A',
+    'Activity: quiz',
+    'Stage: recognition-3',
+    'Question: What is the NATO phonetic alphabet word for A?',
+    'Answer: ALFA',
+    'Distractors: BRAVO, CHARLIE',
+    'Reference: The NATO phonetic alphabet word for A is ALFA.',
+  ].join('\n');
+}
+
 function ladderSourceBody(): string {
   return [
     'Concept: NATO phonetic alphabet',
@@ -127,7 +139,18 @@ describe('mobile beta study interface session', () => {
         },
       ]);
 
-      await study.approveDraft('study-run-1-draft-src-nato-2-nato-cat-composition');
+      const firstApproval = await study.approveDraft(
+        'study-run-1-draft-src-nato-2-nato-cat-composition',
+      );
+      expect(firstApproval).toMatchObject({
+        status: 'drafting',
+        current: null,
+        drafts: [
+          { id: 'study-run-1-draft-src-nato-1-nato-letter-a', approved: false },
+          { id: 'study-run-1-draft-src-nato-2-nato-cat-composition', approved: true },
+        ],
+      });
+
       const approved = await study.approveDraft('study-run-1-draft-src-nato-1-nato-letter-a');
       expect(approved).toMatchObject({
         status: 'answering',
@@ -207,7 +230,11 @@ describe('mobile beta study interface session', () => {
   test('ignores a duplicate submit after grading without double-counting attempts or schedule history', async () => {
     await withTempStudy(async (path) => {
       const study = await createBetaStudySession({ path, now: () => now });
-      await study.addSource({ id: 'src-nato', title: 'NATO practice notes', body: sourceBody() });
+      await study.addSource({
+        id: 'src-nato',
+        title: 'NATO practice notes',
+        body: quizOnlySourceBody(),
+      });
       await study.generate();
       await study.approveDraft('study-run-1-draft-src-nato-1-nato-letter-a');
 
