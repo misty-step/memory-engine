@@ -89,3 +89,8 @@ details behind deep APIs that carry the domain semantics.
   rejected draft parity tests. Also tightened core serde for TypeScript-shaped
   prompt, grade, rating, schedule, progression, queue, and beta-store wire
   contracts. Beta-study session/server cutover remains a future slice.
+- 2026-05-28: Added `memory-engine-study` with Rust beta-study session/API
+  orchestration for source intake, deterministic generation, draft approval,
+  reveal, grade/apply-review, queue advancement, resume, duplicate-submit
+  idempotence, and mobile API JSON shape. HTTP server and web UI cutover remain
+  future slices.

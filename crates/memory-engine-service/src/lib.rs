@@ -68,6 +68,43 @@ pub trait MemoryServiceStore {
     fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error>;
 }
 
+impl<TStore> MemoryServiceStore for &mut TStore
+where
+    TStore: MemoryServiceStore + ?Sized,
+{
+    type Error = TStore::Error;
+
+    fn record_attempt(&mut self, attempt: ServiceAttemptRecord) -> Result<(), Self::Error> {
+        (**self).record_attempt(attempt)
+    }
+
+    fn read_schedule_state(
+        &self,
+        review_unit_id: &ReviewUnitId,
+    ) -> Result<Option<ScheduleState>, Self::Error> {
+        (**self).read_schedule_state(review_unit_id)
+    }
+
+    fn apply_review(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        attempt: ServiceAttemptRecord,
+        schedule_state: ScheduleState,
+        expected_prior_schedule_state: Option<ScheduleState>,
+    ) -> Result<(), Self::Error> {
+        (**self).apply_review(
+            review_unit_id,
+            attempt,
+            schedule_state,
+            expected_prior_schedule_state,
+        )
+    }
+
+    fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
+        (**self).list_queue_candidates()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordAttemptInput {

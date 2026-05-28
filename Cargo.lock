@@ -52,6 +52,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-study"
+version = "0.0.0"
+dependencies = [
+ "memory-engine-core",
+ "memory-engine-generation",
+ "memory-engine-persistence",
+ "memory-engine-service",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"

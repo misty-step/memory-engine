@@ -61,9 +61,6 @@ the app surfaces have moved.
 - camelCase beta-store envelope fields for the durable snapshot while the
   `ScheduleState` contract remains the existing JSON-safe scheduler shape.
 
-Beta generation, the beta-study server, and the web UI are still
-TypeScript-owned.
-
 `crates/memory-engine-generation` now ports the deterministic beta-generation
 probe:
 
@@ -78,8 +75,21 @@ probe:
   numeric schedule states, camelCase app fields, and preserved snake_case
   `ScheduleState` internals.
 
-The beta-study session state machine, server, and web UI are still
-TypeScript-owned.
+`crates/memory-engine-study` now ports the beta-study session/API boundary:
+
+- source intake, generation invocation, draft approval, reveal state,
+  grade/apply-review, and queue advancement as one session object;
+- API DTOs for sources, drafts, queue rows, current review state, schedule
+  changes, summary, and API-pressure notes with TypeScript-compatible serde
+  field names;
+- duplicate-submit-after-grade behavior that is view-only instead of issuing a
+  second store write;
+- persisted resume behavior through the Rust beta store, with no regeneration
+  required;
+- tests that mirror the current mobile beta session flow and a JSON wire-shape
+  test for the mobile API contract.
+
+The beta-study HTTP server and web UI are still TypeScript-owned.
 
 ## Parity Strategy
 
@@ -106,4 +116,4 @@ requires:
 | Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
-| Beta study app | TypeScript `experiments/beta-study/` | Not migrated | Phone/browser smoke on Rust host |
+| Beta study app | TypeScript `experiments/beta-study/` | Session/API crate port | Phone/browser smoke on Rust host |
