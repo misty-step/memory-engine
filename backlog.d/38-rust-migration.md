@@ -142,3 +142,7 @@ details behind deep APIs that carry the domain semantics.
   `memory-engine-coverage`, a Rust command that still runs Bun's TypeScript
   coverage oracle but owns coverage summary parsing and the 80% function/line
   floor enforcement.
+- 2026-05-28: Deleted the TypeScript CLI review, import probe, and web-shell
+  dogfood oracles after their Rust crates owned receipt, service-loop, session,
+  and HTTP route parity. The web-shell HTML asset remains shared by the Rust
+  host.

@@ -10,8 +10,8 @@ compiled prompt through the Rust service loop. The probe discovers input
 pressure for dogfood clients without adding content parsing, taxonomy, or AI
 compilation behavior to the reusable kernel.
 
-The TypeScript `experiments/import-probe/` path remains a migration oracle until
-the TypeScript runtime is deleted.
+The former TypeScript `experiments/import-probe/` oracle was deleted after the
+Rust crate covered authored fixture compilation and service-loop parity.
 
 ## Commands
 
@@ -19,8 +19,6 @@ the TypeScript runtime is deleted.
 bun run experiments:import-probe
 bun run rust:import-probe
 cargo test -p memory-engine-import
-bun test experiments/import-probe/import-probe.test.ts
-bun run experiments:import-probe:ts-oracle
 ```
 
 ## Authored Fixture

@@ -4,8 +4,8 @@ Refs-backlog: 21
 
 ## Purpose
 
-`experiments/cli-review/` is the first dogfood client. It exercises the modular
-API and repo-local service prototype from outside `src/` with a narrow,
+`crates/memory-engine-cli` is the first dogfood client. It exercises the Rust
+facade and service crate from outside the reusable kernel with a narrow,
 non-interactive review loop.
 
 The experiment is calibration-aware: the fixture includes learner confidence,
@@ -15,14 +15,13 @@ graded attempt.
 ## Commands
 
 ```sh
-bun test experiments/cli-review/cli-review.test.ts
 bun run experiments:cli-review
 bun run rust:cli-review
+cargo test -p memory-engine-cli
 ```
 
-`bun run experiments:cli-review` now resolves to the Rust dogfood path. The
-TypeScript experiment remains as `bun run experiments:cli-review:ts-oracle`
-during the Rust migration.
+`bun run experiments:cli-review` resolves to the Rust dogfood path. The former
+TypeScript oracle was deleted after Rust receipt parity landed.
 
 ## Fixture
 
@@ -63,7 +62,6 @@ then `next-queue` selects the second unit.
 
 ## Boundary Notes
 
-The experiment imports public package subpaths for learning-domain types and
-uses the repo-local `service/` prototype only as an experiment boundary. It does
-not export the service, add a parser, introduce persistence, or move confidence
+The experiment uses the Rust facade and service crates without exporting a
+product service, adding a parser, introducing persistence, or moving confidence
 policy into the kernel.

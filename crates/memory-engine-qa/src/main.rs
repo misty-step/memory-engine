@@ -197,22 +197,6 @@ fn boundary_lanes() -> Vec<QaLane> {
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
-        QaLane {
-            id: "dogfood.ts-oracles",
-            title: "TypeScript dogfood parity oracles",
-            surface: "CLI review, import probe, web shell",
-            purpose:
-                "Keep legacy dogfood behavior executable until the TypeScript runtime is deleted.",
-            command: &[
-                "bun",
-                "test",
-                "experiments/cli-review/cli-review.test.ts",
-                "experiments/import-probe/import-probe.test.ts",
-                "experiments/web-shell/web-shell.test.ts",
-            ],
-            gating: true,
-            modes: &[QaMode::Local, QaMode::Full],
-        },
     ]
 }
 
@@ -399,8 +383,8 @@ mod tests {
         let local = selected_lanes(QaMode::Local);
         let full = selected_lanes(QaMode::Full);
 
-        assert_eq!(local.len(), 13);
-        assert_eq!(full.len(), 14);
+        assert_eq!(local.len(), 12);
+        assert_eq!(full.len(), 13);
         assert_eq!(local.first().map(|lane| lane.id), Some("static.typecheck"));
         assert_eq!(full.last().map(|lane| lane.id), Some("ci.canonical"));
         assert!(!local.iter().any(|lane| lane.id == "ci.canonical"));

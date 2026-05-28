@@ -156,8 +156,8 @@ The web UI markup is still shared from `experiments/beta-study/index.html`.
 
 The operator-facing `experiments:cli-review`, `experiments:import-probe`, and
 `experiments:web-shell` scripts now resolve to Rust implementations. Their
-TypeScript predecessors remain available with `:ts-oracle` suffixes only for
-parity checks until deletion.
+TypeScript predecessors were deleted after the Rust crates covered receipt,
+service-loop, and HTTP route parity.
 
 `crates/memory-engine-bench` now ports the benchmark receipt path:
 
@@ -213,9 +213,9 @@ requires:
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
 | Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
-| CLI dogfood | TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
-| Import probe | TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
-| Web shell | TypeScript `experiments/web-shell/` | Rust web-shell crate port | Session, receipt, and HTTP route parity |
+| CLI dogfood | Deleted TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
+| Import probe | Deleted TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
+| Web shell | Deleted TypeScript runtime under `experiments/web-shell/`; HTML asset retained | Rust web-shell crate port | Session, receipt, and HTTP route parity |
 | Bench receipts | TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
 | QA receipts | TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |
 | Coverage gate | TypeScript `scripts/check-coverage.ts` | Rust coverage crate | Coverage parser tests plus `bun run coverage` |

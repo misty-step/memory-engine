@@ -9,8 +9,9 @@ memory-engine API. It renders a study loop over the import-probe dogfood
 fixture, then drives answer submission, reveal, review-state visibility, and
 queue transitions through the Rust service boundary.
 
-The TypeScript `experiments/web-shell/` path remains a migration oracle until
-the TypeScript runtime is deleted.
+The former TypeScript `experiments/web-shell/` runtime oracle was deleted after
+the Rust crate covered session, receipt, and HTTP route parity. The HTML asset
+under `experiments/web-shell/index.html` remains shared by the Rust host.
 
 ## Commands
 
@@ -20,12 +21,10 @@ bun run experiments:web-shell:receipt
 bun run rust:web-shell:receipt
 bun run experiments:web-shell
 bun run rust:web-shell
-bun test experiments/web-shell/web-shell.test.ts
-bun run experiments:web-shell:ts-oracle
 ```
 
-The Rust and TypeScript servers listen on `http://127.0.0.1:4173` unless `HOST`
-or `PORT` is set.
+The Rust server listens on `http://127.0.0.1:4173` unless `HOST` or `PORT` is
+set.
 For phone testing over a trusted Tailscale tailnet, run:
 
 ```sh

@@ -26,9 +26,9 @@ There are two separate gates:
 
 | Experiment | Evidence | Decision pressure |
 | --- | --- | --- |
-| CLI review | `experiments/cli-review/` runs a calibration-aware review loop through the service boundary. | Attempts, confidence, grading, scheduling, and queueing compose cleanly, but receipt formatting and confidence policy stay product-owned. |
-| Import probe | `experiments/import-probe/` compiles authored material into canonical prompts, queue candidates, and schedule state. | Canonical API types can represent imported learning inputs; parsers and authoring policy should remain outside `src/`. |
-| Web shell | `experiments/web-shell/` renders a local study loop and exercises answer, reveal, review-state visibility, and queue transitions. | A usable interface needs review-state presentation, reveal policy, persistence, and eventually content generation. One web client is not enough proof to stabilize these as package contracts. |
+| CLI review | `crates/memory-engine-cli` runs a calibration-aware review loop through the service boundary. | Attempts, confidence, grading, scheduling, and queueing compose cleanly, but receipt formatting and confidence policy stay product-owned. |
+| Import probe | `crates/memory-engine-import` compiles authored material into canonical prompts, queue candidates, and schedule state. | Canonical API types can represent imported learning inputs; parsers and authoring policy should remain outside the kernel. |
+| Web shell | `crates/memory-engine-web-shell` renders a local study loop and exercises answer, reveal, review-state visibility, and queue transitions. | A usable interface needs review-state presentation, reveal policy, persistence, and eventually content generation. One web client is not enough proof to stabilize these as package contracts. |
 | QA harness | `bun run qa` runs public exports, kernel behavior, service prototype, eval corpus, dogfood clients, benchmarks, and Dagger CI. | Package confidence is strong; product readiness still needs beta persistence, content generation, and mobile dogfood receipts. |
 
 ## What Stays In `memory-engine`
