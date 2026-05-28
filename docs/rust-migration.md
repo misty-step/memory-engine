@@ -118,6 +118,15 @@ The web UI markup is still shared from `experiments/beta-study/index.html`.
   the next queue item;
 - emits a JSON receipt from `bun run rust:import-probe`.
 
+`crates/memory-engine-web-shell` now ports the local web-shell dogfood path:
+
+- builds a learner-facing session view over the Rust import-probe fixture;
+- keeps reveal status, compact review-state DTOs, prompt copy, answer draft
+  flow, and interface-pressure receipt formatting in the shell boundary;
+- drives `next-queue` and `grade/apply-review` through `memory-engine-service`;
+- serves the existing web-shell HTML and `/state`, `/reveal`, `/answer`, and
+  `/next` routes from a Rust binary.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -147,3 +156,4 @@ requires:
 | Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
 | CLI dogfood | TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
 | Import probe | TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
+| Web shell | TypeScript `experiments/web-shell/` | Rust web-shell crate port | Session, receipt, and HTTP route parity |

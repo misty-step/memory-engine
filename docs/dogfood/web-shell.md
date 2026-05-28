@@ -4,23 +4,29 @@ Refs-backlog: 23
 
 ## Purpose
 
-`experiments/web-shell/` is a local interface experiment for the memory-engine
-API. It renders a study loop over the import-probe dogfood fixture, then drives
-answer submission, reveal, review-state visibility, and queue transitions
-through the repo-local service prototype from outside `src/`.
+`crates/memory-engine-web-shell` is a local interface experiment for the
+memory-engine API. It renders a study loop over the import-probe dogfood
+fixture, then drives answer submission, reveal, review-state visibility, and
+queue transitions through the Rust service boundary.
+
+The TypeScript `experiments/web-shell/` path remains a migration oracle until
+the TypeScript runtime is deleted.
 
 ## Commands
 
 ```sh
+cargo test -p memory-engine-web-shell
+bun run rust:web-shell
 bun test experiments/web-shell/web-shell.test.ts
 bun run experiments:web-shell
 ```
 
-The server listens on `http://127.0.0.1:4173` unless `HOST` or `PORT` is set.
+The Rust and TypeScript servers listen on `http://127.0.0.1:4173` unless `HOST`
+or `PORT` is set.
 For phone testing over a trusted Tailscale tailnet, run:
 
 ```sh
-HOST=0.0.0.0 bun run experiments:web-shell
+HOST=0.0.0.0 bun run rust:web-shell
 ```
 
 ## Fixture
@@ -43,6 +49,10 @@ that schedule and moves the queue to the second, unscheduled unit.
 Reveal is intentionally UI-owned in this experiment. The service has no
 first-class revealed-review command, and the ticket did not add one.
 
+The Rust shell exposes this as `WebShellSession::advance()` at the library
+boundary to avoid overloading Rust's standard `Iterator::next` convention, while
+the HTTP route stays `/next` for TypeScript web-shell parity.
+
 ## Interface Pressure
 
 - Review-state visibility needs a compact DTO. Raw `ScheduleState` is useful
@@ -54,6 +64,9 @@ first-class revealed-review command, and the ticket did not add one.
   outside the kernel.
 - The web shell did not require a UI framework dependency or changes under
   `src/`.
+- `memory-engine-service` exposes a read-only `store()` accessor so app shells
+  can build compact view DTOs without moving or reassembling the service-owned
+  workflow.
 
 ## Extraction Recommendation
 

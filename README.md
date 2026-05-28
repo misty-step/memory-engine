@@ -135,6 +135,7 @@ bun run ci:local
 bun run rust:beta-study
 bun run rust:cli-review
 bun run rust:import-probe
+bun run rust:web-shell
 bun run ci
 dagger call check --source=.
 ```

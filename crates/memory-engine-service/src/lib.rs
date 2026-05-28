@@ -281,6 +281,11 @@ where
         self.store
     }
 
+    #[must_use]
+    pub fn store(&self) -> &TStore {
+        &self.store
+    }
+
     /// Execute one typed service command.
     ///
     /// # Errors

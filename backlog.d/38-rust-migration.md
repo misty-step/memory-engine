@@ -106,3 +106,7 @@ details behind deep APIs that carry the domain semantics.
   probe, canonical prompt / queue / schedule compilation, service-loop receipt,
   and boundary tests. The TypeScript import experiment remains only as a
   migration oracle.
+- 2026-05-28: Added `memory-engine-web-shell` with Rust learner-facing session
+  choreography, compact view DTOs, reveal handling, web-shell receipt output,
+  and HTTP route tests over the Rust service boundary. The TypeScript web-shell
+  experiment remains only as a migration oracle.
