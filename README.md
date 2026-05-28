@@ -2,8 +2,10 @@
 
 [![CI](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml)
 
-`memory-engine` is a TypeScript learning engine workspace for spaced
-repetition, answer grading, modular API design, and dogfood client experiments.
+`memory-engine` is a learning engine workspace for spaced repetition, answer
+grading, modular API design, and dogfood client experiments. It is currently
+migrating from a TypeScript package to a Rust library/application stack while
+keeping the TypeScript runtime as the executable parity oracle until cutover.
 
 It started as a framework-free kernel extracted from four learning apps:
 
@@ -34,6 +36,9 @@ The core runtime under `src/` stays framework-free. Service, storage, UI, auth,
 content parsing, and deployment experiments must live outside that pure kernel
 until dogfood evidence proves a stable boundary.
 
+The Rust core crate follows the same boundary: no filesystem, network, UI,
+logging, model clients, or persistence in the reusable kernel.
+
 ## Status
 
 Slices 1 through 3 are in place:
@@ -60,6 +65,8 @@ Roadmap and shaping docs:
 Active backlog now tracks Slice 5: modular API entrypoints, service-boundary
 failure semantics, evals/benchmarks, CLI dogfood, import probes, web-shell
 dogfood, and extraction gates.
+
+The active Rust migration ledger is [docs/rust-migration.md](./docs/rust-migration.md).
 
 ## Install
 
@@ -125,6 +132,9 @@ import { StaticRubricGrader } from 'memory-engine/adapters';
 bun install
 git config core.hooksPath .githooks
 bun run ci:local
+bun run rust:beta-study
+bun run rust:cli-review
+bun run rust:import-probe
 bun run ci
 dagger call check --source=.
 ```

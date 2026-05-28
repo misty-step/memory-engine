@@ -102,3 +102,7 @@ details behind deep APIs that carry the domain semantics.
 - 2026-05-28: Added `memory-engine-cli` with a Rust CLI review dogfood client,
   in-memory service-store fixture, calibration receipt output, and boundary
   tests. The TypeScript CLI experiment remains only as a migration oracle.
+- 2026-05-28: Added `memory-engine-import` with a Rust authored-content import
+  probe, canonical prompt / queue / schedule compilation, service-loop receipt,
+  and boundary tests. The TypeScript import experiment remains only as a
+  migration oracle.

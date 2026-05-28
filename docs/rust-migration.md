@@ -108,6 +108,16 @@ The web UI markup is still shared from `experiments/beta-study/index.html`.
 - emits a JSON receipt from `bun run rust:cli-review`;
 - tests the receipt and the CLI store validation boundary.
 
+`crates/memory-engine-import` now ports the authored-content import dogfood path:
+
+- compiles the Latin-prayer authored fixture into canonical prompts, queue
+  candidates, prompt IDs, and schedule state;
+- validates that source text, translations, confidence copy, and notes remain
+  product-owned import metadata rather than reusable-kernel concerns;
+- runs the first imported review through the Rust service boundary and selects
+  the next queue item;
+- emits a JSON receipt from `bun run rust:import-probe`.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -136,3 +146,4 @@ requires:
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
 | Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
 | CLI dogfood | TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
+| Import probe | TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |

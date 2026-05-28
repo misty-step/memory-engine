@@ -39,6 +39,7 @@
     "rust:doc": "cargo doc --workspace --no-deps",
     "rust:beta-study": "cargo run -p memory-engine-beta-app",
     "rust:cli-review": "cargo run -p memory-engine-cli",
+    "rust:import-probe": "cargo run -p memory-engine-import",
     "rust:ci": "bun run rust:fmt && bun run rust:test && bun run rust:clippy && bun run rust:doc",
     "ci:local": "bun run typecheck && bun run check && bun run coverage && bun run rust:ci",
     "ci": "dagger call check --source=."

@@ -52,6 +52,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-import"
+version = "0.0.0"
+dependencies = [
+ "memory-engine-core",
+ "memory-engine-service",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memory-engine-persistence"
 version = "0.0.0"
 dependencies = [

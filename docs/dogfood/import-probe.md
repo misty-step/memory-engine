@@ -4,14 +4,20 @@ Refs-backlog: 22
 
 ## Purpose
 
-`experiments/import-probe/` converts one tiny authored fixture into canonical
-`Prompt`, `QueueCandidate`, and `ScheduleState` inputs. The probe discovers
-input pressure for dogfood clients without adding content parsing, taxonomy, or
-AI compilation behavior to `src/`.
+`crates/memory-engine-import` converts one tiny authored fixture into canonical
+`Prompt`, `QueueCandidate`, and `ScheduleState` inputs, then runs the first
+compiled prompt through the Rust service loop. The probe discovers input
+pressure for dogfood clients without adding content parsing, taxonomy, or AI
+compilation behavior to the reusable kernel.
+
+The TypeScript `experiments/import-probe/` path remains a migration oracle until
+the TypeScript runtime is deleted.
 
 ## Commands
 
 ```sh
+bun run rust:import-probe
+cargo test -p memory-engine-import
 bun test experiments/import-probe/import-probe.test.ts
 bun run experiments:import-probe
 ```
@@ -58,3 +64,7 @@ This is an import probe, not a parser framework. It uses a canned authored
 fixture and a deterministic compiler so future AI-assisted compilers can be
 evaluated against the same canonical output contract before any product client
 depends on them.
+
+The Rust crate validates that authored cards still carry product-owned study
+metadata, but only canonical prompts, queue candidates, prompt IDs, and schedule
+state cross into the service boundary.
