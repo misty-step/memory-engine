@@ -1,7 +1,7 @@
 ---
 id: 38
 title: Rust migration
-status: ready
+status: shipped
 priority: high
 created: 2026-05-28
 ---
@@ -79,29 +79,26 @@ details behind deep APIs that carry the domain semantics.
   tests.
 - 2026-05-28: Added `memory-engine-service` with typed command/result
   envelopes, store trait, deep grade/apply-review orchestration, and service
-  contract tests. Persistence and beta app cutover remain future slices.
+  contract tests.
 - 2026-05-28: Added `memory-engine-persistence` with a file-backed beta
   store, typed validation and conflict errors, atomic commit behavior, queue
-  projection, and service-store integration tests. Beta generation and app
-  server cutover remain future slices.
+  projection, and service-store integration tests.
 - 2026-05-28: Added `memory-engine-generation` with deterministic source-block
   parsing, generated prompt drafts, generation-run bookkeeping, and accepted /
   rejected draft parity tests. Also tightened core serde for TypeScript-shaped
   prompt, grade, rating, schedule, progression, queue, and beta-store wire
-  contracts. Beta-study session/server cutover remains a future slice.
+  contracts.
 - 2026-05-28: Added `memory-engine-study` with Rust beta-study session/API
   orchestration for source intake, deterministic generation, draft approval,
   reveal, grade/apply-review, queue advancement, resume, duplicate-submit
-  idempotence, and mobile API JSON shape. HTTP server and web UI cutover remain
-  future slices.
+  idempotence, and mobile API JSON shape.
 - 2026-05-28: Added `memory-engine-beta-app`, a Rust HTTP host for the local
-  beta-study app. It serves the existing mobile HTML and ports `/state`,
-  `/source`, `/generate`, `/approve`, `/reveal`, `/answer`, and `/next` onto
-  the Rust study session with route tests. Shared HTML and final TypeScript
-  package/API removal remain future slices.
+  beta-study app. It ports `/state`, `/source`, `/generate`, `/approve`,
+  `/reveal`, `/answer`, and `/next` onto the Rust study session with route
+  tests.
 - 2026-05-28: Added `memory-engine-cli` with a Rust CLI review dogfood client,
   in-memory service-store fixture, calibration receipt output, and boundary
-  tests. The TypeScript CLI experiment remains only as a migration oracle.
+  tests.
 - 2026-05-28: Added `memory-engine-import` with a Rust authored-content import
   probe, canonical prompt / queue / schedule compilation, service-loop receipt,
   and boundary tests. The TypeScript import experiment was later deleted after
@@ -143,12 +140,11 @@ details behind deep APIs that carry the domain semantics.
   the executable confidence path.
 - 2026-05-28: Deleted the TypeScript CLI review, import probe, and web-shell
   dogfood oracles after their Rust crates owned receipt, service-loop, session,
-  and HTTP route parity. The web-shell HTML asset remains shared by the Rust
-  host.
+  and HTTP route parity.
 - 2026-05-28: Deleted the TypeScript beta-study session and server oracle after
   `memory-engine-study` and `memory-engine-beta-app` owned source, generation,
   approval, reveal, review, restart/resume, duplicate-submit, and HTTP route
-  parity. The mobile HTML asset remains shared by the Rust host.
+  parity.
 - 2026-05-28: Deleted the TypeScript beta-generation oracle after
   `memory-engine-generation` owned source-block parsing, provenance/reference
   persistence, accepted/rejected draft validation, promotion, and source-error
