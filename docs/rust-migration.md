@@ -24,6 +24,17 @@ the app surfaces have moved.
 
 ## Current Rust Slice
 
+`crates/memory-engine` is now the consumer-facing Rust facade:
+
+- root exports mirror the current TypeScript package ergonomics for grading,
+  scheduling, progression, queueing, and canonical types;
+- modular namespaces preserve deep ownership instead of asking consumers to
+  depend on every internal crate directly;
+- beta and dogfood modules expose repo-local application surfaces without
+  promoting those concerns into the pure kernel;
+- facade tests prove README-style root usage, modular package-path composition,
+  and dogfood receipt access through the Rust surface.
+
 `crates/memory-engine-core` ports the first pure-kernel surface:
 
 - domain types for prompts, grades, schedule state, progression metadata, and
@@ -145,6 +156,7 @@ requires:
 
 | Surface | Current owner | Rust status | Cutover evidence |
 | --- | --- | --- | --- |
+| Package facade | TypeScript `package.json` exports | Rust `memory-engine` facade crate | Root and modular facade tests |
 | Domain types | TypeScript `src/types.ts` | First core port | JSON fixture parity |
 | Deterministic grading | TypeScript `src/grader.ts` | First core port | Fixture parity and property tests |
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |

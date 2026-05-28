@@ -110,3 +110,7 @@ details behind deep APIs that carry the domain semantics.
   choreography, compact view DTOs, reveal handling, web-shell receipt output,
   and HTTP route tests over the Rust service boundary. The TypeScript web-shell
   experiment remains only as a migration oracle.
+- 2026-05-28: Added the consumer-facing `memory-engine` Rust facade crate,
+  with root and modular API tests that mirror the current TypeScript package
+  export ergonomics while preserving deep ownership in the existing Rust crates.
+  TypeScript package exports remain as the migration oracle until final cutover.

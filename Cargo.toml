@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/memory-engine",
     "crates/memory-engine-beta-app",
     "crates/memory-engine-cli",
     "crates/memory-engine-core",

@@ -84,6 +84,35 @@ Workspace-style usage also works as long as the package is linked into the consu
 
 ## Usage
 
+Rust consumers should use the facade crate during the migration:
+
+```rust
+use memory_engine::{next, ExactPrompt, ExactPromptKind, GradeContext, Grader, Prompt, ReviewUnitId};
+
+let prompt = Prompt::Exact(ExactPrompt {
+    kind: ExactPromptKind::ShortAnswer,
+    review_unit_id: ReviewUnitId::new("latin-1"),
+    prompt: "Translate poena".to_owned(),
+    accepted_answers: vec!["punishment".to_owned()],
+    equivalence_groups: Vec::new(),
+    ignored_tokens: Vec::new(),
+});
+
+let grade = Grader::new().grade(
+    &prompt,
+    "Punishment",
+    GradeContext {
+        response_time_ms: 3_200,
+        prior_reps: 3,
+    },
+);
+
+let next_state = next(None, grade.rating, 1_779_465_600_000).expect("schedule");
+```
+
+The TypeScript package remains available as the executable parity oracle until
+cutover:
+
 ```ts
 import { Grader } from 'memory-engine/grading';
 import { next } from 'memory-engine/scheduling';

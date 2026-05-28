@@ -1,0 +1,22 @@
+[package]
+name = "memory-engine"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Consumer-facing Rust facade for memory-engine."
+
+[dependencies]
+memory-engine-cli = { path = "../memory-engine-cli" }
+memory-engine-core = { path = "../memory-engine-core" }
+memory-engine-generation = { path = "../memory-engine-generation" }
+memory-engine-import = { path = "../memory-engine-import" }
+memory-engine-persistence = { path = "../memory-engine-persistence" }
+memory-engine-service = { path = "../memory-engine-service" }
+memory-engine-study = { path = "../memory-engine-study" }
+memory-engine-web-shell = { path = "../memory-engine-web-shell" }
+
+[dev-dependencies]
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
