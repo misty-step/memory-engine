@@ -47,8 +47,9 @@ handoff, trace, or commit message.
 This hygiene pass used stdout receipts rather than adding
 `memory-engine-qa --report <path>`.
 
-- `bun test experiments/beta-store/ experiments/beta-generation/`: 8 pass,
-  0 fail.
+- `bun test experiments/beta-store/` plus
+  `cargo test -p memory-engine-generation`: persistence and deterministic
+  beta-generation proof passed.
 - `bun run check`: Biome checked 62 files with no fixes applied.
 - `bun run qa`: 13 lanes passed, 0 warnings, 0 failures; canonical CI lane
   passed; coverage floor met at 93.06% funcs and 93.18% lines.

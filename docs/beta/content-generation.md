@@ -4,10 +4,10 @@ Refs-backlog: 27
 
 ## Purpose
 
-`experiments/beta-generation/` is the first deterministic content-generation
+`crates/memory-engine-generation` is the deterministic content-generation
 probe for the beta interface. It turns persisted source material into
 source-grounded quiz and exercise drafts, records generation receipts, and
-keeps every generated artifact outside the published `src/` kernel.
+keeps every generated artifact outside the published kernel.
 
 This is deliberately not a model-provider integration. It is the contract and
 QA spine that real provider calls must satisfy later.
@@ -114,10 +114,13 @@ Before model-backed generation can be trusted, add evals for:
 ## Verification
 
 ```sh
-bun test experiments/beta-generation/
+cargo test -p memory-engine-generation
 bun run ci
 ```
 
 The focused suite covers accepted quiz drafts, accepted exercise drafts,
 promotion into review units, rejected unsupported drafts, duplicate-ish drafts,
 and missing-provenance failures.
+
+The former TypeScript `experiments/beta-generation/` runtime oracle was deleted
+after the Rust crate covered deterministic generation and fixture parity.

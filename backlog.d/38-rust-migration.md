@@ -150,3 +150,7 @@ details behind deep APIs that carry the domain semantics.
   `memory-engine-study` and `memory-engine-beta-app` owned source, generation,
   approval, reveal, review, restart/resume, duplicate-submit, and HTTP route
   parity. The mobile HTML asset remains shared by the Rust host.
+- 2026-05-28: Deleted the TypeScript beta-generation oracle after
+  `memory-engine-generation` owned source-block parsing, provenance/reference
+  persistence, accepted/rejected draft validation, promotion, and source-error
+  fixture parity.

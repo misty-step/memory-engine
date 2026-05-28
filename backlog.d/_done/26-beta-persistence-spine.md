@@ -72,5 +72,6 @@ shared service contract.
 - Implemented in `experiments/beta-store/` with durable beta-owned persistence
   and no runtime persistence under `src/`.
 - Documented in `docs/beta/persistence-spine.md`.
-- Verified during backlog hygiene with `bun test experiments/beta-store/
-  experiments/beta-generation/`.
+- Verified during backlog hygiene with `bun test experiments/beta-store/`; the
+  former beta-generation TypeScript oracle has since moved to
+  `cargo test -p memory-engine-generation`.
