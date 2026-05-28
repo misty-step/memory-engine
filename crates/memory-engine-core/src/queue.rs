@@ -152,8 +152,7 @@ fn compare_due_then_rep(left: &QueueCandidate, right: &QueueCandidate) -> Orderi
     left.due
         .cmp(&right.due)
         .then_with(|| {
-            right
-                .schedule_state
+            left.schedule_state
                 .as_ref()
                 .map_or(0, |state| state.reps)
                 .cmp(&right.schedule_state.as_ref().map_or(0, |state| state.reps))

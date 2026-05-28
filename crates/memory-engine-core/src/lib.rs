@@ -7,6 +7,7 @@ mod domain;
 mod grading;
 mod progression;
 mod queue;
+mod scheduler;
 
 pub use domain::{
     ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata,
@@ -19,3 +20,4 @@ pub use progression::{
     ProgressionCandidate, ProgressionFilterResult, ProgressionLike,
 };
 pub use queue::{compare_queue_priority, pick_next_queue_candidate, reviewable_queue_candidates};
+pub use scheduler::{next, FsrsScheduler, Scheduler, SchedulerError};

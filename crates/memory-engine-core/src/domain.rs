@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ReviewUnitId(String);
 
 impl ReviewUnitId {
@@ -21,7 +23,7 @@ impl fmt::Display for ReviewUnitId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Rating {
     Again = 1,
     Hard = 2,
@@ -29,7 +31,7 @@ pub enum Rating {
     Easy = 4,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Verdict {
     Correct,
     Close,
@@ -37,13 +39,13 @@ pub enum Verdict {
     Revealed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum GraderKind {
     Deterministic,
     RubricLlm,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ScheduleStatus {
     New = 0,
     Learning = 1,
@@ -51,7 +53,7 @@ pub enum ScheduleStatus {
     Relearning = 3,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ScheduleState {
     pub due: i64,
     pub stability: f64,
@@ -64,13 +66,13 @@ pub struct ScheduleState {
     pub last_review: Option<i64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GradeContext {
     pub response_time_ms: u32,
     pub prior_reps: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GradeResult {
     pub verdict: Verdict,
     pub rating: Rating,
@@ -84,20 +86,20 @@ pub struct GradeResult {
     pub criterion_results: Vec<RubricCriterionResult>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RubricCriterionResult {
     pub name: String,
     pub verdict: RubricCriterionVerdict,
     pub evidence: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RubricCriterionVerdict {
     Pass,
     Fail,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Prompt {
     Mcq {
         review_unit_id: ReviewUnitId,
@@ -113,7 +115,7 @@ pub enum Prompt {
     Exact(ExactPrompt),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExactPrompt {
     pub kind: ExactPromptKind,
     pub review_unit_id: ReviewUnitId,
@@ -123,14 +125,14 @@ pub struct ExactPrompt {
     pub ignored_tokens: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ExactPromptKind {
     Cloze,
     ShortAnswer,
     Recitation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProgressionMetadata {
     pub progression_group: Option<String>,
     pub stage_order: u32,
@@ -165,7 +167,7 @@ impl Default for ProgressionMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct QueueCandidate {
     pub review_unit_id: ReviewUnitId,
     pub schedule_state: Option<ScheduleState>,

@@ -65,7 +65,7 @@ details behind deep APIs that carry the domain semantics.
 ## Migration Slices
 
 1. Rust core crate with domain, grading, progression, and queue parity.
-2. Rust scheduler wrapper with fixture parity against current `ts-fsrs` output.
+2. Rust scheduler boundary with fixture parity against current `ts-fsrs` output.
 3. Rust service crate with typed command envelope and storage trait.
 4. Rust persistence crate for the beta store.
 5. Rust beta generation and study API, keeping deterministic fixtures first.

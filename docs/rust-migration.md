@@ -31,10 +31,12 @@ the app surfaces have moved.
 - deterministic grading for MCQ, boolean, cloze, short answer, and recitation;
 - progression eligibility with strict and fallback modes;
 - queue due filtering, priority ordering, anti-clumping, and progression
-  fallback.
+  fallback;
+- scheduler advancement through a Rust `Scheduler` trait and default
+  `FsrsScheduler`, pinned to the current TypeScript FSRS-6 fixture outputs.
 
-The scheduler, service boundary, persistence store, beta generation, beta-study
-server, and web UI are still TypeScript-owned.
+The service boundary, persistence store, beta generation, beta-study server, and
+web UI are still TypeScript-owned.
 
 ## Parity Strategy
 
@@ -42,7 +44,8 @@ The Rust tests intentionally mirror current Bun behavior first. Broader parity
 requires:
 
 - shared JSON fixtures for grading, progression, queue, and scheduler cases;
-- a Rust scheduler wrapper pinned against the current `ts-fsrs` snapshots;
+- deeper JSON fixture coverage beyond the first scheduler new/learning/review
+  and relearning transitions;
 - service scenario fixtures that execute both TypeScript and Rust command
   envelopes until cutover;
 - beta-study smoke tests against the Rust server before TypeScript deletion.
@@ -55,7 +58,7 @@ requires:
 | Deterministic grading | TypeScript `src/grader.ts` | First core port | Fixture parity and property tests |
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
-| Scheduling | TypeScript `src/scheduler.ts` | Not migrated | FSRS snapshot parity |
+| Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
 | Service | TypeScript `service/` | Not migrated | Command scenario parity |
 | Persistence | TypeScript `experiments/beta-store/` | Not migrated | Store commit/restart tests |
 | Beta study app | TypeScript `experiments/beta-study/` | Not migrated | Phone/browser smoke on Rust host |
