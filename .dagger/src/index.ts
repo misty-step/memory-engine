@@ -11,6 +11,7 @@ import { type Container, type Directory, dag, func, object } from '@dagger.io/da
 
 const BUN_IMAGE = 'oven/bun:1.3.9-alpine';
 const GITLEAKS_IMAGE = 'zricethezav/gitleaks:v8.30.0';
+const RUST_IMAGE = 'rust:1.94-bookworm';
 
 @object()
 export class MemoryEngine {
@@ -25,6 +26,19 @@ export class MemoryEngine {
       .withMountedDirectory('/src', source)
       .withWorkdir('/src')
       .withExec(['bun', 'install', '--frozen-lockfile']);
+  }
+
+  /**
+   * Base Rust container with formatting and lint components available.
+   */
+  @func()
+  rustBase(source: Directory): Container {
+    return dag
+      .container()
+      .from(RUST_IMAGE)
+      .withMountedDirectory('/src', source)
+      .withWorkdir('/src')
+      .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
   }
 
   /**
@@ -60,6 +74,40 @@ export class MemoryEngine {
   }
 
   /**
+   * Run `cargo fmt --all --check`.
+   */
+  @func()
+  async rustFmt(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'fmt', '--all', '--check']).stdout();
+  }
+
+  /**
+   * Run `cargo test --workspace`.
+   */
+  @func()
+  async rustTest(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'test', '--workspace']).stdout();
+  }
+
+  /**
+   * Run `cargo clippy --workspace --all-targets -- -D warnings`.
+   */
+  @func()
+  async rustClippy(source: Directory): Promise<string> {
+    return this.rustBase(source)
+      .withExec(['cargo', 'clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'])
+      .stdout();
+  }
+
+  /**
+   * Run `cargo doc --workspace --no-deps`.
+   */
+  @func()
+  async rustDoc(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'doc', '--workspace', '--no-deps']).stdout();
+  }
+
+  /**
    * Scan the mounted source tree for hard-coded secrets with Gitleaks.
    */
   @func()
@@ -84,11 +132,19 @@ export class MemoryEngine {
     const typecheck = await base.withExec(['bun', 'run', 'typecheck']).stdout();
     const lint = await base.withExec(['bun', 'run', 'check']).stdout();
     const coverage = await base.withExec(['bun', 'run', 'coverage']).stdout();
+    const rustFmt = await this.rustFmt(source);
+    const rustTest = await this.rustTest(source);
+    const rustClippy = await this.rustClippy(source);
+    const rustDoc = await this.rustDoc(source);
     const secrets = await this.secrets(source);
     return [
       `=== typecheck ===\n${typecheck}`,
       `=== lint ===\n${lint}`,
       `=== coverage ===\n${coverage}`,
+      `=== rust fmt ===\n${rustFmt}`,
+      `=== rust test ===\n${rustTest}`,
+      `=== rust clippy ===\n${rustClippy}`,
+      `=== rust doc ===\n${rustDoc}`,
       `=== secrets ===\n${secrets}`,
     ].join('\n');
   }

@@ -1,0 +1,12 @@
+[package]
+name = "memory-engine-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Pure Rust kernel for memory-engine learning semantics."
+
+[dependencies]
+unicode-normalization = "0.1.25"
+
+[lints]
+workspace = true

@@ -33,7 +33,12 @@
     "format": "biome format --write .",
     "check": "biome check .",
     "check:fix": "biome check --write .",
-    "ci:local": "bun run typecheck && bun run check && bun run coverage",
+    "rust:fmt": "cargo fmt --all --check",
+    "rust:test": "cargo test --workspace",
+    "rust:clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:doc": "cargo doc --workspace --no-deps",
+    "rust:ci": "bun run rust:fmt && bun run rust:test && bun run rust:clippy && bun run rust:doc",
+    "ci:local": "bun run typecheck && bun run check && bun run coverage && bun run rust:ci",
     "ci": "dagger call check --source=."
   },
   "dependencies": {
