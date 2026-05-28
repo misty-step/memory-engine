@@ -8,6 +8,7 @@ members = [
     "crates/memory-engine-generation",
     "crates/memory-engine-import",
     "crates/memory-engine-service",
+    "crates/memory-engine-qa",
     "crates/memory-engine-persistence",
     "crates/memory-engine-study",
     "crates/memory-engine-web-shell",

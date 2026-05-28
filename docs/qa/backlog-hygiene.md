@@ -31,11 +31,11 @@ re-run the proof without reading the old conversation.
 
 ## QA Receipts
 
-For now, QA receipts remain stdout-first. `scripts/qa.ts` already prints lane
-ids, surfaces, purposes, commands, pass/fail receipts, and a summary. Adding
-`scripts/qa.ts --report <path>` would create another artifact format before
-review workflow has shown a durable need for persisted machine-readable
-receipts.
+For now, QA receipts remain stdout-first. `crates/memory-engine-qa` already
+prints lane ids, surfaces, purposes, commands, pass/fail receipts, and a
+summary. Adding a persisted `--report <path>` mode would create another
+artifact format before review workflow has shown a durable need for persisted
+machine-readable receipts.
 
 Use persisted QA reports only when a future ticket names a consumer that needs
 stable report files, such as release notes, a PR bot, dashboard import, or
@@ -45,7 +45,7 @@ handoff, trace, or commit message.
 ## Backlog 30 Delivery Receipt
 
 This hygiene pass used stdout receipts rather than adding
-`scripts/qa.ts --report <path>`.
+`memory-engine-qa --report <path>`.
 
 - `bun test experiments/beta-store/ experiments/beta-generation/`: 8 pass,
   0 fail.

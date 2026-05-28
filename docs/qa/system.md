@@ -37,8 +37,8 @@ QA evidence is organized around product quality, not implementation folders:
 
 ## Executable Lanes
 
-`scripts/qa.ts` runs these lanes in a fixed order and prints a receipt after
-each lane:
+`crates/memory-engine-qa` runs these lanes in a fixed order and prints a
+receipt after each lane:
 
 | Lane | Surface | Purpose |
 |---|---|---|

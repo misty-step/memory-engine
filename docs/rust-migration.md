@@ -168,6 +168,14 @@ parity checks until deletion.
 - makes `bun run bench` a Rust runtime command instead of a TypeScript package
   benchmark.
 
+`crates/memory-engine-qa` now ports the QA receipt runner:
+
+- preserves the local/full lane model, exact command receipts, gating versus
+  non-gating behavior, and canonical Dagger handoff lane;
+- keeps the remaining TypeScript oracle tests as explicit executed lanes while
+  moving the orchestration runtime to Rust;
+- makes `bun run qa:local` and `bun run qa` Rust runtime commands.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -202,3 +210,4 @@ requires:
 | Import probe | TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
 | Web shell | TypeScript `experiments/web-shell/` | Rust web-shell crate port | Session, receipt, and HTTP route parity |
 | Bench receipts | TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
+| QA receipts | TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |

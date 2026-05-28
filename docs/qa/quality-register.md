@@ -57,8 +57,9 @@ beta/product proof, or a shaped extraction decision.
 ### QI-005: QA harness reports lane receipts but does not persist run artifacts
 
 - Dimension: auditability.
-- Current evidence: `bun run qa` prints deterministic lane names, commands,
-  elapsed time, and pass/fail receipts to stdout.
+- Current evidence: `bun run qa` runs the Rust `memory-engine-qa` crate and
+  prints deterministic lane names, commands, elapsed time, and pass/fail
+  receipts to stdout.
 - Improvement: add an explicit `--report <path>` mode that writes a timestamped
   Markdown or JSON receipt under a non-source artifact directory.
 - Promote when: review workflow needs comparable QA receipts across branches or

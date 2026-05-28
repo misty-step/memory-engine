@@ -134,3 +134,7 @@ details behind deep APIs that carry the domain semantics.
   grading, scheduler advancement, queue selection, and service composition.
   `bun run bench` now runs the Rust crate while remaining non-gating until
   historical performance budgets exist.
+- 2026-05-28: Replaced the TypeScript QA runner with `memory-engine-qa`, a Rust
+  receipt runner that preserves local/full lane selection, command receipts,
+  gating versus warning behavior, and the canonical Dagger lane while keeping
+  remaining TypeScript oracle tests explicit until final deletion.
