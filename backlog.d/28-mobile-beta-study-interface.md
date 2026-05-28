@@ -29,7 +29,7 @@ API ergonomics. It may own local persistence and UI state because it lives under
 
 - No production deployment, auth, billing, telemetry, or app-store packaging.
 - No public service export.
-- No database or UI dependency in `src/`.
+- No database or UI dependency in `crates/memory-engine-core`.
 - No broad content ingestion matrix before pasted text works end to end.
 - No extraction until a later decision ticket.
 - No quiz-only interaction model. The beta interface should support exercise

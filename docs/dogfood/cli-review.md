@@ -50,9 +50,9 @@ then `next-queue` selects the second unit.
 - grade verdict and rating
 - scheduled repetition count
 - next selected review unit
-- explicit list of behavior that stayed outside `src/`
+- explicit list of behavior that stayed outside the pure kernel
 
-## Stayed Outside `src/`
+## Stayed Outside The Pure Kernel
 
 - fixture content
 - confidence capture

@@ -621,7 +621,7 @@ fn project_required_schedule(schedule: &ScheduleState) -> ReviewStateProjection 
 fn api_pressure() -> Vec<String> {
     [
         "Beta study still owns source creation, draft approval, reveal state, and mobile UI state.",
-        "The service boundary is usable for queue selection and grade/apply-review without promoting persistence into src.",
+        "The service boundary is usable for queue selection and grade/apply-review without promoting persistence into the pure kernel.",
         "Worked-solution display is activity metadata, not a kernel scheduling concern yet.",
     ]
     .into_iter()

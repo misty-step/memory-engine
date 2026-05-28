@@ -212,7 +212,7 @@ Depends on `19-service-boundary-failure-semantics`.
 
 Oracle:
 
-- schema for tutoring state transitions outside `src`
+- schema for tutoring state transitions outside the pure kernel
 - replay fixture proves attempt -> feedback -> repair -> schedule
 - invalid model command is rejected before service execution
 

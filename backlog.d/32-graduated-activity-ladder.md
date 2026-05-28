@@ -28,7 +28,7 @@ explicit metadata before attempting broad AI-generated exercises.
 
 - No public package export in this ticket.
 - No provider SDKs, prompt templates, vector stores, or generation network calls
-  under `src/`.
+  under `crates/memory-engine-core`.
 - No assumption that FSRS alone decides pedagogical stage transitions.
 - No unlimited exercise generation before deterministic templates and QA
   receipts prove the shape.

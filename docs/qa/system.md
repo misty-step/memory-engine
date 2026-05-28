@@ -24,7 +24,7 @@ with the canonical `bun run ci` Dagger gate.
 
 QA evidence is organized around product quality, not implementation folders:
 
-- API integrity: public exports compose without private `src` imports.
+- API integrity: Rust facade exports compose without private crate imports.
 - Learning semantics: scheduling, grading, progression, and queue behavior stay
   stable against fixtures and regression corpus cases.
 - Contract usefulness: testkit fixtures and adapter doubles remain valid
@@ -33,7 +33,8 @@ QA evidence is organized around product quality, not implementation folders:
   UI, authored content, confidence, and session choreography outside the kernel.
 - Drift detection: evals and benchmark receipts expose behavior and performance
   changes before clients absorb them.
-- Handoff confidence: typecheck, Biome, coverage, Gitleaks, and Dagger all pass.
+- Handoff confidence: Rust formatting, tests, Clippy, rustdoc, Gitleaks, and
+  Dagger all pass.
 
 ## Executable Lanes
 
@@ -42,19 +43,19 @@ receipt after each lane:
 
 | Lane | Surface | Purpose |
 |---|---|---|
-| `static.typecheck` | all package code included by `tsconfig` | catch type drift across public contracts and behavior tests |
-| `static.biome` | repo source, tests, scripts, docs-adjacent code | catch formatting, unused imports, and unsafe patterns |
-| `api.exports` | root and modular package exports | prove consumers can compose the API without private imports |
-| `kernel.types-scheduler` | types and scheduler | protect `ScheduleState` shape and FSRS round-trip semantics |
-| `kernel.grader` | deterministic and rubric grading | protect one-envelope grade results and fixed verdict semantics |
-| `kernel.progression-queue` | progression and queue | prove actual learning-flow selection behavior |
-| `contracts.testkit-adapters` | `testkit` and `adapters` | prove shared fixtures and adapter doubles remain usable |
+| `static.rustfmt` | all Rust crates | keep checked-in Rust in canonical format |
+| `static.clippy` | all Rust targets | catch correctness, maintainability, and API-shape warnings |
+| `api.facade` | `memory-engine` facade crate | prove consumers can compose root, modular, testkit, and dogfood surfaces |
+| `kernel.core` | `memory-engine-core` | protect pure learning semantics and adapter contracts |
 | `service.prototype` | `memory-engine-service` command boundary | prove command flow, injected persistence, and failure semantics |
-| `evals.regression-corpus` | fixtures through live API surfaces | catch semantic drift across core behaviors |
+| `persistence.beta-store` | `memory-engine-persistence` durable beta store | prove persisted snapshots, restart, conflict, and validation semantics |
+| `generation.beta` | `memory-engine-generation` deterministic generation probe | prove source parsing, provenance, draft validation, and promotion behavior |
+| `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, queue, and resume flow |
+| `app.beta-http` | `memory-engine-beta-app` local HTTP routes | prove mobile routes and validation run through the Rust study session |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
-| `coverage.all` | all Bun tests through the Rust coverage gate | preserve broad coverage evidence |
+| `docs.rustdoc` | all public Rust crates | prove public API documentation compiles |
 | `performance.benchmarks` | Rust facade, scheduler, queue, service | expose migrated-runtime performance drift without brittle thresholds |
-| `ci.canonical` | Dagger CI | prove install, typecheck, Biome, coverage, and Gitleaks together |
+| `ci.canonical` | Dagger CI | prove Rust fmt, test, Clippy, doc, and Gitleaks together |
 
 All lanes are gating except `performance.benchmarks`, which is receipt-only
 until the project has enough historical data to define stable budgets.
@@ -72,9 +73,9 @@ For a focused change, run the affected surface first, then finish with the QA
 harness. Examples:
 
 ```sh
-bun test tests/grader/
-bun test tests/queue/
-bun test tests/api/module-exports.test.ts tests/api/compatibility.test.ts
+cargo test -p memory-engine-core
+cargo test -p memory-engine
+cargo test -p memory-engine-study
 ```
 
 Report QA evidence with exact commands, final status, surfaces exercised, and

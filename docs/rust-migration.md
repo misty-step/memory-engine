@@ -5,9 +5,9 @@ Refs-backlog: 38
 ## Target Shape
 
 The migration target is a Rust library/application stack with the same learning
-semantics as the current TypeScript package and beta-study experiments. The
-TypeScript code remains the executable oracle until Rust has parity coverage and
-the app surfaces have moved.
+semantics as the former TypeScript package and beta-study experiments. The
+TypeScript runtime and Bun oracle tests were deleted after Rust parity coverage
+and app surfaces moved.
 
 ## Design Rules
 
@@ -26,7 +26,7 @@ the app surfaces have moved.
 
 `crates/memory-engine` is now the consumer-facing Rust facade:
 
-- root exports mirror the current TypeScript package ergonomics for grading,
+- root exports mirror the former TypeScript package ergonomics for grading,
   scheduling, progression, queueing, and canonical types;
 - the `adapters` namespace mirrors the TypeScript `memory-engine/adapters`
   rubric adapter surface with a vendor-neutral trait and static test double;
@@ -54,7 +54,7 @@ the app surfaces have moved.
 - queue due filtering, priority ordering, anti-clumping, and progression
   fallback;
 - scheduler advancement through a Rust `Scheduler` trait and default
-  `FsrsScheduler`, pinned to the current TypeScript FSRS-6 fixture outputs.
+  `FsrsScheduler`, pinned to the former TypeScript FSRS-6 fixture outputs.
 
 `crates/memory-engine-service` now ports the first command boundary:
 
@@ -69,9 +69,8 @@ the app surfaces have moved.
 - serde `kind` tags that match the TypeScript service envelope names for later
   cross-runtime fixture replay.
 - shared service command scenarios in `fixtures/service-command-scenarios.json`
-  now execute against both the TypeScript service oracle and the Rust service
-  crate, covering record-attempt, grade/apply-review, next-queue, and
-  progression unlock behavior.
+  execute against the Rust service crate, covering record-attempt,
+  grade/apply-review, next-queue, and progression unlock behavior.
 
 `crates/memory-engine-persistence` now ports the first beta-store boundary:
 
@@ -174,43 +173,33 @@ service-loop, and HTTP route parity.
 
 - preserves the local/full lane model, exact command receipts, gating versus
   non-gating behavior, and canonical Dagger handoff lane;
-- keeps the remaining TypeScript oracle tests as explicit executed lanes while
-  moving the orchestration runtime to Rust;
+- executes Rust facade, core, service, persistence, generation, study, beta
+  app, dogfood, rustdoc, benchmark, and Dagger lanes;
 - makes `bun run qa:local` and `bun run qa` Rust runtime commands.
-
-`crates/memory-engine-coverage` now ports the coverage floor gate:
-
-- keeps Bun as the TypeScript oracle test runner with `bun test --coverage`;
-- moves summary parsing and floor enforcement into Rust;
-- makes `bun run coverage` a Rust runtime command while preserving the same
-  80% function and line floors.
 
 ## Parity Strategy
 
-The Rust tests intentionally mirror current Bun behavior first. Broader parity
-requires:
+The Rust tests intentionally mirror the former Bun behavior first. Broader
+hardening after cutover should focus on:
 
-- shared JSON fixtures for grading, progression, queue, and scheduler cases;
-- deeper JSON fixture coverage beyond the first scheduler new/learning/review
-  and relearning transitions;
-- broader service failure fixtures that execute both TypeScript and Rust command
-  envelopes until cutover, including storage conflict and malformed-attempt
-  failures;
-- beta-study browser smoke tests against the Rust server before TypeScript
-  deletion.
+- richer checked-in fixture corpora for grading, progression, queue, and
+  scheduler cases;
+- more service failure fixtures for storage conflict, malformed-attempt, and
+  retry behavior;
+- repeated mobile dogfood receipts against the Rust beta-study server.
 
 ## Cutover Matrix
 
 | Surface | Current owner | Rust status | Cutover evidence |
 | --- | --- | --- | --- |
-| Package facade | TypeScript `package.json` exports | Rust `memory-engine` facade crate | Root and modular facade tests |
-| Testkit fixtures | TypeScript `testkit/` | Rust facade `testkit` module | Rust fixture replay through public surfaces |
-| Domain types | TypeScript `src/types.ts` | First core port | JSON fixture parity |
-| Deterministic grading | TypeScript `src/grader.ts` | First core port | Fixture parity and property tests |
-| Rubric grading and adapters | TypeScript `src/async-grader.ts`, `src/adapters/` | Rust core rubric boundary plus facade `adapters` namespace | Core rubric parity tests and facade export test |
-| Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
-| Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
-| Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
+| Package facade | Deleted TypeScript `package.json` exports | Rust `memory-engine` facade crate | Root and modular facade tests |
+| Testkit fixtures | Deleted TypeScript `testkit/` | Rust facade `testkit` module | Rust fixture replay through public surfaces |
+| Domain types | Deleted TypeScript `src/types.ts` | Rust core port | JSON fixture parity |
+| Deterministic grading | Deleted TypeScript `src/grader.ts` | Rust core port | Fixture parity and property tests |
+| Rubric grading and adapters | Deleted TypeScript `src/async-grader.ts`, `src/adapters/` | Rust core rubric boundary plus facade `adapters` namespace | Core rubric parity tests and facade export test |
+| Progression | Deleted TypeScript `src/progression.ts` | Rust core port | Vault/Ruminatio-style fixtures |
+| Queue | Deleted TypeScript `src/queue.ts` | Rust core port | Priority and anti-clump fixtures |
+| Scheduling | Deleted TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
 | Service | Deleted TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
 | Persistence | Deleted TypeScript `experiments/beta-store/` | Rust persistence crate | Store commit/restart tests |
 | Beta generation | Deleted TypeScript `experiments/beta-generation/` | Rust generation crate | Deterministic generation fixture parity |
@@ -218,6 +207,6 @@ requires:
 | CLI dogfood | Deleted TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
 | Import probe | Deleted TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
 | Web shell | Deleted TypeScript runtime under `experiments/web-shell/`; HTML asset retained | Rust web-shell crate port | Session, receipt, and HTTP route parity |
-| Bench receipts | TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
-| QA receipts | TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |
-| Coverage gate | TypeScript `scripts/check-coverage.ts` | Rust coverage crate | Coverage parser tests plus `bun run coverage` |
+| Bench receipts | Deleted TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
+| QA receipts | Deleted TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |
+| Coverage gate | Deleted TypeScript/Bun coverage gate | Retired after TypeScript oracle deletion | Rust workspace tests, Clippy, rustdoc, QA, and Dagger gate |

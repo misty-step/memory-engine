@@ -1,8 +1,8 @@
 //! QA lane runner for memory-engine.
 //!
 //! This binary owns QA orchestration and receipt formatting. The individual
-//! lanes still execute the tools that prove each surface: Bun for the remaining
-//! TypeScript oracle tests, Cargo for Rust crates, and Dagger for canonical CI.
+//! lanes execute the Rust tools that prove each surface, with Dagger retained as
+//! the canonical CI handoff.
 
 use std::{
     env, fmt,
@@ -84,20 +84,28 @@ fn lanes() -> Vec<QaLane> {
 fn static_lanes() -> Vec<QaLane> {
     vec![
         QaLane {
-            id: "static.typecheck",
-            title: "TypeScript strict contract",
-            surface: "all package code included by tsconfig",
-            purpose: "Catch type drift across public contracts and behavior tests.",
-            command: &["bun", "run", "typecheck"],
+            id: "static.rustfmt",
+            title: "Rust formatting",
+            surface: "all Rust crates",
+            purpose: "Keep generated and hand-written Rust in the canonical format.",
+            command: &["cargo", "fmt", "--all", "--check"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
-            id: "static.biome",
-            title: "Biome lint and format",
-            surface: "repo source, tests, scripts, docs-adjacent code",
-            purpose: "Keep strict style, unused imports, and unsafe patterns out of QA evidence.",
-            command: &["bun", "run", "check"],
+            id: "static.clippy",
+            title: "Rust lint",
+            surface: "all Rust targets",
+            purpose: "Catch correctness, maintainability, and API-shape warnings across crates.",
+            command: &[
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
@@ -107,58 +115,20 @@ fn static_lanes() -> Vec<QaLane> {
 fn kernel_lanes() -> Vec<QaLane> {
     vec![
         QaLane {
-            id: "api.exports",
-            title: "Public package exports",
-            surface: "memory-engine, subpath exports, root compatibility",
-            purpose: "Prove consumers can compose API surfaces without private src imports.",
-            command: &[
-                "bun",
-                "test",
-                "tests/api/module-exports.test.ts",
-                "tests/api/compatibility.test.ts",
-            ],
+            id: "api.facade",
+            title: "Rust facade exports",
+            surface: "memory-engine facade crate",
+            purpose: "Prove consumers can compose root, modular, testkit, and dogfood surfaces.",
+            command: &["cargo", "test", "-p", "memory-engine"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
-            id: "kernel.types-scheduler",
-            title: "Types and scheduler behavior",
-            surface: "ReviewUnitId, ScheduleState, FSRS next-state transition",
-            purpose: "Protect JSON-safe schedule state and ts-fsrs round-trip semantics.",
-            command: &[
-                "bun",
-                "test",
-                "tests/types/",
-                "tests/scheduler/roundtrip.test.ts",
-                "tests/scheduler/serialize.test.ts",
-            ],
-            gating: true,
-            modes: &[QaMode::Local, QaMode::Full],
-        },
-        QaLane {
-            id: "kernel.grader",
-            title: "Deterministic and rubric grading",
-            surface: "Grader, AsyncGrader, rating policy, prompt exhaustiveness",
-            purpose: "Protect one-envelope grade results and fixed verdict semantics.",
-            command: &["bun", "test", "tests/grader/"],
-            gating: true,
-            modes: &[QaMode::Local, QaMode::Full],
-        },
-        QaLane {
-            id: "kernel.progression-queue",
-            title: "Progression and queue behavior",
-            surface: "mastery, prerequisites, supersession, due ordering, anti-clumping",
-            purpose: "Prove the actual learning flow selects eligible work in stable order.",
-            command: &["bun", "test", "tests/progression/", "tests/queue/"],
-            gating: true,
-            modes: &[QaMode::Local, QaMode::Full],
-        },
-        QaLane {
-            id: "contracts.testkit-adapters",
-            title: "Testkit and adapter contracts",
-            surface: "memory-engine/testkit, memory-engine/adapters",
-            purpose: "Prove shared fixtures and adapter doubles remain usable consumer contracts.",
-            command: &["bun", "test", "tests/testkit/", "tests/adapters/"],
+            id: "kernel.core",
+            title: "Rust kernel behavior",
+            surface: "memory-engine-core types, scheduler, grading, progression, queue",
+            purpose: "Protect pure learning semantics and provider-neutral adapter contracts.",
+            command: &["cargo", "test", "-p", "memory-engine-core"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
@@ -178,12 +148,38 @@ fn boundary_lanes() -> Vec<QaLane> {
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
-            id: "evals.regression-corpus",
-            title: "Learning behavior regression corpus",
-            surface: "fixtures replayed through live public API surfaces",
-            purpose:
-                "Catch semantic drift across grading, scheduling, progression, and queue behavior.",
-            command: &["bun", "test", "tests/evals/regression-corpus.test.ts"],
+            id: "persistence.beta-store",
+            title: "Rust beta persistence behavior",
+            surface: "memory-engine-persistence durable beta store",
+            purpose: "Prove persisted snapshots, restart, conflict, and validation semantics.",
+            command: &["cargo", "test", "-p", "memory-engine-persistence"],
+            gating: true,
+            modes: &[QaMode::Local, QaMode::Full],
+        },
+        QaLane {
+            id: "generation.beta",
+            title: "Rust beta generation behavior",
+            surface: "memory-engine-generation deterministic generation probe",
+            purpose: "Prove source parsing, provenance, draft validation, and promotion behavior.",
+            command: &["cargo", "test", "-p", "memory-engine-generation"],
+            gating: true,
+            modes: &[QaMode::Local, QaMode::Full],
+        },
+        QaLane {
+            id: "study.beta-session",
+            title: "Rust beta study session",
+            surface: "memory-engine-study session/API boundary",
+            purpose: "Prove source, generation, approval, reveal, answer, queue, and resume flow.",
+            command: &["cargo", "test", "-p", "memory-engine-study"],
+            gating: true,
+            modes: &[QaMode::Local, QaMode::Full],
+        },
+        QaLane {
+            id: "app.beta-http",
+            title: "Rust beta HTTP host",
+            surface: "memory-engine-beta-app local HTTP routes",
+            purpose: "Prove mobile app routes and validation run through the Rust study session.",
+            command: &["cargo", "test", "-p", "memory-engine-beta-app"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
@@ -193,7 +189,11 @@ fn boundary_lanes() -> Vec<QaLane> {
             surface: "Rust CLI review, import probe, web shell",
             purpose:
                 "Exercise migrated dogfood clients through the Rust facade and service crates.",
-            command: &["bun", "run", "rust:dogfood"],
+            command: &[
+                "bash",
+                "-lc",
+                "cargo run -p memory-engine-cli && cargo run -p memory-engine-import && cargo run -p memory-engine-web-shell -- --receipt",
+            ],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
@@ -203,11 +203,11 @@ fn boundary_lanes() -> Vec<QaLane> {
 fn handoff_lanes() -> Vec<QaLane> {
     vec![
         QaLane {
-            id: "coverage.all",
-            title: "Coverage-enforced full test sweep",
-            surface: "all Bun tests included by the repo",
-            purpose: "Preserve broad executable confidence and coverage floor evidence.",
-            command: &["bun", "run", "coverage"],
+            id: "docs.rustdoc",
+            title: "Rust documentation build",
+            surface: "all public Rust crates",
+            purpose: "Prove public API documentation compiles after the cutover.",
+            command: &["cargo", "doc", "--workspace", "--no-deps"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },
@@ -216,14 +216,14 @@ fn handoff_lanes() -> Vec<QaLane> {
             title: "Rust benchmark receipts",
             surface: "Rust facade, scheduler, queue, service composition",
             purpose: "Expose migrated-runtime performance drift without brittle local thresholds.",
-            command: &["bun", "run", "bench"],
+            command: &["cargo", "run", "-p", "memory-engine-bench"],
             gating: false,
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
             id: "ci.canonical",
             title: "Canonical Dagger CI gate",
-            surface: "install, typecheck, Biome, coverage, Gitleaks",
+            surface: "Rust fmt, test, clippy, doc, and Gitleaks",
             purpose: "Prove handoff quality with the repository gate, not adjacent evidence.",
             command: &["bun", "run", "ci"],
             gating: true,
@@ -385,7 +385,7 @@ mod tests {
 
         assert_eq!(local.len(), 12);
         assert_eq!(full.len(), 13);
-        assert_eq!(local.first().map(|lane| lane.id), Some("static.typecheck"));
+        assert_eq!(local.first().map(|lane| lane.id), Some("static.rustfmt"));
         assert_eq!(full.last().map(|lane| lane.id), Some("ci.canonical"));
         assert!(!local.iter().any(|lane| lane.id == "ci.canonical"));
         assert!(local
@@ -410,12 +410,15 @@ mod tests {
 
     #[test]
     fn shell_quoting_matches_the_old_receipt_shape() {
-        assert_eq!(quote_shell_arg("tests/grader/"), "tests/grader/");
+        assert_eq!(
+            quote_shell_arg("crates/memory-engine-core"),
+            "crates/memory-engine-core"
+        );
         assert_eq!(quote_shell_arg("two words"), "'two words'");
         assert_eq!(quote_shell_arg("a'b"), "'a'\\''b'");
         assert_eq!(
-            shell_command(&["bun", "test", "tests/api/module-exports.test.ts"]),
-            "bun test tests/api/module-exports.test.ts"
+            shell_command(&["cargo", "test", "-p", "memory-engine-core"]),
+            "cargo test -p memory-engine-core"
         );
     }
 }

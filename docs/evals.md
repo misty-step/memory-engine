@@ -11,10 +11,12 @@ features build on top of changed behavior.
 Run:
 
 ```sh
-bun test tests/evals/regression-corpus.test.ts
+cargo test -p memory-engine
+cargo test -p memory-engine-core
 ```
 
-The first corpus replays stable fixture data through live API surfaces:
+The Rust facade and core tests replay stable fixture data through live API
+surfaces:
 
 - grading fixtures through `Grader`
 - scheduler fixtures through `next`

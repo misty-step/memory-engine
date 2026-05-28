@@ -66,10 +66,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memory-engine-coverage"
-version = "0.0.0"
-
-[[package]]
 name = "memory-engine-generation"
 version = "0.0.0"
 dependencies = [

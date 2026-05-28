@@ -65,7 +65,7 @@ the HTTP route stays `/next` for TypeScript web-shell parity.
 - Prompt copy, confidence copy, answer draft state, and layout state stay
   outside the kernel.
 - The web shell did not require a UI framework dependency or changes under
-  `src/`.
+  `crates/memory-engine-core`.
 - `memory-engine-service` exposes a read-only `store()` accessor so app shells
   can build compact view DTOs without moving or reassembling the service-owned
   workflow.

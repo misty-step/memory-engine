@@ -1,34 +1,18 @@
 /**
  * Memory Engine CI pipeline.
  *
- * One canonical place to run typecheck, lint, coverage-enforced tests,
- * and secret scanning against a Bun workspace. Each function mounts the
- * source, installs dependencies, and runs the corresponding package script.
- * The coverage gate uses Rust to enforce the floor while Bun remains the
- * TypeScript oracle test runner. The `check` function runs all gates in
- * sequence and is what CI and agents should invoke before proposing a merge.
+ * One canonical place to run Rust formatting, tests, linting, documentation,
+ * and secret scanning. Each function mounts the source and runs the
+ * corresponding Cargo command. The `check` function runs all gates in sequence
+ * and is what CI and agents should invoke before proposing a merge.
  */
 import { type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
 
-const BUN_IMAGE = 'oven/bun:1.3.9-alpine';
 const GITLEAKS_IMAGE = 'zricethezav/gitleaks:v8.30.0';
 const RUST_IMAGE = 'rust:1.94-bookworm';
 
 @object()
 export class MemoryEngine {
-  /**
-   * Base container with source mounted and dependencies installed.
-   */
-  @func()
-  base(source: Directory): Container {
-    return dag
-      .container()
-      .from(BUN_IMAGE)
-      .withMountedDirectory('/src', source)
-      .withWorkdir('/src')
-      .withExec(['bun', 'install', '--frozen-lockfile']);
-  }
-
   /**
    * Base Rust container with formatting and lint components available.
    */
@@ -40,57 +24,6 @@ export class MemoryEngine {
       .withMountedDirectory('/src', source)
       .withWorkdir('/src')
       .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
-  }
-
-  /**
-   * Base Rust container with Bun installed for coverage oracle execution.
-   */
-  @func()
-  coverageBase(source: Directory): Container {
-    return dag
-      .container()
-      .from(RUST_IMAGE)
-      .withMountedDirectory('/src', source)
-      .withWorkdir('/src')
-      .withExec([
-        'bash',
-        '-lc',
-        'apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*',
-      ])
-      .withExec(['bash', '-lc', 'curl -fsSL https://bun.sh/install | bash'])
-      .withExec(['bash', '-lc', '/root/.bun/bin/bun install --frozen-lockfile']);
-  }
-
-  /**
-   * Run `bun run typecheck`.
-   */
-  @func()
-  async typecheck(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'typecheck']).stdout();
-  }
-
-  /**
-   * Run `bun run check` (Biome lint + format).
-   */
-  @func()
-  async lint(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'check']).stdout();
-  }
-
-  /**
-   * Run `bun test`.
-   */
-  @func()
-  async test(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'test']).stdout();
-  }
-
-  /**
-   * Run `bun run coverage` to enforce the repository coverage floor.
-   */
-  @func()
-  async coverage(source: Directory): Promise<string> {
-    return this.coverageBase(source).withExec(['/root/.bun/bin/bun', 'run', 'coverage']).stdout();
   }
 
   /**
@@ -142,25 +75,17 @@ export class MemoryEngine {
   }
 
   /**
-   * Run every gate in sequence: typecheck → lint/format →
-   * coverage-enforced tests → secrets scan. A non-zero exit on any
-   * gate fails the pipeline. Returns a concatenated log on success.
+   * Run every gate in sequence. A non-zero exit on any gate fails the pipeline.
+   * Returns a concatenated log on success.
    */
   @func()
   async check(source: Directory): Promise<string> {
-    const base = this.base(source);
-    const typecheck = await base.withExec(['bun', 'run', 'typecheck']).stdout();
-    const lint = await base.withExec(['bun', 'run', 'check']).stdout();
-    const coverage = await this.coverage(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
     const rustClippy = await this.rustClippy(source);
     const rustDoc = await this.rustDoc(source);
     const secrets = await this.secrets(source);
     return [
-      `=== typecheck ===\n${typecheck}`,
-      `=== lint ===\n${lint}`,
-      `=== coverage ===\n${coverage}`,
       `=== rust fmt ===\n${rustFmt}`,
       `=== rust test ===\n${rustTest}`,
       `=== rust clippy ===\n${rustClippy}`,

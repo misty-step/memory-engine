@@ -10,10 +10,10 @@ created: 2026-05-28
 
 ## Context
 
-`memory-engine` is still a Bun/TypeScript kernel plus repo-local dogfood
-experiments. The target state is a Rust application and Rust library substrate
-with the same product behavior, stronger type boundaries, and parity evidence
-against the current TypeScript implementation until cutover.
+`memory-engine` is now a Rust kernel, service, persistence, generation, study,
+and local app workspace. The target state is a Rust application and Rust
+library substrate with the same product behavior, stronger type boundaries, and
+parity evidence preserved from the former TypeScript implementation.
 
 The migration must not flatten the design into shallow wrappers. Rust modules
 should hide scheduling, grading, progression, queue, persistence, and interface
@@ -21,13 +21,13 @@ details behind deep APIs that carry the domain semantics.
 
 ## Scope
 
-- Add a Rust workspace beside the existing TypeScript code.
+- Add a Rust workspace and cut the runtime over from the former TypeScript code.
 - Port the pure kernel first: domain types, deterministic grading,
   progression eligibility, queue selection, and scheduler semantics.
 - Keep TypeScript tests and experiments green as the migration oracle until a
-  Rust replacement covers the same behavior.
+  Rust replacement covers the same behavior, then delete them.
 - Migrate service, persistence, beta generation, beta study UI/API, CLI
-  experiments, and package exports in later slices.
+  experiments, QA, benchmarks, and package exports.
 - Remove the TypeScript runtime only after Rust has executable parity for the
   published API and the beta-study application.
 
@@ -58,8 +58,8 @@ details behind deep APIs that carry the domain semantics.
 - `cargo doc --workspace --no-deps`
 - `bun run ci:local`
 - `bun run ci`
-- Rust parity docs identify what is migrated, what is still TypeScript-owned,
-  and the cutover evidence required before deleting TypeScript code.
+- Rust parity docs identify what was migrated, what was deleted, and the
+  hardening evidence required after cutover.
 - The beta-study app remains locally runnable during the migration.
 
 ## Migration Slices
@@ -104,20 +104,21 @@ details behind deep APIs that carry the domain semantics.
   tests. The TypeScript CLI experiment remains only as a migration oracle.
 - 2026-05-28: Added `memory-engine-import` with a Rust authored-content import
   probe, canonical prompt / queue / schedule compilation, service-loop receipt,
-  and boundary tests. The TypeScript import experiment remains only as a
-  migration oracle.
+  and boundary tests. The TypeScript import experiment was later deleted after
+  Rust parity landed.
 - 2026-05-28: Added `memory-engine-web-shell` with Rust learner-facing session
   choreography, compact view DTOs, reveal handling, web-shell receipt output,
   and HTTP route tests over the Rust service boundary. The TypeScript web-shell
-  experiment remains only as a migration oracle.
+  experiment was later deleted after Rust parity landed.
 - 2026-05-28: Added the consumer-facing `memory-engine` Rust facade crate,
-  with root and modular API tests that mirror the current TypeScript package
+  with root and modular API tests that mirror the former TypeScript package
   export ergonomics while preserving deep ownership in the existing Rust crates.
-  TypeScript package exports remain as the migration oracle until final cutover.
+  The TypeScript package exports were later deleted after Rust facade parity
+  landed.
 - 2026-05-28: Added `fixtures/service-command-scenarios.json` and replay tests
-  in both TypeScript and Rust for service record-attempt, grade/apply-review,
-  next-queue, and progression-unlock scenarios. Rust `NextQueueOptions` now
-  deserializes missing option fields through explicit defaults to match the
+  for service record-attempt, grade/apply-review, next-queue, and
+  progression-unlock scenarios. Rust `NextQueueOptions` now deserializes
+  missing option fields through explicit defaults to match the former
   TypeScript command ergonomics.
 - 2026-05-28: Added the Rust facade `testkit` module with grading, recitation,
   scheduler, progression, and queue fixtures replayed through the public Rust
@@ -136,12 +137,10 @@ details behind deep APIs that carry the domain semantics.
   historical performance budgets exist.
 - 2026-05-28: Replaced the TypeScript QA runner with `memory-engine-qa`, a Rust
   receipt runner that preserves local/full lane selection, command receipts,
-  gating versus warning behavior, and the canonical Dagger lane while keeping
-  remaining TypeScript oracle tests explicit until final deletion.
-- 2026-05-28: Replaced the TypeScript coverage gate with
-  `memory-engine-coverage`, a Rust command that still runs Bun's TypeScript
-  coverage oracle but owns coverage summary parsing and the 80% function/line
-  floor enforcement.
+  gating versus warning behavior, and the canonical Dagger lane.
+- 2026-05-28: Retired the TypeScript/Bun coverage gate after the oracle tests
+  were deleted; Rust workspace tests, Clippy, rustdoc, QA, and Dagger are now
+  the executable confidence path.
 - 2026-05-28: Deleted the TypeScript CLI review, import probe, and web-shell
   dogfood oracles after their Rust crates owned receipt, service-loop, session,
   and HTTP route parity. The web-shell HTML asset remains shared by the Rust
@@ -162,3 +161,7 @@ details behind deep APIs that carry the domain semantics.
   oracle after `memory-engine-service` owned typed command/result envelopes,
   shared service fixtures, store failure propagation, queue selection, and JSON
   kind-tag parity.
+- 2026-05-28: Deleted the remaining TypeScript package facade, testkit, and Bun
+  oracle tests after the Rust facade, core, testkit, service, persistence,
+  generation, study, app, dogfood, benchmark, QA, and Dagger gates covered the
+  migration surfaces. Root package scripts now dispatch to Rust commands.

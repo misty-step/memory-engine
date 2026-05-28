@@ -31,7 +31,7 @@ pub struct CliReviewReceipt {
     pub graded_rating: u8,
     pub scheduled_reps: u32,
     pub next_review_unit_id: Option<String>,
-    pub stayed_outside_src: Vec<String>,
+    pub stayed_outside_kernel: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -236,7 +236,7 @@ pub fn run_cli_review() -> Result<CliReviewReceipt, CliReviewError> {
             .candidate
             .as_ref()
             .map(|candidate| candidate.review_unit_id.as_str().to_owned()),
-        stayed_outside_src: vec![
+        stayed_outside_kernel: vec![
             "fixture content".to_owned(),
             "confidence capture".to_owned(),
             "calibration metric".to_owned(),
@@ -345,7 +345,7 @@ mod tests {
             Some("cli-pater-opening")
         );
         assert!(receipt
-            .stayed_outside_src
+            .stayed_outside_kernel
             .contains(&"confidence capture".to_owned()));
     }
 
