@@ -6,7 +6,7 @@ Refs-backlog: 15
 
 The service prototype lives in `crates/memory-engine-service`, outside the
 published pure kernel. It is a contract probe for a future dedicated memory
-service, not a new runtime surface for the TypeScript package.
+service, not a new runtime surface for the pure kernel facade.
 
 The first command envelope has three commands:
 
@@ -37,8 +37,8 @@ The first command envelope has three commands:
 ## Boundary Decision
 
 Storage stays behind `MemoryServiceStore`. The prototype may orchestrate kernel
-calls, but it does not make `src/` aware of persistence, framework lifecycles,
-network clients, or product workflow policy.
+calls, but it does not make `crates/memory-engine-core` aware of persistence,
+framework lifecycles, network clients, or product workflow policy.
 
 `grade/apply-review` hands the graded attempt and the new schedule state to the
 store through one `apply_review` boundary method so a future repository can make

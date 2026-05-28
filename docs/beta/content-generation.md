@@ -75,7 +75,7 @@ generation can be evaluated rather than hand-waved.
 ## Kernel Boundary
 
 No generation code, provider SDK, prompt template, vector index, source parser,
-or persistence dependency was added under `src/`.
+or persistence dependency was added under `crates/memory-engine-core`.
 
 The kernel currently owns only stable learning behavior:
 

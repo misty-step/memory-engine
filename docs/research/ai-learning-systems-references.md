@@ -108,7 +108,7 @@ and which should stay out of the pure kernel until proven by dogfood evidence.
 ## Beta AI Workflow Requirements
 
 The beta interface may need a database immediately. That does not imply the
-published `src/` kernel should own one. The product shell should persist enough
+published pure kernel should own one. The product shell should persist enough
 state to make AI-assisted learning usable and auditable:
 
 - `SourceDocument`: user-entered text, uploaded file metadata, link metadata,
@@ -177,7 +177,7 @@ Only shape these after dogfood pressure:
 
 ### Boundary Rules
 
-- No provider SDKs in `src/`.
+- No provider SDKs in `crates/memory-engine-core`.
 - No vector store or prompt template in the kernel.
 - No model output accepted without schema validation and behavior evals.
 - No AI-generated content promoted to testkit without provenance.

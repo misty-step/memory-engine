@@ -26,11 +26,12 @@ Belongs to the kernel/API:
 
 - canonical `Prompt`, `QueueCandidate`, `ScheduleState`, grading, scheduling,
   progression, and queue semantics;
-- pure functions and package exports under `src/`;
+- pure functions in `crates/memory-engine-core` and facade exports from
+  `crates/memory-engine`;
 - fixture/eval contracts that prove shared learning behavior.
 
 No filesystem, database, provider SDK, network, or UI code is added under
-`src/`.
+`crates/memory-engine-core`.
 
 ## Storage Shape
 
@@ -99,7 +100,8 @@ fixtures only. Source documents carry a permission label:
 - `model-eligible`: may be used by a product-level generation workflow.
 
 This label is recorded but not enforced by the kernel. Enforcement belongs to
-future beta generation and provider-adapter code outside `src/`.
+future beta generation and provider-adapter code outside
+`crates/memory-engine-core`.
 
 ## Extraction Criteria
 
@@ -113,7 +115,7 @@ true:
   provenance stabilize across more than one workflow.
 - graduated activity metadata, quiz/exercise drafts, and worked-solution
   records prove reusable across multiple beta workflows without importing
-  provider, UI, or persistence concepts into `src/`.
+  provider, UI, or persistence concepts into `crates/memory-engine-core`.
 
 Until then, `crates/memory-engine-persistence` is a dogfood spine, not the
 memory-engine database.

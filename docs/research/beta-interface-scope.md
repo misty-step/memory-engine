@@ -17,7 +17,7 @@ study sessions while preserving the pure `memory-engine` kernel boundary.
 ## Strategic Decision
 
 Build the beta interface in this repository as an experiment, with its own
-local persistence and product workflow outside `src/`.
+local persistence and product workflow outside `crates/memory-engine-core`.
 
 The interface must save content, generated quiz/exercise drafts, approved
 review units, attempts, schedule updates, reference material, generation

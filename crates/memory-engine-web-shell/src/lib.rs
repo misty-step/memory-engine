@@ -1,7 +1,7 @@
 //! Rust web-shell dogfood host.
 //!
 //! This crate owns learner-facing session choreography, reveal state, compact
-//! view DTOs, HTTP parsing, and static HTML delivery. The reusable service owns
+//! view DTOs, HTTP parsing, and server-rendered HTML delivery. The reusable service owns
 //! grading, scheduling, and queue selection.
 
 use std::{
@@ -22,7 +22,6 @@ use memory_engine_service::{
 };
 use serde::{Deserialize, Serialize};
 
-const INDEX_HTML: &str = include_str!("../../../experiments/web-shell/index.html");
 const NOW: i64 = 1_779_984_000_000;
 
 const INTERFACE_PRESSURE: [&str; 3] = [
@@ -526,6 +525,7 @@ pub fn serve(config: &WebShellConfig) -> Result<(), WebShellError> {
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -538,16 +538,17 @@ pub struct HttpResponse {
 
 pub fn route(session: &mut WebShellSession, request: &HttpRequest) -> HttpResponse {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => HttpResponse::html(INDEX_HTML),
+        ("GET", "/") => HttpResponse::html(&render_page(&session.view())),
         ("GET", "/state") => HttpResponse::json(200, &session.view()),
-        ("POST", "/reveal") => view_response(session.reveal()),
+        ("POST", "/reveal") => response_for(request, session.reveal()),
         ("POST", "/answer") => match read_answer(&request.body) {
-            Ok(answer) => {
-                view_response(session.submit_answer(answer.answer, answer.response_time_ms))
-            }
+            Ok(answer) => response_for(
+                request,
+                session.submit_answer(answer.answer, answer.response_time_ms),
+            ),
             Err(error) => HttpResponse::bad_request(&error),
         },
-        ("POST", "/next") => view_response(session.advance()),
+        ("POST", "/next") => response_for(request, session.advance()),
         _ => HttpResponse::plain(404, "Not found"),
     }
 }
@@ -591,8 +592,15 @@ impl HttpRequest {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing path"))?;
         let path = target.split('?').next().unwrap_or(target).to_owned();
-        let content_length = lines
+        let headers = lines
             .filter_map(|line| line.split_once(':'))
+            .collect::<Vec<_>>();
+        let content_type = headers.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        });
+        let content_length = headers
+            .iter()
             .find_map(|(name, value)| {
                 name.eq_ignore_ascii_case("content-length")
                     .then(|| value.trim().parse::<usize>().ok())
@@ -615,8 +623,19 @@ impl HttpRequest {
         Ok(Self {
             method,
             path,
+            content_type,
             body: bytes[body_start..body_start + content_length].to_vec(),
         })
+    }
+
+    fn is_form_post(&self) -> bool {
+        self.method == "POST"
+            && self.content_type.as_deref().is_some_and(|content_type| {
+                content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim() == "application/x-www-form-urlencoded")
+            })
     }
 }
 
@@ -688,7 +707,38 @@ fn view_response(result: Result<WebShellView, WebShellError>) -> HttpResponse {
     }
 }
 
+fn response_for(
+    request: &HttpRequest,
+    result: Result<WebShellView, WebShellError>,
+) -> HttpResponse {
+    if request.is_form_post() {
+        match result {
+            Ok(view) => HttpResponse::html(&render_page(&view)),
+            Err(error) => HttpResponse::plain(500, &error.to_string()),
+        }
+    } else {
+        view_response(result)
+    }
+}
+
 fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
+    if !looks_like_json(body) {
+        let fields = parse_form(body)?;
+        let answer = form_required(&fields, "answer")?;
+        let response_time_ms = fields
+            .iter()
+            .find_map(|(key, value)| (key == "responseTimeMs").then_some(value))
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| "responseTimeMs must be a positive integer".to_owned())?;
+        if response_time_ms == 0 {
+            return Err("responseTimeMs must be a positive integer".to_owned());
+        }
+        return Ok(AnswerPayload {
+            answer,
+            response_time_ms,
+        });
+    }
+
     let payload: AnswerPayload = serde_json::from_slice(body)
         .map_err(|error| format!("Request body must be an answer object: {error}"))?;
     if payload.answer.trim().is_empty() {
@@ -700,6 +750,187 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
 
     Ok(payload)
 }
+
+fn looks_like_json(body: &[u8]) -> bool {
+    body.iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| byte == b'{')
+}
+
+fn parse_form(body: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let text = std::str::from_utf8(body).map_err(|error| format!("invalid form body: {error}"))?;
+    text.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            Ok((percent_decode(key)?, percent_decode(value)?))
+        })
+        .collect()
+}
+
+fn form_required(fields: &[(String, String)], key: &str) -> Result<String, String> {
+    let value = fields
+        .iter()
+        .find_map(|(field_key, value)| (field_key == key).then(|| value.clone()))
+        .ok_or_else(|| format!("{key} must be a non-empty string"))?;
+    if value.trim().is_empty() {
+        Err(format!("{key} must be a non-empty string"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn percent_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .map_err(|error| format!("invalid percent encoding: {error}"))?;
+                let byte = u8::from_str_radix(hex, 16)
+                    .map_err(|_| format!("invalid percent encoding: %{hex}"))?;
+                decoded.push(byte);
+                index += 3;
+            }
+            b'%' => return Err("truncated percent encoding".to_owned()),
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|error| format!("invalid utf-8 form value: {error}"))
+}
+
+fn render_page(view: &WebShellView) -> String {
+    let mut html = page_head("Memory Engine Web Shell");
+    html.push_str("<main><section class=\"study\"><header><strong>Web Shell</strong><span>");
+    html.push_str(&escape_html(&format!("{:?}", view.status)).to_lowercase());
+    html.push_str("</span></header>");
+    render_current(&mut html, view.current.as_ref());
+    html.push_str("</section><aside>");
+    render_summary(&mut html, view);
+    render_queue(&mut html, view);
+    render_pressure(&mut html, view);
+    html.push_str("</aside></main></body></html>");
+    html
+}
+
+fn page_head(title: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>{}</style></head><body>",
+        escape_html(title),
+        CSS
+    )
+}
+
+fn render_current(html: &mut String, current: Option<&WebShellCurrent>) {
+    html.push_str("<div class=\"prompt\"><div class=\"kind\"><span>fixture</span><span>service review</span></div><h1>");
+    html.push_str(&current.map_or_else(
+        || "No active review unit.".to_owned(),
+        |current| escape_html(&current.prompt),
+    ));
+    html.push_str("</h1>");
+    if let Some(current) = current {
+        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
+        if let Some(expected) = &current.expected_answer {
+            html.push_str("<div class=\"answer\">");
+            html.push_str(&escape_html(expected));
+            html.push_str("</div>");
+        }
+        if let Some(grade) = &current.grade {
+            html.push_str("<div class=\"grade\">");
+            html.push_str(&escape_html(&format!(
+                "{:?} rating {}",
+                grade.verdict, grade.rating
+            )));
+            html.push_str("</div>");
+        }
+        if let Some(review_state) = &current.review_state {
+            html.push_str("<div class=\"solution\">");
+            html.push_str(&escape_html(&format!(
+                "{:?}, {} reps, due {}",
+                review_state.state, review_state.reps, review_state.due
+            )));
+            html.push_str("</div>");
+        }
+    }
+    html.push_str("</div>");
+}
+
+fn render_summary(html: &mut String, view: &WebShellView) {
+    html.push_str("<section class=\"panel\"><h2>State</h2><dl><dt>Fixture</dt><dd>");
+    html.push_str(&escape_html(&view.fixture));
+    html.push_str("</dd><dt>Attempts</dt><dd>");
+    html.push_str(&view.attempts.to_string());
+    html.push_str("</dd><dt>Commands</dt><dd>");
+    html.push_str(&view.commands.len().to_string());
+    html.push_str("</dd></dl></section>");
+}
+
+fn render_queue(html: &mut String, view: &WebShellView) {
+    html.push_str("<section class=\"panel\"><h2>Queue</h2><ol>");
+    for row in &view.queue {
+        html.push_str("<li><strong>");
+        html.push_str(&escape_html(row.review_unit_id.as_str()));
+        html.push_str("</strong>");
+        html.push_str(&escape_html(&format!("{} reps, due {}", row.reps, row.due)));
+        html.push_str("</li>");
+    }
+    html.push_str("</ol></section>");
+}
+
+fn render_pressure(html: &mut String, view: &WebShellView) {
+    html.push_str("<section class=\"panel\"><h2>Interface Pressure</h2><ul>");
+    for pressure in &view.interface_pressure {
+        html.push_str("<li>");
+        html.push_str(&escape_html(pressure));
+        html.push_str("</li>");
+    }
+    html.push_str("</ul></section>");
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+const CSS: &str = r"
+body{margin:0;background:#f6f7f9;color:#202327;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+*{box-sizing:border-box}
+main{min-height:100vh;display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,360px)}
+.study{min-width:0;display:grid;grid-template-rows:auto minmax(0,1fr);padding:24px}
+header,.actions{display:flex;align-items:center;justify-content:space-between;gap:12px}
+header{border-bottom:1px solid #d8dee5;padding-bottom:16px;color:#58616d;font-size:14px}
+.prompt{width:min(100%,760px);align-self:center;padding:28px 0}
+h1{margin:0 0 18px;font-size:34px;line-height:1.12;letter-spacing:0}
+.kind,.actions{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.kind span{border:1px solid #b8c2cc;border-radius:6px;padding:5px 8px;background:#fff;color:#45505b;font-size:13px;font-weight:650}
+label{display:block;margin-bottom:8px;color:#58616d;font-size:14px;font-weight:650}
+textarea{width:100%;min-height:116px;resize:vertical;border:1px solid #b8c2cc;border-radius:6px;padding:12px 14px;background:#fff;color:#202327;font:inherit;line-height:1.45}
+button{min-height:40px;border:1px solid #1f5b6b;border-radius:6px;padding:0 14px;background:#1f5b6b;color:#fff;font:inherit;font-weight:700;cursor:pointer}
+button.secondary{background:#fff;color:#1f5b6b}
+.answer,.grade,.solution{margin-top:12px;min-height:24px;overflow-wrap:anywhere;font-size:15px;font-weight:650}.answer{color:#1f5b6b}.grade{color:#754222}.solution{color:#45505b;font-weight:500}
+aside{min-width:0;border-left:1px solid #d8dee5;background:#fff}
+section.panel{border-bottom:1px solid #d8dee5;padding:20px}
+h2{margin:0 0 14px;font-size:15px;line-height:1.2;letter-spacing:0}
+dl{display:grid;grid-template-columns:1fr auto;gap:9px 14px;margin:0;color:#58616d;font-size:14px}
+dd{margin:0;color:#202327;font-weight:700;text-align:right;overflow-wrap:anywhere}
+ol,ul{display:grid;gap:9px;margin:0;padding-left:18px;color:#58616d;font-size:14px}
+li strong{display:block;color:#202327;overflow-wrap:anywhere}
+@media(max-width:760px){main{grid-template-columns:1fr}.study{display:block;min-height:auto;padding:18px}h1{font-size:28px}aside{border-left:0;border-top:1px solid #d8dee5}}
+";
 
 fn units_from_compiled(compiled: &CompiledImportProbe) -> Result<Vec<WebShellUnit>, WebShellError> {
     compiled
@@ -802,7 +1033,9 @@ fn reason_phrase(status: u16) -> &'static str {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{route, run_web_shell_flow, HttpRequest, WebShellSession, WebShellStatus};
+    use super::{
+        looks_like_json, route, run_web_shell_flow, HttpRequest, WebShellSession, WebShellStatus,
+    };
 
     #[test]
     fn drives_reveal_review_and_queue_choreography_through_the_service_boundary() {
@@ -908,6 +1141,11 @@ mod tests {
         assert!(String::from_utf8(html.body)
             .expect("html")
             .contains("Memory Engine Web Shell"));
+        assert!(
+            !String::from_utf8(route(&mut shell, &request("GET", "/", "")).body)
+                .expect("html")
+                .contains("<script")
+        );
 
         let state = route(&mut shell, &request("GET", "/state", ""));
         assert_eq!(state.status, 200);
@@ -930,10 +1168,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serves_phone_forms_without_browser_javascript() {
+        let mut shell = WebShellSession::new();
+        shell.start().expect("start");
+
+        let revealed = route(&mut shell, &form_request("/reveal", ""));
+        assert_eq!(revealed.status, 200);
+        assert_eq!(revealed.content_type, "text/html; charset=utf-8");
+        let revealed = String::from_utf8(revealed.body).expect("revealed html");
+        assert!(revealed.contains("I believe in one God"));
+        assert!(!revealed.contains("<script"));
+
+        let answered = route(
+            &mut shell,
+            &form_request("/answer", "answer=I+believe+in+one+God&responseTimeMs=2400"),
+        );
+        assert_eq!(answered.status, 200);
+        let answered = String::from_utf8(answered.body).expect("answered html");
+        assert!(answered.contains("Correct rating 4"));
+        assert!(!answered.contains("<script"));
+    }
+
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {
         HttpRequest {
             method: method.to_owned(),
             path: path.to_owned(),
+            content_type: looks_like_json(body.as_bytes()).then(|| "application/json".to_owned()),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn form_request(path: &str, body: &str) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_owned(),
+            path: path.to_owned(),
+            content_type: Some("application/x-www-form-urlencoded".to_owned()),
             body: body.as_bytes().to_vec(),
         }
     }

@@ -115,16 +115,19 @@ probe:
 
 `crates/memory-engine-beta-app` now ports the local beta-study HTTP host:
 
-- serves the existing mobile `index.html` from a Rust binary;
+- serves a phone-friendly HTML/form interface rendered by the Rust binary;
 - exposes the existing `/state`, `/source`, `/generate`, `/approve`, `/reveal`,
   `/answer`, and `/next` routes over the Rust `memory-engine-study` session;
 - validates malformed JSON payloads before touching session state;
+- accepts URL-encoded form submissions for browser flows while preserving the
+  JSON API contract for tests and external clients;
 - keeps HTTP parsing/status-code mapping in the app host, not in the kernel,
   service, persistence, generation, or study crates.
 
 The former TypeScript beta-study session and server were deleted after the Rust
 study and beta-app crates covered session, persistence, and HTTP route parity.
-The web UI markup is still shared from `experiments/beta-study/index.html`.
+The former static HTML/JavaScript asset was deleted after the Rust host owned
+the browser markup and form flow.
 
 `crates/memory-engine-cli` now ports the CLI review dogfood path:
 
@@ -150,8 +153,10 @@ The web UI markup is still shared from `experiments/beta-study/index.html`.
 - keeps reveal status, compact review-state DTOs, prompt copy, answer draft
   flow, and interface-pressure receipt formatting in the shell boundary;
 - drives `next-queue` and `grade/apply-review` through `memory-engine-service`;
-- serves the existing web-shell HTML and `/state`, `/reveal`, `/answer`, and
-  `/next` routes from a Rust binary.
+- serves Rust-rendered HTML forms and `/state`, `/reveal`, `/answer`, and
+  `/next` routes from a Rust binary;
+- preserves JSON route responses for programmatic clients while returning HTML
+  after browser form submissions;
 - emits the web-shell extraction receipt with `bun run rust:web-shell:receipt`
   so dogfood QA no longer needs to launch the TypeScript shell for receipts.
 
@@ -203,10 +208,10 @@ hardening after cutover should focus on:
 | Service | Deleted TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
 | Persistence | Deleted TypeScript `experiments/beta-store/` | Rust persistence crate | Store commit/restart tests |
 | Beta generation | Deleted TypeScript `experiments/beta-generation/` | Rust generation crate | Deterministic generation fixture parity |
-| Beta study app | Deleted TypeScript runtime under `experiments/beta-study/`; HTML asset retained | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
+| Beta study app | Deleted TypeScript runtime and static HTML under `experiments/beta-study/` | Rust session/API, HTTP host, and rendered form UI | Phone/browser smoke on Rust host |
 | CLI dogfood | Deleted TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
 | Import probe | Deleted TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
-| Web shell | Deleted TypeScript runtime under `experiments/web-shell/`; HTML asset retained | Rust web-shell crate port | Session, receipt, and HTTP route parity |
+| Web shell | Deleted TypeScript runtime and static HTML under `experiments/web-shell/` | Rust web-shell crate and rendered form UI | Session, receipt, and HTTP route parity |
 | Bench receipts | Deleted TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
 | QA receipts | Deleted TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |
 | Coverage gate | Deleted TypeScript/Bun coverage gate | Retired after TypeScript oracle deletion | Rust workspace tests, Clippy, rustdoc, QA, and Dagger gate |

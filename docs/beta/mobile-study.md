@@ -38,10 +38,10 @@ BETA_STUDY_STORE=.tmp/beta-study/store.json bun run rust:beta-study
 ```
 
 The Rust shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and
-uses the existing phone-friendly HTML layout. The former TypeScript
-`experiments/beta-study/` runtime oracle was deleted after the Rust crates
-covered session, persistence, and HTTP route parity. The HTML asset remains
-shared by the Rust host.
+renders a phone-friendly HTML/form interface. The former TypeScript
+`experiments/beta-study/` runtime oracle and static HTML/JavaScript asset were
+deleted after the Rust crates covered session, persistence, HTTP route, and
+browser form-flow parity.
 
 Browser smoke receipt on May 22, 2026:
 
@@ -77,8 +77,8 @@ Browser smoke receipt on May 22, 2026:
 - `memory-engine-service` is sufficient for `next-queue` and
   `grade/apply-review`; no package export or runtime persistence was needed.
 - Worked solutions and activity kind/stage remain beta metadata. They should not
-  move into `src/` until the graduated ladder ticket proves provider-neutral
-  semantics across more than one fixture.
+  move into `crates/memory-engine-core` until the graduated ladder ticket proves
+  provider-neutral semantics across more than one fixture.
 - Duplicate submit behavior is best handled at the interface boundary for now:
   once a local item is graded, a repeated submit returns the existing view
   instead of invoking another review.

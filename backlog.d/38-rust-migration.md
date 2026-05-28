@@ -165,3 +165,6 @@ details behind deep APIs that carry the domain semantics.
   oracle tests after the Rust facade, core, testkit, service, persistence,
   generation, study, app, dogfood, benchmark, QA, and Dagger gates covered the
   migration surfaces. Root package scripts now dispatch to Rust commands.
+- 2026-05-28: Replaced the remaining static beta-study and web-shell browser
+  assets with Rust-rendered HTML/form flows, preserving JSON routes for
+  programmatic clients and deleting the obsolete JavaScript assets.

@@ -10,8 +10,9 @@ fixture, then drives answer submission, reveal, review-state visibility, and
 queue transitions through the Rust service boundary.
 
 The former TypeScript `experiments/web-shell/` runtime oracle was deleted after
-the Rust crate covered session, receipt, and HTTP route parity. The HTML asset
-under `experiments/web-shell/index.html` remains shared by the Rust host.
+the Rust crate covered session, receipt, and HTTP route parity. The former
+static HTML/JavaScript asset was deleted after the Rust host owned the
+server-rendered form UI.
 
 ## Commands
 

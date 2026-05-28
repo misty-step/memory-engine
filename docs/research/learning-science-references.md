@@ -155,8 +155,8 @@ promoting new API surface.
 ## Beta Interface Research Requirements
 
 The next usable interface needs persistence, but persistence should live outside
-`src/` until repeated experiments prove a stable package contract. For beta
-work, the application layer should own:
+`crates/memory-engine-core` until repeated experiments prove a stable package
+contract. For beta work, the application layer should own:
 
 - local database tables or files for learner-owned content, generated prompts,
   attempts, schedules, sources, references, and generation provenance;
