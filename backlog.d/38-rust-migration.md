@@ -158,3 +158,7 @@ details behind deep APIs that carry the domain semantics.
   `memory-engine-persistence` owned durable snapshot IO, atomic commit,
   duplicate/stale review protection, queue projection, generated-draft
   validation, and camelCase wire-shape parity.
+- 2026-05-28: Deleted the TypeScript service prototype and `tests/service`
+  oracle after `memory-engine-service` owned typed command/result envelopes,
+  shared service fixtures, store failure propagation, queue selection, and JSON
+  kind-tag parity.

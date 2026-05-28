@@ -211,7 +211,7 @@ requires:
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
-| Service | TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
+| Service | Deleted TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
 | Persistence | Deleted TypeScript `experiments/beta-store/` | Rust persistence crate | Store commit/restart tests |
 | Beta generation | Deleted TypeScript `experiments/beta-generation/` | Rust generation crate | Deterministic generation fixture parity |
 | Beta study app | Deleted TypeScript runtime under `experiments/beta-study/`; HTML asset retained | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |

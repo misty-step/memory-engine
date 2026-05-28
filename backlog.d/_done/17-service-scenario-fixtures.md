@@ -8,7 +8,7 @@ estimate: M
 depends_on: [15-service-interface-prototype]
 oracles:
   - bun run ci
-  - bun test tests/service/session-flow-fixtures.test.ts
+  - cargo test -p memory-engine-service
   - test -f docs/service-scenarios.md
 ---
 
@@ -33,7 +33,7 @@ moving persistence, session choreography, or content parsing into `src/`.
 
 ## Oracle
 
-- [x] `tests/service/session-flow-fixtures.test.ts` defines at least two
+- [x] `crates/memory-engine-service/tests/command_contract.rs` defines at least two
       representative scenario fixtures: one deterministic prompt loop and one
       progression-aware queue loop.
 - [x] The fixture runner executes `record-attempt`, `grade/apply-review`, and
@@ -82,9 +82,9 @@ inspecting product-specific identity or content taxonomy.
 ### Alternatives
 
 Minimal service-fixture approach: keep all new work outside `src/`, add a
-contract-style scenario runner under `tests/service/`, and document the first
-loop evidence. This is the selected path because it tests composition while
-preserving the kernel boundary.
+contract-style scenario runner under `crates/memory-engine-service/tests/`, and
+document the first loop evidence. This is the selected path because it tests
+composition while preserving the kernel boundary.
 
 Stricter consumer-owned approach: leave scenario fixtures to the future extracted
 app and only keep unit-level command tests here. This keeps `memory-engine`

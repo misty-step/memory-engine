@@ -169,11 +169,11 @@ fn boundary_lanes() -> Vec<QaLane> {
     vec![
         QaLane {
             id: "service.prototype",
-            title: "Service prototype behavior",
-            surface: "repo-local service command boundary",
+            title: "Rust service boundary behavior",
+            surface: "memory-engine-service command boundary",
             purpose:
                 "Prove injected persistence, command flow, and failure semantics stay explicit.",
-            command: &["bun", "test", "tests/service/"],
+            command: &["cargo", "test", "-p", "memory-engine-service"],
             gating: true,
             modes: &[QaMode::Local, QaMode::Full],
         },

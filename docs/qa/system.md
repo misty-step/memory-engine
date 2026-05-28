@@ -29,7 +29,7 @@ QA evidence is organized around product quality, not implementation folders:
   stable against fixtures and regression corpus cases.
 - Contract usefulness: testkit fixtures and adapter doubles remain valid
   consumer-facing contracts.
-- Boundary clarity: the service prototype and dogfood clients keep persistence,
+- Boundary clarity: the Rust service boundary and dogfood clients keep persistence,
   UI, authored content, confidence, and session choreography outside the kernel.
 - Drift detection: evals and benchmark receipts expose behavior and performance
   changes before clients absorb them.
@@ -49,7 +49,7 @@ receipt after each lane:
 | `kernel.grader` | deterministic and rubric grading | protect one-envelope grade results and fixed verdict semantics |
 | `kernel.progression-queue` | progression and queue | prove actual learning-flow selection behavior |
 | `contracts.testkit-adapters` | `testkit` and `adapters` | prove shared fixtures and adapter doubles remain usable |
-| `service.prototype` | repo-local service boundary | prove command flow, injected persistence, and failure semantics |
+| `service.prototype` | `memory-engine-service` command boundary | prove command flow, injected persistence, and failure semantics |
 | `evals.regression-corpus` | fixtures through live API surfaces | catch semantic drift across core behaviors |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
 | `coverage.all` | all Bun tests through the Rust coverage gate | preserve broad coverage evidence |

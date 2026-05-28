@@ -27,7 +27,6 @@
     "tests/**/*.ts",
     "testkit/**/*.ts",
     "scripts/**/*.ts",
-    "service/**/*.ts",
     "experiments/**/*.ts"
   ]
 }

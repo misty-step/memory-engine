@@ -11,7 +11,7 @@ beta/product proof, or a shaped extraction decision.
 ### QI-001: Product proof is separate from package QA
 
 - Dimension: beta/product proof.
-- Current evidence: `bun run qa` proves package behavior, service prototype
+- Current evidence: `bun run qa` proves package behavior, Rust service boundary
   behavior, dogfood experiments, and Dagger CI. Historical Scry and Vault
   canaries are deprecated and are not part of current harness proof.
 - Improvement: define extra proof lanes only when a ticket changes behavior

@@ -18,7 +18,7 @@ oracles:
 ## Goal
 
 Build the first repo-local experimental client that consumes the modular API and
-service prototype from outside `src/`: a thin Bun CLI review loop over a small
+service boundary from outside `src/`: a thin Bun CLI review loop over a small
 fixture, with executable evidence of attempt recording, grading, scheduling,
 and next-queue selection.
 
@@ -29,12 +29,12 @@ and next-queue selection.
 - No durable database; a file or in-memory store is enough if the contract is
   explicit.
 - No content parser beyond a tiny fixture adapter owned by the experiment.
-- No package export for the service prototype.
+- No package export for the service boundary.
 
 ## Oracle
 
 - [ ] `experiments/cli-review/` contains a CLI client that imports public API
-      subpaths where possible and imports the repo-local service prototype only
+      subpaths where possible and imports the repo-local service boundary only
       as an experiment boundary.
 - [ ] `bun test experiments/cli-review/cli-review.test.ts` proves one review
       loop records an attempt, applies a review, updates schedule state, and
@@ -49,7 +49,7 @@ and next-queue selection.
 
 This is not a product. It is an API pressure test. If the CLI needs a reusable
 helper, first ask whether that helper belongs in `testkit`, the service
-prototype, or the future extracted client app.
+boundary, or the future extracted client app.
 
 ## Study
 

@@ -74,7 +74,7 @@ Browser smoke receipt on May 22, 2026:
 
 - `BetaPersistenceStore` is carrying the right durable shape for source,
   generation, approval, attempts, schedules, and applied-review receipts.
-- `createMemoryService` is sufficient for `next-queue` and
+- `memory-engine-service` is sufficient for `next-queue` and
   `grade/apply-review`; no package export or runtime persistence was needed.
 - Worked solutions and activity kind/stage remain beta metadata. They should not
   move into `src/` until the graduated ladder ticket proves provider-neutral
