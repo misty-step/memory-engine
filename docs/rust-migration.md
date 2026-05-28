@@ -176,6 +176,13 @@ parity checks until deletion.
   moving the orchestration runtime to Rust;
 - makes `bun run qa:local` and `bun run qa` Rust runtime commands.
 
+`crates/memory-engine-coverage` now ports the coverage floor gate:
+
+- keeps Bun as the TypeScript oracle test runner with `bun test --coverage`;
+- moves summary parsing and floor enforcement into Rust;
+- makes `bun run coverage` a Rust runtime command while preserving the same
+  80% function and line floors.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -211,3 +218,4 @@ requires:
 | Web shell | TypeScript `experiments/web-shell/` | Rust web-shell crate port | Session, receipt, and HTTP route parity |
 | Bench receipts | TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |
 | QA receipts | TypeScript `scripts/qa.ts` | Rust QA crate | Local/full lane tests plus `bun run qa` |
+| Coverage gate | TypeScript `scripts/check-coverage.ts` | Rust coverage crate | Coverage parser tests plus `bun run coverage` |

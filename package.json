@@ -30,7 +30,7 @@
     "experiments:web-shell": "bun run rust:web-shell",
     "experiments:web-shell:receipt": "bun run rust:web-shell:receipt",
     "experiments:web-shell:ts-oracle": "bun run experiments/web-shell/server.ts",
-    "coverage": "bun run scripts/check-coverage.ts",
+    "coverage": "cargo run -p memory-engine-coverage",
     "qa": "cargo run -p memory-engine-qa -- --full",
     "qa:local": "cargo run -p memory-engine-qa -- --local",
     "lint": "biome lint .",

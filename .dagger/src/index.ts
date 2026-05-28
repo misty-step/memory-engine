@@ -3,8 +3,9 @@
  *
  * One canonical place to run typecheck, lint, coverage-enforced tests,
  * and secret scanning against a Bun workspace. Each function mounts the
- * source, installs dependencies inside a Bun container, and runs the
- * corresponding package script. The `check` function runs all gates in
+ * source, installs dependencies, and runs the corresponding package script.
+ * The coverage gate uses Rust to enforce the floor while Bun remains the
+ * TypeScript oracle test runner. The `check` function runs all gates in
  * sequence and is what CI and agents should invoke before proposing a merge.
  */
 import { type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
@@ -42,6 +43,25 @@ export class MemoryEngine {
   }
 
   /**
+   * Base Rust container with Bun installed for coverage oracle execution.
+   */
+  @func()
+  coverageBase(source: Directory): Container {
+    return dag
+      .container()
+      .from(RUST_IMAGE)
+      .withMountedDirectory('/src', source)
+      .withWorkdir('/src')
+      .withExec([
+        'bash',
+        '-lc',
+        'apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*',
+      ])
+      .withExec(['bash', '-lc', 'curl -fsSL https://bun.sh/install | bash'])
+      .withExec(['bash', '-lc', '/root/.bun/bin/bun install --frozen-lockfile']);
+  }
+
+  /**
    * Run `bun run typecheck`.
    */
   @func()
@@ -70,7 +90,7 @@ export class MemoryEngine {
    */
   @func()
   async coverage(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'coverage']).stdout();
+    return this.coverageBase(source).withExec(['/root/.bun/bin/bun', 'run', 'coverage']).stdout();
   }
 
   /**
@@ -131,7 +151,7 @@ export class MemoryEngine {
     const base = this.base(source);
     const typecheck = await base.withExec(['bun', 'run', 'typecheck']).stdout();
     const lint = await base.withExec(['bun', 'run', 'check']).stdout();
-    const coverage = await base.withExec(['bun', 'run', 'coverage']).stdout();
+    const coverage = await this.coverage(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
     const rustClippy = await this.rustClippy(source);

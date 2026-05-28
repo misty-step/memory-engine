@@ -4,6 +4,7 @@ members = [
     "crates/memory-engine-beta-app",
     "crates/memory-engine-bench",
     "crates/memory-engine-cli",
+    "crates/memory-engine-coverage",
     "crates/memory-engine-core",
     "crates/memory-engine-generation",
     "crates/memory-engine-import",

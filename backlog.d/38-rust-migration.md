@@ -138,3 +138,7 @@ details behind deep APIs that carry the domain semantics.
   receipt runner that preserves local/full lane selection, command receipts,
   gating versus warning behavior, and the canonical Dagger lane while keeping
   remaining TypeScript oracle tests explicit until final deletion.
+- 2026-05-28: Replaced the TypeScript coverage gate with
+  `memory-engine-coverage`, a Rust command that still runs Bun's TypeScript
+  coverage oracle but owns coverage summary parsing and the 80% function/line
+  floor enforcement.

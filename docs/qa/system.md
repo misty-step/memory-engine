@@ -53,7 +53,7 @@ receipt after each lane:
 | `evals.regression-corpus` | fixtures through live API surfaces | catch semantic drift across core behaviors |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
 | `dogfood.ts-oracles` | TypeScript CLI, import probe, web shell | keep legacy dogfood behavior executable until TypeScript deletion |
-| `coverage.all` | all Bun tests | preserve broad coverage evidence |
+| `coverage.all` | all Bun tests through the Rust coverage gate | preserve broad coverage evidence |
 | `performance.benchmarks` | Rust facade, scheduler, queue, service | expose migrated-runtime performance drift without brittle thresholds |
 | `ci.canonical` | Dagger CI | prove install, typecheck, Biome, coverage, and Gitleaks together |
 
