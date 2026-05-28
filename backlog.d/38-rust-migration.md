@@ -154,3 +154,7 @@ details behind deep APIs that carry the domain semantics.
   `memory-engine-generation` owned source-block parsing, provenance/reference
   persistence, accepted/rejected draft validation, promotion, and source-error
   fixture parity.
+- 2026-05-28: Deleted the TypeScript beta-store oracle after
+  `memory-engine-persistence` owned durable snapshot IO, atomic commit,
+  duplicate/stale review protection, queue projection, generated-draft
+  validation, and camelCase wire-shape parity.

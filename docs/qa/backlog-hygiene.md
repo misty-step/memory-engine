@@ -47,7 +47,7 @@ handoff, trace, or commit message.
 This hygiene pass used stdout receipts rather than adding
 `memory-engine-qa --report <path>`.
 
-- `bun test experiments/beta-store/` plus
+- `cargo test -p memory-engine-persistence` plus
   `cargo test -p memory-engine-generation`: persistence and deterministic
   beta-generation proof passed.
 - `bun run check`: Biome checked 62 files with no fixes applied.

@@ -4,10 +4,10 @@ Refs-backlog: 26
 
 ## Purpose
 
-`experiments/beta-store/` is the first durable persistence proof for the
-memory-engine beta interface. It is intentionally repo-local and outside
-`src/`: the beta product needs saved state now, but the published kernel should
-remain pure until repeated clients prove a stable service contract.
+`crates/memory-engine-persistence` is the durable persistence proof for the
+memory-engine beta interface. It is intentionally repo-local and outside the
+pure kernel: the beta product needs saved state now, but the published kernel
+should remain pure until repeated clients prove a stable service contract.
 
 ## Ownership Boundary
 
@@ -115,18 +115,21 @@ true:
   records prove reusable across multiple beta workflows without importing
   provider, UI, or persistence concepts into `src/`.
 
-Until then, `experiments/beta-store/` is a dogfood spine, not the memory-engine
-database.
+Until then, `crates/memory-engine-persistence` is a dogfood spine, not the
+memory-engine database.
 
 ## Verification
 
 Ticket 26 evidence:
 
 ```sh
-bun test experiments/beta-store/
+cargo test -p memory-engine-persistence
 bun run ci
 ```
 
 The focused test suite covers restart/reload, applied-review duplicate safety,
 failed-write atomicity, realistic queue-pile reload, generated-draft validation,
 and promotion from accepted draft to review unit.
+
+The former TypeScript `experiments/beta-store/` runtime oracle was deleted
+after the Rust crate covered durable store behavior and wire-shape parity.

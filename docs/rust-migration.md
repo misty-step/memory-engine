@@ -212,7 +212,7 @@ requires:
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
 | Service | TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
-| Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
+| Persistence | Deleted TypeScript `experiments/beta-store/` | Rust persistence crate | Store commit/restart tests |
 | Beta generation | Deleted TypeScript `experiments/beta-generation/` | Rust generation crate | Deterministic generation fixture parity |
 | Beta study app | Deleted TypeScript runtime under `experiments/beta-study/`; HTML asset retained | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
 | CLI dogfood | Deleted TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |

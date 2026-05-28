@@ -8,7 +8,7 @@ estimate: M
 depends_on: [24-extraction-decision-gate]
 oracles:
   - bun run ci
-  - bun test experiments/beta-store/
+  - cargo test -p memory-engine-persistence
   - test -f docs/beta/persistence-spine.md
 ---
 
@@ -35,7 +35,7 @@ shared service contract.
 
 ## Oracle
 
-- [ ] `experiments/beta-store/` defines a durable local persistence boundary
+- [ ] `crates/memory-engine-persistence` defines a durable local persistence boundary
       outside `src/` with stores for source documents, reference spans,
       generated prompt drafts, review units, attempts, schedules, queue
       candidates, and generation runs.
@@ -69,9 +69,9 @@ shared service contract.
 
 ## Closure Evidence
 
-- Implemented in `experiments/beta-store/` with durable beta-owned persistence
+- Implemented in `crates/memory-engine-persistence` with durable beta-owned persistence
   and no runtime persistence under `src/`.
 - Documented in `docs/beta/persistence-spine.md`.
-- Verified during backlog hygiene with `bun test experiments/beta-store/`; the
-  former beta-generation TypeScript oracle has since moved to
-  `cargo test -p memory-engine-generation`.
+- The former TypeScript oracle was deleted during the Rust migration after
+  `cargo test -p memory-engine-persistence` covered durable behavior and
+  wire-shape parity.
