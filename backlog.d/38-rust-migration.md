@@ -71,3 +71,12 @@ details behind deep APIs that carry the domain semantics.
 5. Rust beta generation and study API, keeping deterministic fixtures first.
 6. Rust web/app delivery path or extracted app host.
 7. TypeScript removal after parity gates and dogfood receipt pass.
+
+## Progress
+
+- 2026-05-28: Added `memory-engine-core` for pure domain, grading,
+  progression, queue, and scheduler semantics with Rust and TypeScript parity
+  tests.
+- 2026-05-28: Added `memory-engine-service` with typed command/result
+  envelopes, store trait, deep grade/apply-review orchestration, and service
+  contract tests. Persistence and beta app cutover remain future slices.

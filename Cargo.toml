@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/memory-engine-core"]
+members = ["crates/memory-engine-core", "crates/memory-engine-service"]
 resolver = "2"
 
 [workspace.package]

@@ -35,7 +35,20 @@ the app surfaces have moved.
 - scheduler advancement through a Rust `Scheduler` trait and default
   `FsrsScheduler`, pinned to the current TypeScript FSRS-6 fixture outputs.
 
-The service boundary, persistence store, beta generation, beta-study server, and
+`crates/memory-engine-service` now ports the first command boundary:
+
+- closed `MemoryServiceCommand` and `MemoryServiceResult` enums for
+  record-attempt, grade/apply-review, and next-queue workflows;
+- `MemoryServiceStore` as the persistence trait, including the
+  `expected_prior_schedule_state` seat needed for later optimistic
+  concurrency;
+- `MemoryService` orchestration that keeps read schedule -> grade -> schedule
+  advance -> apply review as one deep operation instead of asking callers to
+  reassemble kernel helpers;
+- serde `kind` tags that match the TypeScript service envelope names for later
+  cross-runtime fixture replay.
+
+The persistence store implementation, beta generation, beta-study server, and
 web UI are still TypeScript-owned.
 
 ## Parity Strategy
@@ -47,7 +60,8 @@ requires:
 - deeper JSON fixture coverage beyond the first scheduler new/learning/review
   and relearning transitions;
 - service scenario fixtures that execute both TypeScript and Rust command
-  envelopes until cutover;
+  envelopes until cutover, including storage conflict and malformed-attempt
+  failures;
 - beta-study smoke tests against the Rust server before TypeScript deletion.
 
 ## Cutover Matrix
@@ -59,6 +73,6 @@ requires:
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
-| Service | TypeScript `service/` | Not migrated | Command scenario parity |
+| Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
 | Persistence | TypeScript `experiments/beta-store/` | Not migrated | Store commit/restart tests |
 | Beta study app | TypeScript `experiments/beta-study/` | Not migrated | Phone/browser smoke on Rust host |

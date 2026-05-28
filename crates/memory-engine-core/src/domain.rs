@@ -178,7 +178,7 @@ pub struct QueueCandidate {
     pub domain_key: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueueSeparationPass {
     pub concept: bool,
     pub source: bool,
