@@ -241,7 +241,7 @@ fn command_and_result_envelopes_keep_typescript_kind_tags() {
     let encoded = serde_json::to_value(&command).expect("command json");
 
     assert_eq!(encoded["kind"], "grade/apply-review");
-    assert_eq!(encoded["submitted_answer"], "Lord have mercy");
+    assert_eq!(encoded["submittedAnswer"], "Lord have mercy");
 
     let result = MemoryServiceResult::QueueSelected { candidate: None };
     let encoded = serde_json::to_value(&result).expect("result json");

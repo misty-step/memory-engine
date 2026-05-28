@@ -48,8 +48,21 @@ the app surfaces have moved.
 - serde `kind` tags that match the TypeScript service envelope names for later
   cross-runtime fixture replay.
 
-The persistence store implementation, beta generation, beta-study server, and
-web UI are still TypeScript-owned.
+`crates/memory-engine-persistence` now ports the first beta-store boundary:
+
+- file-backed `BetaPersistenceStore` for source documents, reference spans,
+  generation runs, generated drafts, review units, schedules, attempts, and
+  applied-review receipts;
+- typed `BetaStoreError` variants for duplicate reviews, stale schedule writes,
+  missing references, missing generation runs, and injected commit failures;
+- atomic temp-file-to-rename commits with copy-on-write snapshots so failed
+  commits do not corrupt persisted history;
+- a concrete `MemoryServiceStore` implementation for the Rust service crate;
+- camelCase beta-store envelope fields for the durable snapshot while the
+  `ScheduleState` contract remains the existing JSON-safe scheduler shape.
+
+Beta generation, the beta-study server, and the web UI are still
+TypeScript-owned.
 
 ## Parity Strategy
 
@@ -74,5 +87,5 @@ requires:
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
 | Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
-| Persistence | TypeScript `experiments/beta-store/` | Not migrated | Store commit/restart tests |
+| Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta study app | TypeScript `experiments/beta-study/` | Not migrated | Phone/browser smoke on Rust host |

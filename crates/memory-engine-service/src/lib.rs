@@ -14,6 +14,7 @@ use memory_engine_core::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceAttemptRecord {
     pub review_unit_id: ReviewUnitId,
     pub prompt_id: Option<String>,
@@ -68,6 +69,7 @@ pub trait MemoryServiceStore {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordAttemptInput {
     pub review_unit_id: ReviewUnitId,
     pub prompt_id: Option<String>,
@@ -78,11 +80,13 @@ pub struct RecordAttemptInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordAttemptCommand {
     pub attempt: RecordAttemptInput,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GradeApplyReviewCommand {
     pub prompt: Prompt,
     pub submitted_answer: String,
@@ -93,6 +97,7 @@ pub struct GradeApplyReviewCommand {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NextQueueOptions {
     pub recent_candidates: Vec<QueueCandidate>,
     pub population: Option<Vec<QueueCandidate>>,
@@ -104,6 +109,7 @@ pub struct NextQueueOptions {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NextQueueCommand {
     pub options: NextQueueOptions,
 }
@@ -115,6 +121,7 @@ pub enum MemoryServiceCommand {
         attempt: RecordAttemptInput,
     },
     #[serde(rename = "grade/apply-review")]
+    #[serde(rename_all = "camelCase")]
     GradeApplyReview {
         prompt: Prompt,
         submitted_answer: String,
@@ -129,11 +136,13 @@ pub enum MemoryServiceCommand {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttemptRecordedResult {
     pub attempt: ServiceAttemptRecord,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReviewAppliedResult {
     pub attempt: ServiceAttemptRecord,
     pub grade: GradeResult,

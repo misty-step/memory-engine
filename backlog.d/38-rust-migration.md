@@ -80,3 +80,7 @@ details behind deep APIs that carry the domain semantics.
 - 2026-05-28: Added `memory-engine-service` with typed command/result
   envelopes, store trait, deep grade/apply-review orchestration, and service
   contract tests. Persistence and beta app cutover remain future slices.
+- 2026-05-28: Added `memory-engine-persistence` with a file-backed beta
+  store, typed validation and conflict errors, atomic commit behavior, queue
+  projection, and service-store integration tests. Beta generation and app
+  server cutover remain future slices.
