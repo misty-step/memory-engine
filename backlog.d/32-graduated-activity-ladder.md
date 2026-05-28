@@ -8,7 +8,7 @@ estimate: L
 depends_on: [28-mobile-beta-study-interface, 29-service-contract-v0-hardening]
 oracles:
   - bun run ci
-  - bun test experiments/beta-study/
+  - cargo test -p memory-engine-study -p memory-engine-beta-app
   - test -f docs/beta/graduated-activity-ladder.md
 ---
 
@@ -36,7 +36,7 @@ explicit metadata before attempting broad AI-generated exercises.
 
 ## Oracle
 
-- [ ] `experiments/beta-study/` represents at least one concept with multiple
+- [ ] The Rust beta study app represents at least one concept with multiple
       activity variants and a shared concept/progression group.
 - [ ] Tests prove mastery of simpler variants can unlock harder variants
       without duplicating schedule history or losing attempt provenance.

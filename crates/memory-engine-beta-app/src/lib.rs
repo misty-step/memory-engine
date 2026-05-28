@@ -423,6 +423,49 @@ mod tests {
         assert_eq!(session.view().expect("view").summary.source_count, 0);
     }
 
+    #[test]
+    fn rejects_zero_response_time_before_touching_the_session() {
+        let directory = TempDirectory::new("zero-response-time");
+        let mut session = session(directory.path().join("study.json"));
+        route(
+            &mut session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-nato",
+                    "title": "NATO practice notes",
+                    "body": source_body()
+                })
+                .to_string(),
+            ),
+        );
+        route(&mut session, &request("POST", "/generate", "{}"));
+        route(
+            &mut session,
+            &request(
+                "POST",
+                "/approve",
+                &json!({"draftId": "study-run-1-draft-src-nato-1-nato-letter-a"}).to_string(),
+            ),
+        );
+
+        let answered = route(
+            &mut session,
+            &request(
+                "POST",
+                "/answer",
+                &json!({"answer": "ALFA", "responseTimeMs": 0}).to_string(),
+            ),
+        );
+
+        assert_eq!(answered.status, 400);
+        assert!(String::from_utf8(answered.body)
+            .expect("body")
+            .contains("responseTimeMs must be"));
+        assert_eq!(session.view().expect("view").summary.attempt_count, 0);
+    }
+
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {
         HttpRequest {
             method: method.to_owned(),

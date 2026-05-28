@@ -8,7 +8,7 @@ estimate: L
 depends_on: [26-beta-persistence-spine, 27-ai-content-generation-probe]
 oracles:
   - bun run ci
-  - bun test experiments/beta-study/
+  - cargo test -p memory-engine-study -p memory-engine-beta-app
   - test -f docs/beta/mobile-study.md
 ---
 
@@ -38,8 +38,9 @@ API ergonomics. It may own local persistence and UI state because it lives under
 
 ## Oracle
 
-- [ ] `experiments/beta-study/` provides a local mobile-responsive interface
-      over the beta store and generation probe.
+- [ ] `crates/memory-engine-study` and `crates/memory-engine-beta-app` provide
+      a local mobile-responsive interface over the beta store and generation
+      probe.
 - [ ] A code-level test drives source creation, quiz/exercise draft approval,
       queue selection, answer submission or worked-solution entry, reveal,
       grade/apply-review, next item, and persisted session summary.

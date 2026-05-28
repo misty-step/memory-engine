@@ -146,3 +146,7 @@ details behind deep APIs that carry the domain semantics.
   dogfood oracles after their Rust crates owned receipt, service-loop, session,
   and HTTP route parity. The web-shell HTML asset remains shared by the Rust
   host.
+- 2026-05-28: Deleted the TypeScript beta-study session and server oracle after
+  `memory-engine-study` and `memory-engine-beta-app` owned source, generation,
+  approval, reveal, review, restart/resume, duplicate-submit, and HTTP route
+  parity. The mobile HTML asset remains shared by the Rust host.

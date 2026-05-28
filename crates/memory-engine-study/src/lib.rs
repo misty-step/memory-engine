@@ -343,7 +343,7 @@ impl BetaStudySession {
     /// Grade an answer and atomically apply its schedule update.
     ///
     /// Duplicate submit calls after a successful grade are view-only, matching
-    /// the TypeScript beta-study session contract.
+    /// the migrated beta-study session contract.
     ///
     /// # Errors
     ///

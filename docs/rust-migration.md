@@ -123,6 +123,8 @@ probe:
 - keeps HTTP parsing/status-code mapping in the app host, not in the kernel,
   service, persistence, generation, or study crates.
 
+The former TypeScript beta-study session and server were deleted after the Rust
+study and beta-app crates covered session, persistence, and HTTP route parity.
 The web UI markup is still shared from `experiments/beta-study/index.html`.
 
 `crates/memory-engine-cli` now ports the CLI review dogfood path:
@@ -212,7 +214,7 @@ requires:
 | Service | TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
-| Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
+| Beta study app | Deleted TypeScript runtime under `experiments/beta-study/`; HTML asset retained | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
 | CLI dogfood | Deleted TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
 | Import probe | Deleted TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
 | Web shell | Deleted TypeScript runtime under `experiments/web-shell/`; HTML asset retained | Rust web-shell crate port | Session, receipt, and HTTP route parity |

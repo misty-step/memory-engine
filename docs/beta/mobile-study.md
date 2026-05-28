@@ -4,17 +4,18 @@ Refs-backlog: 28
 
 ## Purpose
 
-`experiments/beta-study/` is the first local beta interface over the persistence
-spine and deterministic generation probe. It is intentionally application-layer
-code: source input, approval state, reveal state, worked-solution display, and
-mobile UI behavior stay outside the published `src/` kernel.
+`crates/memory-engine-study` and `crates/memory-engine-beta-app` are the local
+beta interface over the persistence spine and deterministic generation probe.
+They are intentionally application-layer code: source input, approval state,
+reveal state, worked-solution display, and mobile UI behavior stay outside the
+published kernel.
 
 ## Executable Receipt
 
 Focused oracle:
 
 ```sh
-bun test experiments/beta-study/
+cargo test -p memory-engine-study -p memory-engine-beta-app
 ```
 
 Covered behaviors:
@@ -37,9 +38,10 @@ BETA_STUDY_STORE=.tmp/beta-study/store.json bun run rust:beta-study
 ```
 
 The Rust shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and
-uses the existing phone-friendly HTML layout. The legacy Bun host in
-`experiments/beta-study/server.ts` remains as a parity oracle during the
-migration.
+uses the existing phone-friendly HTML layout. The former TypeScript
+`experiments/beta-study/` runtime oracle was deleted after the Rust crates
+covered session, persistence, and HTTP route parity. The HTML asset remains
+shared by the Rust host.
 
 Browser smoke receipt on May 22, 2026:
 
