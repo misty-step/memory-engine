@@ -33,11 +33,13 @@ Covered behaviors:
 Local browser target:
 
 ```sh
-BETA_STUDY_STORE=.tmp/beta-study/store.json bun run experiments/beta-study/server.ts
+BETA_STUDY_STORE=.tmp/beta-study/store.json bun run rust:beta-study
 ```
 
-The shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and uses a
-phone-friendly single-column layout below 760px.
+The Rust shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and
+uses the existing phone-friendly HTML layout. The legacy Bun host in
+`experiments/beta-study/server.ts` remains as a parity oracle during the
+migration.
 
 Browser smoke receipt on May 22, 2026:
 

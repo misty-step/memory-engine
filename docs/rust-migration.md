@@ -89,7 +89,16 @@ probe:
 - tests that mirror the current mobile beta session flow and a JSON wire-shape
   test for the mobile API contract.
 
-The beta-study HTTP server and web UI are still TypeScript-owned.
+`crates/memory-engine-beta-app` now ports the local beta-study HTTP host:
+
+- serves the existing mobile `index.html` from a Rust binary;
+- exposes the existing `/state`, `/source`, `/generate`, `/approve`, `/reveal`,
+  `/answer`, and `/next` routes over the Rust `memory-engine-study` session;
+- validates malformed JSON payloads before touching session state;
+- keeps HTTP parsing/status-code mapping in the app host, not in the kernel,
+  service, persistence, generation, or study crates.
+
+The web UI markup is still shared from `experiments/beta-study/index.html`.
 
 ## Parity Strategy
 
@@ -102,7 +111,8 @@ requires:
 - service scenario fixtures that execute both TypeScript and Rust command
   envelopes until cutover, including storage conflict and malformed-attempt
   failures;
-- beta-study smoke tests against the Rust server before TypeScript deletion.
+- beta-study browser smoke tests against the Rust server before TypeScript
+  deletion.
 
 ## Cutover Matrix
 
@@ -116,4 +126,4 @@ requires:
 | Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
-| Beta study app | TypeScript `experiments/beta-study/` | Session/API crate port | Phone/browser smoke on Rust host |
+| Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |

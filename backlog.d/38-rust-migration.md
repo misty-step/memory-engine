@@ -94,3 +94,8 @@ details behind deep APIs that carry the domain semantics.
   reveal, grade/apply-review, queue advancement, resume, duplicate-submit
   idempotence, and mobile API JSON shape. HTTP server and web UI cutover remain
   future slices.
+- 2026-05-28: Added `memory-engine-beta-app`, a Rust HTTP host for the local
+  beta-study app. It serves the existing mobile HTML and ports `/state`,
+  `/source`, `/generate`, `/approve`, `/reveal`, `/answer`, and `/next` onto
+  the Rust study session with route tests. Shared HTML and final TypeScript
+  package/API removal remain future slices.
