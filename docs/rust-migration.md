@@ -58,6 +58,10 @@ the app surfaces have moved.
   reassemble kernel helpers;
 - serde `kind` tags that match the TypeScript service envelope names for later
   cross-runtime fixture replay.
+- shared service command scenarios in `fixtures/service-command-scenarios.json`
+  now execute against both the TypeScript service oracle and the Rust service
+  crate, covering record-attempt, grade/apply-review, next-queue, and
+  progression unlock behavior.
 
 `crates/memory-engine-persistence` now ports the first beta-store boundary:
 
@@ -153,7 +157,7 @@ requires:
 - shared JSON fixtures for grading, progression, queue, and scheduler cases;
 - deeper JSON fixture coverage beyond the first scheduler new/learning/review
   and relearning transitions;
-- service scenario fixtures that execute both TypeScript and Rust command
+- broader service failure fixtures that execute both TypeScript and Rust command
   envelopes until cutover, including storage conflict and malformed-attempt
   failures;
 - beta-study browser smoke tests against the Rust server before TypeScript
@@ -169,7 +173,7 @@ requires:
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
-| Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
+| Service | TypeScript `service/` | Rust command crate with shared scenario parity | Shared command fixtures plus failure fixture parity |
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
 | Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |

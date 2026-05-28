@@ -1,16 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
 
 use memory_engine_core::{
-    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, Rating, ReviewUnitId, ScheduleState,
-    ScheduleStatus,
+    ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, QueueCandidate, Rating,
+    ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceCommand, MemoryServiceResult,
     MemoryServiceStore, NextQueueCommand, NextQueueOptions, RecordAttemptCommand,
     RecordAttemptInput, ServiceAttemptRecord, ServiceError,
 };
+use serde::Deserialize;
 
-const NOW: i64 = 1_779_989_400_000;
+const NOW: i64 = 1_778_760_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StoreError {
@@ -27,6 +28,122 @@ struct TestStore {
     schedules: HashMap<ReviewUnitId, ScheduleState>,
     candidates: Vec<QueueCandidate>,
     fail_apply: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedScenario {
+    name: String,
+    now: i64,
+    units: Vec<SharedScenarioUnit>,
+    commands: Vec<MemoryServiceCommand>,
+    expected: Vec<ExpectedResult>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedScenarioUnit {
+    review_unit_id: ReviewUnitId,
+    #[allow(dead_code)]
+    prompt_id: String,
+    #[allow(dead_code)]
+    prompt: Prompt,
+    queue: SharedQueueFields,
+    schedule_state: Option<ScheduleState>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedQueueFields {
+    progression: Option<ProgressionMetadata>,
+    concept_key: Option<String>,
+    source_key: Option<String>,
+    domain_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum ExpectedResult {
+    #[serde(rename_all = "camelCase")]
+    AttemptRecorded { attempt: ExpectedAttempt },
+    #[serde(rename_all = "camelCase")]
+    ReviewApplied {
+        attempt: ExpectedAttempt,
+        grade: ExpectedGrade,
+        schedule_state: ScheduleState,
+    },
+    #[serde(rename_all = "camelCase")]
+    QueueSelected { candidate: Option<QueueCandidate> },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedAttempt {
+    review_unit_id: ReviewUnitId,
+    prompt_id: Option<String>,
+    submitted_answer: String,
+    response_time_ms: u32,
+    occurred_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedGrade {
+    verdict: Verdict,
+    rating: Rating,
+    is_correct: bool,
+    expected_answer: String,
+}
+
+#[derive(Default)]
+struct SharedScenarioStore {
+    known: BTreeSet<ReviewUnitId>,
+    schedules: HashMap<ReviewUnitId, ScheduleState>,
+    units: Vec<SharedScenarioUnit>,
+    now: i64,
+}
+
+impl SharedScenarioStore {
+    fn from_scenario(scenario: &SharedScenario) -> Self {
+        Self {
+            known: scenario
+                .units
+                .iter()
+                .map(|unit| unit.review_unit_id.clone())
+                .collect(),
+            schedules: scenario
+                .units
+                .iter()
+                .filter_map(|unit| {
+                    unit.schedule_state
+                        .clone()
+                        .map(|schedule| (unit.review_unit_id.clone(), schedule))
+                })
+                .collect(),
+            units: scenario.units.clone(),
+            now: scenario.now,
+        }
+    }
+
+    fn assert_known(&self, review_unit_id: &ReviewUnitId) -> Result<(), StoreError> {
+        if self.known.contains(review_unit_id) {
+            Ok(())
+        } else {
+            Err(StoreError::UnknownReviewUnit(review_unit_id.clone()))
+        }
+    }
+
+    fn assert_attempt(&self, attempt: &ServiceAttemptRecord) -> Result<(), StoreError> {
+        self.assert_known(&attempt.review_unit_id)?;
+        if attempt.submitted_answer.trim().is_empty() {
+            return Err(StoreError::BlankAnswer);
+        }
+        if attempt.response_time_ms == 0 {
+            return Err(StoreError::NonPositiveResponseTime);
+        }
+
+        Ok(())
+    }
 }
 
 impl TestStore {
@@ -101,6 +218,90 @@ impl MemoryServiceStore for TestStore {
 
     fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
         Ok(self.candidates.clone())
+    }
+}
+
+impl MemoryServiceStore for SharedScenarioStore {
+    type Error = StoreError;
+
+    fn record_attempt(&mut self, attempt: ServiceAttemptRecord) -> Result<(), Self::Error> {
+        self.assert_attempt(&attempt)
+    }
+
+    fn read_schedule_state(
+        &self,
+        review_unit_id: &ReviewUnitId,
+    ) -> Result<Option<ScheduleState>, Self::Error> {
+        self.assert_known(review_unit_id)?;
+
+        Ok(self.schedules.get(review_unit_id).cloned())
+    }
+
+    fn apply_review(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        attempt: ServiceAttemptRecord,
+        schedule_state: ScheduleState,
+        _expected_prior_schedule_state: Option<ScheduleState>,
+    ) -> Result<(), Self::Error> {
+        self.assert_known(review_unit_id)?;
+        self.assert_attempt(&attempt)?;
+        assert_eq!(review_unit_id, &attempt.review_unit_id);
+        assert_eq!(schedule_state.last_review, Some(attempt.occurred_at));
+
+        self.schedules
+            .insert(review_unit_id.clone(), schedule_state);
+
+        Ok(())
+    }
+
+    fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
+        Ok(self
+            .units
+            .iter()
+            .map(|unit| {
+                let schedule_state = self.schedules.get(&unit.review_unit_id).cloned();
+                QueueCandidate {
+                    review_unit_id: unit.review_unit_id.clone(),
+                    due: schedule_state
+                        .as_ref()
+                        .map_or(self.now - 60_000, |state| state.due),
+                    schedule_state,
+                    progression: unit.queue.progression.clone(),
+                    concept_key: unit.queue.concept_key.clone(),
+                    source_key: unit.queue.source_key.clone(),
+                    domain_key: unit.queue.domain_key.clone(),
+                }
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn replays_shared_service_command_scenarios() {
+    let scenarios: Vec<SharedScenario> = serde_json::from_str(include_str!(
+        "../../../fixtures/service-command-scenarios.json"
+    ))
+    .expect("valid shared service fixtures");
+
+    for scenario in scenarios {
+        assert_eq!(
+            scenario.commands.len(),
+            scenario.expected.len(),
+            "{}: command and expectation count",
+            scenario.name
+        );
+
+        let store = SharedScenarioStore::from_scenario(&scenario);
+        assert_eq!(scenario.now, NOW, "{}: shared fixture clock", scenario.name);
+        let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
+
+        for (index, command) in scenario.commands.into_iter().enumerate() {
+            let actual = service.execute(command).unwrap_or_else(|error| {
+                panic!("{} step {index} should execute: {error:?}", scenario.name)
+            });
+            assert_expected_result(&actual, &scenario.expected[index], &scenario.name, index);
+        }
     }
 }
 
@@ -316,4 +517,96 @@ fn schedule(status: ScheduleStatus, reps: u32, due: i64) -> ScheduleState {
 
 fn review_unit_id(value: &str) -> ReviewUnitId {
     ReviewUnitId::new(value)
+}
+
+fn assert_expected_result(
+    actual: &MemoryServiceResult,
+    expected: &ExpectedResult,
+    scenario_name: &str,
+    step_index: usize,
+) {
+    match (actual, expected) {
+        (
+            MemoryServiceResult::AttemptRecorded { attempt },
+            ExpectedResult::AttemptRecorded { attempt: expected },
+        ) => assert_attempt(attempt, expected, scenario_name, step_index),
+        (
+            MemoryServiceResult::ReviewApplied {
+                attempt,
+                grade,
+                schedule_state,
+            },
+            ExpectedResult::ReviewApplied {
+                attempt: expected_attempt,
+                grade: expected_grade,
+                schedule_state: expected_schedule,
+            },
+        ) => {
+            assert_attempt(attempt, expected_attempt, scenario_name, step_index);
+            assert_eq!(
+                grade.verdict, expected_grade.verdict,
+                "{scenario_name} step {step_index}: grade verdict"
+            );
+            assert_eq!(
+                grade.rating, expected_grade.rating,
+                "{scenario_name} step {step_index}: grade rating"
+            );
+            assert_eq!(
+                grade.is_correct, expected_grade.is_correct,
+                "{scenario_name} step {step_index}: grade correctness"
+            );
+            assert_eq!(
+                grade.expected_answer, expected_grade.expected_answer,
+                "{scenario_name} step {step_index}: expected answer"
+            );
+            assert_eq!(
+                schedule_state.as_ref(),
+                expected_schedule,
+                "{scenario_name} step {step_index}: schedule state"
+            );
+        }
+        (
+            MemoryServiceResult::QueueSelected { candidate },
+            ExpectedResult::QueueSelected {
+                candidate: expected,
+            },
+        ) => {
+            assert_eq!(
+                candidate.as_deref(),
+                expected.as_ref(),
+                "{scenario_name} step {step_index}: queue candidate"
+            );
+        }
+        _ => panic!(
+            "{scenario_name} step {step_index}: actual result kind did not match expected fixture"
+        ),
+    }
+}
+
+fn assert_attempt(
+    actual: &ServiceAttemptRecord,
+    expected: &ExpectedAttempt,
+    scenario_name: &str,
+    step_index: usize,
+) {
+    assert_eq!(
+        actual.review_unit_id, expected.review_unit_id,
+        "{scenario_name} step {step_index}: attempt review_unit_id"
+    );
+    assert_eq!(
+        actual.prompt_id, expected.prompt_id,
+        "{scenario_name} step {step_index}: attempt prompt_id"
+    );
+    assert_eq!(
+        actual.submitted_answer, expected.submitted_answer,
+        "{scenario_name} step {step_index}: attempt submitted_answer"
+    );
+    assert_eq!(
+        actual.response_time_ms, expected.response_time_ms,
+        "{scenario_name} step {step_index}: attempt response_time_ms"
+    );
+    assert_eq!(
+        actual.occurred_at, expected.occurred_at,
+        "{scenario_name} step {step_index}: attempt occurred_at"
+    );
 }

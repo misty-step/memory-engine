@@ -114,3 +114,8 @@ details behind deep APIs that carry the domain semantics.
   with root and modular API tests that mirror the current TypeScript package
   export ergonomics while preserving deep ownership in the existing Rust crates.
   TypeScript package exports remain as the migration oracle until final cutover.
+- 2026-05-28: Added `fixtures/service-command-scenarios.json` and replay tests
+  in both TypeScript and Rust for service record-attempt, grade/apply-review,
+  next-queue, and progression-unlock scenarios. Rust `NextQueueOptions` now
+  deserializes missing option fields through explicit defaults to match the
+  TypeScript command ergonomics.

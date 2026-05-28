@@ -134,7 +134,7 @@ pub struct GradeApplyReviewCommand {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct NextQueueOptions {
     pub recent_candidates: Vec<QueueCandidate>,
     pub population: Option<Vec<QueueCandidate>>,
