@@ -123,3 +123,9 @@ details behind deep APIs that carry the domain semantics.
   scheduler, progression, and queue fixtures replayed through the public Rust
   surfaces. The TypeScript `memory-engine/testkit` surface now has a cutover
   counterpart instead of remaining a TypeScript-only consumer contract.
+- 2026-05-28: Added Rust rubric grading and adapter parity. The pure core now
+  owns rubric prompt/assessment types, the async-grader facade, no-adapter
+  failure semantics, blank-answer handling, criterion/result normalization, and
+  a static adapter double; the consumer facade exposes matching root,
+  `grading`, `types`, and `adapters` paths without adding model-client or
+  runtime dependencies to the kernel.

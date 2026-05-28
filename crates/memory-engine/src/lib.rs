@@ -56,12 +56,21 @@ pub mod dogfood {
     }
 }
 
+pub mod adapters {
+    //! Adapter contracts for rubric-backed grading.
+
+    pub use memory_engine_core::{RubricGraderAdapter, StaticRubricGrader};
+}
+
 pub mod grading {
     //! Deterministic grading and grade result types.
 
     pub use memory_engine_core::{
-        default_rating_policy, ExactPrompt, ExactPromptKind, GradeContext, GradeResult, Grader,
-        GraderKind, Rating, RubricCriterionResult, RubricCriterionVerdict, Verdict,
+        default_rating_policy, resolve_rubric_grade, AsyncGrader, ExactPrompt, ExactPromptKind,
+        GradeContext, GradeResult, GradeablePrompt, Grader, GraderKind, Rating, RatingPolicy,
+        RubricAssessment, RubricCriterion, RubricCriterionResult, RubricCriterionVerdict,
+        RubricDefinition, RubricGradeError, RubricGraderAdapter, RubricPrompt, StaticRubricGrader,
+        Verdict, DEFAULT_RUBRIC_CONFIDENCE_FLOOR,
     };
 }
 
@@ -108,11 +117,18 @@ pub mod types {
     pub use memory_engine_core::{
         ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata,
         Prompt, QueueCandidate, QueueSelectionOptions, QueueSeparationPass, Rating, ReviewUnitId,
-        RubricCriterionResult, RubricCriterionVerdict, ScheduleState, ScheduleStatus, Verdict,
+        RubricAssessment, RubricCriterion, RubricCriterionResult, RubricCriterionVerdict,
+        RubricDefinition, RubricPrompt, ScheduleState, ScheduleStatus, Verdict,
     };
 }
 
-pub use grading::{default_rating_policy, ExactPrompt, ExactPromptKind, Grader, Rating, Verdict};
+pub use adapters::{RubricGraderAdapter, StaticRubricGrader};
+pub use grading::{
+    default_rating_policy, resolve_rubric_grade, AsyncGrader, ExactPrompt, ExactPromptKind,
+    GradeablePrompt, Grader, Rating, RatingPolicy, RubricAssessment, RubricCriterion,
+    RubricCriterionResult, RubricCriterionVerdict, RubricDefinition, RubricGradeError,
+    RubricPrompt, Verdict, DEFAULT_RUBRIC_CONFIDENCE_FLOOR,
+};
 pub use progression::{
     filter_eligible_candidates, filter_eligible_candidates_with_fallback, is_mastered,
     ProgressionCandidate, ProgressionFilterResult, ProgressionMetadata,
@@ -128,10 +144,11 @@ mod tests {
     use memory_engine_core::{ProgressionMetadata, QueueCandidate, ScheduleState, ScheduleStatus};
 
     use super::{
-        default_rating_policy, dogfood, filter_eligible_candidates,
+        adapters, default_rating_policy, dogfood, filter_eligible_candidates,
         filter_eligible_candidates_with_fallback, grading, next, pick_next_queue_candidate, queue,
         scheduling, testkit, types, ExactPrompt, ExactPromptKind, Grader, ProgressionCandidate,
-        Prompt, Rating, ReviewUnitId,
+        Prompt, Rating, ReviewUnitId, RubricAssessment, RubricCriterion, RubricCriterionResult,
+        RubricCriterionVerdict, RubricDefinition, RubricPrompt, StaticRubricGrader,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -230,6 +247,72 @@ mod tests {
         assert_eq!(cli.fixture, "latin-prayer-opening");
         assert_eq!(import.fixture, "latin-prayer-authored-v1");
         assert_eq!(web.fixture, "latin-prayer-authored-v1");
+    }
+
+    #[test]
+    fn facade_exposes_rubric_grading_and_adapter_subpaths() {
+        let prompt = RubricPrompt {
+            review_unit_id: ReviewUnitId::new("api-rubric"),
+            prompt: "Continue the prayer.".to_owned(),
+            rubric: RubricDefinition {
+                answer_guide: vec!["Continue with the next line.".to_owned()],
+                passing_score: 1,
+                criteria: vec![RubricCriterion {
+                    name: "continuation".to_owned(),
+                    description: "Gives the next line.".to_owned(),
+                    required: true,
+                }],
+            },
+        };
+        let adapter = adapters::StaticRubricGrader::new(RubricAssessment {
+            model: Some("gpt-5.4-mini".to_owned()),
+            confidence: 0.91,
+            feedback: "Strong answer.".to_owned(),
+            criterion_results: vec![RubricCriterionResult {
+                name: "continuation".to_owned(),
+                verdict: RubricCriterionVerdict::Pass,
+                evidence: "Continued with the correct line.".to_owned(),
+            }],
+        });
+
+        let root_grader = grading::AsyncGrader::with_rubric_grader(adapter);
+        let result = root_grader
+            .grade_prompt(
+                grading::GradeablePrompt::Rubric(&prompt),
+                "Strong answer.",
+                types::GradeContext {
+                    response_time_ms: 6_000,
+                    prior_reps: 0,
+                },
+            )
+            .expect("rubric grade");
+
+        assert_eq!(result.verdict, types::Verdict::Correct);
+        assert_eq!(result.grader_kind, types::GraderKind::RubricLlm);
+        assert!((grading::DEFAULT_RUBRIC_CONFIDENCE_FLOOR - 0.85).abs() < f64::EPSILON);
+
+        let static_grader = StaticRubricGrader::new(RubricAssessment {
+            model: None,
+            confidence: 1.0,
+            feedback: "Still available from the root facade.".to_owned(),
+            criterion_results: vec![RubricCriterionResult {
+                name: "continuation".to_owned(),
+                verdict: RubricCriterionVerdict::Pass,
+                evidence: "Root re-export works.".to_owned(),
+            }],
+        });
+        let root_result = grading::AsyncGrader::with_rubric_grader(static_grader)
+            .grade_prompt(
+                grading::GradeablePrompt::Rubric(&prompt),
+                "Strong answer.",
+                types::GradeContext {
+                    response_time_ms: 6_000,
+                    prior_reps: 0,
+                },
+            )
+            .expect("rubric grade");
+
+        assert_eq!(root_result.verdict, types::Verdict::Correct);
     }
 
     #[test]

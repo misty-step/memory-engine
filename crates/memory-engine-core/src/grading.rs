@@ -1,9 +1,9 @@
 use crate::{ExactPrompt, GradeContext, GradeResult, GraderKind, Prompt, Rating, Verdict};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
-type RatingPolicy = fn(Verdict, GradeContext) -> Rating;
+pub type RatingPolicy = fn(Verdict, GradeContext) -> Rating;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Grader {
     rating_policy: RatingPolicy,
 }

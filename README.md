@@ -110,6 +110,49 @@ let grade = Grader::new().grade(
 let next_state = next(None, grade.rating, 1_779_465_600_000).expect("schedule");
 ```
 
+Rubric grading stays adapter-backed; the Rust core owns normalization and
+dispatch, while callers own any model client:
+
+```rust
+use memory_engine::{
+    AsyncGrader, GradeContext, GradeablePrompt, RubricAssessment, RubricCriterion,
+    RubricCriterionResult, RubricCriterionVerdict, RubricDefinition, RubricPrompt,
+    ReviewUnitId, StaticRubricGrader,
+};
+
+let prompt = RubricPrompt {
+    review_unit_id: ReviewUnitId::new("rubric-1"),
+    prompt: "Continue the prayer.".to_owned(),
+    rubric: RubricDefinition {
+        answer_guide: vec!["Continue with the next line.".to_owned()],
+        passing_score: 1,
+        criteria: vec![RubricCriterion {
+            name: "continuation".to_owned(),
+            description: "Gives the next line.".to_owned(),
+            required: true,
+        }],
+    },
+};
+let grader = AsyncGrader::with_rubric_grader(StaticRubricGrader::new(RubricAssessment {
+    model: Some("fixture".to_owned()),
+    confidence: 1.0,
+    feedback: "Strong answer.".to_owned(),
+    criterion_results: vec![RubricCriterionResult {
+        name: "continuation".to_owned(),
+        verdict: RubricCriterionVerdict::Pass,
+        evidence: "Supplied the continuation.".to_owned(),
+    }],
+}));
+let grade = grader.grade_prompt(
+    GradeablePrompt::Rubric(&prompt),
+    "Strong answer.",
+    GradeContext {
+        response_time_ms: 6_000,
+        prior_reps: 0,
+    },
+).expect("rubric grade");
+```
+
 The TypeScript package remains available as the executable parity oracle until
 cutover:
 

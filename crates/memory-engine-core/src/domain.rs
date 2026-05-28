@@ -156,6 +156,39 @@ pub enum RubricCriterionVerdict {
     Fail,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RubricCriterion {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RubricDefinition {
+    pub answer_guide: Vec<String>,
+    pub passing_score: usize,
+    pub criteria: Vec<RubricCriterion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RubricPrompt {
+    pub review_unit_id: ReviewUnitId,
+    pub prompt: String,
+    pub rubric: RubricDefinition,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RubricAssessment {
+    pub model: Option<String>,
+    pub confidence: f64,
+    pub feedback: String,
+    pub criterion_results: Vec<RubricCriterionResult>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Prompt {
     Mcq {

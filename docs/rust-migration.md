@@ -28,6 +28,8 @@ the app surfaces have moved.
 
 - root exports mirror the current TypeScript package ergonomics for grading,
   scheduling, progression, queueing, and canonical types;
+- the `adapters` namespace mirrors the TypeScript `memory-engine/adapters`
+  rubric adapter surface with a vendor-neutral trait and static test double;
 - modular namespaces preserve deep ownership instead of asking consumers to
   depend on every internal crate directly;
 - `testkit` exposes Rust fixture corpora for grading, recitation, scheduling,
@@ -44,6 +46,10 @@ the app surfaces have moved.
 - domain types for prompts, grades, schedule state, progression metadata, and
   queue candidates;
 - deterministic grading for MCQ, boolean, cloze, short answer, and recitation;
+- rubric prompt, rubric assessment, async-grader facade, adapter trait, static
+  adapter double, confidence normalization, criterion normalization, and
+  no-adapter failure semantics without adding any model client or async runtime
+  to the pure kernel;
 - progression eligibility with strict and fallback modes;
 - queue due filtering, priority ordering, anti-clumping, and progression
   fallback;
@@ -175,6 +181,7 @@ requires:
 | Testkit fixtures | TypeScript `testkit/` | Rust facade `testkit` module | Rust fixture replay through public surfaces |
 | Domain types | TypeScript `src/types.ts` | First core port | JSON fixture parity |
 | Deterministic grading | TypeScript `src/grader.ts` | First core port | Fixture parity and property tests |
+| Rubric grading and adapters | TypeScript `src/async-grader.ts`, `src/adapters/` | Rust core rubric boundary plus facade `adapters` namespace | Core rubric parity tests and facade export test |
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |
 | Queue | TypeScript `src/queue.ts` | First core port | Priority and anti-clump fixtures |
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
