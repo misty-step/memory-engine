@@ -139,6 +139,10 @@ const nextState = next(null, grade.rating, Date.now());
 
 Test fixtures for contract and interface tests:
 
+```rust
+use memory_engine::testkit::{grading_fixtures, scheduler_fixtures};
+```
+
 ```ts
 import {
   gradingFixtures,

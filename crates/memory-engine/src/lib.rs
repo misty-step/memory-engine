@@ -100,6 +100,8 @@ pub mod service {
     };
 }
 
+pub mod testkit;
+
 pub mod types {
     //! Canonical learning-domain data types.
 
@@ -126,9 +128,10 @@ mod tests {
     use memory_engine_core::{ProgressionMetadata, QueueCandidate, ScheduleState, ScheduleStatus};
 
     use super::{
-        default_rating_policy, dogfood, filter_eligible_candidates, grading, next,
-        pick_next_queue_candidate, queue, scheduling, types, ExactPrompt, ExactPromptKind, Grader,
-        ProgressionCandidate, Prompt, Rating, ReviewUnitId,
+        default_rating_policy, dogfood, filter_eligible_candidates,
+        filter_eligible_candidates_with_fallback, grading, next, pick_next_queue_candidate, queue,
+        scheduling, testkit, types, ExactPrompt, ExactPromptKind, Grader, ProgressionCandidate,
+        Prompt, Rating, ReviewUnitId,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -229,6 +232,90 @@ mod tests {
         assert_eq!(web.fixture, "latin-prayer-authored-v1");
     }
 
+    #[test]
+    fn testkit_fixtures_stay_in_sync_with_rust_public_surfaces() {
+        let grader = Grader::new();
+
+        for fixture in testkit::grading_fixtures() {
+            assert_eq!(
+                grader.grade(&fixture.prompt, &fixture.submitted, fixture.context),
+                fixture.expected,
+                "{}",
+                fixture.name
+            );
+        }
+
+        for fixture in testkit::scheduler_fixtures() {
+            assert_eq!(
+                next(fixture.initial_state.as_ref(), fixture.rating, fixture.now)
+                    .expect("schedule"),
+                fixture.expected,
+                "{}",
+                fixture.name
+            );
+        }
+
+        for fixture in testkit::progression_fixtures() {
+            let mastery_policy = progression_mastery_policy(fixture.mastery_policy);
+            let population = fixture.population.as_deref();
+            let result = match fixture.mode {
+                testkit::ProgressionFixtureMode::Strict => {
+                    filter_eligible_candidates(&fixture.candidates, mastery_policy, population)
+                }
+                testkit::ProgressionFixtureMode::Fallback => {
+                    filter_eligible_candidates_with_fallback(
+                        &fixture.candidates,
+                        mastery_policy,
+                        population,
+                    )
+                }
+            };
+
+            assert_eq!(
+                result
+                    .available
+                    .iter()
+                    .map(|candidate| candidate.review_unit_id.clone())
+                    .collect::<Vec<_>>(),
+                fixture.expected_available_review_unit_ids,
+                "{}",
+                fixture.name
+            );
+            assert_eq!(
+                result.locked_fresh_count, fixture.expected_locked_fresh_count,
+                "{}",
+                fixture.name
+            );
+        }
+
+        for fixture in testkit::queue_fixtures() {
+            let mastery_policy = queue_mastery_policy(fixture.mastery_policy);
+            let recent_source_window = fixture
+                .recent_source_window
+                .unwrap_or(queue::QueueSelectionOptions::default().recent_source_window);
+            let candidate = pick_next_queue_candidate(
+                &fixture.candidates,
+                mastery_policy,
+                &queue::QueueSelectionOptions {
+                    now: fixture.now,
+                    recent_candidates: &fixture.recent_candidates,
+                    population: fixture.population.as_deref(),
+                    recent_source_window,
+                    ..queue::QueueSelectionOptions::default()
+                },
+            );
+
+            assert_eq!(
+                candidate.map(|candidate| candidate.review_unit_id),
+                fixture.expected_next_review_unit_id,
+                "{}",
+                fixture.name
+            );
+        }
+
+        assert!(!testkit::recitation_fixtures().is_empty());
+    }
+
     fn progression_fixture() -> (
         ReviewUnitId,
         Vec<QueueCandidate>,
@@ -287,5 +374,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         (advanced, candidates, progression_candidates)
+    }
+
+    fn progression_mastery_policy(
+        policy: testkit::Slice2MasteryPolicy,
+    ) -> impl Fn(&testkit::ProgressionFixtureReview) -> bool + Copy {
+        move |review| match policy {
+            testkit::Slice2MasteryPolicy::Ruminatio => {
+                review.state == ScheduleStatus::Review || review.reps >= 2
+            }
+            testkit::Slice2MasteryPolicy::Vault => {
+                review.state == ScheduleStatus::Review && review.reps >= 3
+            }
+        }
+    }
+
+    fn queue_mastery_policy(
+        policy: testkit::Slice2MasteryPolicy,
+    ) -> impl Fn(&ScheduleState) -> bool + Copy {
+        move |review| match policy {
+            testkit::Slice2MasteryPolicy::Ruminatio => {
+                review.state == ScheduleStatus::Review || review.reps >= 2
+            }
+            testkit::Slice2MasteryPolicy::Vault => {
+                review.state == ScheduleStatus::Review && review.reps >= 3
+            }
+        }
     }
 }

@@ -26,6 +26,7 @@ dependencies = [
  "memory-engine-service",
  "memory-engine-study",
  "memory-engine-web-shell",
+ "serde",
  "serde_json",
 ]
 

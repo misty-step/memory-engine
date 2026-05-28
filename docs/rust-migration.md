@@ -30,10 +30,14 @@ the app surfaces have moved.
   scheduling, progression, queueing, and canonical types;
 - modular namespaces preserve deep ownership instead of asking consumers to
   depend on every internal crate directly;
+- `testkit` exposes Rust fixture corpora for grading, recitation, scheduling,
+  progression, and queue contract tests without moving fixture construction
+  into the pure kernel;
 - beta and dogfood modules expose repo-local application surfaces without
   promoting those concerns into the pure kernel;
 - facade tests prove README-style root usage, modular package-path composition,
-  and dogfood receipt access through the Rust surface.
+  Rust testkit fixture replay, and dogfood receipt access through the Rust
+  surface.
 
 `crates/memory-engine-core` ports the first pure-kernel surface:
 
@@ -168,6 +172,7 @@ requires:
 | Surface | Current owner | Rust status | Cutover evidence |
 | --- | --- | --- | --- |
 | Package facade | TypeScript `package.json` exports | Rust `memory-engine` facade crate | Root and modular facade tests |
+| Testkit fixtures | TypeScript `testkit/` | Rust facade `testkit` module | Rust fixture replay through public surfaces |
 | Domain types | TypeScript `src/types.ts` | First core port | JSON fixture parity |
 | Deterministic grading | TypeScript `src/grader.ts` | First core port | Fixture parity and property tests |
 | Progression | TypeScript `src/progression.ts` | First core port | Vault/Ruminatio-style fixtures |

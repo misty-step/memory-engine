@@ -119,3 +119,7 @@ details behind deep APIs that carry the domain semantics.
   next-queue, and progression-unlock scenarios. Rust `NextQueueOptions` now
   deserializes missing option fields through explicit defaults to match the
   TypeScript command ergonomics.
+- 2026-05-28: Added the Rust facade `testkit` module with grading, recitation,
+  scheduler, progression, and queue fixtures replayed through the public Rust
+  surfaces. The TypeScript `memory-engine/testkit` surface now has a cutover
+  counterpart instead of remaining a TypeScript-only consumer contract.
