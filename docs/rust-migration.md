@@ -100,6 +100,14 @@ probe:
 
 The web UI markup is still shared from `experiments/beta-study/index.html`.
 
+`crates/memory-engine-cli` now ports the CLI review dogfood path:
+
+- runs the Latin-prayer review fixture through the Rust service boundary;
+- keeps fixture content, confidence capture, calibration metrics, receipt
+  formatting, and the in-memory dogfood store outside the reusable kernel;
+- emits a JSON receipt from `bun run rust:cli-review`;
+- tests the receipt and the CLI store validation boundary.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -127,3 +135,4 @@ requires:
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
 | Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
 | Beta study app | TypeScript `experiments/beta-study/` | Rust session/API and HTTP host port | Phone/browser smoke on Rust host |
+| CLI dogfood | TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |

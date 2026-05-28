@@ -16,8 +16,11 @@ graded attempt.
 
 ```sh
 bun test experiments/cli-review/cli-review.test.ts
-bun run experiments:cli-review
+bun run rust:cli-review
 ```
+
+`bun run rust:cli-review` is the active dogfood path. The TypeScript experiment
+remains as a parity oracle during the Rust migration.
 
 ## Fixture
 

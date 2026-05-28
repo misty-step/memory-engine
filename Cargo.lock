@@ -24,6 +24,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-cli"
+version = "0.0.0"
+dependencies = [
+ "memory-engine-core",
+ "memory-engine-service",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memory-engine-core"
 version = "0.0.0"
 dependencies = [

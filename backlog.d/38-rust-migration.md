@@ -99,3 +99,6 @@ details behind deep APIs that carry the domain semantics.
   `/source`, `/generate`, `/approve`, `/reveal`, `/answer`, and `/next` onto
   the Rust study session with route tests. Shared HTML and final TypeScript
   package/API removal remain future slices.
+- 2026-05-28: Added `memory-engine-cli` with a Rust CLI review dogfood client,
+  in-memory service-store fixture, calibration receipt output, and boundary
+  tests. The TypeScript CLI experiment remains only as a migration oracle.
