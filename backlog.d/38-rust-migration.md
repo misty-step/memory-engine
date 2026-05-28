@@ -129,3 +129,8 @@ details behind deep APIs that carry the domain semantics.
   a static adapter double; the consumer facade exposes matching root,
   `grading`, `types`, and `adapters` paths without adding model-client or
   runtime dependencies to the kernel.
+- 2026-05-28: Replaced the TypeScript benchmark script with
+  `memory-engine-bench`, a Rust receipt generator that exercises facade
+  grading, scheduler advancement, queue selection, and service composition.
+  `bun run bench` now runs the Rust crate while remaining non-gating until
+  historical performance budgets exist.

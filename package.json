@@ -22,7 +22,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:watch": "bun test --watch",
-    "bench": "bun run scripts/bench.ts",
+    "bench": "cargo run -p memory-engine-bench",
     "experiments:cli-review": "bun run rust:cli-review",
     "experiments:cli-review:ts-oracle": "bun run experiments/cli-review/index.ts",
     "experiments:import-probe": "bun run rust:import-probe",

@@ -24,8 +24,8 @@ beta/product proof, or a shaped extraction decision.
 ### QI-002: Benchmark receipts are non-gating
 
 - Dimension: performance quality.
-- Current evidence: `bun run bench` reports grader, scheduler, queue, and
-  service throughput, but there is no historical budget.
+- Current evidence: `bun run bench` reports Rust facade grading, scheduler,
+  queue, and service throughput, but there is no historical budget.
 - Improvement: capture benchmark receipts across several stable machines or CI
   containers, then shape a ticket for conservative regression budgets.
 - Promote when: a repeatable slowdown appears in queue selection, grading, FSRS

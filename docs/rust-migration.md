@@ -159,6 +159,15 @@ The operator-facing `experiments:cli-review`, `experiments:import-probe`, and
 TypeScript predecessors remain available with `:ts-oracle` suffixes only for
 parity checks until deletion.
 
+`crates/memory-engine-bench` now ports the benchmark receipt path:
+
+- runs grading, scheduler advancement, queue selection, and service
+  grade/apply-review plus next-queue loops through Rust APIs;
+- keeps benchmark receipts non-gating and threshold-free until historical data
+  justifies stable budgets;
+- makes `bun run bench` a Rust runtime command instead of a TypeScript package
+  benchmark.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -192,3 +201,4 @@ requires:
 | CLI dogfood | TypeScript `experiments/cli-review/` | Rust CLI port | Receipt parity |
 | Import probe | TypeScript `experiments/import-probe/` | Rust import crate port | Authored fixture and service-loop receipt parity |
 | Web shell | TypeScript `experiments/web-shell/` | Rust web-shell crate port | Session, receipt, and HTTP route parity |
+| Bench receipts | TypeScript `scripts/bench.ts` | Rust benchmark crate | Non-gating `bun run bench` receipt |

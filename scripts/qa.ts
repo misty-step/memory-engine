@@ -139,9 +139,9 @@ const lanes: readonly QaLane[] = [
   },
   {
     id: 'performance.benchmarks',
-    title: 'Non-gating benchmark receipts',
-    surface: 'grader, scheduler, queue, service composition',
-    purpose: 'Expose performance-quality drift without brittle local thresholds.',
+    title: 'Rust benchmark receipts',
+    surface: 'Rust facade, scheduler, queue, service composition',
+    purpose: 'Expose migrated-runtime performance drift without brittle local thresholds.',
     command: ['bun', 'run', 'bench'],
     gating: false,
     modes: ['local', 'full'],
