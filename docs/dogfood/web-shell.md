@@ -16,9 +16,12 @@ the TypeScript runtime is deleted.
 
 ```sh
 cargo test -p memory-engine-web-shell
+bun run experiments:web-shell:receipt
+bun run rust:web-shell:receipt
+bun run experiments:web-shell
 bun run rust:web-shell
 bun test experiments/web-shell/web-shell.test.ts
-bun run experiments:web-shell
+bun run experiments:web-shell:ts-oracle
 ```
 
 The Rust and TypeScript servers listen on `http://127.0.0.1:4173` unless `HOST`

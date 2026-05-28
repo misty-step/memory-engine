@@ -51,7 +51,8 @@ each lane:
 | `contracts.testkit-adapters` | `testkit` and `adapters` | prove shared fixtures and adapter doubles remain usable |
 | `service.prototype` | repo-local service boundary | prove command flow, injected persistence, and failure semantics |
 | `evals.regression-corpus` | fixtures through live API surfaces | catch semantic drift across core behaviors |
-| `dogfood.experiments` | CLI, import probe, web shell | record client pressure from outside `src` |
+| `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
+| `dogfood.ts-oracles` | TypeScript CLI, import probe, web shell | keep legacy dogfood behavior executable until TypeScript deletion |
 | `coverage.all` | all Bun tests | preserve broad coverage evidence |
 | `performance.benchmarks` | grader, scheduler, queue, service | expose performance-quality drift without brittle thresholds |
 | `ci.canonical` | Dagger CI | prove install, typecheck, Biome, coverage, and Gitleaks together |

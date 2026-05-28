@@ -137,6 +137,13 @@ The web UI markup is still shared from `experiments/beta-study/index.html`.
 - drives `next-queue` and `grade/apply-review` through `memory-engine-service`;
 - serves the existing web-shell HTML and `/state`, `/reveal`, `/answer`, and
   `/next` routes from a Rust binary.
+- emits the web-shell extraction receipt with `bun run rust:web-shell:receipt`
+  so dogfood QA no longer needs to launch the TypeScript shell for receipts.
+
+The operator-facing `experiments:cli-review`, `experiments:import-probe`, and
+`experiments:web-shell` scripts now resolve to Rust implementations. Their
+TypeScript predecessors remain available with `:ts-oracle` suffixes only for
+parity checks until deletion.
 
 ## Parity Strategy
 

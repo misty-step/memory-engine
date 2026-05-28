@@ -105,10 +105,19 @@ const lanes: readonly QaLane[] = [
     modes: ['local', 'full'],
   },
   {
-    id: 'dogfood.experiments',
-    title: 'Dogfood client receipts',
+    id: 'dogfood.rust-receipts',
+    title: 'Rust dogfood client receipts',
+    surface: 'Rust CLI review, import probe, web shell',
+    purpose: 'Exercise migrated dogfood clients through the Rust facade and service crates.',
+    command: ['bun', 'run', 'rust:dogfood'],
+    gating: true,
+    modes: ['local', 'full'],
+  },
+  {
+    id: 'dogfood.ts-oracles',
+    title: 'TypeScript dogfood parity oracles',
     surface: 'CLI review, import probe, web shell',
-    purpose: 'Exercise API ergonomics from clients outside src and record boundary pressure.',
+    purpose: 'Keep legacy dogfood behavior executable until the TypeScript runtime is deleted.',
     command: [
       'bun',
       'test',

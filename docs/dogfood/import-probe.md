@@ -16,10 +16,11 @@ the TypeScript runtime is deleted.
 ## Commands
 
 ```sh
+bun run experiments:import-probe
 bun run rust:import-probe
 cargo test -p memory-engine-import
 bun test experiments/import-probe/import-probe.test.ts
-bun run experiments:import-probe
+bun run experiments:import-probe:ts-oracle
 ```
 
 ## Authored Fixture
