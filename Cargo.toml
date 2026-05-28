@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/memory-engine-core",
+    "crates/memory-engine-generation",
     "crates/memory-engine-service",
     "crates/memory-engine-persistence",
 ]

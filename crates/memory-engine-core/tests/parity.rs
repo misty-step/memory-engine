@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 
 use memory_engine_core::{
-    compare_queue_priority, default_rating_policy, pick_next_queue_candidate, GradeContext,
-    ProgressionMetadata, QueueCandidate, QueueSelectionOptions, Rating, ReviewUnitId,
-    ScheduleState, ScheduleStatus, Verdict,
+    compare_queue_priority, default_rating_policy, pick_next_queue_candidate, ExactPrompt,
+    ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata, Prompt,
+    QueueCandidate, QueueSelectionOptions, Rating, ReviewUnitId, ScheduleState, ScheduleStatus,
+    Verdict,
 };
 
 const NOW: i64 = 1_775_650_400_000;
@@ -144,6 +145,68 @@ fn queue_separation_normalizes_recent_keys_like_typescript() {
         next.map(|entry| entry.review_unit_id),
         Some(ReviewUnitId::new("alternative")),
     );
+}
+
+#[test]
+fn beta_wire_serialization_matches_typescript_prompt_and_grade_shapes() {
+    let prompt = Prompt::Exact(ExactPrompt {
+        kind: ExactPromptKind::ShortAnswer,
+        review_unit_id: ReviewUnitId::new("unit-1"),
+        prompt: "Translate: Pater noster".to_owned(),
+        accepted_answers: vec!["Our Father".to_owned()],
+        equivalence_groups: Vec::new(),
+        ignored_tokens: vec![".".to_owned()],
+    });
+    let encoded = serde_json::to_value(&prompt).expect("prompt json");
+
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "kind": "shortAnswer",
+            "reviewUnitId": "unit-1",
+            "prompt": "Translate: Pater noster",
+            "acceptedAnswers": ["Our Father"],
+            "equivalenceGroups": [],
+            "ignoredTokens": ["."]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<Prompt>(encoded).expect("prompt decode"),
+        prompt
+    );
+
+    let grade = GradeResult {
+        verdict: Verdict::Correct,
+        rating: Rating::Good,
+        is_correct: true,
+        submitted_answer: "Our Father".to_owned(),
+        expected_answer: "Our Father".to_owned(),
+        grader_kind: GraderKind::Deterministic,
+        grader_model: None,
+        grader_confidence: None,
+        feedback: String::new(),
+        criterion_results: Vec::new(),
+    };
+    let encoded = serde_json::to_value(&grade).expect("grade json");
+
+    assert_eq!(encoded["verdict"], "correct");
+    assert_eq!(encoded["rating"], 3);
+    assert_eq!(encoded["isCorrect"], true);
+    assert_eq!(encoded["graderKind"], "deterministic");
+    assert_eq!(encoded["submittedAnswer"], "Our Father");
+}
+
+#[test]
+fn schedule_wire_keeps_ts_fsrs_numeric_state_and_snake_case_fields() {
+    let encoded = serde_json::to_value(ScheduleState {
+        last_review: Some(NOW - 86_400_000),
+        ..schedule(ScheduleStatus::Review, 3, 2, NOW)
+    })
+    .expect("schedule json");
+
+    assert_eq!(encoded["state"], 2);
+    assert_eq!(encoded["last_review"], NOW - 86_400_000);
+    assert!(encoded.get("lastReview").is_none());
 }
 
 fn schedule(state: ScheduleStatus, reps: u32, scheduled_days: i64, due: i64) -> ScheduleState {

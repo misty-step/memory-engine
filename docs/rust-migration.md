@@ -64,6 +64,23 @@ the app surfaces have moved.
 Beta generation, the beta-study server, and the web UI are still
 TypeScript-owned.
 
+`crates/memory-engine-generation` now ports the deterministic beta-generation
+probe:
+
+- source-block parsing for concept/question/answer/reference fields;
+- deterministic IDs, slugs, duplicate signatures, stage ordering, and
+  validation reasons matching the TypeScript beta oracle;
+- reference span, generated draft, and generation-run writes through the Rust
+  beta store;
+- accepted/rejected draft tests for quiz, exercise, duplicate, unsupported,
+  missing-provenance, and bad-source paths;
+- core serde tests for TypeScript-compatible prompt tags, numeric ratings,
+  numeric schedule states, camelCase app fields, and preserved snake_case
+  `ScheduleState` internals.
+
+The beta-study session state machine, server, and web UI are still
+TypeScript-owned.
+
 ## Parity Strategy
 
 The Rust tests intentionally mirror current Bun behavior first. Broader parity
@@ -88,4 +105,5 @@ requires:
 | Scheduling | TypeScript `src/scheduler.ts` | Rust core port | Shared JSON fixture parity |
 | Service | TypeScript `service/` | First Rust crate port | Command scenario parity |
 | Persistence | TypeScript `experiments/beta-store/` | First Rust crate port | Store commit/restart tests |
+| Beta generation | TypeScript `experiments/beta-generation/` | First Rust crate port | Deterministic generation fixture parity |
 | Beta study app | TypeScript `experiments/beta-study/` | Not migrated | Phone/browser smoke on Rust host |

@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-generation"
+version = "0.0.0"
+dependencies = [
+ "memory-engine-core",
+ "memory-engine-persistence",
+ "memory-engine-service",
+]
+
+[[package]]
 name = "memory-engine-persistence"
 version = "0.0.0"
 dependencies = [

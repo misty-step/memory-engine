@@ -84,3 +84,8 @@ details behind deep APIs that carry the domain semantics.
   store, typed validation and conflict errors, atomic commit behavior, queue
   projection, and service-store integration tests. Beta generation and app
   server cutover remain future slices.
+- 2026-05-28: Added `memory-engine-generation` with deterministic source-block
+  parsing, generated prompt drafts, generation-run bookkeeping, and accepted /
+  rejected draft parity tests. Also tightened core serde for TypeScript-shaped
+  prompt, grade, rating, schedule, progression, queue, and beta-store wire
+  contracts. Beta-study session/server cutover remains a future slice.
