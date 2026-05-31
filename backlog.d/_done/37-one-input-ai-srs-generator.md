@@ -1,6 +1,6 @@
 ticket: 37
-status: shaped
-shaping: true
+status: delivered
+shaping: false
 
 # One-input AI SRS generator
 
@@ -319,6 +319,30 @@ Why this is best:
   run.
 - Scope creep: defer uploads, embeddings, chat, hosting, auth, and production
   persistence until the one-input text path earns repeated dogfood receipts.
+
+## What Was Built
+
+- Added a `LearningContentGenerator` seam around beta generation while keeping
+  the deterministic fixture generator as the CI path.
+- Added arbitrary-prose compilation into source-backed quiz and exercise drafts
+  with validation failures when prose has no citeable facts.
+- Reworked the beta-study shell into a phone-first one-input flow: paste source,
+  generate drafts, keep/skip/edit one draft at a time, then study from a single
+  answer box.
+- Replaced the hardcoded browser answer latency with measured elapsed response
+  time.
+- Preserved reveal as display-only UI state and duplicate-submit protection at
+  the beta/session boundary.
+
+## Verification Receipt
+
+- `bun test experiments/beta-generation/ experiments/beta-study/`
+- `bun run check`
+- `bun run ci:local`
+- `bun run ci`
+- Browser smoke at `390 x 844` against `http://127.0.0.1:4176/` covered paste,
+  generate, keep, reveal, submit, duplicate submit, next card, and no horizontal
+  overflow. Screenshot: `.tmp/beta-study-037/mobile-smoke.png`.
 
 ## Provider Lanes
 

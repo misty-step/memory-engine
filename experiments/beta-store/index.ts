@@ -111,6 +111,11 @@ export type ApproveGeneratedPromptDraftOptions = {
   initialScheduleState?: ScheduleState | null;
 };
 
+export type ReviseGeneratedPromptDraftInput = {
+  prompt: string;
+  expectedAnswer: string;
+};
+
 export class DuplicateAppliedReviewError extends Error {
   constructor(key: string) {
     super(`Duplicate applied review: ${key}`);
@@ -219,6 +224,57 @@ export class BetaPersistenceStore implements MemoryServiceStore {
     applyScheduleRecord(next, draft.reviewUnitId, options.initialScheduleState ?? null);
     await this.commit(next);
     return reviewUnit;
+  }
+
+  async rejectGeneratedPromptDraft(draftId: string, reason: string): Promise<GeneratedPromptDraft> {
+    assertNonBlank(reason, 'Generated prompt rejection reason');
+    const draft = findById(this.data.generatedPromptDrafts, draftId);
+    if (draft === undefined) {
+      throw new Error(`Unknown generated prompt draft: ${draftId}`);
+    }
+    if (this.data.reviewUnits.some((unit) => unit.generatedPromptDraftId === draft.id)) {
+      throw new Error('Approved generated prompt drafts cannot be rejected');
+    }
+    if (draft.validation.status === 'rejected') {
+      return draft;
+    }
+
+    const rejected: GeneratedPromptDraft = {
+      ...draft,
+      validation: {
+        status: 'rejected',
+        reasons: [reason],
+      },
+      critiqueNotes: [`Rejected: ${reason}`],
+    };
+    const next = cloneSnapshot(this.data);
+    upsertById(next.generatedPromptDrafts, rejected);
+    await this.commit(next);
+    return rejected;
+  }
+
+  async reviseGeneratedPromptDraft(
+    draftId: string,
+    revision: ReviseGeneratedPromptDraftInput,
+  ): Promise<GeneratedPromptDraft> {
+    assertNonBlank(revision.prompt, 'Generated prompt revision prompt');
+    assertNonBlank(revision.expectedAnswer, 'Generated prompt revision answer');
+    const draft = findById(this.data.generatedPromptDrafts, draftId);
+    if (draft === undefined) {
+      throw new Error(`Unknown generated prompt draft: ${draftId}`);
+    }
+    if (draft.validation.status !== 'accepted') {
+      throw new Error('Only accepted generated prompt drafts can be revised');
+    }
+    if (this.data.reviewUnits.some((unit) => unit.generatedPromptDraftId === draft.id)) {
+      throw new Error('Approved generated prompt drafts cannot be revised');
+    }
+
+    const revised = reviseDraftPrompt(draft, revision);
+    const next = cloneSnapshot(this.data);
+    upsertById(next.generatedPromptDrafts, revised);
+    await this.commit(next);
+    return revised;
   }
 
   async saveReviewUnit(reviewUnit: BetaReviewUnitRecord): Promise<BetaReviewUnitRecord> {
@@ -484,6 +540,57 @@ function applyScheduleRecord(
     return;
   }
   snapshot.schedules[existingIndex] = record;
+}
+
+function reviseDraftPrompt(
+  draft: GeneratedPromptDraft,
+  revision: ReviseGeneratedPromptDraftInput,
+): GeneratedPromptDraft {
+  return {
+    ...draft,
+    prompt: revisePrompt(draft.prompt, revision),
+    critiqueNotes: [...draft.critiqueNotes, 'Learner edited generated wording before approval.'],
+  };
+}
+
+function revisePrompt(prompt: Prompt, revision: ReviseGeneratedPromptDraftInput): Prompt {
+  switch (prompt.kind) {
+    case 'mcq':
+      return {
+        ...prompt,
+        prompt: revision.prompt,
+        choices: uniqueChoices([revision.expectedAnswer, ...prompt.choices]),
+        correctChoice: revision.expectedAnswer,
+      };
+    case 'boolean':
+      return {
+        ...prompt,
+        prompt: revision.prompt,
+        correctAnswer: revision.expectedAnswer.toLowerCase() === 'true',
+      };
+    case 'cloze':
+    case 'shortAnswer':
+    case 'recitation':
+      return {
+        ...prompt,
+        prompt: revision.prompt,
+        acceptedAnswers: [revision.expectedAnswer],
+      };
+  }
+}
+
+function uniqueChoices(values: string[]): string[] {
+  const seen = new Set<string>();
+  const uniqueValues: string[] = [];
+  for (const value of values) {
+    const key = value.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    uniqueValues.push(value);
+  }
+  return uniqueValues;
 }
 
 function appliedReviewKey(attempt: ServiceAttemptRecord): string {

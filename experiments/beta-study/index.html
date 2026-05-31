@@ -10,7 +10,7 @@
         font-family:
           Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
           sans-serif;
-        background: #f7f8f4;
+        background: #f5f6f2;
         color: #20241f;
       }
 
@@ -20,33 +20,27 @@
 
       body {
         margin: 0;
-        background: #f7f8f4;
+        background: #f5f6f2;
       }
 
       main {
         min-height: 100vh;
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+        place-items: center;
+        padding: 20px;
       }
 
-      .study {
-        min-width: 0;
+      .shell {
+        width: min(100%, 720px);
         display: grid;
-        grid-template-rows: auto minmax(0, 1fr);
-        padding: 24px;
+        gap: 20px;
       }
 
-      header,
-      .actions {
+      header {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-      }
-
-      header {
-        border-bottom: 1px solid #d9ded5;
-        padding-bottom: 16px;
         color: #586257;
         font-size: 14px;
       }
@@ -61,27 +55,24 @@
         font-size: 15px;
       }
 
-      .brand span {
-        color: #586257;
-      }
-
-      .mode {
-        border: 1px solid #b9c4b5;
+      .status {
+        border: 1px solid #b8c5b3;
         border-radius: 999px;
         padding: 6px 10px;
         background: #ffffff;
         color: #24533d;
         font-weight: 750;
+        white-space: nowrap;
       }
 
-      .prompt {
-        width: min(100%, 760px);
-        align-self: center;
-        padding: 28px 0;
+      .surface {
+        display: grid;
+        gap: 18px;
+        align-content: start;
       }
 
       .eyebrow {
-        margin: 0 0 10px;
+        margin: 0;
         color: #586257;
         font-size: 14px;
         font-weight: 750;
@@ -89,63 +80,37 @@
       }
 
       h1 {
-        margin: 0 0 18px;
+        margin: 0;
         font-size: 34px;
         line-height: 1.12;
         letter-spacing: 0;
       }
 
-      .lede {
-        max-width: 680px;
-        margin: -6px 0 20px;
+      .lede,
+      .hint,
+      .reference,
+      details {
         color: #455048;
-        font-size: 17px;
+        font-size: 15px;
         line-height: 1.45;
       }
 
-      .steps {
+      .lede {
+        margin: 0;
+        max-width: 620px;
+      }
+
+      form,
+      .reviewer,
+      .approval,
+      .failure,
+      .empty {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 8px;
-        margin: 0 0 22px;
-      }
-
-      .step {
-        border: 1px solid #d9ded5;
-        border-radius: 6px;
-        padding: 9px 10px;
-        background: #ffffff;
-        color: #586257;
-        font-size: 13px;
-        font-weight: 700;
-      }
-
-      .step.active {
-        border-color: #24533d;
-        background: #e9f1ea;
-        color: #20241f;
-      }
-
-      .kind {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-bottom: 16px;
-      }
-
-      .kind span {
-        border: 1px solid #b9c4b5;
-        border-radius: 6px;
-        padding: 5px 8px;
-        background: #ffffff;
-        color: #485348;
-        font-size: 13px;
-        font-weight: 650;
+        gap: 14px;
       }
 
       label {
         display: block;
-        margin-bottom: 8px;
         color: #586257;
         font-size: 14px;
         font-weight: 650;
@@ -153,32 +118,42 @@
 
       textarea {
         width: 100%;
-        min-height: 116px;
+        min-height: 148px;
         resize: vertical;
-        border: 1px solid #b9c4b5;
-        border-radius: 6px;
-        padding: 12px 14px;
+        border: 1px solid #b8c5b3;
+        border-radius: 8px;
+        padding: 14px;
         background: #ffffff;
         color: #20241f;
         font: inherit;
         line-height: 1.45;
       }
 
+      .reviewer textarea {
+        min-height: 132px;
+      }
+
       button {
-        min-height: 40px;
+        min-height: 44px;
         border: 1px solid #24533d;
-        border-radius: 6px;
-        padding: 0 14px;
+        border-radius: 8px;
+        padding: 0 15px;
         background: #24533d;
         color: #ffffff;
         font: inherit;
-        font-weight: 700;
+        font-weight: 750;
         cursor: pointer;
       }
 
       button.secondary {
         background: #ffffff;
         color: #24533d;
+      }
+
+      button.warn {
+        border-color: #8d4d2d;
+        background: #ffffff;
+        color: #8d4d2d;
       }
 
       button:disabled {
@@ -189,272 +164,268 @@
       }
 
       .actions {
-        justify-content: flex-start;
+        display: flex;
         flex-wrap: wrap;
-        padding-top: 16px;
+        gap: 10px;
       }
 
       .answer,
       .grade,
-      .solution {
-        margin-top: 12px;
-        min-height: 24px;
+      .solution,
+      .failure {
         overflow-wrap: anywhere;
-        font-size: 15px;
-        font-weight: 650;
-      }
-
-      .answer:empty,
-      .grade:empty,
-      .solution:empty {
-        display: none;
-      }
-
-      .hint {
-        margin-top: 10px;
-        color: #586257;
-        font-size: 14px;
-        line-height: 1.45;
       }
 
       .answer {
         color: #24533d;
+        font-weight: 700;
       }
 
       .grade {
         color: #7a4322;
+        font-weight: 700;
       }
 
       .solution {
         color: #455048;
-        font-weight: 500;
       }
 
-      aside {
-        min-width: 0;
-        border-left: 1px solid #d9ded5;
-        background: #ffffff;
-      }
-
-      section.panel {
-        border-bottom: 1px solid #d9ded5;
-        padding: 20px;
-      }
-
-      h2 {
-        margin: 0 0 14px;
-        font-size: 15px;
-        line-height: 1.2;
-        letter-spacing: 0;
-      }
-
-      dl {
-        display: grid;
-        grid-template-columns: 1fr auto;
-        gap: 9px 14px;
-        margin: 0;
-        color: #586257;
-        font-size: 14px;
-      }
-
-      dd {
-        margin: 0;
-        color: #20241f;
-        font-weight: 700;
-      }
-
-      ol,
-      ul {
-        display: grid;
-        gap: 9px;
-        margin: 0;
-        padding-left: 18px;
-        color: #586257;
-        font-size: 14px;
-      }
-
-      li strong {
-        display: block;
-        color: #20241f;
-        overflow-wrap: anywhere;
-      }
-
-      .composer {
-        display: grid;
-        gap: 10px;
-        margin-top: 22px;
+      .approval,
+      .failure,
+      .empty,
+      details {
         border: 1px solid #d9ded5;
         border-radius: 8px;
-        padding: 16px;
         background: #ffffff;
+        padding: 16px;
       }
 
-      .composer[hidden],
-      .reviewer[hidden],
-      .panel[hidden] {
-        display: none;
+      .reference {
+        margin: 0;
+        border-left: 3px solid #d9b166;
+        padding-left: 12px;
       }
 
-      input {
-        width: 100%;
-        min-height: 38px;
-        border: 1px solid #b9c4b5;
-        border-radius: 6px;
-        padding: 0 10px;
-        font: inherit;
+      .edit-fields {
+        display: grid;
+        gap: 10px;
       }
 
-      @media (max-width: 760px) {
+      details {
+        font-size: 14px;
+      }
+
+      summary {
+        cursor: pointer;
+        color: #24533d;
+        font-weight: 750;
+      }
+
+      .diagnostics {
+        margin: 12px 0 0;
+        padding-left: 18px;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      @media (max-width: 520px) {
         main {
-          grid-template-columns: 1fr;
+          display: block;
+          padding: 16px;
         }
 
-        .study {
-          display: block;
-          min-height: auto;
-          padding: 18px;
+        .shell {
+          min-height: calc(100vh - 32px);
+          align-content: center;
         }
 
         h1 {
-          font-size: 28px;
+          font-size: 29px;
         }
 
-        .steps {
-          grid-template-columns: 1fr 1fr;
-        }
-
-        aside {
-          border-left: 0;
-          border-top: 1px solid #d9ded5;
+        .actions button {
+          flex: 1 1 136px;
         }
       }
     </style>
   </head>
   <body>
     <main>
-      <section class="study">
+      <section class="shell">
         <header>
           <div class="brand">
             <strong>Memory Engine</strong>
-            <span>Turn notes into retrieval practice.</span>
+            <span>Modern AI-enhanced SRS</span>
           </div>
-          <span class="mode" id="status">Loading</span>
+          <span class="status" id="status">Loading</span>
         </header>
-        <div class="prompt">
-          <p class="eyebrow" id="eyebrow">Set up practice</p>
-          <div class="steps" aria-label="Study setup progress">
-            <div class="step" id="step-source">1. Add notes</div>
-            <div class="step" id="step-generate">2. Make cards</div>
-            <div class="step" id="step-approve">3. Approve</div>
-            <div class="step" id="step-study">4. Study</div>
-          </div>
-          <div class="kind">
-            <span id="activity">activity</span>
-            <span id="stage">stage</span>
-          </div>
-          <h1 id="prompt">Paste something you want to remember.</h1>
+
+        <section class="surface">
+          <p class="eyebrow" id="eyebrow">Build a memory</p>
+          <h1 id="prompt">Paste anything you want to remember.</h1>
           <p class="lede" id="lede">
-            This local beta turns a short source into practice cards, schedules them with FSRS,
-            and keeps your review history on this machine.
+            The app will turn your source into cited recall practice before anything enters the
+            review queue.
           </p>
-          <div class="reviewer" id="reviewer" hidden>
-            <label for="answer" id="answer-label">Your answer</label>
+
+          <form id="source-form">
+            <label for="source-body">Source text</label>
+            <textarea
+              id="source-body"
+              autocomplete="off"
+              spellcheck="true"
+              placeholder="Paste notes, facts, worked examples, or a paragraph you want to remember."
+            ></textarea>
+            <div class="actions">
+              <button type="submit" id="primary-action">Make practice</button>
+            </div>
+          </form>
+
+          <section class="failure" id="failure" hidden>
+            <strong>Could not make useful practice yet.</strong>
+            <p id="failure-copy"></p>
+          </section>
+
+          <section class="approval" id="approval" hidden>
+            <p class="eyebrow">Check the source</p>
+            <p class="reference" id="draft-reference"></p>
+            <div class="edit-fields">
+              <label for="draft-prompt">Question</label>
+              <textarea id="draft-prompt" readonly></textarea>
+              <label for="draft-answer">Expected answer</label>
+              <textarea id="draft-answer" readonly></textarea>
+            </div>
+            <div class="actions">
+              <button type="button" id="approve">Keep</button>
+              <button type="button" class="warn" id="skip">Skip</button>
+              <button type="button" class="secondary" id="edit">Edit</button>
+              <button type="button" class="secondary" id="save-edit" hidden>Save edit</button>
+              <button type="button" class="secondary" id="start-practice" hidden>
+                Start practice
+              </button>
+            </div>
+          </section>
+
+          <section class="reviewer" id="reviewer" hidden>
+            <label for="answer" id="answer-label">Answer from memory</label>
             <textarea id="answer" autocomplete="off" spellcheck="false"></textarea>
             <div class="answer" id="expected"></div>
             <div class="solution" id="solution"></div>
             <div class="grade" id="grade"></div>
-            <p class="hint" id="study-hint"></p>
             <div class="actions">
               <button type="button" id="submit">Submit answer</button>
               <button type="button" class="secondary" id="reveal">Show answer</button>
               <button type="button" class="secondary" id="next">Next card</button>
             </div>
-          </div>
-          <form class="composer" id="source-form">
-            <label for="source-title">What are these notes about?</label>
-            <input id="source-title" value="NATO practice notes" />
-            <label for="source-body">Paste notes, facts, or worked examples</label>
-            <textarea id="source-body"></textarea>
-            <p class="hint">
-              The sample below is already filled in. Save it, make practice cards, approve them,
-              then answer from memory.
-            </p>
+          </section>
+
+          <section class="empty" id="empty" hidden>
+            <p class="hint" id="empty-copy"></p>
             <div class="actions">
-              <button type="submit" id="save-source">Save notes</button>
-              <button type="button" class="secondary" id="generate">Make practice cards</button>
+              <button type="button" id="empty-start">Start practice</button>
             </div>
-          </form>
-        </div>
+          </section>
+
+          <details id="details" hidden>
+            <summary>Session details</summary>
+            <ul class="diagnostics" id="diagnostics"></ul>
+          </details>
+        </section>
       </section>
-      <aside>
-        <section class="panel">
-          <h2>Session</h2>
-          <dl>
-            <dt>This card seen</dt>
-            <dd id="reps">0</dd>
-            <dt>Memory status</dt>
-            <dd id="state">new</dd>
-            <dt>Attempts</dt>
-            <dd id="attempts">0</dd>
-            <dt>Outcome</dt>
-            <dd id="outcome">none</dd>
-          </dl>
-        </section>
-        <section class="panel" id="draft-panel">
-          <h2>Practice cards to approve</h2>
-          <ul id="drafts"></ul>
-        </section>
-        <section class="panel" id="queue-panel">
-          <h2>Coming up</h2>
-          <ol id="queue"></ol>
-        </section>
-      </aside>
     </main>
     <script>
-      const fixture = [
-        "Concept: NATO letter A",
-        "Activity: quiz",
-        "Stage: recognition-3",
-        "Question: What is the NATO phonetic alphabet word for A?",
-        "Answer: ALFA",
-        "Distractors: BRAVO, CHARLIE",
-        "Reference: The NATO phonetic alphabet word for A is ALFA.",
-        "",
-        "Concept: NATO CAT composition",
-        "Activity: exercise",
-        "Stage: composition",
-        "Question: Spell CAT over the phone using the NATO phonetic alphabet.",
-        "Answer: CHARLIE ALFA TANGO",
-        "Worked Solution: C is CHARLIE, A is ALFA, and T is TANGO.",
-        "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
-      ].join("\n");
-
+      const sourceForm = document.querySelector("#source-form");
       const sourceBody = document.querySelector("#source-body");
       const answer = document.querySelector("#answer");
-      sourceBody.value = fixture;
+      const draftPrompt = document.querySelector("#draft-prompt");
+      const draftAnswer = document.querySelector("#draft-answer");
 
-      document.querySelector("#source-form").addEventListener("submit", async (event) => {
+      let latestView = null;
+      let activeDraftId = null;
+      let questionShownAt = Date.now();
+
+      sourceForm.addEventListener("submit", async (event) => {
         event.preventDefault();
-        await post("/source", {
-          id: `source-${Date.now()}`,
-          title: document.querySelector("#source-title").value,
-          body: sourceBody.value,
+        const body = sourceBody.value.trim();
+        if (body.length === 0) {
+          sourceBody.focus();
+          return;
+        }
+        setBusy("Finding concepts");
+        const sourceId = `source-${Date.now()}`;
+        const sourceTitle = titleFromBody(body);
+        await fetchJson("/source", {
+          method: "POST",
+          body: JSON.stringify({ id: sourceId, title: sourceTitle, body }),
         });
+        render(
+          await fetchJson("/generate", {
+            method: "POST",
+            body: JSON.stringify({}),
+          }),
+        );
       });
-      document
-        .querySelector("#generate")
-        .addEventListener("click", async () => post("/generate", {}));
-      document.querySelector("#reveal").addEventListener("click", async () => post("/reveal", {}));
+
+      document.querySelector("#approve").addEventListener("click", async () => {
+        if (activeDraftId === null) return;
+        render(await post("/approve", { draftId: activeDraftId }));
+      });
+
+      document.querySelector("#skip").addEventListener("click", async () => {
+        if (activeDraftId === null) return;
+        render(await post("/reject", { draftId: activeDraftId, reason: "Skipped by learner" }));
+      });
+
+      document.querySelector("#edit").addEventListener("click", () => {
+        draftPrompt.readOnly = false;
+        draftAnswer.readOnly = false;
+        document.querySelector("#save-edit").hidden = false;
+        draftPrompt.focus();
+      });
+
+      document.querySelector("#save-edit").addEventListener("click", async () => {
+        if (activeDraftId === null) return;
+        render(
+          await post("/draft", {
+            draftId: activeDraftId,
+            prompt: draftPrompt.value,
+            expectedAnswer: draftAnswer.value,
+          }),
+        );
+      });
+
+      document.querySelector("#start-practice").addEventListener("click", async () => {
+        answer.value = "";
+        render(await post("/next", {}));
+      });
+
+      document.querySelector("#empty-start").addEventListener("click", async () => {
+        answer.value = "";
+        render(await post("/next", {}));
+      });
+
+      document.querySelector("#reveal").addEventListener("click", async () => {
+        render(await post("/reveal", {}));
+      });
+
       document.querySelector("#next").addEventListener("click", async () => {
         answer.value = "";
-        await post("/next", {});
+        render(await post("/next", {}));
       });
+
       document.querySelector("#submit").addEventListener("click", async () => {
-        await post("/answer", { answer: answer.value, responseTimeMs: 2400 });
+        const responseTimeMs = Math.max(1, Date.now() - questionShownAt);
+        render(await post("/answer", { answer: answer.value, responseTimeMs }));
+      });
+
+      answer.addEventListener("input", () => {
+        document.querySelector("#submit").disabled = answer.value.trim() === "";
       });
 
       async function post(path, payload) {
-        render(await fetchJson(path, { method: "POST", body: JSON.stringify(payload) }));
+        return fetchJson(path, { method: "POST", body: JSON.stringify(payload) });
       }
 
       async function fetchJson(path, options = {}) {
@@ -468,226 +439,171 @@
         return response.json();
       }
 
-      function render(view) {
-        const phase = phaseFor(view);
-        document.querySelector("#status").textContent = phase.status;
-        document.querySelector("#eyebrow").textContent = phase.eyebrow;
-        document.querySelector("#lede").textContent = phase.lede;
-        document.querySelector("#attempts").textContent = String(view.summary.attemptCount);
-        document.querySelector("#outcome").textContent = view.summary.lastOutcome ?? "none";
+      function setBusy(message) {
+        document.querySelector("#status").textContent = message;
+        document.querySelector("#primary-action").disabled = true;
+        document.querySelector("#primary-action").textContent = "Checking sources";
+      }
 
+      function render(view) {
+        const previousCurrent = latestView?.current?.reviewUnitId ?? null;
+        latestView = view;
+        const draft = currentDraft(view);
+        activeDraftId = draft?.id ?? null;
+        if (view.current?.reviewUnitId !== previousCurrent) {
+          questionShownAt = Date.now();
+        }
+
+        hideAll();
+        document.querySelector("#status").textContent = statusText(view, draft);
+        document.querySelector("#eyebrow").textContent = eyebrowText(view, draft);
+        document.querySelector("#prompt").textContent = promptText(view, draft);
+        document.querySelector("#lede").textContent = ledeText(view, draft);
+        document.querySelector("#primary-action").disabled = false;
+        document.querySelector("#primary-action").textContent = "Make practice";
+
+        if (view.current) {
+          renderStudy(view);
+        } else if (draft) {
+          renderApproval(view, draft);
+        } else if (view.generationFailures.length > 0) {
+          renderFailure(view);
+        } else if (view.queue.length > 0) {
+          renderEmpty(view);
+        } else {
+          sourceForm.hidden = false;
+        }
+
+        renderDiagnostics(view);
+      }
+
+      function hideAll() {
+        sourceForm.hidden = true;
+        document.querySelector("#failure").hidden = true;
+        document.querySelector("#approval").hidden = true;
+        document.querySelector("#reviewer").hidden = true;
+        document.querySelector("#empty").hidden = true;
+        document.querySelector("#save-edit").hidden = true;
+        document.querySelector("#start-practice").hidden = true;
+      }
+
+      function renderApproval(view, draft) {
+        document.querySelector("#approval").hidden = false;
+        document.querySelector("#draft-reference").textContent =
+          draft.referenceText ?? "No source excerpt was recorded.";
+        draftPrompt.value = draft.prompt;
+        draftPrompt.readOnly = true;
+        draftAnswer.value = draft.expectedAnswer;
+        draftAnswer.readOnly = true;
+        document.querySelector("#start-practice").hidden = view.queue.length === 0;
+      }
+
+      function renderStudy(view) {
         const current = view.current;
-        document.querySelector("#prompt").textContent = current?.prompt ?? phase.prompt;
-        document.querySelector("#activity").textContent = current
-          ? labelActivity(current.activityKind)
-          : phase.activity;
-        document.querySelector("#stage").textContent = current
-          ? labelStage(current.activityStage)
-          : phase.stage;
-        document.querySelector("#expected").textContent = current?.expectedAnswer
+        if (!current) return;
+        document.querySelector("#reviewer").hidden = false;
+        document.querySelector("#answer-label").textContent =
+          current.activityKind === "exercise" ? "Work it out" : "Answer from memory";
+        document.querySelector("#expected").textContent = current.expectedAnswer
           ? `Expected: ${current.expectedAnswer}`
           : "";
-        document.querySelector("#solution").textContent = current?.workedSolution
+        document.querySelector("#solution").textContent = current.workedSolution
           ? `Worked solution: ${current.workedSolution}`
           : "";
-        document.querySelector("#grade").textContent = current?.grade
-          ? `${labelVerdict(current.grade.verdict)} · memory rating ${current.grade.rating}`
+        document.querySelector("#grade").textContent = current.grade
+          ? `${labelVerdict(current.grade.verdict)}. Rating ${current.grade.rating}.`
           : "";
-        document.querySelector("#reps").textContent = String(current?.reviewState?.reps ?? 0);
-        document.querySelector("#state").textContent = labelMemoryState(current?.reviewState?.state);
-        document.querySelector("#study-hint").textContent = phase.hint;
-        document.querySelector("#source-form").hidden = phase.hideComposer;
-        document.querySelector("#reviewer").hidden = phase.hideReviewer;
-        document.querySelector("#answer-label").textContent =
-          current?.activityKind === "exercise" ? "Work it out" : "Answer from memory";
-        document.querySelector("#save-source").disabled = phase.disableSave;
-        document.querySelector("#generate").disabled = phase.disableGenerate;
-        document.querySelector("#submit").disabled = phase.disableSubmit || answer.value.trim() === "";
-        document.querySelector("#reveal").disabled = phase.disableReveal;
-        document.querySelector("#next").disabled = phase.disableNext;
-        markStep(phase.step);
-
-        const approvableDrafts = view.drafts.filter(
-          (draft) => draft.validationStatus === "accepted" && !draft.approved,
-        );
-        document.querySelector("#drafts").replaceChildren(
-          ...approvableDrafts.map((draft) => {
-            const item = document.createElement("li");
-            const title = document.createElement("strong");
-            const metadata = document.createTextNode(
-              `${labelActivity(draft.activityKind)} · ${labelStage(draft.activityStage)}`,
-            );
-            const button = document.createElement("button");
-            button.type = "button";
-            button.textContent = "Approve card";
-            button.className = "secondary";
-            button.addEventListener("click", async () => post("/approve", { draftId: draft.id }));
-            title.textContent = draft.prompt;
-            item.append(title, metadata);
-            item.append(" ", button);
-            return item;
-          }),
-        );
-        document.querySelector("#draft-panel").hidden = approvableDrafts.length === 0;
-
-        document.querySelector("#queue").replaceChildren(
-          ...view.queue.map((row) => {
-            const item = document.createElement("li");
-            const title = document.createElement("strong");
-            title.textContent = labelActivity(row.activityKind ?? "item");
-            item.append(title, `${labelStage(row.activityStage ?? "practice")} · seen ${row.reps}`);
-            return item;
-          }),
-        );
-        document.querySelector("#queue-panel").hidden = view.queue.length === 0;
+        document.querySelector("#submit").disabled =
+          view.status === "graded" || answer.value.trim() === "";
+        document.querySelector("#reveal").disabled =
+          view.status === "revealed" || view.status === "graded";
+        document.querySelector("#next").disabled = view.status !== "graded";
       }
 
-      answer.addEventListener("input", () => {
-        document.querySelector("#submit").disabled = answer.value.trim() === "";
-      });
+      function renderFailure(view) {
+        document.querySelector("#failure").hidden = false;
+        document.querySelector("#failure-copy").textContent = view.generationFailures.join(" ");
+        sourceForm.hidden = false;
+      }
 
-      function phaseFor(view) {
+      function renderEmpty() {
+        document.querySelector("#empty").hidden = false;
+        document.querySelector("#empty-copy").textContent =
+          "You have kept practice ready. Start the next due card when you are ready.";
+      }
+
+      function renderDiagnostics(view) {
+        const details = document.querySelector("#details");
+        const items = [
+          `${view.summary.sourceCount} sources`,
+          `${view.summary.acceptedDraftCount} accepted drafts`,
+          `${view.summary.approvedReviewUnitCount} kept items`,
+          `${view.summary.attemptCount} attempts`,
+          `${view.summary.generationFailureCount} generation failures`,
+        ];
+        document.querySelector("#diagnostics").replaceChildren(
+          ...items.map((item) => {
+            const row = document.createElement("li");
+            row.textContent = item;
+            return row;
+          }),
+        );
+        details.hidden = view.summary.sourceCount === 0 && view.summary.attemptCount === 0;
+      }
+
+      function currentDraft(view) {
+        return (
+          view.drafts.find((draft) => draft.validationStatus === "accepted" && !draft.approved) ??
+          null
+        );
+      }
+
+      function statusText(view, draft) {
         if (view.current) {
-          if (view.status === "graded") {
-            return {
-              step: "study",
-              status: "Result saved",
-              eyebrow: "Review result",
-              prompt: view.current.prompt,
-              lede: "Your answer was graded and the next review was scheduled.",
-              activity: "Study",
-              stage: "Scheduled",
-              hint: "Move to the next card when you are ready.",
-              hideComposer: true,
-              hideReviewer: false,
-              disableSave: true,
-              disableGenerate: true,
-              disableSubmit: true,
-              disableReveal: true,
-              disableNext: false,
-            };
-          }
-
-          if (view.status === "revealed") {
-            return {
-              step: "study",
-              status: "Answer shown",
-              eyebrow: "Check yourself",
-              prompt: view.current.prompt,
-              lede: "Compare the answer, then submit what you remembered so the scheduler can update.",
-              activity: "Study",
-              stage: "Reveal",
-              hint: "Reveal does not count as a review. Submit an answer to save progress.",
-              hideComposer: true,
-              hideReviewer: false,
-              disableSave: true,
-              disableGenerate: true,
-              disableSubmit: false,
-              disableReveal: true,
-              disableNext: true,
-            };
-          }
-
-          return {
-            step: "study",
-            status: "Studying",
-            eyebrow: "Active recall",
-            prompt: view.current.prompt,
-            lede: "Try to answer before revealing. Retrieval practice is the point.",
-            activity: "Study",
-            stage: "Answer",
-            hint: "Submit your answer, or reveal first if you are stuck.",
-            hideComposer: true,
-            hideReviewer: false,
-            disableSave: true,
-            disableGenerate: true,
-            disableSubmit: false,
-            disableReveal: false,
-            disableNext: true,
-          };
+          if (view.status === "graded") return "Saved";
+          if (view.status === "revealed") return "Answer shown";
+          return "Studying";
         }
-
-        if (view.drafts.some((draft) => draft.validationStatus === "accepted")) {
-          return {
-            step: "approve",
-            status: "Approve cards",
-            eyebrow: "Cards are ready",
-            prompt: "Approve the cards you want to study.",
-            lede: "Generated cards stay out of your review queue until you approve them.",
-            activity: "Card prep",
-            stage: "Approval",
-            hint: "",
-            hideComposer: true,
-            hideReviewer: true,
-            disableSave: true,
-            disableGenerate: true,
-            disableSubmit: true,
-            disableReveal: true,
-            disableNext: true,
-          };
-        }
-
-        if (view.summary.sourceCount > 0) {
-          return {
-            step: "generate",
-            status: "Make cards",
-            eyebrow: "Notes saved",
-            prompt: "Turn those notes into practice cards.",
-            lede: "Memory Engine will make quiz and exercise drafts from the source you saved.",
-            activity: "Card prep",
-            stage: "Generate",
-            hint: "",
-            hideComposer: false,
-            hideReviewer: true,
-            disableSave: false,
-            disableGenerate: false,
-            disableSubmit: true,
-            disableReveal: true,
-            disableNext: true,
-          };
-        }
-
-        return {
-          step: "source",
-          status: "Start here",
-          eyebrow: "Build a memory",
-          prompt: "Paste something you want to remember.",
-          lede:
-            "Start with a short source. The app will make retrieval-practice cards and schedule reviews.",
-          activity: "Setup",
-          stage: "Notes",
-          hint: "",
-          hideComposer: false,
-          hideReviewer: true,
-          disableSave: false,
-          disableGenerate: true,
-          disableSubmit: true,
-          disableReveal: true,
-          disableNext: true,
-        };
+        if (draft) return "Review draft";
+        if (view.generationFailures.length > 0) return "Needs source";
+        if (view.queue.length > 0) return "Ready";
+        return "Start here";
       }
 
-      function markStep(activeStep) {
-        for (const [id, step] of [
-          ["#step-source", "source"],
-          ["#step-generate", "generate"],
-          ["#step-approve", "approve"],
-          ["#step-study", "study"],
-        ]) {
-          document.querySelector(id).classList.toggle("active", step === activeStep);
+      function eyebrowText(view, draft) {
+        if (view.current) return view.status === "graded" ? "Review result" : "Active recall";
+        if (draft) return "Keep or skip";
+        if (view.generationFailures.length > 0) return "Try a clearer source";
+        if (view.queue.length > 0) return "Practice is ready";
+        return "Build a memory";
+      }
+
+      function promptText(view, draft) {
+        if (view.current) return view.current.prompt;
+        if (draft) return "Does this look worth studying?";
+        if (view.generationFailures.length > 0) return "Paste source-backed facts.";
+        if (view.queue.length > 0) return "Start retrieval practice.";
+        return "Paste anything you want to remember.";
+      }
+
+      function ledeText(view, draft) {
+        if (view.current && view.status === "graded") {
+          return "Your answer was graded and the schedule was updated.";
         }
+        if (view.current) return "Answer first. Reveal only if you need to check yourself.";
+        if (draft) return "Generated items stay out of review until you keep them.";
+        if (view.generationFailures.length > 0) {
+          return "Use sentences like Alpha is the first Greek letter. The generator needs evidence it can cite.";
+        }
+        if (view.queue.length > 0) return "Your kept cards are due now.";
+        return "The app will turn your source into cited recall practice before anything enters the review queue.";
       }
 
-      function labelActivity(value) {
-        if (value === "quiz") return "Quiz";
-        if (value === "exercise") return "Exercise";
-        return "Practice";
-      }
-
-      function labelStage(value) {
-        return String(value)
-          .replaceAll("-", " ")
-          .replace(/\b\w/g, (letter) => letter.toUpperCase());
+      function titleFromBody(body) {
+        return body
+          .split(/[.!?\n]/)[0]
+          .trim()
+          .slice(0, 48) || "Pasted notes";
       }
 
       function labelVerdict(value) {
@@ -696,13 +612,6 @@
         if (value === "wrong") return "Needs work";
         if (value === "revealed") return "Revealed";
         return String(value);
-      }
-
-      function labelMemoryState(value) {
-        if (value === 1) return "Learning";
-        if (value === 2) return "Review";
-        if (value === 3) return "Relearning";
-        return "New";
       }
 
       fetchJson("/state").then(render);

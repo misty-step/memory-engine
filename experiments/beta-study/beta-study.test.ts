@@ -254,6 +254,93 @@ describe('mobile beta study interface session', () => {
     });
   });
 
+  test('surfaces generation failures for prose that cannot produce source-backed drafts', async () => {
+    await withTempStudy(async (path) => {
+      const study = await createBetaStudySession({ path, now: () => now });
+      await study.addSource({
+        id: 'src-vague',
+        title: 'Vague notes',
+        body: 'Remember this later maybe somehow.',
+      });
+
+      const generated = await study.generate();
+
+      expect(generated).toMatchObject({
+        status: 'drafting',
+        drafts: [],
+        generationFailures: [
+          'src-vague: arbitrary text did not contain enough source-backed facts to generate practice',
+        ],
+        summary: {
+          generationFailureCount: 1,
+          approvedReviewUnitCount: 0,
+        },
+      });
+    });
+  });
+
+  test('supports one-at-a-time keep, skip, and edit decisions before study starts', async () => {
+    await withTempStudy(async (path) => {
+      const study = await createBetaStudySession({ path, now: () => now });
+      await study.addSource({
+        id: 'src-greek',
+        title: 'Greek notes',
+        body: [
+          'Alpha is the first Greek letter.',
+          'Beta is the second Greek letter.',
+          'Gamma measures the rate of change of Delta.',
+        ].join(' '),
+      });
+
+      const generated = await study.generate();
+      expect(generated.drafts[0]).toMatchObject({
+        id: 'study-run-1-draft-src-greek-1-alpha',
+        prompt: 'According to Greek notes, what is Alpha?',
+        expectedAnswer: 'first Greek letter',
+        referenceText: 'Alpha is the first Greek letter.',
+        approved: false,
+      });
+
+      const revised = await study.reviseDraft({
+        draftId: 'study-run-1-draft-src-greek-1-alpha',
+        prompt: 'Which Greek letter starts the sequence?',
+        expectedAnswer: 'Alpha',
+      });
+      expect(revised.drafts[0]).toMatchObject({
+        prompt: 'Which Greek letter starts the sequence?',
+        expectedAnswer: 'Alpha',
+        approved: false,
+      });
+
+      const kept = await study.approveDraft('study-run-1-draft-src-greek-1-alpha');
+      expect(kept).toMatchObject({
+        status: 'drafting',
+        summary: { approvedReviewUnitCount: 1 },
+      });
+
+      const skipped = await study.rejectDraft('study-run-1-draft-src-greek-2-beta');
+      expect(skipped.drafts).toContainEqual(
+        expect.objectContaining({
+          id: 'study-run-1-draft-src-greek-2-beta',
+          validationStatus: 'rejected',
+          validationReasons: ['Skipped by learner'],
+        }),
+      );
+      expect(skipped.queue.map((row) => row.reviewUnitId)).toEqual([
+        reviewUnitId('generated-quiz-src-greek-1-alpha'),
+      ]);
+
+      const started = await study.next();
+      expect(started).toMatchObject({
+        status: 'answering',
+        current: {
+          prompt: 'Which Greek letter starts the sequence?',
+          expectedAnswer: null,
+        },
+      });
+    });
+  });
+
   test('unlocks a shared-concept ladder without copying schedule history and records typed recall plus exercise attempts through the service', async () => {
     await withTempStudy(async (path) => {
       const store = await createBetaPersistenceStore(path);

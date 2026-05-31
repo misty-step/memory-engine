@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+target/
 *.tsbuildinfo
 
 # Test coverage
@@ -33,3 +34,7 @@ bun-debug.log*
 !.spellbook/
 !.spellbook/repo-brief.md
 backlog.d/_cycles/
+
+# Local provider handoff state
+.pi/state/
+.harness-kit/traces/

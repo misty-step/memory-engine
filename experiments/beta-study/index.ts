@@ -42,6 +42,8 @@ export type BetaStudyDraftRow = {
   activityKind: GeneratedPromptDraft['activityKind'];
   activityStage: string;
   prompt: string;
+  expectedAnswer: string;
+  referenceText: string | null;
   validationStatus: GeneratedPromptDraft['validation']['status'];
   validationReasons: string[];
   workedSolution: string | null;
@@ -63,6 +65,7 @@ export type BetaStudySummary = {
   sourceCount: number;
   acceptedDraftCount: number;
   approvedReviewUnitCount: number;
+  generationFailureCount: number;
   attemptCount: number;
   lastOutcome: GradeResult['verdict'] | null;
   nextReviewUnitId: ReviewUnitId | null;
@@ -74,6 +77,7 @@ export type BetaStudyView = {
   drafts: BetaStudyDraftRow[];
   queue: BetaStudyQueueRow[];
   current: BetaStudyCurrent | null;
+  generationFailures: string[];
   summary: BetaStudySummary;
   apiPressure: string[];
 };
@@ -83,10 +87,18 @@ export type BetaStudySession = {
   addSource(input: BetaStudySourceInput): Promise<BetaStudyView>;
   generate(sourceDocumentIds?: string[]): Promise<BetaStudyView>;
   approveDraft(draftId: string): Promise<BetaStudyView>;
+  rejectDraft(draftId: string, reason?: string): Promise<BetaStudyView>;
+  reviseDraft(input: BetaStudyDraftRevision): Promise<BetaStudyView>;
   reveal(): Promise<BetaStudyView>;
   submitAnswer(answer: string, responseTimeMs: number): Promise<BetaStudyView>;
   next(): Promise<BetaStudyView>;
   view(): Promise<BetaStudyView>;
+};
+
+export type BetaStudyDraftRevision = {
+  draftId: string;
+  prompt: string;
+  expectedAnswer: string;
 };
 
 export type BetaStudySourceInput = {
@@ -151,12 +163,14 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
               grade,
               scheduleChange,
             ),
+      generationFailures: latestGenerationFailures(snapshot),
       summary: {
         sourceCount: snapshot.sourceDocuments.length,
         acceptedDraftCount: snapshot.generatedPromptDrafts.filter(
           (draft) => draft.validation.status === 'accepted',
         ).length,
         approvedReviewUnitCount: snapshot.reviewUnits.length,
+        generationFailureCount: latestGenerationFailures(snapshot).length,
         attemptCount: snapshot.attempts.length,
         lastOutcome: snapshot.attempts.at(-1)?.grade?.verdict ?? null,
         nextReviewUnitId,
@@ -210,6 +224,27 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
       }
       return readView();
     },
+    async rejectDraft(draftId: string, reason = 'Skipped by learner'): Promise<BetaStudyView> {
+      await store.rejectGeneratedPromptDraft(draftId, reason);
+      status = 'drafting';
+      current = null;
+      expectedAnswer = null;
+      grade = null;
+      scheduleChange = null;
+      return readView();
+    },
+    async reviseDraft(input: BetaStudyDraftRevision): Promise<BetaStudyView> {
+      await store.reviseGeneratedPromptDraft(input.draftId, {
+        prompt: input.prompt,
+        expectedAnswer: input.expectedAnswer,
+      });
+      status = 'drafting';
+      current = null;
+      expectedAnswer = null;
+      grade = null;
+      scheduleChange = null;
+      return readView();
+    },
     async reveal(): Promise<BetaStudyView> {
       const active = requireCurrent(current);
       if (status === 'graded') {
@@ -260,16 +295,32 @@ function draftRow(
   snapshot: ReturnType<BetaPersistenceStore['snapshot']>,
   draft: GeneratedPromptDraft,
 ): BetaStudyDraftRow {
+  const referenceSpanId = draft.referenceSpanIds[0] ?? null;
+  const referenceSpan =
+    referenceSpanId === null
+      ? null
+      : snapshot.referenceSpans.find((span) => span.id === referenceSpanId);
   return {
     id: draft.id,
     activityKind: draft.activityKind,
     activityStage: draft.activityStage,
     prompt: draft.prompt.prompt,
+    expectedAnswer: promptExpectedAnswer(draft.prompt),
+    referenceText: referenceSpan?.text ?? null,
     validationStatus: draft.validation.status,
     validationReasons: [...draft.validation.reasons],
     workedSolution: draft.workedSolution,
     approved: snapshot.reviewUnits.some((unit) => unit.generatedPromptDraftId === draft.id),
   };
+}
+
+function latestGenerationFailures(
+  snapshot: ReturnType<BetaPersistenceStore['snapshot']>,
+): string[] {
+  const latest = snapshot.generationRuns
+    .slice()
+    .sort((left, right) => right.startedAt - left.startedAt)[0];
+  return latest?.validationFailures ?? [];
 }
 
 function queueRow(drafts: GeneratedPromptDraft[], candidate: QueueCandidate): BetaStudyQueueRow {

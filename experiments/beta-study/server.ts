@@ -35,6 +35,27 @@ const server = Bun.serve({
       return json(await study.approveDraft(readString(await readJson(request), 'draftId')));
     }
 
+    if (request.method === 'POST' && url.pathname === '/reject') {
+      const payload = await readJson(request);
+      return json(
+        await study.rejectDraft(
+          readString(payload, 'draftId'),
+          readOptionalString(payload, 'reason') ?? undefined,
+        ),
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/draft') {
+      const payload = await readJson(request);
+      return json(
+        await study.reviseDraft({
+          draftId: readString(payload, 'draftId'),
+          prompt: readString(payload, 'prompt'),
+          expectedAnswer: readString(payload, 'expectedAnswer'),
+        }),
+      );
+    }
+
     if (request.method === 'POST' && url.pathname === '/reveal') {
       return json(await study.reveal());
     }
@@ -87,6 +108,17 @@ function readString(payload: JsonRecord, key: string): string {
   const value = payload[key];
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`${key} must be a non-empty string`);
+  }
+  return value;
+}
+
+function readOptionalString(payload: JsonRecord, key: string): string | null {
+  const value = payload[key];
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${key} must be a non-empty string when present`);
   }
   return value;
 }

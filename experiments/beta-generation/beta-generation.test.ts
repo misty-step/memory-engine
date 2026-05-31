@@ -361,6 +361,115 @@ describe('beta generation probe', () => {
     });
   });
 
+  test('compiles arbitrary prose into source-grounded quiz and exercise drafts', async () => {
+    await withTempStore(async (path) => {
+      const store = await createBetaPersistenceStore(path);
+      await store.saveSourceDocument({
+        id: 'src-plain-notes',
+        kind: 'text',
+        title: 'Greek notes',
+        body: [
+          'Alpha is the first Greek letter.',
+          'Beta is the second Greek letter.',
+          'Gamma measures the rate of change of Delta.',
+        ].join(' '),
+        uri: null,
+        permission: 'model-eligible',
+        freshness: now,
+        createdAt: now,
+      });
+
+      const result = await runBetaGeneration(store, {
+        runId: 'run-plain',
+        sourceDocumentIds: ['src-plain-notes'],
+        startedAt: now,
+        defaultDue: now - 60_000,
+      });
+
+      expect(result.validationFailures).toEqual([]);
+      expect(result.acceptedDraftIds).toEqual([
+        'run-plain-draft-src-plain-notes-1-alpha',
+        'run-plain-draft-src-plain-notes-2-beta',
+        'run-plain-draft-src-plain-notes-3-gamma',
+        'run-plain-draft-src-plain-notes-4-greek-notes-synthesis',
+      ]);
+      expect(store.snapshot().referenceSpans.map((span) => span.text)).toEqual([
+        'Alpha is the first Greek letter.',
+        'Beta is the second Greek letter.',
+        'Gamma measures the rate of change of Delta.',
+        'Alpha is the first Greek letter. Beta is the second Greek letter.',
+      ]);
+      expect(store.snapshot().generatedPromptDrafts).toMatchObject([
+        {
+          prompt: {
+            kind: 'mcq',
+            prompt: 'According to Greek notes, what is Alpha?',
+            correctChoice: 'first Greek letter',
+          },
+        },
+        {
+          prompt: {
+            kind: 'mcq',
+            prompt: 'According to Greek notes, what is Beta?',
+            correctChoice: 'second Greek letter',
+          },
+        },
+        {
+          prompt: {
+            kind: 'mcq',
+            prompt: 'According to Greek notes, what is Gamma?',
+            correctChoice: 'rate of change of Delta',
+          },
+        },
+        {
+          activityKind: 'exercise',
+          workedSolution: 'Alpha: first Greek letter. Beta: second Greek letter.',
+          scoringRubric:
+            'Pass when the answer uses both cited facts without adding unsupported claims.',
+          prompt: {
+            kind: 'recitation',
+            prompt: 'Use the source to explain how Alpha and Beta fit together.',
+            acceptedAnswers: ['Alpha: first Greek letter; Beta: second Greek letter'],
+          },
+        },
+      ]);
+    });
+  });
+
+  test('reports arbitrary prose that lacks source-backed facts without saving drafts', async () => {
+    await withTempStore(async (path) => {
+      const store = await createBetaPersistenceStore(path);
+      await store.saveSourceDocument({
+        id: 'src-vague',
+        kind: 'text',
+        title: 'Vague notes',
+        body: 'Remember this later maybe somehow.',
+        uri: null,
+        permission: 'model-eligible',
+        freshness: now,
+        createdAt: now,
+      });
+
+      const result = await runBetaGeneration(store, {
+        runId: 'run-vague',
+        sourceDocumentIds: ['src-vague'],
+        startedAt: now,
+        defaultDue: now,
+      });
+
+      expect(result).toEqual({
+        runId: 'run-vague',
+        draftIds: [],
+        acceptedDraftIds: [],
+        rejectedDraftIds: [],
+        validationFailures: [
+          'src-vague: arbitrary text did not contain enough source-backed facts to generate practice',
+        ],
+      });
+      expect(store.snapshot().generatedPromptDrafts).toEqual([]);
+    });
+  });
+
   test('keeps generated ids distinct across multiple source documents', async () => {
     await withTempStore(async (path) => {
       const store = await createBetaPersistenceStore(path);

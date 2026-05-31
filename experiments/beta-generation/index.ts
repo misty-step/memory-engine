@@ -24,6 +24,11 @@ export type BetaGenerationResult = {
   validationFailures: string[];
 };
 
+export type LearningContentGenerator = (input: {
+  sources: SourceDocument[];
+  validationFailures: string[];
+}) => Promise<ParsedCandidate[]> | ParsedCandidate[];
+
 type ParsedCandidate = {
   source: SourceDocument;
   blockIndex: number;
@@ -48,6 +53,7 @@ const defaultModel: GeneratedPromptModel = {
 export async function runBetaGeneration(
   store: BetaPersistenceStore,
   request: BetaGenerationRequest,
+  generator: LearningContentGenerator = deterministicLearningContentGenerator,
 ): Promise<BetaGenerationResult> {
   const model = request.model ?? defaultModel;
   const snapshot = store.snapshot();
@@ -72,51 +78,50 @@ export async function runBetaGeneration(
 
   const seenSignatures = new Set(existingDraftSignatures(snapshot.generatedPromptDrafts));
   const previousUnitByGroup = new Map<string, ReviewUnitId>();
-  for (const source of sources) {
-    const candidates = parseSourceDocument(source, validationFailures);
-    for (const candidate of candidates) {
-      if (candidate.reference === null) {
-        validationFailures.push(
-          `${source.id} block ${candidate.blockIndex}: generated drafts require source provenance`,
-        );
-        continue;
-      }
-
-      const signature = candidateSignature(candidate);
-      const duplicate = seenSignatures.has(signature);
-      seenSignatures.add(signature);
-
-      const referenceSpan = await store.saveReferenceSpan({
-        id: generatedId(request.runId, 'ref', candidate),
-        sourceDocumentId: source.id,
-        label: `${candidate.concept} source evidence`,
-        text: candidate.reference,
-        locator: `block:${candidate.blockIndex}`,
-        createdAt: request.startedAt,
-      });
-      const progressionGroup = slug(candidate.concept);
-      const requires = previousUnitByGroup.get(progressionGroup);
-      const draft = await store.saveGeneratedPromptDraft(
-        buildDraft(candidate, {
-          runId: request.runId,
-          referenceSpanId: referenceSpan.id,
-          model,
-          due: request.defaultDue,
-          createdAt: request.startedAt,
-          duplicate,
-          requires: requires === undefined ? [] : [requires],
-        }),
+  const candidates = await generator({ sources, validationFailures });
+  for (const candidate of candidates) {
+    const source = candidate.source;
+    if (candidate.reference === null) {
+      validationFailures.push(
+        `${source.id} block ${candidate.blockIndex}: generated drafts require source provenance`,
       );
-      if (draft.validation.status === 'accepted') {
-        previousUnitByGroup.set(progressionGroup, draft.reviewUnitId);
-      }
+      continue;
+    }
 
-      draftIds.push(draft.id);
-      if (draft.validation.status === 'accepted') {
-        acceptedDraftIds.push(draft.id);
-      } else {
-        rejectedDraftIds.push(draft.id);
-      }
+    const signature = candidateSignature(candidate);
+    const duplicate = seenSignatures.has(signature);
+    seenSignatures.add(signature);
+
+    const referenceSpan = await store.saveReferenceSpan({
+      id: generatedId(request.runId, 'ref', candidate),
+      sourceDocumentId: source.id,
+      label: `${candidate.concept} source evidence`,
+      text: candidate.reference,
+      locator: `block:${candidate.blockIndex}`,
+      createdAt: request.startedAt,
+    });
+    const progressionGroup = slug(candidate.concept);
+    const requires = previousUnitByGroup.get(progressionGroup);
+    const draft = await store.saveGeneratedPromptDraft(
+      buildDraft(candidate, {
+        runId: request.runId,
+        referenceSpanId: referenceSpan.id,
+        model,
+        due: request.defaultDue,
+        createdAt: request.startedAt,
+        duplicate,
+        requires: requires === undefined ? [] : [requires],
+      }),
+    );
+    if (draft.validation.status === 'accepted') {
+      previousUnitByGroup.set(progressionGroup, draft.reviewUnitId);
+    }
+
+    draftIds.push(draft.id);
+    if (draft.validation.status === 'accepted') {
+      acceptedDraftIds.push(draft.id);
+    } else {
+      rejectedDraftIds.push(draft.id);
     }
   }
 
@@ -140,6 +145,13 @@ export async function runBetaGeneration(
   };
 }
 
+function deterministicLearningContentGenerator(input: {
+  sources: SourceDocument[];
+  validationFailures: string[];
+}): ParsedCandidate[] {
+  return input.sources.flatMap((source) => parseSourceDocument(source, input.validationFailures));
+}
+
 function requireSource(sources: SourceDocument[], sourceDocumentId: string): SourceDocument {
   const source = sources.find((candidate) => candidate.id === sourceDocumentId);
   if (source === undefined) {
@@ -156,10 +168,119 @@ function parseSourceDocument(
   validationFailures: string[],
 ): ParsedCandidate[] {
   const body = source.body ?? '';
-  return body
+  const structuredFailuresStart = validationFailures.length;
+  const structuredCandidates = body
     .split(/\n\s*\n/)
     .map((block, index) => parseCandidateBlock(source, block, index + 1, validationFailures))
     .filter((candidate): candidate is ParsedCandidate => candidate !== null);
+
+  if (structuredCandidates.length > 0) {
+    return structuredCandidates;
+  }
+
+  validationFailures.splice(structuredFailuresStart);
+  const proseCandidates = parseProseDocument(source);
+  if (proseCandidates.length === 0) {
+    validationFailures.push(
+      `${source.id}: arbitrary text did not contain enough source-backed facts to generate practice`,
+    );
+  }
+  return proseCandidates;
+}
+
+type SourceFact = {
+  concept: string;
+  answer: string;
+  sentence: string;
+};
+
+function parseProseDocument(source: SourceDocument): ParsedCandidate[] {
+  const facts = sourceFacts(source.body ?? '');
+  const quizCandidates = facts.slice(0, 5).map((fact, index): ParsedCandidate => {
+    const distractors = facts
+      .filter((candidate) => candidate !== fact)
+      .map((candidate) => candidate.answer)
+      .slice(0, 4);
+    return {
+      source,
+      blockIndex: index + 1,
+      activityKind: 'quiz',
+      activityStage: distractors.length >= 4 ? 'recognition-5' : 'free-recall',
+      concept: fact.concept,
+      question: `According to ${source.title}, what is ${fact.concept}?`,
+      answer: fact.answer,
+      reference: fact.sentence,
+      distractors,
+      workedSolution: null,
+      scoringRubric: null,
+      unsupported: false,
+    };
+  });
+
+  if (facts.length < 2) {
+    return quizCandidates;
+  }
+
+  const first = facts[0];
+  const second = facts[1];
+  if (first === undefined || second === undefined) {
+    return quizCandidates;
+  }
+
+  return [
+    ...quizCandidates,
+    {
+      source,
+      blockIndex: quizCandidates.length + 1,
+      activityKind: 'exercise',
+      activityStage: 'composition',
+      concept: `${source.title} synthesis`,
+      question: `Use the source to explain how ${first.concept} and ${second.concept} fit together.`,
+      answer: `${first.concept}: ${first.answer}; ${second.concept}: ${second.answer}`,
+      reference: `${first.sentence} ${second.sentence}`,
+      distractors: [],
+      workedSolution: `${first.concept}: ${first.answer}. ${second.concept}: ${second.answer}.`,
+      scoringRubric:
+        'Pass when the answer uses both cited facts without adding unsupported claims.',
+      unsupported: false,
+    },
+  ];
+}
+
+function sourceFacts(body: string): SourceFact[] {
+  return sentences(body)
+    .map(sourceFact)
+    .filter((fact): fact is SourceFact => fact !== null);
+}
+
+function sentences(body: string): string[] {
+  const matches = body.match(/[^.!?]+[.!?]+/g) ?? [];
+  return matches.map((sentence) => sentence.trim()).filter((sentence) => sentence.length > 0);
+}
+
+function sourceFact(sentence: string): SourceFact | null {
+  const normalized = sentence.replace(/\s+/g, ' ').trim();
+  const match = normalized.match(
+    /^(.+?)\s+(is|are|means|measure|measures|refers to|describes)\s+(.+?)[.!?]$/i,
+  );
+  if (match === null) {
+    return null;
+  }
+
+  const concept = cleanFactPart(match[1] ?? '');
+  const answer = cleanFactPart(match[3] ?? '');
+  if (concept.length === 0 || answer.length === 0) {
+    return null;
+  }
+
+  return { concept, answer, sentence: normalized };
+}
+
+function cleanFactPart(value: string): string {
+  return value
+    .trim()
+    .replace(/^(a|an|the)\s+/i, '')
+    .replace(/\s+/g, ' ');
 }
 
 function parseCandidateBlock(
