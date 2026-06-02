@@ -87,6 +87,7 @@ export type BetaStudySession = {
   addSource(input: BetaStudySourceInput): Promise<BetaStudyView>;
   generate(sourceDocumentIds?: string[]): Promise<BetaStudyView>;
   approveDraft(draftId: string): Promise<BetaStudyView>;
+  approveAllDrafts(): Promise<BetaStudyView>;
   rejectDraft(draftId: string, reason?: string): Promise<BetaStudyView>;
   reviseDraft(input: BetaStudyDraftRevision): Promise<BetaStudyView>;
   reveal(): Promise<BetaStudyView>;
@@ -222,6 +223,21 @@ export async function createBetaStudySession(options: BetaStudyOptions): Promise
       } else {
         await selectNext();
       }
+      return readView();
+    },
+    async approveAllDrafts(): Promise<BetaStudyView> {
+      const approvedDraftIds = new Set(
+        store.snapshot().reviewUnits.map((unit) => unit.generatedPromptDraftId),
+      );
+      const drafts = store
+        .snapshot()
+        .generatedPromptDrafts.filter(
+          (draft) => draft.validation.status === 'accepted' && !approvedDraftIds.has(draft.id),
+        );
+      for (const draft of drafts) {
+        await store.approveGeneratedPromptDraft(draft.id);
+      }
+      await selectNext();
       return readView();
     },
     async rejectDraft(draftId: string, reason = 'Skipped by learner'): Promise<BetaStudyView> {

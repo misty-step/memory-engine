@@ -37,11 +37,27 @@ Covered behaviors:
 Local browser target:
 
 ```sh
-BETA_STUDY_STORE=.tmp/beta-study/store.json bun run experiments/beta-study/server.ts
+bun run local:server start
 ```
 
-The shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and uses a
-phone-friendly single-column layout below 760px.
+The manager starts the beta study shell on port `4177`, binds it to
+`0.0.0.0`, persists a JSON beta store, writes logs under
+`.tmp/local-servers/`, and prints both a localhost URL and the best share URL
+for phone testing. When Tailscale is active, the share URL should use the
+machine's `100.x.y.z` address.
+
+Useful commands:
+
+```sh
+bun run local:server status
+bun run local:server open
+bun run local:server url
+bun run local:server stop
+bun run local:server start --reset
+```
+
+Use `status` before handing off a phone URL. A stale shell session is not proof
+that a server is still listening.
 
 Browser smoke receipt on May 22, 2026:
 

@@ -299,6 +299,7 @@
             </div>
             <div class="actions">
               <button type="button" id="approve">Keep</button>
+              <button type="button" class="secondary" id="approve-all">Keep all</button>
               <button type="button" class="warn" id="skip">Skip</button>
               <button type="button" class="secondary" id="edit">Edit</button>
               <button type="button" class="secondary" id="save-edit" hidden>Save edit</button>
@@ -356,21 +357,29 @@
         setBusy("Finding concepts");
         const sourceId = `source-${Date.now()}`;
         const sourceTitle = titleFromBody(body);
-        await fetchJson("/source", {
-          method: "POST",
-          body: JSON.stringify({ id: sourceId, title: sourceTitle, body }),
-        });
-        render(
-          await fetchJson("/generate", {
+        try {
+          await fetchJson("/source", {
             method: "POST",
-            body: JSON.stringify({}),
-          }),
-        );
+            body: JSON.stringify({ id: sourceId, title: sourceTitle, body }),
+          });
+          render(
+            await fetchJson("/generate", {
+              method: "POST",
+              body: JSON.stringify({}),
+            }),
+          );
+        } catch (error) {
+          renderClientError(error);
+        }
       });
 
       document.querySelector("#approve").addEventListener("click", async () => {
         if (activeDraftId === null) return;
         render(await post("/approve", { draftId: activeDraftId }));
+      });
+
+      document.querySelector("#approve-all").addEventListener("click", async () => {
+        render(await post("/approve-all", {}));
       });
 
       document.querySelector("#skip").addEventListener("click", async () => {
@@ -429,14 +438,33 @@
       }
 
       async function fetchJson(path, options = {}) {
-        const response = await fetch(path, {
+        const response = await fetchWithTimeout(path, {
           ...options,
           headers: { "content-type": "application/json" },
         });
         if (!response.ok) {
-          throw new Error(await response.text());
+          const payload = await safeJson(response);
+          throw new Error(payload?.error ?? (await response.text()) ?? "Request failed");
         }
         return response.json();
+      }
+
+      async function fetchWithTimeout(path, options = {}) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12_000);
+        try {
+          return await fetch(path, { ...options, signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      async function safeJson(response) {
+        try {
+          return await response.clone().json();
+        } catch {
+          return null;
+        }
       }
 
       function setBusy(message) {
@@ -475,6 +503,21 @@
         }
 
         renderDiagnostics(view);
+      }
+
+      function renderClientError(error) {
+        hideAll();
+        document.querySelector("#status").textContent = "Needs retry";
+        document.querySelector("#eyebrow").textContent = "Connection issue";
+        document.querySelector("#prompt").textContent = "Generation did not finish.";
+        document.querySelector("#lede").textContent =
+          "The local study server did not return practice. Check that it is still running, then try again.";
+        document.querySelector("#primary-action").disabled = false;
+        document.querySelector("#primary-action").textContent = "Try again";
+        document.querySelector("#failure").hidden = false;
+        document.querySelector("#failure-copy").textContent =
+          error instanceof Error ? error.message : String(error);
+        sourceForm.hidden = false;
       }
 
       function hideAll() {
@@ -591,7 +634,7 @@
           return "Your answer was graded and the schedule was updated.";
         }
         if (view.current) return "Answer first. Reveal only if you need to check yourself.";
-        if (draft) return "Generated items stay out of review until you keep them.";
+        if (draft) return `${pendingDraftCount(view)} generated items are ready. Keep this one, skip it, edit it, or keep all.`;
         if (view.generationFailures.length > 0) {
           return "Use sentences like Alpha is the first Greek letter. The generator needs evidence it can cite.";
         }
@@ -604,6 +647,11 @@
           .split(/[.!?\n]/)[0]
           .trim()
           .slice(0, 48) || "Pasted notes";
+      }
+
+      function pendingDraftCount(view) {
+        return view.drafts.filter((draft) => draft.validationStatus === "accepted" && !draft.approved)
+          .length;
       }
 
       function labelVerdict(value) {

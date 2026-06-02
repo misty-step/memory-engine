@@ -341,6 +341,38 @@ describe('mobile beta study interface session', () => {
     });
   });
 
+  test('keeps an entire accepted NATO alphabet draft set in one action', async () => {
+    await withTempStudy(async (path) => {
+      const study = await createBetaStudySession({ path, now: () => now });
+      await study.addSource({
+        id: 'src-nato-alphabet',
+        title: 'NATO phonetic alphabet',
+        body: [
+          'I want to learn the NATO phonetic alphabet.',
+          'A Alfa, B Bravo, C Charlie, D Delta, E Echo, F Foxtrot, G Golf, H Hotel.',
+          'I India, J Juliett, K Kilo, L Lima, M Mike, N November, O Oscar.',
+          'P Papa, Q Quebec, R Romeo, S Sierra, T Tango, U Uniform.',
+          'V Victor, W Whiskey, X X-ray, Y Yankee, Z Zulu.',
+        ].join(' '),
+      });
+
+      const generated = await study.generate();
+      expect(generated.summary.acceptedDraftCount).toBe(27);
+      expect(generated.summary.approvedReviewUnitCount).toBe(0);
+      expect(generated.drafts.filter((draft) => draft.activityKind === 'quiz')).toHaveLength(26);
+
+      const kept = await study.approveAllDrafts();
+
+      expect(kept.summary.approvedReviewUnitCount).toBe(27);
+      expect(kept.status).toBe('answering');
+      expect(kept.current).toMatchObject({
+        prompt: 'According to NATO phonetic alphabet, what is A?',
+        expectedAnswer: null,
+      });
+      expect(kept.queue).toHaveLength(27);
+    });
+  });
+
   test('unlocks a shared-concept ladder without copying schedule history and records typed recall plus exercise attempts through the service', async () => {
     await withTempStudy(async (path) => {
       const store = await createBetaPersistenceStore(path);

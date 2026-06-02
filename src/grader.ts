@@ -61,7 +61,7 @@ export class Grader {
   }
 
   private gradeMcq(prompt: McqPrompt, submittedAnswer: string, ctx: GradeCtx): GradeResult {
-    const isCorrect = submittedAnswer === prompt.correctChoice;
+    const isCorrect = normalizeExact(submittedAnswer) === normalizeExact(prompt.correctChoice);
     const verdict: Verdict = isCorrect ? 'correct' : 'wrong';
 
     return deterministicGrade(

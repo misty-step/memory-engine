@@ -159,6 +159,19 @@ const baseGradingFixtures: GradingFixture[] = [
     expected: deterministicGrade('wrong', Rating.Again, 'Beta', 'Alpha', false),
   },
   {
+    name: 'mcq normalizes typed answer casing and punctuation',
+    prompt: {
+      kind: 'mcq',
+      reviewUnitId: reviewUnitId('mcq-normalized'),
+      prompt: 'Which color means stop?',
+      choices: ['Red', 'Green', 'Yellow'],
+      correctChoice: 'Red',
+    },
+    submitted: 'red.',
+    ctx: { responseTimeMs: 2_400, priorReps: 0 },
+    expected: deterministicGrade('correct', Rating.Good, 'red.', 'Red', true),
+  },
+  {
     name: 'boolean uses normalized exact matching',
     prompt: {
       kind: 'boolean',

@@ -42,6 +42,7 @@ type ParsedCandidate = {
   workedSolution: string | null;
   scoringRubric: string | null;
   unsupported: boolean;
+  dueOffsetMs?: number;
 };
 
 const defaultModel: GeneratedPromptModel = {
@@ -194,9 +195,20 @@ type SourceFact = {
   sentence: string;
 };
 
+type SourcePair = {
+  key: string;
+  value: string;
+  sentence: string;
+};
+
 function parseProseDocument(source: SourceDocument): ParsedCandidate[] {
+  const pairCandidates = parsePairDocument(source);
+  if (pairCandidates.length > 0) {
+    return pairCandidates;
+  }
+
   const facts = sourceFacts(source.body ?? '');
-  const quizCandidates = facts.slice(0, 5).map((fact, index): ParsedCandidate => {
+  const quizCandidates = facts.map((fact, index): ParsedCandidate => {
     const distractors = facts
       .filter((candidate) => candidate !== fact)
       .map((candidate) => candidate.answer)
@@ -214,6 +226,7 @@ function parseProseDocument(source: SourceDocument): ParsedCandidate[] {
       workedSolution: null,
       scoringRubric: null,
       unsupported: false,
+      dueOffsetMs: index * 1_000,
     };
   });
 
@@ -245,6 +258,145 @@ function parseProseDocument(source: SourceDocument): ParsedCandidate[] {
       unsupported: false,
     },
   ];
+}
+
+function parsePairDocument(source: SourceDocument): ParsedCandidate[] {
+  const pairs = sourcePairs(source.body ?? '');
+  if (pairs.length < 3) {
+    return [];
+  }
+
+  const quizCandidates = pairs.map((pair, index): ParsedCandidate => {
+    const distractors = pairs
+      .filter((candidate) => candidate.key !== pair.key)
+      .slice(index + 1)
+      .concat(pairs.slice(0, index))
+      .slice(0, 4)
+      .map((candidate) => candidate.value);
+
+    return {
+      source,
+      blockIndex: index + 1,
+      activityKind: 'quiz',
+      activityStage: 'recognition-5',
+      concept: pair.key,
+      question: `According to ${source.title}, what is ${pair.key}?`,
+      answer: pair.value,
+      reference: pair.sentence,
+      distractors,
+      workedSolution: null,
+      scoringRubric: null,
+      unsupported: false,
+      dueOffsetMs: index * 1_000,
+    };
+  });
+
+  const exercise = pairSequenceExercise(source, pairs, quizCandidates.length);
+  if (exercise === null) {
+    return quizCandidates;
+  }
+
+  return [...quizCandidates, exercise];
+}
+
+function pairSequenceExercise(
+  source: SourceDocument,
+  pairs: SourcePair[],
+  startingIndex: number,
+): ParsedCandidate | null {
+  if (pairs.length < 4) {
+    return null;
+  }
+
+  const practiced = pairs.slice(0, 4);
+  const answer = practiced.map((pair) => `${pair.key}: ${pair.value}`).join('; ');
+
+  return {
+    source,
+    blockIndex: startingIndex + 1,
+    activityKind: 'exercise',
+    activityStage: 'composition',
+    concept: `${source.title} mapping sequence`,
+    question: `Recall the first four mappings from ${source.title}.`,
+    answer,
+    reference: practiced.map((pair) => pair.sentence).join(' '),
+    distractors: [],
+    workedSolution: `${answer}.`,
+    scoringRubric: 'Pass when all four cited mappings are recalled without unsupported additions.',
+    unsupported: false,
+    dueOffsetMs: startingIndex * 1_000,
+  };
+}
+
+function sourcePairs(body: string): SourcePair[] {
+  const seen = new Set<string>();
+  const pairs: SourcePair[] = [];
+  for (const chunk of pairChunks(body)) {
+    const pair = sourcePair(chunk);
+    if (pair === null) {
+      continue;
+    }
+
+    const key = pair.key.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    pairs.push(pair);
+  }
+  return pairs;
+}
+
+function pairChunks(body: string): string[] {
+  return body
+    .split(/\n+|[.;]+|\s*,\s*/)
+    .map((chunk) => chunk.replace(/\s+/g, ' ').trim())
+    .filter((chunk) => chunk.length > 0);
+}
+
+function sourcePair(chunk: string): SourcePair | null {
+  const normalized = chunk.replace(/\s+/g, ' ').trim();
+  const explicit = normalized.match(/^(.+?)\s*(?::|=|->|=>|–|—)\s*(.+)$/);
+  if (explicit !== null) {
+    return cleanSourcePair(explicit[1] ?? '', explicit[2] ?? '', normalized);
+  }
+
+  const verbal = normalized.match(
+    /^(.+?)\s+(?:is|are|means|equals|refers to|maps to|stands for)\s+(.+)$/i,
+  );
+  if (verbal !== null) {
+    return cleanSourcePair(verbal[1] ?? '', verbal[2] ?? '', normalized);
+  }
+
+  const compact = normalized.match(/^([A-Za-z0-9]{1,12})\s+(.+)$/);
+  if (compact !== null) {
+    const value = compact[2] ?? '';
+    if (/^[A-Z0-9]/.test(value)) {
+      return cleanSourcePair(compact[1] ?? '', value, normalized);
+    }
+  }
+
+  return null;
+}
+
+function cleanSourcePair(rawKey: string, rawValue: string, sentence: string): SourcePair | null {
+  const key = cleanPairPart(rawKey);
+  const value = cleanPairPart(rawValue);
+  if (key.length === 0 || value.length === 0 || key === value) {
+    return null;
+  }
+  if (key.split(/\s+/).length > 6 || value.split(/\s+/).length > 8) {
+    return null;
+  }
+  return { key, value, sentence };
+}
+
+function cleanPairPart(value: string): string {
+  return value
+    .trim()
+    .replace(/^[\s"'`([{]+|[\s"'`)\]}.,;:!?]+$/g, '')
+    .replace(/\s+/g, ' ');
 }
 
 function sourceFacts(body: string): SourceFact[] {
@@ -392,7 +544,7 @@ function buildDraft(
     prompt: buildPrompt(candidate, unitId),
     queue: {
       reviewUnitId: unitId,
-      due: context.due,
+      due: context.due + (candidate.dueOffsetMs ?? 0),
       progression: {
         progressionGroup: slug(candidate.concept),
         stageOrder: stageOrder(candidate.activityStage, candidate.activityKind),

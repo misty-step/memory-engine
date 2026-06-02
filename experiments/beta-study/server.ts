@@ -11,72 +11,85 @@ const server = Bun.serve({
   hostname,
   port: Number(Bun.env.PORT ?? 4174),
   async fetch(request) {
-    const url = new URL(request.url);
-
-    if (request.method === 'GET' && url.pathname === '/') {
-      return new Response(Bun.file(new URL('./index.html', import.meta.url)), {
-        headers: { 'content-type': 'text/html; charset=utf-8' },
-      });
+    try {
+      return await route(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return json({ error: message }, 400);
     }
-
-    if (request.method === 'GET' && url.pathname === '/state') {
-      return json(await study.view());
-    }
-
-    if (request.method === 'POST' && url.pathname === '/source') {
-      return json(await study.addSource(readSource(await readJson(request))));
-    }
-
-    if (request.method === 'POST' && url.pathname === '/generate') {
-      return json(await study.generate());
-    }
-
-    if (request.method === 'POST' && url.pathname === '/approve') {
-      return json(await study.approveDraft(readString(await readJson(request), 'draftId')));
-    }
-
-    if (request.method === 'POST' && url.pathname === '/reject') {
-      const payload = await readJson(request);
-      return json(
-        await study.rejectDraft(
-          readString(payload, 'draftId'),
-          readOptionalString(payload, 'reason') ?? undefined,
-        ),
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/draft') {
-      const payload = await readJson(request);
-      return json(
-        await study.reviseDraft({
-          draftId: readString(payload, 'draftId'),
-          prompt: readString(payload, 'prompt'),
-          expectedAnswer: readString(payload, 'expectedAnswer'),
-        }),
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/reveal') {
-      return json(await study.reveal());
-    }
-
-    if (request.method === 'POST' && url.pathname === '/answer') {
-      const payload = await readJson(request);
-      return json(
-        await study.submitAnswer(
-          readString(payload, 'answer'),
-          readNonNegativeNumber(payload, 'responseTimeMs'),
-        ),
-      );
-    }
-
-    if (request.method === 'POST' && url.pathname === '/next') {
-      return json(await study.next());
-    }
-
-    return new Response('Not found', { status: 404 });
   },
 });
+
+async function route(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (request.method === 'GET' && url.pathname === '/') {
+    return new Response(Bun.file(new URL('./index.html', import.meta.url)), {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/state') {
+    return json(await study.view());
+  }
+
+  if (request.method === 'POST' && url.pathname === '/source') {
+    return json(await study.addSource(readSource(await readJson(request))));
+  }
+
+  if (request.method === 'POST' && url.pathname === '/generate') {
+    return json(await study.generate());
+  }
+
+  if (request.method === 'POST' && url.pathname === '/approve') {
+    return json(await study.approveDraft(readString(await readJson(request), 'draftId')));
+  }
+
+  if (request.method === 'POST' && url.pathname === '/approve-all') {
+    return json(await study.approveAllDrafts());
+  }
+
+  if (request.method === 'POST' && url.pathname === '/reject') {
+    const payload = await readJson(request);
+    return json(
+      await study.rejectDraft(
+        readString(payload, 'draftId'),
+        readOptionalString(payload, 'reason') ?? undefined,
+      ),
+    );
+  }
+
+  if (request.method === 'POST' && url.pathname === '/draft') {
+    const payload = await readJson(request);
+    return json(
+      await study.reviseDraft({
+        draftId: readString(payload, 'draftId'),
+        prompt: readString(payload, 'prompt'),
+        expectedAnswer: readString(payload, 'expectedAnswer'),
+      }),
+    );
+  }
+
+  if (request.method === 'POST' && url.pathname === '/reveal') {
+    return json(await study.reveal());
+  }
+
+  if (request.method === 'POST' && url.pathname === '/answer') {
+    const payload = await readJson(request);
+    return json(
+      await study.submitAnswer(
+        readString(payload, 'answer'),
+        readNonNegativeNumber(payload, 'responseTimeMs'),
+      ),
+    );
+  }
+
+  if (request.method === 'POST' && url.pathname === '/next') {
+    return json(await study.next());
+  }
+
+  return json({ error: 'Not found' }, 404);
+}
 
 console.log(`Beta study listening on http://${hostname}:${server.port}`);
 setInterval(() => {}, 60_000);

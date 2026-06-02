@@ -436,6 +436,149 @@ describe('beta generation probe', () => {
     });
   });
 
+  test('turns mapping-list input into one quiz per supplied pair plus a generic exercise', async () => {
+    await withTempStore(async (path) => {
+      const store = await createBetaPersistenceStore(path);
+      await store.saveSourceDocument({
+        id: 'src-nato-alphabet',
+        kind: 'text',
+        title: 'NATO phonetic alphabet',
+        body: [
+          'I want to learn the NATO phonetic alphabet.',
+          'A Alfa, B Bravo, C Charlie, D Delta, E Echo, F Foxtrot, G Golf, H Hotel.',
+          'I India, J Juliett, K Kilo, L Lima, M Mike, N November, O Oscar.',
+          'P Papa, Q Quebec, R Romeo, S Sierra, T Tango, U Uniform.',
+          'V Victor, W Whiskey, X X-ray, Y Yankee, Z Zulu.',
+        ].join(' '),
+        uri: null,
+        permission: 'model-eligible',
+        freshness: now,
+        createdAt: now,
+      });
+
+      const result = await runBetaGeneration(store, {
+        runId: 'run-nato-alphabet',
+        sourceDocumentIds: ['src-nato-alphabet'],
+        startedAt: now,
+        defaultDue: now - 60_000,
+      });
+
+      expect(result.validationFailures).toEqual([]);
+      expect(result.acceptedDraftIds).toHaveLength(27);
+      expect(result.rejectedDraftIds).toEqual([]);
+
+      const drafts = store.snapshot().generatedPromptDrafts;
+      const letterDrafts = drafts.slice(0, 26);
+      expect(letterDrafts.map((draft) => draft.queue.conceptKey)).toEqual([
+        'a',
+        'b',
+        'c',
+        'd',
+        'e',
+        'f',
+        'g',
+        'h',
+        'i',
+        'j',
+        'k',
+        'l',
+        'm',
+        'n',
+        'o',
+        'p',
+        'q',
+        'r',
+        's',
+        't',
+        'u',
+        'v',
+        'w',
+        'x',
+        'y',
+        'z',
+      ]);
+      expect(letterDrafts.map((draft) => draft.prompt).slice(0, 3)).toMatchObject([
+        {
+          kind: 'mcq',
+          prompt: 'According to NATO phonetic alphabet, what is A?',
+          correctChoice: 'Alfa',
+        },
+        {
+          kind: 'mcq',
+          prompt: 'According to NATO phonetic alphabet, what is B?',
+          correctChoice: 'Bravo',
+        },
+        {
+          kind: 'mcq',
+          prompt: 'According to NATO phonetic alphabet, what is C?',
+          correctChoice: 'Charlie',
+        },
+      ]);
+      expect(drafts[26]?.prompt).toMatchObject({
+        kind: 'recitation',
+        prompt: 'Recall the first four mappings from NATO phonetic alphabet.',
+        acceptedAnswers: ['A: Alfa; B: Bravo; C: Charlie; D: Delta'],
+      });
+    });
+  });
+
+  test('generates the same mapping ladder for arbitrary non-alphabet input', async () => {
+    await withTempStore(async (path) => {
+      const store = await createBetaPersistenceStore(path);
+      await store.saveSourceDocument({
+        id: 'src-color-rules',
+        kind: 'text',
+        title: 'Color rules',
+        body: 'Red: stop, Green: go, Yellow: caution, Blue: information',
+        uri: null,
+        permission: 'model-eligible',
+        freshness: now,
+        createdAt: now,
+      });
+
+      const result = await runBetaGeneration(store, {
+        runId: 'run-color-rules',
+        sourceDocumentIds: ['src-color-rules'],
+        startedAt: now,
+        defaultDue: now - 60_000,
+      });
+
+      expect(result.validationFailures).toEqual([]);
+      expect(result.acceptedDraftIds).toHaveLength(5);
+
+      const drafts = store.snapshot().generatedPromptDrafts;
+      expect(drafts.map((draft) => draft.queue.conceptKey)).toEqual([
+        'red',
+        'green',
+        'yellow',
+        'blue',
+        'color-rules-mapping-sequence',
+      ]);
+      expect(drafts.map((draft) => draft.prompt).slice(0, 4)).toMatchObject([
+        {
+          kind: 'mcq',
+          prompt: 'According to Color rules, what is Red?',
+          correctChoice: 'stop',
+        },
+        {
+          kind: 'mcq',
+          prompt: 'According to Color rules, what is Green?',
+          correctChoice: 'go',
+        },
+        {
+          kind: 'mcq',
+          prompt: 'According to Color rules, what is Yellow?',
+          correctChoice: 'caution',
+        },
+        {
+          kind: 'mcq',
+          prompt: 'According to Color rules, what is Blue?',
+          correctChoice: 'information',
+        },
+      ]);
+    });
+  });
+
   test('reports arbitrary prose that lacks source-backed facts without saving drafts', async () => {
     await withTempStore(async (path) => {
       const store = await createBetaPersistenceStore(path);

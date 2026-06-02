@@ -23,6 +23,7 @@
     "test": "bun test",
     "test:watch": "bun test --watch",
     "bench": "bun run scripts/bench.ts",
+    "local:server": "bun run scripts/local-server.ts",
     "experiments:cli-review": "bun run experiments/cli-review/index.ts",
     "experiments:import-probe": "bun run experiments/import-probe/index.ts",
     "experiments:web-shell": "bun run experiments/web-shell/server.ts",
