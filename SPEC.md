@@ -530,24 +530,20 @@ This should stay shallow enough that apps can compose their own flows.
 - general tutoring chat UX
 - narrative lesson orchestration
 
-## Package Topology
+## Rust Workspace Topology
 
-These are **logical surfaces first, physical packages second**. The current
-repo can stay a single package with subpath exports as long as the boundaries
-remain clean. Do not split the filesystem just to satisfy the diagram; promote a
-surface into its own package only when adapter/runtime/versioning pressure is
-real.
+The migration cut over from logical TypeScript package surfaces to a Rust
+workspace. Keep the physical crates because the boundary pressure is now real:
+kernel semantics, service orchestration, persistence, local apps, dogfood
+receipts, and QA have different dependencies and release risks.
 
-### `packages/contracts`
+### `crates/memory-engine`
 
-Owns:
+Owns the consumer-facing facade and testkit exports. It should make common
+consumer usage ergonomic without leaking every internal crate as the primary
+entrypoint.
 
-- TypeScript types
-- JSON schemas if needed
-- versioned event envelopes
-- capability flags
-
-### `packages/core`
+### `crates/memory-engine-core`
 
 Owns:
 
@@ -562,23 +558,25 @@ Constraints:
 - no Convex/Bun/React/Hono coupling
 - no global singletons for time, user, or storage
 
-### `packages/adapters`
+### Boundary crates
 
 Owns:
 
-- storage adapters
-- runtime-specific bridges
-- Convex integration
-- SQLite/Bun or Node adapters
+- `crates/memory-engine-service` for typed command workflows
+- `crates/memory-engine-persistence` for local beta storage
+- `crates/memory-engine-generation` for source-backed draft generation
+- `crates/memory-engine-study` for session/API choreography
+- `crates/memory-engine-beta-app` and `crates/memory-engine-web-shell` for
+  local Rust HTTP hosts
+- `crates/memory-engine-cli`, `crates/memory-engine-import`,
+  `crates/memory-engine-bench`, and `crates/memory-engine-qa` for dogfood,
+  import, benchmark, and QA receipts
 
-### `packages/testkit`
+### Retained TypeScript Boundary
 
-Owns:
-
-- golden fixtures
-- grading regression corpus
-- scheduling simulations
-- compatibility harness for consumer apps
+`.dagger/src/index.ts` remains TypeScript because it is the Dagger SDK module.
+No non-Dagger TypeScript runtime, app, service, or test oracle belongs in the
+repo after the Rust cutover.
 
 ## API And Event Contracts
 

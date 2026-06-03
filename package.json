@@ -7,10 +7,6 @@
   "scripts": {
     "test": "cargo test --workspace",
     "bench": "cargo run -p memory-engine-bench",
-    "experiments:cli-review": "bun run rust:cli-review",
-    "experiments:import-probe": "bun run rust:import-probe",
-    "experiments:web-shell": "bun run rust:web-shell",
-    "experiments:web-shell:receipt": "bun run rust:web-shell:receipt",
     "qa": "cargo run -p memory-engine-qa -- --full",
     "qa:local": "cargo run -p memory-engine-qa -- --local",
     "rust:fmt": "cargo fmt --all --check",
@@ -22,8 +18,8 @@
     "rust:import-probe": "cargo run -p memory-engine-import",
     "rust:web-shell": "cargo run -p memory-engine-web-shell",
     "rust:web-shell:receipt": "cargo run -p memory-engine-web-shell -- --receipt",
-    "rust:dogfood": "bun run rust:cli-review && bun run rust:import-probe && bun run rust:web-shell:receipt",
-    "rust:ci": "bun run rust:fmt && bun run rust:test && bun run rust:clippy && bun run rust:doc",
+    "rust:dogfood": "cargo run -p memory-engine-cli && cargo run -p memory-engine-import && cargo run -p memory-engine-web-shell -- --receipt",
+    "rust:ci": "cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo doc --workspace --no-deps",
     "ci:local": "bun run rust:ci",
     "ci": "dagger call check --source=."
   }

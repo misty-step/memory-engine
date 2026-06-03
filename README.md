@@ -148,11 +148,14 @@ use memory_engine::testkit::{grading_fixtures, scheduler_fixtures};
 
 ```sh
 git config core.hooksPath .githooks
-bun run ci:local
-bun run rust:beta-study
-bun run rust:cli-review
-bun run rust:import-probe
-bun run rust:web-shell
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+cargo run -p memory-engine-beta-app
+cargo run -p memory-engine-cli
+cargo run -p memory-engine-import
+cargo run -p memory-engine-web-shell
 bun run ci
 dagger call check --source=.
 ```

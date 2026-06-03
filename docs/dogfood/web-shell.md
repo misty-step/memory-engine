@@ -18,10 +18,8 @@ server-rendered form UI.
 
 ```sh
 cargo test -p memory-engine-web-shell
-bun run experiments:web-shell:receipt
-bun run rust:web-shell:receipt
-bun run experiments:web-shell
-bun run rust:web-shell
+cargo run -p memory-engine-web-shell -- --receipt
+cargo run -p memory-engine-web-shell
 ```
 
 The Rust server listens on `http://127.0.0.1:4173` unless `HOST` or `PORT` is
@@ -29,7 +27,7 @@ set.
 For phone testing over a trusted Tailscale tailnet, run:
 
 ```sh
-HOST=0.0.0.0 bun run rust:web-shell
+HOST=0.0.0.0 cargo run -p memory-engine-web-shell
 ```
 
 ## Fixture

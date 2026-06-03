@@ -4,11 +4,12 @@ Refs-backlog: 33
 
 ## Purpose
 
-This receipt pressure-tests the current beta boundaries across two independent
-clients in `experiments/beta-study/`:
+This receipt pressure-tested beta boundaries across two independent clients.
+After the Rust cutover, the surviving executable pressure lives in
+`crates/memory-engine-study` and `crates/memory-engine-beta-app`:
 
-- mobile-first study session (`index.ts` + `server.ts` + `index.html`), and
-- command-first coach workflow (`multi-client.ts`).
+- mobile-first study/session flow in `memory-engine-study`, and
+- local browser/API flow in `memory-engine-beta-app`.
 
 Both clients use the same persistence spine (`BetaPersistenceStore`) and the
 same service command surface (`next-queue`, `grade/apply-review`) while owning
@@ -17,13 +18,12 @@ client-specific reveal/session choreography.
 ## Executable Receipt
 
 ```sh
-bun test experiments/beta-study/
+cargo test -p memory-engine-study -p memory-engine-beta-app
 ```
 
-`multi-client-pressure.test.ts` now proves the second workflow runs source
-ingest, generation, approval, queue selection, reveal, submit, and
-restart/resume, then checks cross-client parity for reveal semantics,
-duplicate-submit handling, and review-state projection.
+Rust session and HTTP tests prove source ingest, generation, approval, queue
+selection, reveal, submit, and restart/resume behavior. Historical
+multi-client TypeScript pressure was deleted after Rust parity landed.
 
 ## Repeated Cross-Client Signals
 
@@ -55,5 +55,5 @@ These divergences are intentional product behavior, not contract drift.
 ## Boundary Verdict
 
 The current beta boundaries held under repeated pressure: persistence remains in
-`experiments/`, service commands remain stable, reveal remains UI-owned, and no
-new `src/` surface was required.
+`crates/memory-engine-persistence`, service commands remain stable, reveal
+remains UI-owned, and no new pure-kernel surface was required.

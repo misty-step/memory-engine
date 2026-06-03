@@ -34,7 +34,7 @@ Covered behaviors:
 Local browser target:
 
 ```sh
-BETA_STUDY_STORE=.tmp/beta-study/store.json bun run rust:beta-study
+BETA_STUDY_STORE=.tmp/beta-study/store.json cargo run -p memory-engine-beta-app
 ```
 
 The Rust shell serves `http://127.0.0.1:4174`, persists a JSON beta store, and

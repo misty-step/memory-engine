@@ -16,8 +16,7 @@ Rust crate covered authored fixture compilation and service-loop parity.
 ## Commands
 
 ```sh
-bun run experiments:import-probe
-bun run rust:import-probe
+cargo run -p memory-engine-import
 cargo test -p memory-engine-import
 ```
 
