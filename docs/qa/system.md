@@ -13,12 +13,13 @@ to answer two questions:
 The executable entrypoint is:
 
 ```sh
-bun run qa:local
-bun run qa
+cargo run -p memory-engine-qa -- --local
+cargo run -p memory-engine-qa -- --full
 ```
 
-`bun run qa:local` is the inner loop. `bun run qa` is the handoff path and ends
-with the canonical `bun run ci` Dagger gate.
+`cargo run -p memory-engine-qa -- --local` is the inner loop.
+`cargo run -p memory-engine-qa -- --full` is the handoff path and ends with the
+canonical `bun run ci` Dagger gate.
 
 ## Quality Model
 
@@ -65,8 +66,8 @@ until the project has enough historical data to define stable budgets.
 Use this sequence for QA work:
 
 ```sh
-bun run qa:local
-bun run qa
+cargo run -p memory-engine-qa -- --local
+cargo run -p memory-engine-qa -- --full
 ```
 
 For a focused change, run the affected surface first, then finish with the QA

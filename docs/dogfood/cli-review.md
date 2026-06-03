@@ -15,13 +15,11 @@ graded attempt.
 ## Commands
 
 ```sh
-bun run experiments:cli-review
-bun run rust:cli-review
+cargo run -p memory-engine-cli
 cargo test -p memory-engine-cli
 ```
 
-`bun run experiments:cli-review` resolves to the Rust dogfood path. The former
-TypeScript oracle was deleted after Rust receipt parity landed.
+The former TypeScript oracle was deleted after Rust receipt parity landed.
 
 ## Fixture
 

@@ -19,7 +19,7 @@ It is intentionally static and diffable:
    - `summary` text that describes invariant intent;
    - `refs` pointing to concrete source/test/doc/backlog evidence.
 4. Run a local parse/smoke check:
-   - `bun -e 'JSON.parse(await Bun.file("docs/architecture/memory-engine.map.json").text())'`
+   - `python3 -m json.tool docs/architecture/memory-engine.map.json >/dev/null`
    - `test -f docs/architecture/workbench.html`
 5. Open the viewer:
    - `cd docs/architecture && python3 -m http.server 4173`
@@ -28,7 +28,7 @@ It is intentionally static and diffable:
 ## Invariants
 
 - The map is a decision aid, not runtime truth.
-- Runtime behavior is still defined by `src/`, `service/`, and tests.
+- Runtime behavior is still defined by the Rust crates and tests.
 - No code generation, no workflow DSL, and no dependency additions for this artifact.
 
 ## When To Use Other Diagram Tools

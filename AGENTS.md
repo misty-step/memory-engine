@@ -52,8 +52,12 @@ Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work
 
 ## Known Debt
 
-- `backlog.d/28-mobile-beta-study-interface.md`: highest-priority active work. Mobile-first beta usefulness is the next high-risk product proof after persistence and generation.
-- `backlog.d/29-service-contract-v0-hardening.md`: harden service DTO/reveal/failure semantics after beta pressure exists.
-- `backlog.d/32-graduated-activity-ladder.md`: treat exercises/practice problems as first-class beta activities, not quiz variants only.
-- `backlog.d/31-beta-extraction-decision.md`: decide promote, extract, keep experimenting, or reshape after enough beta ladder evidence.
-- `backlog.d/16-system-visualization-workbench.md`: useful later; do not let it displace beta usefulness unless architecture confusion causes repeated defects.
+- Complete the Rust cutover before adding new product scope: no non-Dagger
+  TypeScript runtime/test files should remain, and operator docs must point at
+  Rust crates and Cargo commands.
+- After cutover, prioritize repeated phone-sized dogfood receipts over new
+  abstractions. Beta app extraction or promotion needs repeated evidence from
+  the Rust app, not archived TypeScript-era tickets.
+- The largest current simplification pressure is in boundary crates, especially
+  local HTTP hosts and persistence. Do not move that complexity into
+  `memory-engine-core`.

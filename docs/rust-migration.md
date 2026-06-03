@@ -134,7 +134,7 @@ the browser markup and form flow.
 - runs the Latin-prayer review fixture through the Rust service boundary;
 - keeps fixture content, confidence capture, calibration metrics, receipt
   formatting, and the in-memory dogfood store outside the reusable kernel;
-- emits a JSON receipt from `bun run rust:cli-review`;
+- emits a JSON receipt from `cargo run -p memory-engine-cli`;
 - tests the receipt and the CLI store validation boundary.
 
 `crates/memory-engine-import` now ports the authored-content import dogfood path:
@@ -145,7 +145,7 @@ the browser markup and form flow.
   product-owned import metadata rather than reusable-kernel concerns;
 - runs the first imported review through the Rust service boundary and selects
   the next queue item;
-- emits a JSON receipt from `bun run rust:import-probe`.
+- emits a JSON receipt from `cargo run -p memory-engine-import`.
 
 `crates/memory-engine-web-shell` now ports the local web-shell dogfood path:
 
@@ -157,13 +157,12 @@ the browser markup and form flow.
   `/next` routes from a Rust binary;
 - preserves JSON route responses for programmatic clients while returning HTML
   after browser form submissions;
-- emits the web-shell extraction receipt with `bun run rust:web-shell:receipt`
+- emits the web-shell extraction receipt with
+  `cargo run -p memory-engine-web-shell -- --receipt`
   so dogfood QA no longer needs to launch the TypeScript shell for receipts.
 
-The operator-facing `experiments:cli-review`, `experiments:import-probe`, and
-`experiments:web-shell` scripts now resolve to Rust implementations. Their
-TypeScript predecessors were deleted after the Rust crates covered receipt,
-service-loop, and HTTP route parity.
+The former operator-facing TypeScript experiment scripts were removed after the
+Rust crates covered receipt, service-loop, and HTTP route parity.
 
 `crates/memory-engine-bench` now ports the benchmark receipt path:
 

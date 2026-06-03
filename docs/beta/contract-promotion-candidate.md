@@ -10,24 +10,24 @@ cross-client contract candidate:
 - `ReviewStateProjection`: `{ due, reps, lapses, state, last_review }`
 - `ScheduleChange`: `{ before, after }` using the same projection shape
 
-This contract is now shared in `service/review-state-projection.ts` and consumed
-by both beta clients.
+This contract is now represented by the Rust study/service DTOs and consumed by
+the beta app through `crates/memory-engine-study`.
 
 ## Cross-Client Evidence
 
 Two independent workflows require the same semantics without client fields:
 
-1. Mobile-first beta study (`experiments/beta-study/index.ts`) needs
+1. Mobile-first beta study (`crates/memory-engine-study`) needs
    review-state projection and before/after schedule change display after
    `grade/apply-review`.
-2. Command-first coach workflow (`experiments/beta-study/multi-client.ts`) needs
-   the same projection and schedule-change semantics for command-trace output.
+2. Local Rust HTTP workflow (`crates/memory-engine-beta-app`) needs the same
+   projection and schedule-change semantics for browser/API output.
 
 Pressure proof:
 
-- `bun test experiments/beta-study/` verifies projection parity across clients.
-- `bun test tests/service/` verifies accepted projection paths and rejected
-  non-contract payloads (extra fields or invalid state values).
+- `cargo test -p memory-engine-study -p memory-engine-beta-app` verifies
+  projection behavior across session and HTTP boundaries.
+- `cargo test -p memory-engine-service` verifies service command semantics.
 
 ## Rejected Non-Promoted Alternatives
 
@@ -42,6 +42,6 @@ Pressure proof:
 
 **Promotion-ready as a service-level shared candidate now.**
 
-**Not ready for `src/` package/export promotion yet.** We still need at least
-one non-beta client or extraction boundary decision proving this DTO belongs in
-the published kernel surface rather than repo-local service helpers.
+**Not ready for pure-kernel promotion yet.** We still need at least one non-beta
+client or extraction boundary decision proving this DTO belongs in
+`crates/memory-engine-core` rather than repo-local service/study helpers.
