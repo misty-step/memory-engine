@@ -28,9 +28,9 @@ The strategic direction changed on 2026-05-14:
 
 The current recommendation is:
 
-1. Keep the existing TypeScript kernel as the semantic core.
-2. Add modular package entrypoints for stable API surfaces.
-3. Add experiments beside, not inside, the pure runtime.
+1. Keep the Rust core crate as the semantic core.
+2. Use the Rust facade crate for stable API surfaces.
+3. Add experiments beside, not inside, the pure kernel.
 4. Keep the shared core narrow and semantic:
    - canonical domain types
    - scheduling contracts and reference implementations
@@ -287,19 +287,19 @@ Decks, concepts, passages, prayers, mass responses, language drills, and knowled
 
 ## Core Recommendation
 
-Build `Memory Engine` as a **TypeScript-first modular API** with stable logical
+Build `Memory Engine` as a **Rust-first modular API** with stable logical
 surfaces:
 
-1. `memory-engine/types`
-2. `memory-engine/scheduling`
-3. `memory-engine/grading`
-4. `memory-engine/progression`
-5. `memory-engine/queue`
-6. `memory-engine/adapters`
-7. `memory-engine/testkit`
+1. `memory_engine::types`
+2. `memory_engine::scheduling`
+3. `memory_engine::grading`
+4. `memory_engine::progression`
+5. `memory_engine::queue`
+6. `memory_engine::adapters`
+7. `memory_engine::testkit`
 
-Keep the root `memory-engine` export as a compatibility barrel. Defer any HTTP,
-daemon, or extracted app form until experiments prove that the boundary is real.
+Keep the root `memory_engine` facade as the ergonomic consumer surface. Defer
+any extracted app form until experiments prove that the boundary is real.
 
 ## Architecture Options Considered
 
@@ -713,7 +713,8 @@ Prototype the dedicated service shape inside this repo:
 - review-session interaction model
 - evaluation fixtures for interface-level behavior
 
-Keep experiments outside `src/` unless they are pure reusable kernel code.
+Keep experiments outside `crates/memory-engine-core` unless they are pure
+reusable kernel code.
 
 ### Phase 4: Extract selected service/app
 
@@ -741,7 +742,8 @@ Do not extract a separate repo while the form factor is still churning.
 - the boundary is drawn too wide and absorbs app-specific policy
 - the boundary is drawn too narrow and fails to reduce duplication
 - concept-level and phrasing-level systems normalize poorly
-- service prototypes leak framework/runtime coupling into `src/`
+- service prototypes leak framework/runtime coupling into
+  `crates/memory-engine-core`
 - AI-assisted grading pushes unstable semantics into core
 
 ### Failure modes
@@ -776,8 +778,8 @@ Pause or cut back extraction if:
 ## Immediate Next Work
 
 1. Shape and implement the first service/interface prototype in this repo.
-2. Keep prototype code outside the pure `src/` kernel unless it is reusable
-   domain logic.
+2. Keep prototype code outside the pure `crates/memory-engine-core` kernel
+   unless it is reusable domain logic.
 3. Use fixtures and executable interface tests to decide whether the form
    factor is worth extracting into a separate service/application repository.
 

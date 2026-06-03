@@ -5,11 +5,11 @@ Refs-backlog: 24
 ## Decision
 
 Keep experimenting in this repository. Do not extract a standalone application
-repository yet, and do not promote the repo-local service prototype as a public
-package surface yet.
+repository yet, and do not promote the Rust service boundary as a public package
+surface yet.
 
-The current CLI review, import probe, and web shell prove that the public API
-surfaces are usable from outside `src/`. They also show real pressure around
+The current CLI review, import probe, and web shell prove that the Rust facade
+surfaces are usable outside the pure kernel. They also show real pressure around
 learner-facing review-state DTOs, reveal semantics, session choreography,
 persistence, and generated-content provenance. That pressure is not stable
 enough to freeze into a public service contract or separate product repository.
@@ -26,17 +26,18 @@ There are two separate gates:
 
 | Experiment | Evidence | Decision pressure |
 | --- | --- | --- |
-| CLI review | `experiments/cli-review/` runs a calibration-aware review loop through the service boundary. | Attempts, confidence, grading, scheduling, and queueing compose cleanly, but receipt formatting and confidence policy stay product-owned. |
-| Import probe | `experiments/import-probe/` compiles authored material into canonical prompts, queue candidates, and schedule state. | Canonical API types can represent imported learning inputs; parsers and authoring policy should remain outside `src/`. |
-| Web shell | `experiments/web-shell/` renders a local study loop and exercises answer, reveal, review-state visibility, and queue transitions. | A usable interface needs review-state presentation, reveal policy, persistence, and eventually content generation. One web client is not enough proof to stabilize these as package contracts. |
-| QA harness | `bun run qa` runs public exports, kernel behavior, service prototype, eval corpus, dogfood clients, benchmarks, and Dagger CI. | Package confidence is strong; product readiness still needs beta persistence, content generation, and mobile dogfood receipts. |
+| CLI review | `crates/memory-engine-cli` runs a calibration-aware review loop through the service boundary. | Attempts, confidence, grading, scheduling, and queueing compose cleanly, but receipt formatting and confidence policy stay product-owned. |
+| Import probe | `crates/memory-engine-import` compiles authored material into canonical prompts, queue candidates, and schedule state. | Canonical API types can represent imported learning inputs; parsers and authoring policy should remain outside the kernel. |
+| Web shell | `crates/memory-engine-web-shell` renders a local study loop and exercises answer, reveal, review-state visibility, and queue transitions. | A usable interface needs review-state presentation, reveal policy, persistence, and eventually content generation. One web client is not enough proof to stabilize these as package contracts. |
+| QA harness | `bun run qa` runs Rust facade, kernel, service, persistence, generation, beta study, dogfood clients, benchmarks, rustdoc, and Dagger CI. | Package confidence is strong; product readiness still needs repeated mobile dogfood receipts and graduated activity evidence. |
 
 ## What Stays In `memory-engine`
 
-- Pure learning-kernel runtime under `src/`.
-- Public subpaths for types, scheduling, grading, progression, queue, adapters,
-  and testkit fixtures.
-- Repo-local service prototype and experiments outside `src/`.
+- Pure learning-kernel runtime under `crates/memory-engine-core`.
+- Rust facade modules for types, scheduling, grading, progression, queue,
+  adapters, testkit fixtures, beta surfaces, and dogfood receipts.
+- Rust service boundary and repo-local dogfood experiments outside the pure
+  kernel crate.
 - Dogfood evidence, evals, benchmarks, and quality registers.
 
 ## What The Beta Interface May Own
@@ -61,8 +62,8 @@ workflows need the same abstraction.
 ## Follow-Up Tickets
 
 - `26-beta-persistence-spine`: create the repo-local beta data model and
-  durable local persistence boundary outside `src/`, including restart/reload,
-  realistic queue, and idempotent review-write proof.
+  durable local persistence boundary outside the pure kernel, including
+  restart/reload, realistic queue, and idempotent review-write proof.
 - `27-ai-content-generation-probe`: generate quiz drafts from persisted source
   material with provenance and validation receipts.
 - `28-mobile-beta-study-interface`: make a mobile-first beta shell usable for

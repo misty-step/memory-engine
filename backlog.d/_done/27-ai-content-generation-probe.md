@@ -8,7 +8,7 @@ estimate: M
 depends_on: [26-beta-persistence-spine]
 oracles:
   - bun run ci
-  - bun test experiments/beta-generation/
+  - cargo test -p memory-engine-generation
   - test -f docs/beta/content-generation.md
 ---
 
@@ -37,7 +37,7 @@ testable.
 
 ## Oracle
 
-- [ ] `experiments/beta-generation/` consumes persisted source material and
+- [ ] `crates/memory-engine-generation` consumes persisted source material and
       emits generated quiz/exercise draft records with source ids, reference
       spans, model/provider metadata, validation status, and critique notes.
 - [ ] Tests cover accepted drafts, rejected unsupported drafts, duplicate-ish
@@ -63,8 +63,8 @@ testable.
 
 ## Closure Evidence
 
-- Implemented in `experiments/beta-generation/` with deterministic,
+- Implemented in `crates/memory-engine-generation` with deterministic,
   source-grounded quiz and exercise draft generation.
 - Documented in `docs/beta/content-generation.md`.
-- Verified during backlog hygiene with `bun test experiments/beta-store/
-  experiments/beta-generation/`.
+- The former TypeScript oracle was deleted during the Rust migration after
+  `cargo test -p memory-engine-generation` covered fixture parity.

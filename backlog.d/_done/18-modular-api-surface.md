@@ -43,8 +43,8 @@ compatibility tests that lock the intended public surface.
 ## Notes
 
 Keep the modules deep and boring. The API should expose cohesive capabilities,
-not implementation files. The service prototype remains repo-local until
-dogfood proves which command contract deserves extraction.
+not implementation files. The service boundary remains repo-local until dogfood
+proves which command contract deserves extraction.
 
 ## Study
 

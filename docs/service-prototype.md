@@ -4,9 +4,9 @@ Refs-backlog: 15
 
 ## Current Shape
 
-The service prototype lives in `service/`, outside the published pure kernel in
-`src/`. It is a contract probe for a future dedicated memory service, not a new
-runtime surface for the `memory-engine` package.
+The service prototype lives in `crates/memory-engine-service`, outside the
+published pure kernel. It is a contract probe for a future dedicated memory
+service, not a new runtime surface for the pure kernel facade.
 
 The first command envelope has three commands:
 
@@ -37,11 +37,11 @@ The first command envelope has three commands:
 ## Boundary Decision
 
 Storage stays behind `MemoryServiceStore`. The prototype may orchestrate kernel
-calls, but it does not make `src/` aware of persistence, framework lifecycles,
-network clients, or product workflow policy.
+calls, but it does not make `crates/memory-engine-core` aware of persistence,
+framework lifecycles, network clients, or product workflow policy.
 
 `grade/apply-review` hands the graded attempt and the new schedule state to the
-store through one `applyReview` boundary method so a future repository can make
+store through one `apply_review` boundary method so a future repository can make
 that write transactional.
 
 ## Failure Semantics
@@ -56,6 +56,10 @@ fake should reject unknown review units, blank submitted answers, invalid
 response times, mismatched applied review units, and schedule writes whose
 `last_review` does not match the persisted attempt timestamp.
 
-`applyReview` is the transaction seam. Consumers that need durable persistence
+`apply_review` is the transaction seam. Consumers that need durable persistence
 must commit the graded attempt and next `ScheduleState` together, or reject the
 command so clients can treat the review as unapplied.
+
+The former TypeScript `service/` prototype was deleted after
+`memory-engine-service` covered command/result envelopes, shared service
+fixtures, failure propagation, queue selection, and store-boundary behavior.

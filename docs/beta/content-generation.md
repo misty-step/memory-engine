@@ -4,23 +4,19 @@ Refs-backlog: 27
 
 ## Purpose
 
-`experiments/beta-generation/` is the beta content-generation seam. It turns
-persisted source material into source-grounded quiz and exercise drafts, records
-generation receipts, and keeps every generated artifact outside the published
-`src/` kernel.
+`crates/memory-engine-generation` is the deterministic content-generation
+probe for the beta interface. It turns persisted source material into
+source-grounded quiz and exercise drafts, records generation receipts, and
+keeps every generated artifact outside the published kernel.
 
-The default implementation is deliberately deterministic and live-provider-free
-so CI can exercise the contract without network calls. Real provider calls must
-plug in through the `LearningContentGenerator` interface and satisfy the same
-source provenance, validation, and receipt rules.
+This is deliberately not a model-provider integration. It is the contract and
+QA spine that real provider calls must satisfy later.
 
 ## Workflow
 
 1. Ingest source material into `BetaPersistenceStore` as `SourceDocument`
    records.
-2. Compile source text into candidate learning activities. Structured fixture
-   blocks are supported for precise tests; arbitrary prose can produce citeable
-   fact drafts when it contains simple source-backed statements.
+2. Parse deterministic source blocks into candidate learning activities.
 3. Create `ReferenceSpan` records for cited source evidence.
 4. Save a `GenerationRun` receipt with provider/model/version metadata.
 5. Save generated drafts with source ids, reference span ids, activity kind,
@@ -31,8 +27,7 @@ source provenance, validation, and receipt rules.
 
 ## Fixture Format
 
-The deterministic fixture path reads blank-line-separated blocks from a source
-body.
+The deterministic probe reads blank-line-separated blocks from a source body.
 
 ```text
 Concept: NATO CAT composition
@@ -77,15 +72,10 @@ Rejected drafts remain useful evidence. They preserve source ids, reference
 span ids, critique notes, and rejection reasons so later model-backed
 generation can be evaluated rather than hand-waved.
 
-Arbitrary prose that cannot produce source-backed drafts is recorded as a
-generation failure instead of silently creating empty practice. That keeps the
-phone UI honest: it asks for clearer source material rather than pretending a
-weak input produced useful SRS.
-
 ## Kernel Boundary
 
 No generation code, provider SDK, prompt template, vector index, source parser,
-or persistence dependency was added under `src/`.
+or persistence dependency was added under `crates/memory-engine-core`.
 
 The kernel currently owns only stable learning behavior:
 
@@ -105,15 +95,10 @@ The beta generation layer owns:
 - rejection/critique policy;
 - source parsing and provenance.
 
-The current arbitrary-prose compiler uses deterministic heuristics only as the
-CI-safe stand-in for the future model-backed compiler. It is not the trust
-boundary for real beta use; provider-backed generation still needs schema,
-latency, cost, unsupported-claim, and citation receipts before dogfood trust.
-
 ## Eval Gaps
 
-The deterministic path proves the storage, provenance, and validation contract.
-It does not yet prove model quality.
+The deterministic probe proves the storage and validation contract. It does not
+yet prove model quality.
 
 Before model-backed generation can be trusted, add evals for:
 
@@ -129,10 +114,13 @@ Before model-backed generation can be trusted, add evals for:
 ## Verification
 
 ```sh
-bun test experiments/beta-generation/
+cargo test -p memory-engine-generation
 bun run ci
 ```
 
 The focused suite covers accepted quiz drafts, accepted exercise drafts,
 promotion into review units, rejected unsupported drafts, duplicate-ish drafts,
 and missing-provenance failures.
+
+The former TypeScript `experiments/beta-generation/` runtime oracle was deleted
+after the Rust crate covered deterministic generation and fixture parity.

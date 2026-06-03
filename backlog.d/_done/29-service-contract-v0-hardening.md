@@ -8,8 +8,8 @@ estimate: M
 depends_on: [28-mobile-beta-study-interface]
 oracles:
   - bun run ci
-  - bun test tests/service/
-  - bun test experiments/beta-study/
+  - cargo test -p memory-engine-service
+  - cargo test -p memory-engine-study -p memory-engine-beta-app
   - test -f docs/beta/service-contract-v0.md
 ---
 

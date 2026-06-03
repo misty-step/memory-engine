@@ -8,8 +8,7 @@ estimate: M
 depends_on: [15-service-interface-prototype, 17-service-scenario-fixtures]
 oracles:
   - bun run ci
-  - bun test tests/service/failure-semantics.test.ts
-  - bun test tests/service/interface-contract.test.ts
+  - cargo test -p memory-engine-service
 ---
 
 # Service boundary failure semantics - safe command contracts
@@ -32,7 +31,7 @@ integration point.
 
 ## Oracle
 
-- [ ] `tests/service/failure-semantics.test.ts` proves `record-attempt` does
+- [ ] `crates/memory-engine-service/tests/command_contract.rs` proves `record-attempt` does
       not report success when `MemoryServiceStore.recordAttempt` rejects.
 - [ ] The same suite proves `grade/apply-review` propagates read/apply failures
       without silently swallowing or remapping them to grading verdicts.

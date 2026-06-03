@@ -1,0 +1,653 @@
+use memory_engine_core::{
+    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, Rating, ReviewUnitId, ScheduleState,
+    ScheduleStatus,
+};
+use memory_engine_persistence::{
+    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
+    GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
+    GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
+    PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind, SourcePermission,
+};
+use memory_engine_service::{
+    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
+};
+
+const NOW: i64 = 1_779_989_400_000;
+
+#[test]
+fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
+    let directory = TempDirectory::new("persist-reload");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+
+    let source = store
+        .save_source_document(source_document("src-latin-prayer"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("ref-pater", &source.id))
+        .expect("reference");
+    let draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "draft-pater",
+            "beta-pater-noster",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("run-pater"),
+        ))
+        .expect("draft");
+    store
+        .save_generation_run(generation_run(
+            "run-pater",
+            &[source.id.as_str()],
+            &[draft.id.as_str()],
+        ))
+        .expect("run");
+    store
+        .approve_generated_prompt_draft(
+            &draft.id,
+            ApproveGeneratedPromptDraftOptions {
+                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
+            },
+        )
+        .expect("approve");
+
+    let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
+    let review = service
+        .grade_apply_review(GradeApplyReviewCommand {
+            prompt: draft.prompt.clone(),
+            submitted_answer: "Our Father".to_owned(),
+            response_time_ms: 1_800,
+            prompt_id: Some(draft.prompt_id.clone()),
+            occurred_at: Some(NOW),
+            idempotency_key: None,
+        })
+        .expect("review");
+
+    assert_eq!(review.grade.rating, Rating::Good);
+    assert_eq!(review.schedule_state.reps, 3);
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload");
+    let snapshot = reloaded.snapshot();
+    let queue = reloaded.list_queue_candidates().expect("queue");
+
+    assert_eq!(snapshot.source_documents, [source]);
+    assert_eq!(snapshot.reference_spans, [reference]);
+    assert_eq!(snapshot.generated_prompt_drafts, [draft]);
+    assert_eq!(snapshot.generation_runs.len(), 1);
+    assert_eq!(snapshot.attempts, [review.attempt]);
+    assert_eq!(
+        snapshot.schedules,
+        [memory_engine_persistence::ScheduleRecord {
+            review_unit_id: review_unit_id("beta-pater-noster"),
+            state: review.schedule_state.clone(),
+        }]
+    );
+    assert_eq!(
+        queue,
+        [QueueCandidate {
+            review_unit_id: review_unit_id("beta-pater-noster"),
+            schedule_state: Some(review.schedule_state.clone()),
+            due: review.schedule_state.due,
+            progression: None,
+            concept_key: Some("lords-prayer-opening".to_owned()),
+            source_key: Some("latin-prayer-note".to_owned()),
+            domain_key: Some("latin".to_owned()),
+        }]
+    );
+}
+
+#[test]
+fn rejects_duplicate_reviews_and_failed_commits_without_corrupting_history() {
+    let directory = TempDirectory::new("duplicate-safe");
+    let path = directory.path().join("store.json");
+    let unit_id = review_unit_id("beta-duplicate-safe");
+    let prompt = short_answer_prompt(&unit_id, "Translate: Pater noster");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_review_unit(review_unit(
+            &unit_id,
+            "duplicate-safe-prompt",
+            prompt.clone(),
+            queue_candidate(&unit_id, NOW - 60_000),
+        ))
+        .expect("review unit");
+
+    let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
+    let first_review = service
+        .grade_apply_review(GradeApplyReviewCommand {
+            prompt: prompt.clone(),
+            submitted_answer: "Our Father".to_owned(),
+            response_time_ms: 1_800,
+            prompt_id: Some("duplicate-safe-prompt".to_owned()),
+            occurred_at: Some(NOW),
+            idempotency_key: None,
+        })
+        .expect("first review");
+
+    let duplicate = service
+        .grade_apply_review(GradeApplyReviewCommand {
+            prompt: prompt.clone(),
+            submitted_answer: "Our Father".to_owned(),
+            response_time_ms: 1_800,
+            prompt_id: Some("duplicate-safe-prompt".to_owned()),
+            occurred_at: Some(NOW),
+            idempotency_key: None,
+        })
+        .expect_err("duplicate should fail");
+    assert!(matches!(
+        duplicate,
+        ServiceError::Store(BetaStoreError::DuplicateAppliedReview(_))
+    ));
+
+    let mut store = service.into_store();
+    assert_eq!(
+        store.snapshot().attempts.as_slice(),
+        std::slice::from_ref(&first_review.attempt)
+    );
+    assert_eq!(store.snapshot().schedules.len(), 1);
+
+    store.fail_next_commit_for_test();
+    let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
+    let failed = service
+        .grade_apply_review(GradeApplyReviewCommand {
+            prompt,
+            submitted_answer: "Our Father".to_owned(),
+            response_time_ms: 2_100,
+            prompt_id: Some("duplicate-safe-prompt".to_owned()),
+            occurred_at: Some(NOW + 1_000),
+            idempotency_key: None,
+        })
+        .expect_err("commit failure");
+    assert_eq!(
+        failed,
+        ServiceError::Store(BetaStoreError::InjectedCommitFailure)
+    );
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload");
+    assert_eq!(reloaded.snapshot().attempts, [first_review.attempt]);
+    assert_eq!(reloaded.snapshot().schedules.len(), 1);
+}
+
+#[test]
+fn reloads_queue_projection_with_schedule_due_and_progression_metadata() {
+    let directory = TempDirectory::new("queue-projection");
+    let path = directory.path().join("store.json");
+    let stage_one = review_unit_id("catechism-commandments-worked-example");
+    let stage_two = review_unit_id("catechism-commandments-free-recall");
+    let due_review = review_unit_id("latin-psalm-due-review");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+
+    let mut first_stage_queue = queue_candidate(&stage_one, NOW + 86_400_000);
+    first_stage_queue.progression = Some(memory_engine_core::ProgressionMetadata {
+        progression_group: Some("ten-commandments".to_owned()),
+        stage_order: 1,
+        requires: Vec::new(),
+        supersedes: Vec::new(),
+    });
+    store
+        .save_review_unit(review_unit(
+            &stage_one,
+            "commandments-worked",
+            short_answer_prompt(&stage_one, "What is the first commandment?"),
+            first_stage_queue,
+        ))
+        .expect("stage one");
+    store
+        .set_schedule_state(&stage_one, Some(schedule_state(4, ScheduleStatus::Review)))
+        .expect("stage one schedule");
+
+    let mut second_stage_queue = queue_candidate(&stage_two, NOW - 300_000);
+    second_stage_queue.progression = Some(memory_engine_core::ProgressionMetadata {
+        progression_group: Some("ten-commandments".to_owned()),
+        stage_order: 2,
+        requires: vec![stage_one.clone()],
+        supersedes: vec![stage_one.clone()],
+    });
+    store
+        .save_review_unit(review_unit(
+            &stage_two,
+            "commandments-recall",
+            short_answer_prompt(&stage_two, "Recall the first commandment."),
+            second_stage_queue,
+        ))
+        .expect("stage two");
+    store
+        .save_review_unit(review_unit(
+            &due_review,
+            "psalm-due",
+            short_answer_prompt(&due_review, "Translate the psalm phrase."),
+            queue_candidate(&due_review, NOW - 3_600_000),
+        ))
+        .expect("due review");
+    store
+        .set_schedule_state(
+            &due_review,
+            Some(ScheduleState {
+                due: NOW - 3_600_000,
+                ..schedule_state(5, ScheduleStatus::Review)
+            }),
+        )
+        .expect("due schedule");
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload");
+    let queue = reloaded.list_queue_candidates().expect("queue");
+
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue
+            .iter()
+            .find(|candidate| candidate.review_unit_id == due_review)
+            .expect("due")
+            .due,
+        NOW - 3_600_000
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .find(|candidate| candidate.review_unit_id == stage_two)
+            .and_then(|candidate| candidate.progression.as_ref())
+            .expect("progression")
+            .requires,
+        [stage_one]
+    );
+}
+
+#[test]
+fn validates_generated_drafts_before_promotion() {
+    let directory = TempDirectory::new("draft-validation");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_source_document(source_document("src-generated"))
+        .expect("source");
+    store
+        .save_reference_span(reference_span("ref-generated", "src-generated"))
+        .expect("reference");
+
+    let rejected = GeneratedPromptDraft {
+        validation: GeneratedPromptValidation {
+            status: GeneratedPromptValidationStatus::Rejected,
+            reasons: vec!["Unsupported claim.".to_owned()],
+        },
+        ..accepted_draft(
+            "draft-rejected",
+            "rejected-unit",
+            &["src-generated"],
+            &["ref-generated"],
+            None,
+        )
+    };
+    store
+        .save_generated_prompt_draft(rejected.clone())
+        .expect("rejected draft persists");
+    assert_eq!(
+        store
+            .approve_generated_prompt_draft(
+                &rejected.id,
+                ApproveGeneratedPromptDraftOptions::default()
+            )
+            .expect_err("cannot approve rejected"),
+        BetaStoreError::RejectedGeneratedPromptDraft
+    );
+
+    let missing_reference = GeneratedPromptDraft {
+        id: "draft-missing-reference".to_owned(),
+        reference_span_ids: vec!["missing-reference".to_owned()],
+        ..accepted_draft(
+            "draft-missing-reference",
+            "accepted-missing-reference",
+            &["src-generated"],
+            &["ref-generated"],
+            Some("missing-run"),
+        )
+    };
+    assert_eq!(
+        store
+            .save_generated_prompt_draft(missing_reference)
+            .expect_err("missing reference"),
+        BetaStoreError::UnknownReferenceSpan("missing-reference".to_owned())
+    );
+
+    let accepted_without_run = accepted_draft(
+        "draft-missing-generation-run",
+        "accepted-without-run",
+        &["src-generated"],
+        &["ref-generated"],
+        Some("missing-run"),
+    );
+    store
+        .save_generated_prompt_draft(accepted_without_run.clone())
+        .expect("accepted draft");
+    assert_eq!(
+        store
+            .approve_generated_prompt_draft(
+                &accepted_without_run.id,
+                ApproveGeneratedPromptDraftOptions::default()
+            )
+            .expect_err("missing generation run"),
+        BetaStoreError::MissingGenerationRunForAcceptedDraft
+    );
+}
+
+#[test]
+fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history() {
+    let directory = TempDirectory::new("lifecycle");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+
+    let updated = store
+        .update_review_unit_prompt_text(
+            &draft.review_unit_id,
+            "Translate the opening prayer.",
+            "Our Father",
+        )
+        .expect("revise");
+    assert!(matches!(updated.prompt, Prompt::Exact(_)));
+    let snapshot = store.snapshot();
+    assert_eq!(
+        prompt_text(
+            &snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == draft.review_unit_id)
+                .expect("review unit")
+                .prompt
+        ),
+        "Translate the opening prayer."
+    );
+    assert_eq!(
+        snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|candidate| candidate.id == draft.id)
+            .expect("draft")
+            .critique_notes
+            .last()
+            .map(String::as_str),
+        Some("Learner edited approved wording.")
+    );
+    assert_eq!(
+        prompt_text(
+            &snapshot
+                .generated_prompt_drafts
+                .iter()
+                .find(|candidate| candidate.id == draft.id)
+                .expect("draft")
+                .prompt
+        ),
+        "Translate the opening prayer."
+    );
+
+    let prior_schedule = store
+        .read_schedule_state(&draft.review_unit_id)
+        .expect("read schedule")
+        .expect("schedule");
+    store
+        .snooze_review_unit_until(&draft.review_unit_id, NOW + 86_400_000)
+        .expect("snooze");
+    assert_eq!(
+        store
+            .read_schedule_state(&draft.review_unit_id)
+            .expect("read schedule")
+            .expect("schedule"),
+        prior_schedule
+    );
+    let queue = store.list_queue_candidates().expect("queue");
+    assert_eq!(queue[0].due, NOW + 86_400_000);
+    assert_eq!(queue[0].schedule_state, Some(prior_schedule.clone()));
+
+    store
+        .archive_review_unit(&draft.review_unit_id, NOW + 1_000)
+        .expect("archive");
+    assert!(store.list_queue_candidates().expect("queue").is_empty());
+    assert_eq!(store.snapshot().review_units.len(), 1);
+    assert_eq!(
+        store
+            .read_schedule_state(&draft.review_unit_id)
+            .expect("read schedule")
+            .expect("schedule"),
+        prior_schedule
+    );
+}
+
+fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {
+    let mut store = BetaPersistenceStore::open(path).expect("open store");
+    let source = store
+        .save_source_document(source_document("src-lifecycle"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("ref-lifecycle", &source.id))
+        .expect("reference");
+    let draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "draft-lifecycle",
+            "unit-lifecycle",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("run-lifecycle"),
+        ))
+        .expect("draft");
+    store
+        .save_generation_run(generation_run(
+            "run-lifecycle",
+            &[source.id.as_str()],
+            &[draft.id.as_str()],
+        ))
+        .expect("run");
+    store
+        .approve_generated_prompt_draft(
+            &draft.id,
+            ApproveGeneratedPromptDraftOptions {
+                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
+            },
+        )
+        .expect("approve");
+
+    (store, draft)
+}
+
+#[test]
+fn snapshot_envelope_uses_beta_store_wire_names() {
+    let snapshot = memory_engine_persistence::BetaStoreSnapshot {
+        version: 1,
+        source_documents: vec![source_document("src-wire")],
+        reference_spans: Vec::new(),
+        generated_prompt_drafts: Vec::new(),
+        review_units: Vec::new(),
+        schedules: Vec::new(),
+        attempts: Vec::new(),
+        generation_runs: Vec::new(),
+        applied_reviews: Vec::new(),
+    };
+    let encoded = serde_json::to_value(snapshot).expect("snapshot json");
+
+    assert!(encoded.get("sourceDocuments").is_some());
+    assert!(encoded.get("source_documents").is_none());
+    assert_eq!(encoded["sourceDocuments"][0]["createdAt"], NOW);
+    assert_eq!(
+        encoded["sourceDocuments"][0]["permission"],
+        "model-eligible"
+    );
+}
+
+fn mastered_after_three_reviews(schedule: &ScheduleState) -> bool {
+    schedule.state == ScheduleStatus::Review && schedule.reps >= 3
+}
+
+fn source_document(id: &str) -> SourceDocument {
+    SourceDocument {
+        id: id.to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "Latin prayer note".to_owned(),
+        body: Some("Pater noster means Our Father.".to_owned()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        created_at: NOW,
+    }
+}
+
+fn reference_span(id: &str, source_document_id: &str) -> ReferenceSpan {
+    ReferenceSpan {
+        id: id.to_owned(),
+        source_document_id: source_document_id.to_owned(),
+        label: "Pater noster translation".to_owned(),
+        text: "Pater noster means Our Father.".to_owned(),
+        locator: "paragraph:1".to_owned(),
+        created_at: NOW,
+    }
+}
+
+fn accepted_draft(
+    id: &str,
+    unit_id: &str,
+    source_document_ids: &[&str],
+    reference_span_ids: &[&str],
+    generation_run_id: Option<&str>,
+) -> GeneratedPromptDraft {
+    let review_unit_id = review_unit_id(unit_id);
+
+    GeneratedPromptDraft {
+        id: id.to_owned(),
+        source_document_ids: source_document_ids
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        reference_span_ids: reference_span_ids
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        generation_run_id: generation_run_id.map(str::to_owned),
+        review_unit_id: review_unit_id.clone(),
+        prompt_id: "pater-translation".to_owned(),
+        prompt: short_answer_prompt(&review_unit_id, "Translate: Pater noster"),
+        queue: queue_candidate(&review_unit_id, NOW - 60_000),
+        activity_kind: GeneratedLearningActivityKind::Quiz,
+        activity_stage: "free-recall".to_owned(),
+        worked_solution: None,
+        model: GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "deterministic-draft".to_owned(),
+            version: "v1".to_owned(),
+        },
+        validation: GeneratedPromptValidation {
+            status: GeneratedPromptValidationStatus::Accepted,
+            reasons: Vec::new(),
+        },
+        critique_notes: vec!["Grounded in the cited source span.".to_owned()],
+        created_at: NOW,
+    }
+}
+
+fn generation_run(id: &str, source_document_ids: &[&str], draft_ids: &[&str]) -> GenerationRun {
+    GenerationRun {
+        id: id.to_owned(),
+        source_document_ids: source_document_ids
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        draft_ids: draft_ids.iter().map(|value| (*value).to_owned()).collect(),
+        provider: "fixture".to_owned(),
+        model: "deterministic-draft".to_owned(),
+        started_at: NOW - 1_000,
+        completed_at: Some(NOW),
+        validation_failures: Vec::new(),
+    }
+}
+
+fn review_unit(
+    review_unit_id: &ReviewUnitId,
+    prompt_id: &str,
+    prompt: Prompt,
+    queue: PersistedQueueCandidate,
+) -> BetaReviewUnitRecord {
+    BetaReviewUnitRecord {
+        review_unit_id: review_unit_id.clone(),
+        prompt_id: prompt_id.to_owned(),
+        prompt,
+        queue,
+        reference_span_ids: Vec::new(),
+        generated_prompt_draft_id: None,
+        archived_at: None,
+        snoozed_until: None,
+        created_at: NOW,
+    }
+}
+
+fn queue_candidate(review_unit_id: &ReviewUnitId, due: i64) -> PersistedQueueCandidate {
+    PersistedQueueCandidate {
+        review_unit_id: review_unit_id.clone(),
+        due,
+        progression: None,
+        concept_key: Some("lords-prayer-opening".to_owned()),
+        source_key: Some("latin-prayer-note".to_owned()),
+        domain_key: Some("latin".to_owned()),
+    }
+}
+
+fn short_answer_prompt(review_unit_id: &ReviewUnitId, prompt: &str) -> Prompt {
+    Prompt::Exact(ExactPrompt {
+        kind: ExactPromptKind::ShortAnswer,
+        review_unit_id: review_unit_id.clone(),
+        prompt: prompt.to_owned(),
+        accepted_answers: vec!["Our Father".to_owned()],
+        equivalence_groups: Vec::new(),
+        ignored_tokens: Vec::new(),
+    })
+}
+
+fn schedule_state(reps: u32, status: ScheduleStatus) -> ScheduleState {
+    ScheduleState {
+        due: NOW - 60_000,
+        stability: 4.2,
+        difficulty: 3.1,
+        elapsed_days: 1,
+        scheduled_days: 1,
+        reps,
+        lapses: 0,
+        state: status,
+        last_review: Some(NOW - 86_400_000),
+    }
+}
+
+fn review_unit_id(value: &str) -> ReviewUnitId {
+    ReviewUnitId::new(value)
+}
+
+fn prompt_text(prompt: &Prompt) -> &str {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt,
+        Prompt::Exact(prompt) => &prompt.prompt,
+    }
+}
+
+struct TempDirectory {
+    path: PathBuf,
+}
+
+impl TempDirectory {
+    fn new(label: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "memory-engine-persistence-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+use std::{fs, path::PathBuf};

@@ -198,7 +198,7 @@ Strong candidates for future tickets after the current Slice 5 set:
 
 ## Design Guardrails
 
-- Do not put authored content taxonomy in `src/`.
+- Do not put authored content taxonomy in `crates/memory-engine-core`.
 - Do not promote a UI workflow to API after one client.
 - Do not make feedback timing a kernel constant.
 - Do not treat confidence as correctness.

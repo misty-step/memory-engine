@@ -1,0 +1,9 @@
+[package]
+name = "memory-engine-qa"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Rust QA lane runner for memory-engine."
+
+[lints]
+workspace = true

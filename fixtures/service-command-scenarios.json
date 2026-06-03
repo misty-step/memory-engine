@@ -1,0 +1,255 @@
+[
+  {
+    "name": "latin-review-loop",
+    "now": 1778760000000,
+    "units": [
+      {
+        "reviewUnitId": "credo-opening",
+        "promptId": "credo-opening-en",
+        "prompt": {
+          "kind": "shortAnswer",
+          "reviewUnitId": "credo-opening",
+          "prompt": "What does Credo in unum Deum mean?",
+          "acceptedAnswers": ["I believe in one God"],
+          "equivalenceGroups": [],
+          "ignoredTokens": []
+        },
+        "queue": {
+          "progression": null,
+          "conceptKey": "creed-opening",
+          "sourceKey": "mass-core",
+          "domainKey": "latin"
+        },
+        "scheduleState": null
+      },
+      {
+        "reviewUnitId": "pater-noster-opening",
+        "promptId": "pater-opening-en",
+        "prompt": {
+          "kind": "shortAnswer",
+          "reviewUnitId": "pater-noster-opening",
+          "prompt": "What does Pater noster mean?",
+          "acceptedAnswers": ["Our Father"],
+          "equivalenceGroups": [],
+          "ignoredTokens": []
+        },
+        "queue": {
+          "progression": null,
+          "conceptKey": "lords-prayer-opening",
+          "sourceKey": "mass-core",
+          "domainKey": "latin"
+        },
+        "scheduleState": null
+      }
+    ],
+    "commands": [
+      {
+        "kind": "record-attempt",
+        "attempt": {
+          "reviewUnitId": "credo-opening",
+          "promptId": "credo-opening-note",
+          "submittedAnswer": "I hesitated on unum",
+          "responseTimeMs": 4200
+        }
+      },
+      {
+        "kind": "grade/apply-review",
+        "prompt": {
+          "kind": "shortAnswer",
+          "reviewUnitId": "credo-opening",
+          "prompt": "What does Credo in unum Deum mean?",
+          "acceptedAnswers": ["I believe in one God"],
+          "equivalenceGroups": [],
+          "ignoredTokens": []
+        },
+        "promptId": "credo-opening-en",
+        "submittedAnswer": "I believe in one God",
+        "responseTimeMs": 2600
+      },
+      {
+        "kind": "next-queue",
+        "options": {}
+      }
+    ],
+    "expected": [
+      {
+        "kind": "attempt-recorded",
+        "attempt": {
+          "reviewUnitId": "credo-opening",
+          "promptId": "credo-opening-note",
+          "submittedAnswer": "I hesitated on unum",
+          "responseTimeMs": 4200,
+          "occurredAt": 1778760000000
+        }
+      },
+      {
+        "kind": "review-applied",
+        "attempt": {
+          "reviewUnitId": "credo-opening",
+          "promptId": "credo-opening-en",
+          "submittedAnswer": "I believe in one God",
+          "responseTimeMs": 2600,
+          "occurredAt": 1778760000000
+        },
+        "grade": {
+          "verdict": "correct",
+          "rating": 3,
+          "isCorrect": true,
+          "expectedAnswer": "I believe in one God"
+        },
+        "scheduleState": {
+          "due": 1778760600000,
+          "stability": 2.3065,
+          "difficulty": 2.11810397,
+          "elapsed_days": 0,
+          "scheduled_days": 0,
+          "reps": 1,
+          "lapses": 0,
+          "state": 1,
+          "last_review": 1778760000000
+        }
+      },
+      {
+        "kind": "queue-selected",
+        "candidate": {
+          "reviewUnitId": "pater-noster-opening",
+          "scheduleState": null,
+          "due": 1778759940000,
+          "progression": null,
+          "conceptKey": "lords-prayer-opening",
+          "sourceKey": "mass-core",
+          "domainKey": "latin"
+        }
+      }
+    ]
+  },
+  {
+    "name": "progression-unlocks-next-stage",
+    "now": 1778760000000,
+    "units": [
+      {
+        "reviewUnitId": "st-michael-opening-memorization",
+        "promptId": "st-michael-opening-mcq",
+        "prompt": {
+          "kind": "mcq",
+          "reviewUnitId": "st-michael-opening-memorization",
+          "prompt": "Complete the opening: Saint Michael the Archangel, defend us...",
+          "choices": ["in battle", "at dawn", "with silence"],
+          "correctChoice": "in battle"
+        },
+        "queue": {
+          "progression": {
+            "progressionGroup": "st-michael-prayer",
+            "stageOrder": 1,
+            "requires": [],
+            "supersedes": []
+          },
+          "conceptKey": "st-michael-opening",
+          "sourceKey": "prayer-core",
+          "domainKey": "recitation"
+        },
+        "scheduleState": {
+          "due": 1778846400000,
+          "stability": 0,
+          "difficulty": 0,
+          "elapsed_days": 0,
+          "scheduled_days": 2,
+          "reps": 3,
+          "lapses": 0,
+          "state": 2,
+          "last_review": 1778673600000
+        }
+      },
+      {
+        "reviewUnitId": "st-michael-opening-recitation",
+        "promptId": "st-michael-opening-recitation",
+        "prompt": {
+          "kind": "recitation",
+          "reviewUnitId": "st-michael-opening-recitation",
+          "prompt": "Recite the opening of the Saint Michael prayer.",
+          "acceptedAnswers": ["Saint Michael the Archangel, defend us in battle"],
+          "equivalenceGroups": [],
+          "ignoredTokens": []
+        },
+        "queue": {
+          "progression": {
+            "progressionGroup": "st-michael-prayer",
+            "stageOrder": 2,
+            "requires": ["st-michael-opening-memorization"],
+            "supersedes": []
+          },
+          "conceptKey": "st-michael-opening",
+          "sourceKey": "prayer-core",
+          "domainKey": "recitation"
+        },
+        "scheduleState": null
+      }
+    ],
+    "commands": [
+      {
+        "kind": "next-queue",
+        "options": {}
+      },
+      {
+        "kind": "grade/apply-review",
+        "prompt": {
+          "kind": "recitation",
+          "reviewUnitId": "st-michael-opening-recitation",
+          "prompt": "Recite the opening of the Saint Michael prayer.",
+          "acceptedAnswers": ["Saint Michael the Archangel, defend us in battle"],
+          "equivalenceGroups": [],
+          "ignoredTokens": []
+        },
+        "promptId": "st-michael-opening-recitation",
+        "submittedAnswer": "Saint Michael the Archangel, defend us in battle",
+        "responseTimeMs": 7500
+      }
+    ],
+    "expected": [
+      {
+        "kind": "queue-selected",
+        "candidate": {
+          "reviewUnitId": "st-michael-opening-recitation",
+          "scheduleState": null,
+          "due": 1778759940000,
+          "progression": {
+            "progressionGroup": "st-michael-prayer",
+            "stageOrder": 2,
+            "requires": ["st-michael-opening-memorization"],
+            "supersedes": []
+          },
+          "conceptKey": "st-michael-opening",
+          "sourceKey": "prayer-core",
+          "domainKey": "recitation"
+        }
+      },
+      {
+        "kind": "review-applied",
+        "attempt": {
+          "reviewUnitId": "st-michael-opening-recitation",
+          "promptId": "st-michael-opening-recitation",
+          "submittedAnswer": "Saint Michael the Archangel, defend us in battle",
+          "responseTimeMs": 7500,
+          "occurredAt": 1778760000000
+        },
+        "grade": {
+          "verdict": "correct",
+          "rating": 3,
+          "isCorrect": true,
+          "expectedAnswer": "Saint Michael the Archangel, defend us in battle"
+        },
+        "scheduleState": {
+          "due": 1778760600000,
+          "stability": 2.3065,
+          "difficulty": 2.11810397,
+          "elapsed_days": 0,
+          "scheduled_days": 0,
+          "reps": 1,
+          "lapses": 0,
+          "state": 1,
+          "last_review": 1778760000000
+        }
+      }
+    ]
+  }
+]

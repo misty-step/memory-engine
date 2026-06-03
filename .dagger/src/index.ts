@@ -1,62 +1,63 @@
 /**
  * Memory Engine CI pipeline.
  *
- * One canonical place to run typecheck, lint, coverage-enforced tests,
- * and secret scanning against a Bun workspace. Each function mounts the
- * source, installs dependencies inside a Bun container, and runs the
- * corresponding package script. The `check` function runs all gates in
- * sequence and is what CI and agents should invoke before proposing a merge.
+ * One canonical place to run Rust formatting, tests, linting, documentation,
+ * and secret scanning. Each function mounts the source and runs the
+ * corresponding Cargo command. The `check` function runs all gates in sequence
+ * and is what CI and agents should invoke before proposing a merge.
  */
 import { type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
 
-const BUN_IMAGE = 'oven/bun:1.3.9-alpine';
 const GITLEAKS_IMAGE = 'zricethezav/gitleaks:v8.30.0';
+const RUST_IMAGE = 'rust:1.94-bookworm';
 
 @object()
 export class MemoryEngine {
   /**
-   * Base container with source mounted and dependencies installed.
+   * Base Rust container with formatting and lint components available.
    */
   @func()
-  base(source: Directory): Container {
+  rustBase(source: Directory): Container {
     return dag
       .container()
-      .from(BUN_IMAGE)
+      .from(RUST_IMAGE)
       .withMountedDirectory('/src', source)
       .withWorkdir('/src')
-      .withExec(['bun', 'install', '--frozen-lockfile']);
+      .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
   }
 
   /**
-   * Run `bun run typecheck`.
+   * Run `cargo fmt --all --check`.
    */
   @func()
-  async typecheck(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'typecheck']).stdout();
+  async rustFmt(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'fmt', '--all', '--check']).stdout();
   }
 
   /**
-   * Run `bun run check` (Biome lint + format).
+   * Run `cargo test --workspace`.
    */
   @func()
-  async lint(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'check']).stdout();
+  async rustTest(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'test', '--workspace']).stdout();
   }
 
   /**
-   * Run `bun test`.
+   * Run `cargo clippy --workspace --all-targets -- -D warnings`.
    */
   @func()
-  async test(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'test']).stdout();
+  async rustClippy(source: Directory): Promise<string> {
+    return this.rustBase(source)
+      .withExec(['cargo', 'clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'])
+      .stdout();
   }
 
   /**
-   * Run `bun run coverage` to enforce the repository coverage floor.
+   * Run `cargo doc --workspace --no-deps`.
    */
   @func()
-  async coverage(source: Directory): Promise<string> {
-    return this.base(source).withExec(['bun', 'run', 'coverage']).stdout();
+  async rustDoc(source: Directory): Promise<string> {
+    return this.rustBase(source).withExec(['cargo', 'doc', '--workspace', '--no-deps']).stdout();
   }
 
   /**
@@ -74,21 +75,21 @@ export class MemoryEngine {
   }
 
   /**
-   * Run every gate in sequence: typecheck → lint/format →
-   * coverage-enforced tests → secrets scan. A non-zero exit on any
-   * gate fails the pipeline. Returns a concatenated log on success.
+   * Run every gate in sequence. A non-zero exit on any gate fails the pipeline.
+   * Returns a concatenated log on success.
    */
   @func()
   async check(source: Directory): Promise<string> {
-    const base = this.base(source);
-    const typecheck = await base.withExec(['bun', 'run', 'typecheck']).stdout();
-    const lint = await base.withExec(['bun', 'run', 'check']).stdout();
-    const coverage = await base.withExec(['bun', 'run', 'coverage']).stdout();
+    const rustFmt = await this.rustFmt(source);
+    const rustTest = await this.rustTest(source);
+    const rustClippy = await this.rustClippy(source);
+    const rustDoc = await this.rustDoc(source);
     const secrets = await this.secrets(source);
     return [
-      `=== typecheck ===\n${typecheck}`,
-      `=== lint ===\n${lint}`,
-      `=== coverage ===\n${coverage}`,
+      `=== rust fmt ===\n${rustFmt}`,
+      `=== rust test ===\n${rustTest}`,
+      `=== rust clippy ===\n${rustClippy}`,
+      `=== rust doc ===\n${rustDoc}`,
       `=== secrets ===\n${secrets}`,
     ].join('\n');
   }

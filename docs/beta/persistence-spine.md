@@ -4,10 +4,10 @@ Refs-backlog: 26
 
 ## Purpose
 
-`experiments/beta-store/` is the first durable persistence proof for the
-memory-engine beta interface. It is intentionally repo-local and outside
-`src/`: the beta product needs saved state now, but the published kernel should
-remain pure until repeated clients prove a stable service contract.
+`crates/memory-engine-persistence` is the durable persistence proof for the
+memory-engine beta interface. It is intentionally repo-local and outside the
+pure kernel: the beta product needs saved state now, but the published kernel
+should remain pure until repeated clients prove a stable service contract.
 
 ## Ownership Boundary
 
@@ -26,11 +26,12 @@ Belongs to the kernel/API:
 
 - canonical `Prompt`, `QueueCandidate`, `ScheduleState`, grading, scheduling,
   progression, and queue semantics;
-- pure functions and package exports under `src/`;
+- pure functions in `crates/memory-engine-core` and facade exports from
+  `crates/memory-engine`;
 - fixture/eval contracts that prove shared learning behavior.
 
 No filesystem, database, provider SDK, network, or UI code is added under
-`src/`.
+`crates/memory-engine-core`.
 
 ## Storage Shape
 
@@ -99,7 +100,8 @@ fixtures only. Source documents carry a permission label:
 - `model-eligible`: may be used by a product-level generation workflow.
 
 This label is recorded but not enforced by the kernel. Enforcement belongs to
-future beta generation and provider-adapter code outside `src/`.
+future beta generation and provider-adapter code outside
+`crates/memory-engine-core`.
 
 ## Extraction Criteria
 
@@ -113,20 +115,23 @@ true:
   provenance stabilize across more than one workflow.
 - graduated activity metadata, quiz/exercise drafts, and worked-solution
   records prove reusable across multiple beta workflows without importing
-  provider, UI, or persistence concepts into `src/`.
+  provider, UI, or persistence concepts into `crates/memory-engine-core`.
 
-Until then, `experiments/beta-store/` is a dogfood spine, not the memory-engine
-database.
+Until then, `crates/memory-engine-persistence` is a dogfood spine, not the
+memory-engine database.
 
 ## Verification
 
 Ticket 26 evidence:
 
 ```sh
-bun test experiments/beta-store/
+cargo test -p memory-engine-persistence
 bun run ci
 ```
 
 The focused test suite covers restart/reload, applied-review duplicate safety,
 failed-write atomicity, realistic queue-pile reload, generated-draft validation,
 and promotion from accepted draft to review unit.
+
+The former TypeScript `experiments/beta-store/` runtime oracle was deleted
+after the Rust crate covered durable store behavior and wire-shape parity.

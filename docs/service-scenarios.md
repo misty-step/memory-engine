@@ -16,10 +16,10 @@ data inside tests instead of adding a parser, session builder, or published API.
 
 ### Deterministic Prompt Loop
 
-`tests/service/session-flow-fixtures.test.ts` records an ungraded note attempt,
-grades a short-answer prompt, applies the resulting FSRS schedule state through
-`MemoryServiceStore.applyReview`, and then asks `next-queue` for the following
-candidate.
+`crates/memory-engine-service/tests/command_contract.rs` records an ungraded
+note attempt, grades a short-answer prompt, applies the resulting FSRS schedule
+state through `MemoryServiceStore::apply_review`, and then asks `next-queue` for
+the following candidate.
 
 This proves:
 

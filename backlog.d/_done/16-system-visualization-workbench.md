@@ -22,7 +22,7 @@ workflow paths, state transitions, and extraction candidates.
 
 ## Non-Goals
 
-- No changes to `src/` runtime behavior.
+- No changes to `crates/memory-engine-core` runtime behavior.
 - No production web app, hosted service, auth, telemetry, or persistence.
 - No new runtime dependency for the published `memory-engine` package.
 - No attempt to auto-generate an authoritative architecture from code alone.

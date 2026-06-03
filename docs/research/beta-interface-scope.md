@@ -17,7 +17,7 @@ study sessions while preserving the pure `memory-engine` kernel boundary.
 ## Strategic Decision
 
 Build the beta interface in this repository as an experiment, with its own
-local persistence and product workflow outside `src/`.
+local persistence and product workflow outside `crates/memory-engine-core`.
 
 The interface must save content, generated quiz/exercise drafts, approved
 review units, attempts, schedule updates, reference material, generation
@@ -82,7 +82,7 @@ Belongs in the shared kernel/API:
 | Ticket | Scope | Research basis |
 | --- | --- | --- |
 | `24-extraction-decision-gate` | Decide not to extract yet; use evidence to shape beta. | Current dogfood has one interactive client and no persistent beta. |
-| `26-beta-persistence-spine` | Store sources, generated drafts, review units, attempts, schedules, references, and run receipts outside `src`. | Retrieval/spaced-practice evidence requires durable attempts and schedule history. |
+| `26-beta-persistence-spine` | Store sources, generated drafts, review units, attempts, schedules, references, and run receipts outside the pure kernel. | Retrieval/spaced-practice evidence requires durable attempts and schedule history. |
 | `27-ai-content-generation-probe` | Generate source-grounded quiz/exercise drafts with provenance and validation. | AI output must be cited, evaluated, and approved before entering review or practice. |
 | `28-mobile-beta-study-interface` | Mobile-first local study shell for real dogfood use. | Low-friction retrieval attempts and simple exercises are the product proof. |
 | `29-service-contract-v0-hardening` | Decide DTOs, reveal semantics, activity-kind metadata, typed failures, and shared store harness after beta pressure. | Stable contracts should follow repeated interface evidence. |

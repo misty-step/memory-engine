@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/memory-engine",
+    "crates/memory-engine-beta-app",
+    "crates/memory-engine-bench",
+    "crates/memory-engine-cli",
+    "crates/memory-engine-core",
+    "crates/memory-engine-generation",
+    "crates/memory-engine-import",
+    "crates/memory-engine-service",
+    "crates/memory-engine-qa",
+    "crates/memory-engine-persistence",
+    "crates/memory-engine-study",
+    "crates/memory-engine-web-shell",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.0.0"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "warn"

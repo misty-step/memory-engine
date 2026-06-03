@@ -1,0 +1,12 @@
+[package]
+name = "memory-engine-bench"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Rust benchmark receipt generator for memory-engine."
+
+[dependencies]
+memory-engine = { path = "../memory-engine" }
+
+[lints]
+workspace = true

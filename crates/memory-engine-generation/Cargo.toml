@@ -1,0 +1,16 @@
+[package]
+name = "memory-engine-generation"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Deterministic beta content generation for memory-engine."
+
+[dependencies]
+memory-engine-core = { path = "../memory-engine-core" }
+memory-engine-persistence = { path = "../memory-engine-persistence" }
+
+[dev-dependencies]
+memory-engine-service = { path = "../memory-engine-service" }
+
+[lints]
+workspace = true

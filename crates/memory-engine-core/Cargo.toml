@@ -1,0 +1,16 @@
+[package]
+name = "memory-engine-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Pure Rust kernel for memory-engine learning semantics."
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
