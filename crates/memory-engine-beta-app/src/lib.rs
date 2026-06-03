@@ -110,6 +110,21 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
             Ok(draft_id) => response_for(request, session.approve_draft(&draft_id)),
             Err(error) => HttpResponse::bad_request(&error),
         },
+        ("POST", "/learn-more" | "/current/learn-more") => {
+            response_for(request, session.learn_more())
+        }
+        ("POST", "/edit" | "/current/edit") => match read_revision(&request.body) {
+            Ok(revision) => response_for(
+                request,
+                session.edit_current_prompt(revision.prompt, revision.expected_answer),
+            ),
+            Err(error) => HttpResponse::bad_request(&error),
+        },
+        ("POST", "/delete" | "/current/delete") => response_for(request, session.archive_current()),
+        ("POST", "/snooze" | "/current/snooze") => match read_i64(&request.body, "snoozedUntil") {
+            Ok(snoozed_until) => response_for(request, session.snooze_current_until(snoozed_until)),
+            Err(error) => HttpResponse::bad_request(&error),
+        },
         ("POST", "/reveal") => response_for(request, session.reveal()),
         ("POST", "/answer") => match read_answer(&request.body) {
             Ok(answer) => response_for(
@@ -310,6 +325,11 @@ struct AnswerPayload {
     response_time_ms: u32,
 }
 
+struct RevisionPayload {
+    prompt: String,
+    expected_answer: String,
+}
+
 fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
     if !looks_like_json(body) {
         let fields = parse_form(body)?;
@@ -382,6 +402,30 @@ fn read_required_string(body: &[u8], key: &str) -> Result<String, String> {
     require_non_blank(&value, key)?;
 
     Ok(value)
+}
+
+fn read_revision(body: &[u8]) -> Result<RevisionPayload, String> {
+    Ok(RevisionPayload {
+        prompt: read_required_string(body, "prompt")?,
+        expected_answer: read_required_string(body, "expectedAnswer")?,
+    })
+}
+
+fn read_i64(body: &[u8], key: &str) -> Result<i64, String> {
+    if !looks_like_json(body) {
+        let fields = parse_form(body)?;
+        let value = form_required(&fields, key)?;
+        return value
+            .parse::<i64>()
+            .map_err(|_| format!("{key} must be an integer"));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("Request body must be an object: {error}"))?;
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| format!("{key} must be an integer"))
 }
 
 fn looks_like_json(body: &[u8]) -> bool {
@@ -513,7 +557,19 @@ fn render_current(html: &mut String, current: Option<&BetaStudyCurrent>, error: 
         html.push_str("</p>");
     }
     if let Some(current) = current {
-        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer or worked solution</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
+        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer or worked solution</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/current/learn-more\"><button type=\"submit\" class=\"secondary\">Learn more</button></form><form method=\"post\" action=\"/current/snooze\"><input type=\"hidden\" name=\"snoozedUntil\" value=\"");
+        html.push_str(&snooze_until().to_string());
+        html.push_str("\"><button type=\"submit\" class=\"secondary\">Snooze</button></form><form method=\"post\" action=\"/current/delete\"><button type=\"submit\" class=\"secondary danger\">Delete</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
+        html.push_str("<form class=\"edit\" method=\"post\" action=\"/current/edit\"><label for=\"prompt-edit\">Edit prompt</label><textarea id=\"prompt-edit\" name=\"prompt\">");
+        html.push_str(&escape_html(&current.prompt));
+        html.push_str("</textarea><label for=\"answer-edit\">Edit expected answer</label><input id=\"answer-edit\" name=\"expectedAnswer\" value=\"");
+        html.push_str(&escape_html(&current.revision_expected_answer));
+        html.push_str("\"><button type=\"submit\" class=\"secondary\">Save prompt</button></form>");
+        if let Some(reference_text) = &current.reference_text {
+            html.push_str("<div class=\"reference\">");
+            html.push_str(&escape_html(reference_text));
+            html.push_str("</div>");
+        }
         if let Some(expected) = &current.expected_answer {
             html.push_str("<div class=\"answer\">");
             html.push_str(&escape_html(expected));
@@ -550,6 +606,10 @@ fn render_source_form(html: &mut String) {
     html.push_str("<section class=\"panel\"><h2>Source</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-title\">Source title</label><input id=\"source-title\" name=\"title\" value=\"NATO practice notes\"><label for=\"source-body\">Source blocks</label><textarea id=\"source-body\" name=\"body\">");
     html.push_str(&escape_html(DEFAULT_SOURCE_BODY));
     html.push_str("</textarea><button type=\"submit\">Save source</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate</button></form></section>");
+}
+
+fn snooze_until() -> i64 {
+    memory_engine_study::DEFAULT_BETA_STUDY_NOW + 86_400_000
 }
 
 fn render_drafts(html: &mut String, view: &BetaStudyView) {
@@ -607,7 +667,9 @@ textarea,input{width:100%;border:1px solid #b9c4b5;border-radius:6px;padding:12p
 textarea{min-height:116px;resize:vertical}
 button{min-height:40px;border:1px solid #24533d;border-radius:6px;padding:0 14px;background:#24533d;color:#fff;font:inherit;font-weight:700;cursor:pointer}
 button.secondary{background:#fff;color:#24533d}
-.answer,.grade,.solution{margin-top:12px;min-height:24px;overflow-wrap:anywhere;font-size:15px;font-weight:650}.answer{color:#24533d}.grade{color:#7a4322}.solution{color:#455048;font-weight:500}
+button.danger{border-color:#7a2e2a;color:#7a2e2a}
+.edit{display:grid;gap:10px;margin-top:14px}
+.answer,.grade,.solution,.reference{margin-top:12px;min-height:24px;overflow-wrap:anywhere;font-size:15px;font-weight:650}.answer{color:#24533d}.grade{color:#7a4322}.solution,.reference{color:#455048;font-weight:500}.reference{border-left:3px solid #b9c4b5;padding-left:12px;white-space:pre-wrap}
 aside{min-width:0;border-left:1px solid #d9ded5;background:#fff}
 section.panel{border-bottom:1px solid #d9ded5;padding:20px}
 h2{margin:0 0 14px;font-size:15px;line-height:1.2;letter-spacing:0}
@@ -726,6 +788,79 @@ mod tests {
     }
 
     #[test]
+    fn drives_item_lifecycle_routes_through_rust() {
+        let directory = TempDirectory::new("lifecycle");
+        let mut lifecycle_session = session(directory.path().join("study.json"));
+        seed_nato_source_and_generate(&mut lifecycle_session);
+        approve_draft(
+            &mut lifecycle_session,
+            "study-run-1-draft-src-nato-2-nato-cat-composition",
+        );
+        approve_draft(
+            &mut lifecycle_session,
+            "study-run-1-draft-src-nato-1-nato-letter-a",
+        );
+
+        let learned = route(
+            &mut lifecycle_session,
+            &request("POST", "/current/learn-more", "{}"),
+        );
+        let learned: Value = serde_json::from_slice(&learned.body).expect("learned");
+        assert_eq!(learned["status"], json!("answering"));
+        assert_eq!(learned["current"]["expectedAnswer"], json!(null));
+        assert_eq!(
+            learned["current"]["referenceText"],
+            json!("The NATO phonetic alphabet word for A is ALFA.")
+        );
+
+        let edited = route(
+            &mut lifecycle_session,
+            &request(
+                "POST",
+                "/current/edit",
+                &json!({
+                    "prompt": "Name the NATO code word for A.",
+                    "expectedAnswer": "ALFA"
+                })
+                .to_string(),
+            ),
+        );
+        let edited: Value = serde_json::from_slice(&edited.body).expect("edited");
+        assert_eq!(
+            edited["current"]["prompt"],
+            json!("Name the NATO code word for A.")
+        );
+        assert_eq!(edited["current"]["revisionExpectedAnswer"], json!("ALFA"));
+        assert_eq!(edited["current"]["expectedAnswer"], json!(null));
+
+        let deleted = route(
+            &mut lifecycle_session,
+            &request("POST", "/current/delete", "{}"),
+        );
+        let deleted: Value = serde_json::from_slice(&deleted.body).expect("deleted");
+        assert_eq!(deleted["summary"]["approvedReviewUnitCount"], json!(0));
+        assert_eq!(deleted["queue"], json!([]));
+
+        let mut snooze_session = session(directory.path().join("snooze-study.json"));
+        seed_nato_source_and_generate(&mut snooze_session);
+        approve_draft(
+            &mut snooze_session,
+            "study-run-1-draft-src-nato-1-nato-letter-a",
+        );
+        let snoozed = route(
+            &mut snooze_session,
+            &request(
+                "POST",
+                "/current/snooze",
+                &json!({"snoozedUntil": NOW + 86_400_000}).to_string(),
+            ),
+        );
+        let snoozed: Value = serde_json::from_slice(&snoozed.body).expect("snoozed");
+        assert_eq!(snoozed["status"], json!("drafting"));
+        assert_eq!(snoozed["queue"][0]["due"], json!(NOW + 86_400_000));
+    }
+
+    #[test]
     fn drives_the_phone_form_flow_without_browser_javascript() {
         let directory = TempDirectory::new("form-flow");
         let mut session = session(directory.path().join("study.json"));
@@ -835,6 +970,34 @@ mod tests {
             BetaStudySession::open(BetaStudyOptions::new(path).with_clock(now)).expect("open");
         session.start().expect("start");
         session
+    }
+
+    fn seed_nato_source_and_generate(session: &mut BetaStudySession) {
+        route(
+            session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-nato",
+                    "title": "NATO practice notes",
+                    "body": source_body()
+                })
+                .to_string(),
+            ),
+        );
+        route(session, &request("POST", "/generate", "{}"));
+    }
+
+    fn approve_draft(session: &mut BetaStudySession, draft_id: &str) {
+        route(
+            session,
+            &request(
+                "POST",
+                "/approve",
+                &json!({"draftId": draft_id}).to_string(),
+            ),
+        );
     }
 
     fn now() -> i64 {

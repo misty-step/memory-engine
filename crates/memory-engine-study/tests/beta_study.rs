@@ -205,6 +205,120 @@ fn duplicate_submit_after_grading_is_view_only() {
 }
 
 #[test]
+fn inspects_and_edits_active_review_item_without_revealing_answer() {
+    let directory = TempDirectory::new("inspect-edit");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let started = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve");
+    assert_eq!(started.status, BetaStudyStatus::Answering);
+    assert_eq!(
+        started.current.as_ref().expect("current").expected_answer,
+        None
+    );
+    assert_eq!(
+        started.current.as_ref().expect("current").reference_text,
+        None
+    );
+
+    let inspected = study.learn_more().expect("learn more");
+    let inspected_current = inspected.current.as_ref().expect("inspected current");
+    assert_eq!(inspected.status, BetaStudyStatus::Answering);
+    assert_eq!(inspected_current.expected_answer, None);
+    assert_eq!(
+        inspected_current.reference_text.as_deref(),
+        Some("The NATO phonetic alphabet word for A is ALFA.")
+    );
+
+    let edited = study
+        .edit_current_prompt("Name the NATO code word for the letter A.", "ALFA")
+        .expect("edit");
+    let edited_current = edited.current.as_ref().expect("edited current");
+    assert_eq!(
+        edited_current.prompt,
+        "Name the NATO code word for the letter A."
+    );
+    assert_eq!(edited_current.revision_expected_answer, "ALFA");
+    assert_eq!(edited_current.expected_answer, None);
+    assert_eq!(edited_current.reference_text, None);
+
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    let resumed = resumed.start().expect("start");
+    assert_eq!(
+        resumed.current.expect("resumed current").prompt,
+        "Name the NATO code word for the letter A."
+    );
+}
+
+#[test]
+fn snoozes_and_deletes_active_review_items_without_touching_schedule_history() {
+    let directory = TempDirectory::new("lifecycle");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz");
+    study
+        .submit_answer("CHARLIE ALFA TANGO", 4_200)
+        .expect("submit");
+    let exercise_review_state = study
+        .view()
+        .expect("view")
+        .current
+        .expect("current")
+        .review_state
+        .expect("review state");
+
+    let snoozed = study
+        .snooze_current_until(NOW + 86_400_000)
+        .expect("snooze");
+    assert_eq!(snoozed.status, BetaStudyStatus::Answering);
+    assert_eq!(
+        snoozed.current.expect("next current").prompt,
+        "What is the NATO phonetic alphabet word for A?"
+    );
+    let snoozed_row = snoozed
+        .queue
+        .iter()
+        .find(|row| {
+            row.activity_kind
+                .as_ref()
+                .map(ToStringForTest::to_string_for_test)
+                == Some("exercise".to_owned())
+        })
+        .expect("snoozed row");
+    assert_eq!(snoozed_row.due, NOW + 86_400_000);
+    assert_eq!(snoozed_row.reps, exercise_review_state.reps);
+    assert_eq!(snoozed_row.state, Some(exercise_review_state.state));
+
+    let deleted = study.archive_current().expect("delete current");
+    assert_eq!(deleted.status, BetaStudyStatus::Drafting);
+    assert_eq!(deleted.summary.approved_review_unit_count, 1);
+    assert_eq!(deleted.summary.attempt_count, 1);
+    assert!(deleted.queue.iter().all(|row| {
+        row.review_unit_id.as_str() != "study-run-1-draft-src-nato-1-nato-letter-a"
+    }));
+
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    let resumed = resumed.start().expect("start");
+    assert_eq!(resumed.summary.approved_review_unit_count, 1);
+    assert_eq!(resumed.summary.attempt_count, 1);
+    assert!(resumed.current.is_none());
+}
+
+#[test]
 fn view_serializes_like_the_mobile_beta_api_contract() {
     let directory = TempDirectory::new("wire");
     let path = directory.path().join("study.json");
@@ -223,6 +337,7 @@ fn view_serializes_like_the_mobile_beta_api_contract() {
     assert_eq!(encoded["sources"][0]["createdAt"], json!(NOW));
     assert_eq!(encoded["drafts"][0]["activityKind"], json!("quiz"));
     assert_eq!(encoded["drafts"][0]["validationStatus"], json!("accepted"));
+    assert_eq!(encoded["current"]["revisionExpectedAnswer"], json!("ALFA"));
     assert_eq!(encoded["current"]["expectedAnswer"], json!("ALFA"));
     assert_eq!(encoded["current"]["workedSolution"], json!(null));
     assert_eq!(encoded["summary"]["approvedReviewUnitCount"], json!(1));

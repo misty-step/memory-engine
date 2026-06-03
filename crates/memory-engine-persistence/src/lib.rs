@@ -135,6 +135,10 @@ pub struct BetaReviewUnitRecord {
     pub queue: PersistedQueueCandidate,
     pub reference_span_ids: Vec<String>,
     pub generated_prompt_draft_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<i64>,
     pub created_at: i64,
 }
 
@@ -243,6 +247,7 @@ pub enum BetaStoreError {
     GeneratedPromptDraftRequiresReference,
     GeneratedPromptDraftReviewUnitMismatch,
     ReviewUnitMismatch,
+    ReviewUnitArchived(ReviewUnitId),
     AttemptAnswerBlank,
     AttemptResponseTimeNonPositive,
     ScheduleLastReviewMismatch,
@@ -287,6 +292,7 @@ impl fmt::Display for BetaStoreError {
             Self::ReviewUnitMismatch => {
                 formatter.write_str("Review unit ids must match prompt and queue ids")
             }
+            Self::ReviewUnitArchived(id) => write!(formatter, "Review unit is archived: {id}"),
             Self::AttemptAnswerBlank => formatter.write_str("Attempt answer must not be blank"),
             Self::AttemptResponseTimeNonPositive => {
                 formatter.write_str("Attempt response time must be a positive integer")
@@ -331,6 +337,7 @@ impl PartialEq for BetaStoreError {
                 left == right
             }
             (Self::UnknownReviewUnit(left), Self::UnknownReviewUnit(right))
+            | (Self::ReviewUnitArchived(left), Self::ReviewUnitArchived(right))
             | (Self::StaleScheduleWrite(left), Self::StaleScheduleWrite(right)) => left == right,
             (Self::RejectedGeneratedPromptDraft, Self::RejectedGeneratedPromptDraft)
             | (
@@ -515,6 +522,8 @@ impl BetaPersistenceStore {
             queue: draft.queue.clone(),
             reference_span_ids: draft.reference_span_ids.clone(),
             generated_prompt_draft_id: Some(draft.id.clone()),
+            archived_at: None,
+            snoozed_until: None,
             created_at: draft.created_at,
         };
         let mut next = self.data.clone();
@@ -527,6 +536,109 @@ impl BetaPersistenceStore {
         self.commit(next)?;
 
         Ok(review_unit)
+    }
+
+    /// Replace an approved review unit's prompt text while preserving its answer contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the review unit is unknown, archived, or invalid.
+    pub fn update_review_unit_prompt_text(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        prompt_text: &str,
+        expected_answer: &str,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        assert_non_blank(prompt_text, "Review unit prompt")?;
+        assert_non_blank(expected_answer, "Review unit expected answer")?;
+        let mut next = self.data.clone();
+        let review_unit = next
+            .review_units
+            .iter_mut()
+            .find(|unit| &unit.review_unit_id == review_unit_id)
+            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+        if review_unit.archived_at.is_some() {
+            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+        }
+
+        replace_prompt_text(&mut review_unit.prompt, prompt_text);
+        replace_prompt_answer(&mut review_unit.prompt, expected_answer);
+        if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
+            if let Some(draft) = next
+                .generated_prompt_drafts
+                .iter_mut()
+                .find(|draft| &draft.id == draft_id)
+            {
+                replace_prompt_text(&mut draft.prompt, prompt_text);
+                replace_prompt_answer(&mut draft.prompt, expected_answer);
+                if !draft
+                    .critique_notes
+                    .iter()
+                    .any(|note| note == "Learner edited approved wording.")
+                {
+                    draft
+                        .critique_notes
+                        .push("Learner edited approved wording.".to_owned());
+                }
+            }
+        }
+        let updated = review_unit.clone();
+        assert_review_unit_contract(&next, &updated)?;
+        self.commit(next)?;
+
+        Ok(updated)
+    }
+
+    /// Hide an approved review unit from the active queue while preserving receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the review unit is unknown.
+    pub fn archive_review_unit(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        archived_at: i64,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        let mut next = self.data.clone();
+        let review_unit = next
+            .review_units
+            .iter_mut()
+            .find(|unit| &unit.review_unit_id == review_unit_id)
+            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+        review_unit.archived_at = Some(archived_at);
+        let archived = review_unit.clone();
+        self.commit(next)?;
+
+        Ok(archived)
+    }
+
+    /// Move an approved review unit's beta-owned queue availability forward.
+    ///
+    /// This does not mutate FSRS schedule fields; reviewed units keep their
+    /// schedule record and expose the snoozed due through the queue candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the review unit is unknown or archived.
+    pub fn snooze_review_unit_until(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        snoozed_until: i64,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        let mut next = self.data.clone();
+        let review_unit = next
+            .review_units
+            .iter_mut()
+            .find(|unit| &unit.review_unit_id == review_unit_id)
+            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+        if review_unit.archived_at.is_some() {
+            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+        }
+        review_unit.snoozed_until = Some(snoozed_until);
+        let snoozed = review_unit.clone();
+        self.commit(next)?;
+
+        Ok(snoozed)
     }
 
     /// Save or replace a beta review unit.
@@ -649,10 +761,15 @@ impl MemoryServiceStore for BetaPersistenceStore {
             .data
             .review_units
             .iter()
+            .filter(|review_unit| review_unit.archived_at.is_none())
             .map(|review_unit| {
                 let schedule_state = find_schedule(&self.data, &review_unit.review_unit_id)
                     .map(|record| record.state.clone());
-                review_unit.queue.with_schedule(schedule_state)
+                let mut candidate = review_unit.queue.with_schedule(schedule_state);
+                if let Some(snoozed_until) = review_unit.snoozed_until {
+                    candidate.due = candidate.due.max(snoozed_until);
+                }
+                candidate
             })
             .collect())
     }
@@ -807,6 +924,38 @@ fn prompt_review_unit_id(prompt: &Prompt) -> &ReviewUnitId {
             review_unit_id
         }
         Prompt::Exact(prompt) => &prompt.review_unit_id,
+    }
+}
+
+fn replace_prompt_text(prompt: &mut Prompt, prompt_text: &str) {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => {
+            prompt_text.clone_into(prompt);
+        }
+        Prompt::Exact(prompt) => {
+            prompt_text.clone_into(&mut prompt.prompt);
+        }
+    }
+}
+
+fn replace_prompt_answer(prompt: &mut Prompt, expected_answer: &str) {
+    match prompt {
+        Prompt::Mcq {
+            choices,
+            correct_choice,
+            ..
+        } => {
+            expected_answer.clone_into(correct_choice);
+            if !choices.iter().any(|choice| choice == expected_answer) {
+                choices.push(expected_answer.to_owned());
+            }
+        }
+        Prompt::Boolean { correct_answer, .. } => {
+            *correct_answer = expected_answer.eq_ignore_ascii_case("true");
+        }
+        Prompt::Exact(prompt) => {
+            prompt.accepted_answers = vec![expected_answer.to_owned()];
+        }
     }
 }
 

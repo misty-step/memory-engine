@@ -116,7 +116,9 @@ pub struct BetaStudyCurrent {
     pub activity_kind: GeneratedLearningActivityKind,
     pub activity_stage: String,
     pub prompt: String,
+    pub revision_expected_answer: String,
     pub expected_answer: Option<String>,
+    pub reference_text: Option<String>,
     pub worked_solution: Option<String>,
     pub grade: Option<BetaStudyGrade>,
     pub review_state: Option<ReviewStateProjection>,
@@ -214,6 +216,7 @@ pub struct BetaStudySession {
     current: Option<GeneratedPromptDraft>,
     status: BetaStudyStatus,
     expected_answer: Option<String>,
+    reference_text: Option<String>,
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
 }
@@ -238,6 +241,7 @@ impl BetaStudySession {
             current: None,
             status,
             expected_answer: None,
+            reference_text: None,
             grade: None,
             schedule_change: None,
         })
@@ -318,6 +322,84 @@ impl BetaStudySession {
             draft_id,
             ApproveGeneratedPromptDraftOptions::default(),
         )?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Show source/reference material for the active item without revealing the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError::NoActiveReviewUnit`] when no item is active.
+    pub fn learn_more(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+        let active = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        let snapshot = self.store.snapshot();
+        self.reference_text = reference_text(&snapshot.reference_spans, active);
+        self.view()
+    }
+
+    /// Edit the active approved review prompt without revealing or rescheduling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or persistence fails.
+    pub fn edit_current_prompt(
+        &mut self,
+        prompt_text: impl Into<String>,
+        expected_answer: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError> {
+        let active = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.store.update_review_unit_prompt_text(
+            &active.review_unit_id,
+            &prompt_text.into(),
+            &expected_answer.into(),
+        )?;
+        self.reload_current();
+        self.expected_answer = None;
+        self.reference_text = None;
+        self.grade = None;
+        self.schedule_change = None;
+        self.status = BetaStudyStatus::Answering;
+        self.view()
+    }
+
+    /// Archive the active review item and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or persistence fails.
+    pub fn archive_current(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+        let active = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.store
+            .archive_review_unit(&active.review_unit_id, (self.now)())?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Snooze the active review item's beta queue availability and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or persistence fails.
+    pub fn snooze_current_until(
+        &mut self,
+        snoozed_until: i64,
+    ) -> Result<BetaStudyView, BetaStudyError> {
+        let active = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.store
+            .snooze_review_unit_until(&active.review_unit_id, snoozed_until)?;
         self.select_next()?;
         self.view()
     }
@@ -421,6 +503,7 @@ impl BetaStudySession {
                             draft,
                             schedule.as_ref(),
                             self.expected_answer.clone(),
+                            self.reference_text.clone(),
                             self.grade.clone(),
                             self.schedule_change.clone(),
                         )
@@ -450,7 +533,11 @@ impl BetaStudySession {
                         draft.validation.status == GeneratedPromptValidationStatus::Accepted
                     })
                     .count(),
-                approved_review_unit_count: snapshot.review_units.len(),
+                approved_review_unit_count: snapshot
+                    .review_units
+                    .iter()
+                    .filter(|unit| unit.archived_at.is_none())
+                    .count(),
                 attempt_count: snapshot.attempts.len(),
                 last_outcome: snapshot
                     .attempts
@@ -481,10 +568,23 @@ impl BetaStudySession {
             BetaStudyStatus::Drafting
         };
         self.expected_answer = None;
+        self.reference_text = None;
         self.grade = None;
         self.schedule_change = None;
 
         Ok(())
+    }
+
+    fn reload_current(&mut self) {
+        let Some(active) = self.current.as_ref() else {
+            return;
+        };
+        let snapshot = self.store.snapshot();
+        self.current = snapshot
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == active.review_unit_id)
+            .and_then(|unit| approved_draft_from_unit(&snapshot.generated_prompt_drafts, unit));
     }
 }
 
@@ -545,6 +645,7 @@ fn current_view(
     draft: &GeneratedPromptDraft,
     schedule: Option<&ScheduleState>,
     expected_answer: Option<String>,
+    reference_text: Option<String>,
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
 ) -> BetaStudyCurrent {
@@ -554,10 +655,12 @@ fn current_view(
         activity_kind: draft.activity_kind.clone(),
         activity_stage: draft.activity_stage.clone(),
         prompt: prompt_text(&draft.prompt).to_owned(),
+        revision_expected_answer: prompt_expected_answer(&draft.prompt),
         worked_solution: expected_answer
             .as_ref()
             .and_then(|_| draft.worked_solution.clone()),
         expected_answer,
+        reference_text,
         grade,
         review_state: project_schedule(schedule),
         schedule_change,
@@ -582,6 +685,14 @@ fn find_approved_draft(
         .cloned()
 }
 
+fn approved_draft_from_unit(
+    drafts: &[GeneratedPromptDraft],
+    review_unit: &memory_engine_persistence::BetaReviewUnitRecord,
+) -> Option<GeneratedPromptDraft> {
+    let draft_id = review_unit.generated_prompt_draft_id.as_ref()?;
+    drafts.iter().find(|draft| &draft.id == draft_id).cloned()
+}
+
 fn prompt_text(prompt: &Prompt) -> &str {
     match prompt {
         Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt,
@@ -601,6 +712,25 @@ fn prompt_expected_answer(prompt: &Prompt) -> String {
             ..
         } => "False".to_owned(),
         Prompt::Exact(prompt) => prompt.accepted_answers.join(" / "),
+    }
+}
+
+fn reference_text(
+    spans: &[memory_engine_persistence::ReferenceSpan],
+    draft: &GeneratedPromptDraft,
+) -> Option<String> {
+    let text = draft
+        .reference_span_ids
+        .iter()
+        .filter_map(|id| spans.iter().find(|span| &span.id == id))
+        .map(|span| span.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 

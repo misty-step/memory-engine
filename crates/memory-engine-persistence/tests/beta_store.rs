@@ -330,6 +330,123 @@ fn validates_generated_drafts_before_promotion() {
 }
 
 #[test]
+fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history() {
+    let directory = TempDirectory::new("lifecycle");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+
+    let updated = store
+        .update_review_unit_prompt_text(
+            &draft.review_unit_id,
+            "Translate the opening prayer.",
+            "Our Father",
+        )
+        .expect("revise");
+    assert!(matches!(updated.prompt, Prompt::Exact(_)));
+    let snapshot = store.snapshot();
+    assert_eq!(
+        prompt_text(
+            &snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == draft.review_unit_id)
+                .expect("review unit")
+                .prompt
+        ),
+        "Translate the opening prayer."
+    );
+    assert_eq!(
+        snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|candidate| candidate.id == draft.id)
+            .expect("draft")
+            .critique_notes
+            .last()
+            .map(String::as_str),
+        Some("Learner edited approved wording.")
+    );
+    assert_eq!(
+        prompt_text(
+            &snapshot
+                .generated_prompt_drafts
+                .iter()
+                .find(|candidate| candidate.id == draft.id)
+                .expect("draft")
+                .prompt
+        ),
+        "Translate the opening prayer."
+    );
+
+    let prior_schedule = store
+        .read_schedule_state(&draft.review_unit_id)
+        .expect("read schedule")
+        .expect("schedule");
+    store
+        .snooze_review_unit_until(&draft.review_unit_id, NOW + 86_400_000)
+        .expect("snooze");
+    assert_eq!(
+        store
+            .read_schedule_state(&draft.review_unit_id)
+            .expect("read schedule")
+            .expect("schedule"),
+        prior_schedule
+    );
+    let queue = store.list_queue_candidates().expect("queue");
+    assert_eq!(queue[0].due, NOW + 86_400_000);
+    assert_eq!(queue[0].schedule_state, Some(prior_schedule.clone()));
+
+    store
+        .archive_review_unit(&draft.review_unit_id, NOW + 1_000)
+        .expect("archive");
+    assert!(store.list_queue_candidates().expect("queue").is_empty());
+    assert_eq!(store.snapshot().review_units.len(), 1);
+    assert_eq!(
+        store
+            .read_schedule_state(&draft.review_unit_id)
+            .expect("read schedule")
+            .expect("schedule"),
+        prior_schedule
+    );
+}
+
+fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {
+    let mut store = BetaPersistenceStore::open(path).expect("open store");
+    let source = store
+        .save_source_document(source_document("src-lifecycle"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("ref-lifecycle", &source.id))
+        .expect("reference");
+    let draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "draft-lifecycle",
+            "unit-lifecycle",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("run-lifecycle"),
+        ))
+        .expect("draft");
+    store
+        .save_generation_run(generation_run(
+            "run-lifecycle",
+            &[source.id.as_str()],
+            &[draft.id.as_str()],
+        ))
+        .expect("run");
+    store
+        .approve_generated_prompt_draft(
+            &draft.id,
+            ApproveGeneratedPromptDraftOptions {
+                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
+            },
+        )
+        .expect("approve");
+
+    (store, draft)
+}
+
+#[test]
 fn snapshot_envelope_uses_beta_store_wire_names() {
     let snapshot = memory_engine_persistence::BetaStoreSnapshot {
         version: 1,
@@ -451,6 +568,8 @@ fn review_unit(
         queue,
         reference_span_ids: Vec::new(),
         generated_prompt_draft_id: None,
+        archived_at: None,
+        snoozed_until: None,
         created_at: NOW,
     }
 }
@@ -493,6 +612,13 @@ fn schedule_state(reps: u32, status: ScheduleStatus) -> ScheduleState {
 
 fn review_unit_id(value: &str) -> ReviewUnitId {
     ReviewUnitId::new(value)
+}
+
+fn prompt_text(prompt: &Prompt) -> &str {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt,
+        Prompt::Exact(prompt) => &prompt.prompt,
+    }
 }
 
 struct TempDirectory {
