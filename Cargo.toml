@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/memory-engine",
+    "crates/memory-engine-api",
     "crates/memory-engine-beta-app",
     "crates/memory-engine-bench",
     "crates/memory-engine-cli",
@@ -10,6 +11,7 @@ members = [
     "crates/memory-engine-service",
     "crates/memory-engine-qa",
     "crates/memory-engine-persistence",
+    "crates/memory-engine-persistence-postgres",
     "crates/memory-engine-study",
     "crates/memory-engine-web-shell",
 ]

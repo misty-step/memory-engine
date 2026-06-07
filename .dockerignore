@@ -1,0 +1,11 @@
+.git
+.github
+.codex
+.groom
+.pi
+.spellbook
+target
+docs/qa/receipts
+*.log
+.env
+.env.*

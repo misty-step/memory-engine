@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "work_id": "040-production-mobile-study-app-boundary",
+  "branch": "cx/production-mobile-study-app",
+  "status": "merge_ready",
+  "created_at": "2026-06-06T20:01:24Z",
+  "goal": "Deliver a mobile-optimized production study app boundary with account creation, generated study material, scheduled review, and production infrastructure deployment.",
+  "changed_behavior": [
+    "A learner can use the mobile web shell to generate study material from pasted source text before saving an account email.",
+    "Account-scoped API routes persist source, generation, review, schedule, idempotency state, and API sessions in managed Postgres.",
+    "The deployed Fly service survives Machine restarts and cross-Machine request routing when requests keep the original account session token.",
+    "Email-only account replay is rejected instead of rotating an existing account session."
+  ],
+  "acceptance_sources": [
+    {
+      "path": "backlog.d/040-production-mobile-study-app-boundary.md",
+      "sha256": "bd60ab2d623c56fcb9122dab27ad590ee5bb243aa629f22999b4c9be8b1fa92d"
+    },
+    {
+      "path": "docs/architecture/production-mobile-study-app.md",
+      "sha256": "88a7950385bb4253778153b9b77e242f591bb180e8bcc742ecb70cdf33d15332"
+    },
+    {
+      "path": "docs/architecture/adr-001-production-shell-boundary.md",
+      "sha256": "8439b0c8c51af7e4b049f264b074addd1c2cdd12bf1cd79822eefa49c07da807"
+    },
+    {
+      "path": "docs/qa/fly-staging.md",
+      "sha256": "bf2c63d76b054edec0e6a19257f7308c5a33de8bf626020c3298a1f798b068ed"
+    }
+  ],
+  "evidence": {
+    "packet_dir": ".evidence/cx-production-mobile-study-app/2026-06-06",
+    "index": ".evidence/cx-production-mobile-study-app/2026-06-06/evidence-index.md",
+    "demo": ".evidence/cx-production-mobile-study-app/2026-06-06/demo.md",
+    "delivery_brief": ".evidence/cx-production-mobile-study-app/2026-06-06/delivery-brief.md",
+    "learning_packet": ".evidence/cx-production-mobile-study-app/2026-06-06/learning-packet.md",
+    "qa_receipt": "docs/qa/fly-staging.md"
+  },
+  "deployment": {
+    "provider": "Fly.io",
+    "app": "memory-engine-api",
+    "url": "https://memory-engine-api.fly.dev/",
+    "image": "memory-engine-api:deployment-01KTF8VG6WT38CZDSKE9QKJN95",
+    "postgres_cluster": "memory-engine-api-pg",
+    "postgres_cluster_id": "nlkxjo56lnlry93v",
+    "machines": ["080395df316758", "84e474a4266518"],
+    "secret_names_verified": ["MEMORY_ENGINE_POSTGRES_URL"]
+  },
+  "verification_commands": [
+    "cargo fmt --all --check",
+    "MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test cargo test -p memory-engine-api postgres_backend_routes_drive_source_to_review -- --nocapture",
+    "cargo test -p memory-engine-persistence-postgres migration_uses_account_scoped_primary_keys_and_durable_receipts -- --nocapture",
+    "cargo test -p memory-engine-api -p memory-engine-persistence-postgres",
+    "cargo clippy -p memory-engine-api -p memory-engine-persistence-postgres --all-targets -- -D warnings",
+    "cargo test -p memory-engine-api -- --nocapture",
+    "MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test cargo test -p memory-engine-persistence-postgres -- --nocapture",
+    "cargo run -p memory-engine-qa -- --local",
+    "flyctl deploy -a memory-engine-api --remote-only",
+    "curl -fsS https://memory-engine-api.fly.dev/healthz",
+    "deployed JSON route smoke with duplicate submit after API state recreation using the original session token",
+    "flyctl machine restart 84e474a4266518 -a memory-engine-api",
+    "flyctl machine restart 080395df316758 -a memory-engine-api",
+    "bun run ci"
+  ],
+  "delegation": {
+    "providers_used": [
+      {
+        "provider": "codex",
+        "role": "deployment and delivery critic",
+        "status": "completed in prior pass and redispatched for closeout",
+        "accepted": [
+          "Need explicit Fly secret handling, deployed route proof, and multi-Machine persistence proof."
+        ],
+        "rejected": []
+      },
+      {
+        "provider": "claude",
+        "role": "architecture critic",
+        "status": "failed",
+        "failure": "Provider dispatch previously failed because of monthly spend limit.",
+        "accepted": [],
+        "rejected": []
+      },
+      {
+        "provider": "pi",
+        "role": "production and agent-readiness critic",
+        "status": "partial",
+        "accepted": [
+          "Missing staging proof, mobile proof, and ADR status had to be resolved before closeout."
+        ],
+        "rejected": [
+          "Unmanaged Postgres command recommendation was stale; current Fly CLI uses managed Postgres commands."
+        ]
+      },
+      {
+        "provider": "agy",
+        "role": "repo-fit critic",
+        "status": "redispatched for closeout",
+        "accepted": [],
+        "rejected": []
+      }
+    ],
+    "shape": "parallel read-only critic lanes plus lead synthesis",
+    "waiver": "No repo-local delegation receipt script exists; provider results are summarized in this packet."
+  },
+  "agent_readiness_delta": "improved",
+  "repo_fit": [
+    "New production HTTP, database, deployment, and UI concerns stay outside memory-engine-core.",
+    "Rust workspace, behavior tests, Dagger CI, Gitleaks, and Fly CLI-managed deployment keep the branch agent-verifiable.",
+    "The evidence packet names commands, routes, hashes, deployment IDs, and residual risks."
+  ],
+  "hardening": {
+    "run": true,
+    "result": "Read-only critics found three blockers during polish: email-only account replay rotated sessions, the production binary could boot without durable Postgres, and Postgres review apply checked stale schedule state before the transaction. The fixes reject duplicate account creation without a valid existing session, require MEMORY_ENGINE_POSTGRES_URL unless file storage is explicitly opted in, and move duplicate/prior-schedule checks under a review-unit row lock. A fresh targeted critic found no remaining blocking issue in those three classes."
+  },
+  "residual_risk": [
+    "External auth provider is not integrated.",
+    "Live model provider adapter is not integrated.",
+    "The current no-JavaScript server-rendered forms carry session tokens through hidden fields.",
+    "Postgres pooling and telemetry are not yet hardened for high traffic.",
+    "Fly Managed Postgres is a live paid resource."
+  ]
+}

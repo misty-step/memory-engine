@@ -9,9 +9,10 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaStoreError, GeneratedLearningActivityKind, GeneratedPromptDraft,
-    GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
-    GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
+    BetaPersistenceStore, BetaStoreError, BetaStoreSnapshot, GeneratedLearningActivityKind,
+    GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
+    GeneratedPromptValidationStatus, GenerationRun, PersistedQueueCandidate, ReferenceSpan,
+    SourceDocument, SourceDocumentKind,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,13 +35,16 @@ pub struct BetaGenerationResult {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum BetaGenerationError {
-    Store(BetaStoreError),
+pub enum BetaGenerationError<E = BetaStoreError> {
+    Store(E),
     UnknownSourceDocument(String),
     SourceDocumentHasNoTextBody(String),
 }
 
-impl fmt::Display for BetaGenerationError {
+impl<E> fmt::Display for BetaGenerationError<E>
+where
+    E: fmt::Display,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
@@ -52,7 +56,10 @@ impl fmt::Display for BetaGenerationError {
     }
 }
 
-impl Error for BetaGenerationError {
+impl<E> Error for BetaGenerationError<E>
+where
+    E: Error + 'static,
+{
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(error) => Some(error),
@@ -61,9 +68,75 @@ impl Error for BetaGenerationError {
     }
 }
 
-impl From<BetaStoreError> for BetaGenerationError {
+impl From<BetaStoreError> for BetaGenerationError<BetaStoreError> {
     fn from(error: BetaStoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+pub trait BetaGenerationStore {
+    type Error;
+
+    /// Read the current beta-store snapshot used to select source inputs and
+    /// detect duplicate generated drafts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when snapshot reconstruction fails.
+    fn snapshot(&self) -> Result<BetaStoreSnapshot, Self::Error>;
+
+    /// Save a generation run receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the run is rejected or cannot be persisted.
+    fn save_generation_run(&mut self, run: GenerationRun) -> Result<GenerationRun, Self::Error>;
+
+    /// Save cited source evidence for a generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the reference is rejected or cannot be
+    /// persisted.
+    fn save_reference_span(
+        &mut self,
+        reference: ReferenceSpan,
+    ) -> Result<ReferenceSpan, Self::Error>;
+
+    /// Save a generated prompt draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is rejected or cannot be persisted.
+    fn save_generated_prompt_draft(
+        &mut self,
+        draft: GeneratedPromptDraft,
+    ) -> Result<GeneratedPromptDraft, Self::Error>;
+}
+
+impl BetaGenerationStore for BetaPersistenceStore {
+    type Error = BetaStoreError;
+
+    fn snapshot(&self) -> Result<BetaStoreSnapshot, Self::Error> {
+        Ok(BetaPersistenceStore::snapshot(self))
+    }
+
+    fn save_generation_run(&mut self, run: GenerationRun) -> Result<GenerationRun, Self::Error> {
+        BetaPersistenceStore::save_generation_run(self, run)
+    }
+
+    fn save_reference_span(
+        &mut self,
+        reference: ReferenceSpan,
+    ) -> Result<ReferenceSpan, Self::Error> {
+        BetaPersistenceStore::save_reference_span(self, reference)
+    }
+
+    fn save_generated_prompt_draft(
+        &mut self,
+        draft: GeneratedPromptDraft,
+    ) -> Result<GeneratedPromptDraft, Self::Error> {
+        BetaPersistenceStore::save_generated_prompt_draft(self, draft)
     }
 }
 
@@ -73,32 +146,39 @@ impl From<BetaStoreError> for BetaGenerationError {
 ///
 /// Returns [`BetaGenerationError`] when requested source documents are missing,
 /// have no text body, or when the beta store rejects a generated entity.
-pub fn run_beta_generation(
-    store: &mut BetaPersistenceStore,
+pub fn run_beta_generation<S>(
+    store: &mut S,
     request: BetaGenerationRequest,
-) -> Result<BetaGenerationResult, BetaGenerationError> {
+) -> Result<BetaGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
     let model = request.model.unwrap_or_else(default_model);
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let sources = request
         .source_document_ids
         .iter()
-        .map(|source_document_id| require_source(&snapshot.source_documents, source_document_id))
+        .map(|source_document_id| {
+            require_source::<S::Error>(&snapshot.source_documents, source_document_id)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut validation_failures = Vec::new();
     let mut draft_ids = Vec::new();
     let mut accepted_draft_ids = Vec::new();
     let mut rejected_draft_ids = Vec::new();
 
-    store.save_generation_run(GenerationRun {
-        id: request.run_id.clone(),
-        source_document_ids: request.source_document_ids.clone(),
-        draft_ids: Vec::new(),
-        provider: model.provider.clone(),
-        model: model.name.clone(),
-        started_at: request.started_at,
-        completed_at: None,
-        validation_failures: Vec::new(),
-    })?;
+    store
+        .save_generation_run(GenerationRun {
+            id: request.run_id.clone(),
+            source_document_ids: request.source_document_ids.clone(),
+            draft_ids: Vec::new(),
+            provider: model.provider.clone(),
+            model: model.name.clone(),
+            started_at: request.started_at,
+            completed_at: None,
+            validation_failures: Vec::new(),
+        })
+        .map_err(BetaGenerationError::Store)?;
 
     let mut seen_signatures = existing_draft_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
@@ -116,25 +196,29 @@ pub fn run_beta_generation(
             let duplicate = seen_signatures.contains(&signature);
             seen_signatures.insert(signature);
 
-            let reference_span = store.save_reference_span(ReferenceSpan {
-                id: generated_id(&request.run_id, "ref", &candidate),
-                source_document_id: source.id.clone(),
-                label: format!("{} source evidence", candidate.concept),
-                text: reference.clone(),
-                locator: format!("block:{}", candidate.block_index),
-                created_at: request.started_at,
-            })?;
-            let draft = store.save_generated_prompt_draft(build_draft(
-                &candidate,
-                &DraftContext {
-                    run_id: &request.run_id,
-                    reference_span_id: &reference_span.id,
-                    model: &model,
-                    due: request.default_due,
+            let reference_span = store
+                .save_reference_span(ReferenceSpan {
+                    id: generated_id(&request.run_id, "ref", &candidate),
+                    source_document_id: source.id.clone(),
+                    label: format!("{} source evidence", candidate.concept),
+                    text: reference.clone(),
+                    locator: format!("block:{}", candidate.block_index),
                     created_at: request.started_at,
-                    duplicate,
-                },
-            ))?;
+                })
+                .map_err(BetaGenerationError::Store)?;
+            let draft = store
+                .save_generated_prompt_draft(build_draft(
+                    &candidate,
+                    &DraftContext {
+                        run_id: &request.run_id,
+                        reference_span_id: &reference_span.id,
+                        model: &model,
+                        due: request.default_due,
+                        created_at: request.started_at,
+                        duplicate,
+                    },
+                ))
+                .map_err(BetaGenerationError::Store)?;
 
             draft_ids.push(draft.id.clone());
             if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
@@ -145,16 +229,18 @@ pub fn run_beta_generation(
         }
     }
 
-    store.save_generation_run(GenerationRun {
-        id: request.run_id.clone(),
-        source_document_ids: request.source_document_ids,
-        draft_ids: draft_ids.clone(),
-        provider: model.provider,
-        model: model.name,
-        started_at: request.started_at,
-        completed_at: Some(request.completed_at.unwrap_or(request.started_at)),
-        validation_failures: validation_failures.clone(),
-    })?;
+    store
+        .save_generation_run(GenerationRun {
+            id: request.run_id.clone(),
+            source_document_ids: request.source_document_ids,
+            draft_ids: draft_ids.clone(),
+            provider: model.provider,
+            model: model.name,
+            started_at: request.started_at,
+            completed_at: Some(request.completed_at.unwrap_or(request.started_at)),
+            validation_failures: validation_failures.clone(),
+        })
+        .map_err(BetaGenerationError::Store)?;
 
     Ok(BetaGenerationResult {
         run_id: request.run_id,
@@ -197,10 +283,10 @@ fn default_model() -> GeneratedPromptModel {
     }
 }
 
-fn require_source(
+fn require_source<E>(
     sources: &[SourceDocument],
     source_document_id: &str,
-) -> Result<SourceDocument, BetaGenerationError> {
+) -> Result<SourceDocument, BetaGenerationError<E>> {
     let source = sources
         .iter()
         .find(|candidate| candidate.id == source_document_id)

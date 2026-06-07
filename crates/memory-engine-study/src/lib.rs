@@ -10,9 +10,11 @@ use std::{error::Error, fmt, path::PathBuf};
 use memory_engine_core::{
     GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
 };
-use memory_engine_generation::{run_beta_generation, BetaGenerationError, BetaGenerationRequest};
+use memory_engine_generation::{
+    run_beta_generation, BetaGenerationError, BetaGenerationRequest, BetaGenerationStore,
+};
 use memory_engine_persistence::{
-    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaStoreError,
+    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
     GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptValidationStatus,
     SourceDocument, SourceDocumentKind, SourcePermission,
 };
@@ -161,14 +163,17 @@ pub struct BetaStudySummary {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum BetaStudyError {
-    Store(BetaStoreError),
-    Generation(BetaGenerationError),
-    Service(ServiceError<BetaStoreError>),
+pub enum BetaStudyError<E = BetaStoreError> {
+    Store(E),
+    Generation(BetaGenerationError<E>),
+    Service(ServiceError<E>),
     NoActiveReviewUnit,
 }
 
-impl fmt::Display for BetaStudyError {
+impl<E> fmt::Display for BetaStudyError<E>
+where
+    E: fmt::Display,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
@@ -181,7 +186,10 @@ impl fmt::Display for BetaStudyError {
     }
 }
 
-impl Error for BetaStudyError {
+impl<E> Error for BetaStudyError<E>
+where
+    E: Error + 'static,
+{
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(error) => Some(error),
@@ -192,26 +200,136 @@ impl Error for BetaStudyError {
     }
 }
 
-impl From<BetaStoreError> for BetaStudyError {
+impl From<BetaStoreError> for BetaStudyError<BetaStoreError> {
     fn from(error: BetaStoreError) -> Self {
         Self::Store(error)
     }
 }
 
-impl From<BetaGenerationError> for BetaStudyError {
-    fn from(error: BetaGenerationError) -> Self {
+impl<E> From<BetaGenerationError<E>> for BetaStudyError<E> {
+    fn from(error: BetaGenerationError<E>) -> Self {
         Self::Generation(error)
     }
 }
 
-impl From<ServiceError<BetaStoreError>> for BetaStudyError {
-    fn from(error: ServiceError<BetaStoreError>) -> Self {
+impl<E> From<ServiceError<E>> for BetaStudyError<E> {
+    fn from(error: ServiceError<E>) -> Self {
         Self::Service(error)
     }
 }
 
-pub struct BetaStudySession {
-    store: BetaPersistenceStore,
+pub trait BetaStudyStore:
+    BetaGenerationStore<Error = <Self as MemoryServiceStore>::Error> + MemoryServiceStore
+{
+    /// Save source material for later generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the source is rejected or cannot be persisted.
+    fn save_source_document(
+        &mut self,
+        document: SourceDocument,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
+
+    /// Promote an accepted generated draft into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, rejected, or cannot be
+    /// promoted.
+    fn approve_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        options: ApproveGeneratedPromptDraftOptions,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Replace the prompt text and expected answer for an approved review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the review unit is unknown, archived, or
+    /// cannot be updated.
+    fn update_review_unit_prompt_text(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        prompt_text: &str,
+        expected_answer: &str,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Hide a review unit from the active queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the review unit is unknown or cannot be
+    /// archived.
+    fn archive_review_unit(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        archived_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Move a review unit's beta queue availability forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the review unit is unknown, archived, or
+    /// cannot be snoozed.
+    fn snooze_review_unit_until(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        snoozed_until: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+}
+
+impl BetaStudyStore for BetaPersistenceStore {
+    fn save_source_document(
+        &mut self,
+        document: SourceDocument,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::save_source_document(self, document)
+    }
+
+    fn approve_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        options: ApproveGeneratedPromptDraftOptions,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::approve_generated_prompt_draft(self, draft_id, options)
+    }
+
+    fn update_review_unit_prompt_text(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        prompt_text: &str,
+        expected_answer: &str,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::update_review_unit_prompt_text(
+            self,
+            review_unit_id,
+            prompt_text,
+            expected_answer,
+        )
+    }
+
+    fn archive_review_unit(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        archived_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::archive_review_unit(self, review_unit_id, archived_at)
+    }
+
+    fn snooze_review_unit_until(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        snoozed_until: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::snooze_review_unit_until(self, review_unit_id, snoozed_until)
+    }
+}
+
+pub struct BetaStudySession<S = BetaPersistenceStore> {
+    store: S,
     now: fn() -> i64,
     current: Option<GeneratedPromptDraft>,
     status: BetaStudyStatus,
@@ -221,7 +339,7 @@ pub struct BetaStudySession {
     schedule_change: Option<ScheduleChange>,
 }
 
-impl BetaStudySession {
+impl BetaStudySession<BetaPersistenceStore> {
     /// Open a beta-study session backed by a JSON persistence store.
     ///
     /// # Errors
@@ -246,13 +364,39 @@ impl BetaStudySession {
             schedule_change: None,
         })
     }
+}
+
+impl<S> BetaStudySession<S>
+where
+    S: BetaStudyStore,
+{
+    #[must_use]
+    pub fn from_store(store: S, now: fn() -> i64) -> Self {
+        let status = match store.snapshot() {
+            Ok(snapshot) if snapshot.source_documents.is_empty() => BetaStudyStatus::Empty,
+            Ok(_) | Err(_) => BetaStudyStatus::Drafting,
+        };
+
+        Self {
+            store,
+            now,
+            current: None,
+            status,
+            expected_answer: None,
+            reference_text: None,
+            grade: None,
+            schedule_change: None,
+        }
+    }
 
     /// Start or resume the session by selecting the next review unit.
     ///
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when queue selection fails.
-    pub fn start(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+    pub fn start(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.select_next()?;
         self.view()
     }
@@ -265,17 +409,19 @@ impl BetaStudySession {
     pub fn add_source(
         &mut self,
         input: BetaStudySourceInput,
-    ) -> Result<BetaStudyView, BetaStudyError> {
-        self.store.save_source_document(SourceDocument {
-            id: input.id,
-            kind: SourceDocumentKind::Text,
-            title: input.title,
-            body: Some(input.body),
-            uri: None,
-            permission: SourcePermission::ModelEligible,
-            freshness: Some((self.now)()),
-            created_at: (self.now)(),
-        })?;
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .save_source_document(SourceDocument {
+                id: input.id,
+                kind: SourceDocumentKind::Text,
+                title: input.title,
+                body: Some(input.body),
+                uri: None,
+                permission: SourcePermission::ModelEligible,
+                freshness: Some((self.now)()),
+                created_at: (self.now)(),
+            })
+            .map_err(BetaStudyError::Store)?;
         self.status = BetaStudyStatus::Drafting;
         self.view()
     }
@@ -288,8 +434,8 @@ impl BetaStudySession {
     pub fn generate(
         &mut self,
         source_document_ids: Option<Vec<String>>,
-    ) -> Result<BetaStudyView, BetaStudyError> {
-        let snapshot = self.store.snapshot();
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
         let ids = source_document_ids.unwrap_or_else(|| {
             snapshot
                 .source_documents
@@ -317,11 +463,13 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when approval or queue selection fails.
-    pub fn approve_draft(&mut self, draft_id: &str) -> Result<BetaStudyView, BetaStudyError> {
-        self.store.approve_generated_prompt_draft(
-            draft_id,
-            ApproveGeneratedPromptDraftOptions::default(),
-        )?;
+    pub fn approve_draft(
+        &mut self,
+        draft_id: &str,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
+            .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
     }
@@ -331,12 +479,14 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError::NoActiveReviewUnit`] when no item is active.
-    pub fn learn_more(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+    pub fn learn_more(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
-        let snapshot = self.store.snapshot();
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
         self.reference_text = reference_text(&snapshot.reference_spans, active);
         self.view()
     }
@@ -350,16 +500,18 @@ impl BetaStudySession {
         &mut self,
         prompt_text: impl Into<String>,
         expected_answer: impl Into<String>,
-    ) -> Result<BetaStudyView, BetaStudyError> {
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
-        self.store.update_review_unit_prompt_text(
-            &active.review_unit_id,
-            &prompt_text.into(),
-            &expected_answer.into(),
-        )?;
+        self.store
+            .update_review_unit_prompt_text(
+                &active.review_unit_id,
+                &prompt_text.into(),
+                &expected_answer.into(),
+            )
+            .map_err(BetaStudyError::Store)?;
         self.reload_current();
         self.expected_answer = None;
         self.reference_text = None;
@@ -374,13 +526,16 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when no item is active or persistence fails.
-    pub fn archive_current(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+    pub fn archive_current(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         self.store
-            .archive_review_unit(&active.review_unit_id, (self.now)())?;
+            .archive_review_unit(&active.review_unit_id, (self.now)())
+            .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
     }
@@ -393,13 +548,14 @@ impl BetaStudySession {
     pub fn snooze_current_until(
         &mut self,
         snoozed_until: i64,
-    ) -> Result<BetaStudyView, BetaStudyError> {
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         self.store
-            .snooze_review_unit_until(&active.review_unit_id, snoozed_until)?;
+            .snooze_review_unit_until(&active.review_unit_id, snoozed_until)
+            .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
     }
@@ -409,7 +565,9 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError::NoActiveReviewUnit`] when no item is active.
-    pub fn reveal(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+    pub fn reveal(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         if self.status == BetaStudyStatus::Graded {
             return self.view();
         }
@@ -434,7 +592,21 @@ impl BetaStudySession {
         &mut self,
         answer: impl Into<String>,
         response_time_ms: u32,
-    ) -> Result<BetaStudyView, BetaStudyError> {
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.submit_answer_with_idempotency_key(answer, response_time_ms, None::<String>)
+    }
+
+    /// Grade an answer using a caller-supplied idempotency key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or service execution fails.
+    pub fn submit_answer_with_idempotency_key(
+        &mut self,
+        answer: impl Into<String>,
+        response_time_ms: u32,
+        idempotency_key: Option<impl Into<String>>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         if self.status == BetaStudyStatus::Graded {
             return self.view();
         }
@@ -443,7 +615,10 @@ impl BetaStudySession {
             .clone()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         let answer = answer.into();
-        let prior_schedule = self.store.read_schedule_state(&active.review_unit_id)?;
+        let prior_schedule = self
+            .store
+            .read_schedule_state(&active.review_unit_id)
+            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
         let review = {
             let mut service =
                 MemoryService::with_clock(&mut self.store, mastered_after_three_reviews, self.now);
@@ -453,9 +628,14 @@ impl BetaStudySession {
                 response_time_ms,
                 prompt_id: Some(active.prompt_id.clone()),
                 occurred_at: None,
-                idempotency_key: Some(format!(
-                    "beta-study:{}:{}:{answer}",
-                    active.review_unit_id, active.prompt_id
+                idempotency_key: Some(idempotency_key.map_or_else(
+                    || {
+                        format!(
+                            "beta-study:{}:{}:{answer}",
+                            active.review_unit_id, active.prompt_id
+                        )
+                    },
+                    Into::into,
                 )),
             })?
         };
@@ -475,7 +655,9 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when queue selection fails.
-    pub fn advance(&mut self) -> Result<BetaStudyView, BetaStudyError> {
+    pub fn advance(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.select_next()?;
         self.view()
     }
@@ -485,9 +667,12 @@ impl BetaStudySession {
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when schedule or queue reads fail.
-    pub fn view(&self) -> Result<BetaStudyView, BetaStudyError> {
-        let snapshot = self.store.snapshot();
-        let mut queue = self.store.list_queue_candidates()?;
+    pub fn view(&self) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let mut queue = self
+            .store
+            .list_queue_candidates()
+            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
         queue.sort_by_key(|candidate| candidate.due);
         let next_review_unit_id = queue
             .first()
@@ -509,7 +694,8 @@ impl BetaStudySession {
                         )
                     })
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
 
         Ok(BetaStudyView {
             status: self.status,
@@ -550,7 +736,7 @@ impl BetaStudySession {
         })
     }
 
-    fn select_next(&mut self) -> Result<(), BetaStudyError> {
+    fn select_next(&mut self) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let selected = {
             let mut service =
                 MemoryService::with_clock(&mut self.store, mastered_after_three_reviews, self.now);
@@ -558,10 +744,11 @@ impl BetaStudySession {
                 options: NextQueueOptions::default(),
             })?
         };
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
         self.current = selected
             .candidate
             .as_ref()
-            .and_then(|candidate| find_approved_draft(&self.store, candidate));
+            .and_then(|candidate| find_approved_draft(&snapshot, candidate));
         self.status = if self.current.is_some() {
             BetaStudyStatus::Answering
         } else {
@@ -579,7 +766,10 @@ impl BetaStudySession {
         let Some(active) = self.current.as_ref() else {
             return;
         };
-        let snapshot = self.store.snapshot();
+        let Ok(snapshot) = self.store.snapshot() else {
+            self.current = None;
+            return;
+        };
         self.current = snapshot
             .review_units
             .iter()
@@ -668,10 +858,9 @@ fn current_view(
 }
 
 fn find_approved_draft(
-    store: &BetaPersistenceStore,
+    snapshot: &memory_engine_persistence::BetaStoreSnapshot,
     candidate: &QueueCandidate,
 ) -> Option<GeneratedPromptDraft> {
-    let snapshot = store.snapshot();
     let draft_id = snapshot
         .review_units
         .iter()
