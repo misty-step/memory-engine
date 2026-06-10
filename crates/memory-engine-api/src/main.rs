@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr, process};
 
-use memory_engine_api::{router, AccountRegistry, ApiState};
+use memory_engine_api::{router, AccountRegistry, ApiState, AuthConfig};
 
 #[tokio::main]
 async fn main() {
@@ -25,8 +25,17 @@ async fn main() {
 
     println!("Memory Engine API listening on http://{local_addr}");
 
+    let auth_config = match auth_config_from_env() {
+        Ok(auth_config) => auth_config,
+        Err(error) => {
+            eprintln!("{error}");
+            process::exit(1);
+        }
+    };
     let state = if let Ok(database_url) = env::var("MEMORY_ENGINE_POSTGRES_URL") {
-        ApiState::new(AccountRegistry::with_postgres_url(database_url))
+        ApiState::new(
+            AccountRegistry::with_postgres_url(database_url).with_auth_config(auth_config),
+        )
     } else if env::var("MEMORY_ENGINE_ENABLE_FILE_STORE").as_deref() == Ok("true") {
         let Ok(store_dir) = env::var("MEMORY_ENGINE_API_STORE_DIR") else {
             eprintln!(
@@ -34,7 +43,7 @@ async fn main() {
             );
             process::exit(1);
         };
-        ApiState::new(AccountRegistry::with_store_root(store_dir))
+        ApiState::new(AccountRegistry::with_store_root(store_dir).with_auth_config(auth_config))
     } else {
         eprintln!("MEMORY_ENGINE_POSTGRES_URL is required for memory-engine-api");
         process::exit(1);
@@ -44,4 +53,39 @@ async fn main() {
         eprintln!("{error}");
         process::exit(1);
     }
+}
+
+fn auth_config_from_env() -> Result<AuthConfig, String> {
+    let allowed = env::var("MEMORY_ENGINE_AUTH_ALLOWED_EMAILS")
+        .map_err(|_| "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS is required for memory-engine-api")?;
+    let allowed_emails = allowed
+        .split(',')
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if allowed_emails.is_empty() {
+        return Err(
+            "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS must contain at least one allowed email".to_owned(),
+        );
+    }
+
+    let auth_config = AuthConfig::allow_emails(allowed_emails);
+    if let Ok(command) = env::var("MEMORY_ENGINE_AUTH_MAILER_COMMAND") {
+        let command = command.trim();
+        if !command.is_empty() {
+            return Ok(auth_config.with_mailer_command(command.to_owned()));
+        }
+    }
+    if let Ok(outbox_path) = env::var("MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH") {
+        let outbox_path = outbox_path.trim();
+        if !outbox_path.is_empty() {
+            return Ok(auth_config.with_link_outbox(outbox_path));
+        }
+    }
+
+    Err(
+        "MEMORY_ENGINE_AUTH_MAILER_COMMAND or MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH is required for memory-engine-api"
+            .to_owned(),
+    )
 }

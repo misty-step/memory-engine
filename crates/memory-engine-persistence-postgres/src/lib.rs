@@ -29,6 +29,26 @@ CREATE TABLE IF NOT EXISTS memory_engine_api_sessions (
     updated_at_ms BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
+    session_id_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    session_token TEXT NOT NULL,
+    csrf_token_hash TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    revoked_at_ms BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
+    ON memory_engine_browser_sessions(account_id, expires_at_ms);
+
+CREATE TABLE IF NOT EXISTS memory_engine_auth_challenges (
+    challenge_hash TEXT PRIMARY KEY,
+    email_normalized TEXT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    consumed_at_ms BIGINT
+);
+
 CREATE TABLE IF NOT EXISTS memory_engine_source_documents (
     account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
     source_document_id TEXT NOT NULL,
@@ -147,6 +167,13 @@ pub struct PostgresStudyStore {
     client: RefCell<Client>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserSession {
+    pub account_id: String,
+    pub session_token: String,
+    pub csrf_token_hash: String,
+}
+
 impl PostgresStudyStore {
     /// Connect to Postgres.
     ///
@@ -204,6 +231,118 @@ impl PostgresStudyStore {
         )?;
 
         Ok(row.is_some())
+    }
+
+    /// Save a browser cookie session for later server-side resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn save_browser_session(
+        &mut self,
+        session_id_hash: &str,
+        account_id: &str,
+        session_token: &str,
+        csrf_token_hash: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "INSERT INTO memory_engine_browser_sessions
+                (session_id_hash, account_id, session_token, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)
+             ON CONFLICT (session_id_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id,
+                 session_token = EXCLUDED.session_token,
+                 csrf_token_hash = EXCLUDED.csrf_token_hash,
+                 created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms,
+                 revoked_at_ms = NULL",
+            &[
+                &session_id_hash,
+                &account_id,
+                &session_token,
+                &csrf_token_hash,
+                &now_ms,
+                &expires_at_ms,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Load a current, unrevoked browser session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn browser_session(
+        &mut self,
+        session_id_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<BrowserSession>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT account_id, session_token, csrf_token_hash
+             FROM memory_engine_browser_sessions
+             WHERE session_id_hash = $1
+               AND revoked_at_ms IS NULL
+               AND expires_at_ms > $2",
+            &[&session_id_hash, &now_ms],
+        )?;
+
+        Ok(row.map(|row| BrowserSession {
+            account_id: row.get(0),
+            session_token: row.get(1),
+            csrf_token_hash: row.get(2),
+        }))
+    }
+
+    /// Save a single-use magic-link challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn save_auth_challenge(
+        &mut self,
+        challenge_hash: &str,
+        email_normalized: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "INSERT INTO memory_engine_auth_challenges
+                (challenge_hash, email_normalized, expires_at_ms, consumed_at_ms)
+             VALUES ($1, $2, $3, NULL)
+             ON CONFLICT (challenge_hash) DO UPDATE
+             SET email_normalized = EXCLUDED.email_normalized,
+                 expires_at_ms = EXCLUDED.expires_at_ms,
+                 consumed_at_ms = NULL",
+            &[&challenge_hash, &email_normalized, &expires_at_ms],
+        )?;
+
+        Ok(())
+    }
+
+    /// Atomically consume a current magic-link challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn consume_auth_challenge(
+        &mut self,
+        challenge_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "UPDATE memory_engine_auth_challenges
+             SET consumed_at_ms = $2
+             WHERE challenge_hash = $1
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2
+             RETURNING email_normalized",
+            &[&challenge_hash, &now_ms],
+        )?;
+
+        Ok(row.map(|row| row.get(0)))
     }
 
     /// Scope all following operations to one already-authenticated account.
@@ -1209,6 +1348,12 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (account_id, draft_id)"));
         assert!(sql.contains("PRIMARY KEY (account_id, receipt_key)"));
         assert!(sql.contains("memory_engine_applied_reviews"));
+        assert!(sql.contains("memory_engine_browser_sessions"));
+        assert!(sql.contains("session_id_hash TEXT PRIMARY KEY"));
+        assert!(sql.contains("csrf_token_hash TEXT NOT NULL"));
+        assert!(sql.contains("memory_engine_auth_challenges"));
+        assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
+        assert!(sql.contains("consumed_at_ms BIGINT"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
         assert!(sql.contains("ON DELETE CASCADE"));
     }

@@ -4,16 +4,20 @@
 //! stays outside `memory-engine-core`, which remains pure learning semantics.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::{Path as FsPath, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
 };
 
 use axum::{
-    extract::{Form, Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Form, Path, Query, State},
+    http::{
+        header::{COOKIE, SET_COOKIE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -25,6 +29,7 @@ use memory_engine_study::{
     BetaStudySummary, BetaStudyView,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Default)]
 pub struct ApiState {
@@ -35,6 +40,61 @@ impl ApiState {
     #[must_use]
     pub fn new(accounts: AccountRegistry) -> Self {
         Self { accounts }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuthConfig {
+    allowed_emails: Option<BTreeSet<String>>,
+    expose_debug_links: bool,
+    link_delivery: AuthLinkDelivery,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum AuthLinkDelivery {
+    #[default]
+    None,
+    OutboxFile(PathBuf),
+    Command(String),
+}
+
+impl AuthConfig {
+    #[must_use]
+    pub fn allow_emails(emails: impl IntoIterator<Item = String>) -> Self {
+        let allowed_emails = emails
+            .into_iter()
+            .filter_map(|email| normalize_email(&email))
+            .collect::<BTreeSet<_>>();
+
+        Self {
+            allowed_emails: Some(allowed_emails),
+            expose_debug_links: false,
+            link_delivery: AuthLinkDelivery::None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_debug_links(mut self, expose_debug_links: bool) -> Self {
+        self.expose_debug_links = expose_debug_links;
+        self
+    }
+
+    #[must_use]
+    pub fn with_link_outbox(mut self, path: impl Into<PathBuf>) -> Self {
+        self.link_delivery = AuthLinkDelivery::OutboxFile(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_mailer_command(mut self, command: impl Into<String>) -> Self {
+        self.link_delivery = AuthLinkDelivery::Command(command.into());
+        self
+    }
+
+    fn email_allowed(&self, email: &str) -> bool {
+        self.allowed_emails
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(email))
     }
 }
 
@@ -49,6 +109,8 @@ impl AccountRegistry {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
                 accounts: BTreeMap::new(),
+                browser_sessions: BTreeMap::new(),
+                auth_config: AuthConfig::default(),
                 storage: StudyStorageBackend::File {
                     store_root: store_root.into(),
                 },
@@ -61,17 +123,34 @@ impl AccountRegistry {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
                 accounts: BTreeMap::new(),
+                browser_sessions: BTreeMap::new(),
+                auth_config: AuthConfig::default(),
                 storage: StudyStorageBackend::Postgres {
                     database_url: database_url.into(),
                 },
             })),
         }
     }
+
+    /// Apply browser-auth configuration to this registry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account registry mutex is poisoned.
+    #[must_use]
+    pub fn with_auth_config(self, auth_config: AuthConfig) -> Self {
+        let mut data = self.inner.lock().expect("account registry lock");
+        data.auth_config = auth_config;
+        drop(data);
+        self
+    }
 }
 
 #[derive(Debug, Default)]
 struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
+    browser_sessions: BTreeMap<String, BrowserSessionRecord>,
+    auth_config: AuthConfig,
     storage: StudyStorageBackend,
 }
 
@@ -81,6 +160,13 @@ struct AccountRecord {
     store_path: PathBuf,
     sources: BTreeMap<String, SourceRecord>,
     submitted_reviews: BTreeMap<String, StudyViewResponse>,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserSessionRecord {
+    account_id: String,
+    session_token: String,
+    csrf_token_hash: String,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +252,69 @@ impl AccountRegistry {
         record.session_token.clone_from(&target.session_token);
 
         Ok(target)
+    }
+
+    fn request_magic_link(&self, email: &str) -> Result<MagicLinkRequest, ApiFailure> {
+        let Some(email) = normalize_email(email) else {
+            return Err(ApiFailure::bad_request(
+                "Account email must contain one @ and a domain.",
+            ));
+        };
+        let auth_config = {
+            let data = self.inner.lock().expect("account registry lock");
+            data.auth_config.clone()
+        };
+        if !auth_config.email_allowed(&email) {
+            return Ok(MagicLinkRequest { debug_link: None });
+        }
+
+        let token = new_magic_link_token();
+        let token_hash = secret_hash(&token);
+        self.storage().save_auth_challenge(
+            &token_hash,
+            &email,
+            api_study_now() + AUTH_CHALLENGE_TTL_MS,
+        )?;
+        let link = format!("/app/login/verify?token={token}");
+        auth_config.deliver_magic_link(&email, &link)?;
+
+        Ok(MagicLinkRequest {
+            debug_link: auth_config.expose_debug_links.then_some(link),
+        })
+    }
+
+    fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
+        let token_hash = secret_hash(token.trim());
+        let email = self
+            .storage()
+            .consume_auth_challenge(&token_hash, api_study_now())?
+            .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
+        let account = self.login_account(&email)?;
+
+        self.create_browser_session(&account)
+    }
+
+    fn login_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
+        let account_id = account_id_for(email);
+        let account = AccountCreated {
+            account_id: account_id.clone(),
+            session_token: new_session_token(),
+        };
+        let storage = self.storage();
+        storage.save_account_session(&account_id, &account.session_token)?;
+        let mut data = self.inner.lock().expect("account registry lock");
+        let record = data
+            .accounts
+            .entry(account.account_id.clone())
+            .or_insert_with(|| AccountRecord {
+                session_token: String::new(),
+                store_path: storage.account_store_path(&account_id),
+                sources: BTreeMap::new(),
+                submitted_reviews: BTreeMap::new(),
+            });
+        record.session_token.clone_from(&account.session_token);
+
+        Ok(account)
     }
 
     fn save_source(
@@ -299,6 +448,60 @@ impl AccountRegistry {
         Ok(response)
     }
 
+    fn create_browser_session(&self, account: &AccountCreated) -> Result<AppAccount, ApiFailure> {
+        let browser_session_id = new_browser_session_id();
+        let csrf_token = new_csrf_token();
+        let session = BrowserSessionRecord {
+            account_id: account.account_id.clone(),
+            session_token: account.session_token.clone(),
+            csrf_token_hash: secret_hash(&csrf_token),
+        };
+        self.storage()
+            .save_browser_session(&browser_session_id, &session)?;
+        let mut data = self.inner.lock().expect("account registry lock");
+        data.browser_sessions
+            .insert(browser_session_id.clone(), session);
+
+        Ok(AppAccount {
+            browser_session_id,
+            account_id: account.account_id.clone(),
+            session_token: account.session_token.clone(),
+            csrf_token,
+        })
+    }
+
+    fn require_browser_session(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+    ) -> Result<AppAccount, ApiFailure> {
+        let session_id = read_browser_session_id(headers)?;
+        let mut session = {
+            let data = self.inner.lock().expect("account registry lock");
+            data.browser_sessions.get(session_id).cloned()
+        };
+        if session.is_none() {
+            session = self.storage().load_browser_session(session_id)?;
+            if let Some(session) = &session {
+                let mut data = self.inner.lock().expect("account registry lock");
+                data.browser_sessions
+                    .insert(session_id.to_owned(), session.clone());
+            }
+        }
+        let session = session.ok_or_else(ApiFailure::missing_session)?;
+        if session.csrf_token_hash != secret_hash(csrf_token) {
+            return Err(ApiFailure::forbidden("CSRF token does not match session."));
+        }
+        self.require_account(&session.account_id, &session.session_token)?;
+
+        Ok(AppAccount {
+            browser_session_id: session_id.to_owned(),
+            account_id: session.account_id,
+            session_token: session.session_token,
+            csrf_token: csrf_token.to_owned(),
+        })
+    }
+
     fn storage(&self) -> StudyStorageBackend {
         let data = self.inner.lock().expect("account registry lock");
         data.storage.clone()
@@ -341,6 +544,37 @@ impl AccountRegistry {
         }
 
         Err(ApiFailure::unknown_account())
+    }
+}
+
+impl AuthConfig {
+    fn deliver_magic_link(&self, email: &str, link: &str) -> Result<(), ApiFailure> {
+        match &self.link_delivery {
+            AuthLinkDelivery::None => Ok(()),
+            AuthLinkDelivery::OutboxFile(path) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                }
+                let existing = fs::read_to_string(path).unwrap_or_default();
+                fs::write(path, format!("{existing}{email}\t{link}\n"))
+                    .map_err(|error| ApiFailure::internal(error.to_string()))
+            }
+            AuthLinkDelivery::Command(command) => {
+                let status = Command::new(command)
+                    .env("MEMORY_ENGINE_AUTH_EMAIL", email)
+                    .env("MEMORY_ENGINE_AUTH_LINK", link)
+                    .status()
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(ApiFailure::internal(format!(
+                        "auth mailer command exited with {status}"
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -394,6 +628,149 @@ impl StudyStorageBackend {
             Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
                 store
                     .api_session_matches(account_id, session_token)
+                    .map_err(postgres_failure)
+            }),
+        }
+    }
+
+    fn save_browser_session(
+        &self,
+        session_id: &str,
+        session: &BrowserSessionRecord,
+    ) -> Result<(), ApiFailure> {
+        match self {
+            Self::File { store_root } => {
+                let path = browser_session_path(store_root, session_id);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                }
+                fs::write(
+                    path,
+                    format!(
+                        "{}\n{}\n{}\n",
+                        session.account_id, session.session_token, session.csrf_token_hash
+                    ),
+                )
+                .map_err(|error| ApiFailure::internal(error.to_string()))
+            }
+            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
+                store
+                    .save_browser_session(
+                        &secret_hash(session_id),
+                        &session.account_id,
+                        &session.session_token,
+                        &session.csrf_token_hash,
+                        api_study_now(),
+                        api_study_now()
+                            + i64::try_from(APP_SESSION_MAX_AGE_SECONDS).unwrap_or(i64::MAX)
+                                * 1_000,
+                    )
+                    .map_err(postgres_failure)
+            }),
+        }
+    }
+
+    fn load_browser_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
+        match self {
+            Self::File { store_root } => {
+                let path = browser_session_path(store_root, session_id);
+                let Ok(saved) = fs::read_to_string(path) else {
+                    return Ok(None);
+                };
+                let mut lines = saved.lines();
+                let Some(account_id) = lines.next() else {
+                    return Ok(None);
+                };
+                let Some(session_token) = lines.next() else {
+                    return Ok(None);
+                };
+                let Some(csrf_token_hash) = lines.next() else {
+                    return Ok(None);
+                };
+
+                Ok(Some(BrowserSessionRecord {
+                    account_id: account_id.to_owned(),
+                    session_token: session_token.to_owned(),
+                    csrf_token_hash: csrf_token_hash.to_owned(),
+                }))
+            }
+            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
+                store
+                    .browser_session(&secret_hash(session_id), api_study_now())
+                    .map(|session| {
+                        session.map(|session| BrowserSessionRecord {
+                            account_id: session.account_id,
+                            session_token: session.session_token,
+                            csrf_token_hash: session.csrf_token_hash,
+                        })
+                    })
+                    .map_err(postgres_failure)
+            }),
+        }
+    }
+
+    fn save_auth_challenge(
+        &self,
+        challenge_hash: &str,
+        email: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        match self {
+            Self::File { store_root } => {
+                let path = auth_challenge_path(store_root, challenge_hash);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                }
+                fs::write(path, format!("{email}\n{expires_at_ms}\n\n"))
+                    .map_err(|error| ApiFailure::internal(error.to_string()))
+            }
+            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
+                store
+                    .save_auth_challenge(challenge_hash, email, expires_at_ms)
+                    .map_err(postgres_failure)
+            }),
+        }
+    }
+
+    fn consume_auth_challenge(
+        &self,
+        challenge_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, ApiFailure> {
+        match self {
+            Self::File { store_root } => {
+                let path = auth_challenge_path(store_root, challenge_hash);
+                let Ok(saved) = fs::read_to_string(&path) else {
+                    return Ok(None);
+                };
+                let mut lines = saved.lines();
+                let Some(email) = lines.next() else {
+                    return Ok(None);
+                };
+                let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok())
+                else {
+                    return Ok(None);
+                };
+                let consumed_at_ms = lines
+                    .next()
+                    .filter(|value| !value.trim().is_empty())
+                    .and_then(|value| value.parse::<i64>().ok());
+                if consumed_at_ms.is_some() || expires_at_ms <= now_ms {
+                    return Ok(None);
+                }
+                fs::write(path, format!("{email}\n{expires_at_ms}\n{now_ms}\n"))
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+
+                Ok(Some(email.to_owned()))
+            }
+            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
+                store
+                    .consume_auth_challenge(challenge_hash, now_ms)
                     .map_err(postgres_failure)
             }),
         }
@@ -798,6 +1175,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounts", post(create_account))
         .route("/app/start", post(start_app_study))
         .route("/app/account", post(create_app_account))
+        .route("/app/login/verify", get(verify_app_login))
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
         .route("/app/generate", post(generate_app_source))
@@ -955,6 +1333,17 @@ struct AppAccountForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct AppLoginVerifyQuery {
+    token: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MagicLinkRequest {
+    debug_link: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct AppStartForm {
     title: String,
     body: String,
@@ -963,8 +1352,7 @@ struct AppStartForm {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSourceForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     title: String,
     body: String,
 }
@@ -972,47 +1360,41 @@ struct AppSourceForm {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSaveAccountForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     email: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppAccountActionForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSourceActionForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     source_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppDraftActionForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     draft_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppReviewActionForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     review_unit_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppReviewSubmitForm {
-    account_id: String,
-    session_token: String,
+    csrf_token: Option<String>,
     review_unit_id: String,
     answer: String,
     response_time_ms: u32,
@@ -1022,70 +1404,101 @@ struct AppReviewSubmitForm {
 async fn create_app_account(
     State(state): State<ApiState>,
     Form(form): Form<AppAccountForm>,
-) -> Html<String> {
-    let result = normalize_email(&form.email)
-        .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))
-        .and_then(|email| state.accounts.create_account(&email));
+) -> Response {
+    let result = state.accounts.request_magic_link(&form.email);
 
     match result {
+        Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn verify_app_login(
+    State(state): State<ApiState>,
+    Query(query): Query<AppLoginVerifyQuery>,
+) -> Response {
+    match state.accounts.verify_magic_link(&query.token) {
         Ok(account) => {
-            let account = AppAccount::from(account);
             let view = state
                 .accounts
                 .study_view(&account.account_id, &account.session_token)
                 .ok();
-            Html(render_account_page(&state, &account, view.as_ref(), None))
+            html_with_browser_session(
+                &account,
+                render_account_page(&state, &account, view.as_ref(), None),
+            )
         }
-        Err(error) => Html(render_app_shell(None, &[], None, Some(&error.message))),
+        Err(error) => error.into_response(),
     }
 }
 
 async fn save_app_account(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppSaveAccountForm>,
-) -> Html<String> {
-    let source_account = form.account();
+) -> Response {
+    let source_account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let source_view = state
         .accounts
-        .study_view(&form.account_id, &form.session_token)
+        .study_view(&source_account.account_id, &source_account.session_token)
         .ok();
     let result = normalize_email(&form.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))
         .and_then(|email| {
-            state
-                .accounts
-                .save_account(&form.account_id, &form.session_token, &email)
+            state.accounts.save_account(
+                &source_account.account_id,
+                &source_account.session_token,
+                &email,
+            )
         });
 
     match result {
         Ok(account) => {
-            let account = AppAccount::from(account);
+            let account = match state.accounts.create_browser_session(&account) {
+                Ok(account) => account,
+                Err(error) => return error.into_response(),
+            };
             let view = state
                 .accounts
                 .study_view(&account.account_id, &account.session_token)
                 .ok()
                 .or(source_view);
-            Html(render_account_page(&state, &account, view.as_ref(), None))
+            html_with_browser_session(
+                &account,
+                render_account_page(&state, &account, view.as_ref(), None),
+            )
         }
         Err(error) => Html(render_account_page(
             &state,
             &source_account,
             source_view.as_ref(),
             Some(&error.message),
-        )),
+        ))
+        .into_response(),
     }
 }
 
 async fn start_app_study(
     State(state): State<ApiState>,
     Form(form): Form<AppStartForm>,
-) -> Html<String> {
+) -> Response {
     let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
     let account = match state.accounts.create_account(&email) {
         Ok(account) => account,
-        Err(error) => return Html(render_app_shell(None, &[], None, Some(&error.message))),
+        Err(error) => {
+            return Html(render_app_shell(None, &[], None, Some(&error.message))).into_response();
+        }
     };
-    let account = AppAccount::from(account);
+    let account = match state.accounts.create_browser_session(&account) {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let source = state.accounts.save_source(
         &account.account_id,
         &account.session_token,
@@ -1102,19 +1515,29 @@ async fn start_app_study(
         )
     });
 
-    render_action_result(&state, &account, result)
+    html_with_browser_session(
+        &account,
+        render_action_result_html(&state, &account, result),
+    )
 }
 
 async fn create_app_source(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppSourceForm>,
-) -> Html<String> {
-    let account = form.account();
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let result = state
         .accounts
         .save_source(
-            &form.account_id,
-            &form.session_token,
+            &account.account_id,
+            &account.session_token,
             &CreateSourceRequest {
                 title: form.title,
                 body: form.body,
@@ -1123,79 +1546,117 @@ async fn create_app_source(
         .and_then(|_| {
             state
                 .accounts
-                .list_sources(&form.account_id, &form.session_token)
+                .list_sources(&account.account_id, &account.session_token)
         });
 
     match result {
-        Ok(sources) => Html(render_app_shell(Some(&account), &sources, None, None)),
+        Ok(sources) => Html(render_app_shell(Some(&account), &sources, None, None)).into_response(),
         Err(error) => Html(render_account_page(
             &state,
             &account,
             None,
             Some(&error.message),
-        )),
+        ))
+        .into_response(),
     }
 }
 
 async fn generate_app_source(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppSourceActionForm>,
-) -> Html<String> {
-    let account = form.account();
-    let result =
-        state
-            .accounts
-            .generate_source(&form.account_id, &form.session_token, &form.source_id);
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.generate_source(
+        &account.account_id,
+        &account.session_token,
+        &form.source_id,
+    );
 
-    render_action_result(&state, &account, result)
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn approve_app_draft(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppDraftActionForm>,
-) -> Html<String> {
-    let account = form.account();
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let result =
         state
             .accounts
-            .approve_draft(&form.account_id, &form.session_token, &form.draft_id);
+            .approve_draft(&account.account_id, &account.session_token, &form.draft_id);
 
-    render_action_result(&state, &account, result)
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn next_app_review(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppAccountActionForm>,
-) -> Html<String> {
-    let account = form.account();
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let result = state
         .accounts
-        .next_review(&form.account_id, &form.session_token);
+        .next_review(&account.account_id, &account.session_token);
 
-    render_action_result(&state, &account, result)
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn reveal_app_review(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
-) -> Html<String> {
-    let account = form.account();
-    let result =
-        state
-            .accounts
-            .reveal_review(&form.account_id, &form.session_token, &form.review_unit_id);
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.reveal_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
 
-    render_action_result(&state, &account, result)
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn submit_app_review(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppReviewSubmitForm>,
-) -> Html<String> {
-    let account = form.account();
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let result = state.accounts.submit_review(
-        &form.account_id,
-        &form.session_token,
+        &account.account_id,
+        &account.session_token,
         &form.review_unit_id,
         &SubmitReviewRequest {
             answer: form.answer,
@@ -1204,100 +1665,25 @@ async fn submit_app_review(
         },
     );
 
-    render_action_result(&state, &account, result)
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AppAccount {
+    browser_session_id: String,
     account_id: String,
     session_token: String,
+    csrf_token: String,
 }
 
-impl From<AccountCreated> for AppAccount {
-    fn from(account: AccountCreated) -> Self {
-        Self {
-            account_id: account.account_id,
-            session_token: account.session_token,
-        }
-    }
-}
-
-impl AppSourceForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppSaveAccountForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppAccountActionForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppSourceActionForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppDraftActionForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppReviewActionForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-impl AppReviewSubmitForm {
-    fn account(&self) -> AppAccount {
-        AppAccount {
-            account_id: self.account_id.clone(),
-            session_token: self.session_token.clone(),
-        }
-    }
-}
-
-fn render_action_result(
+fn render_action_result_html(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
-) -> Html<String> {
+) -> String {
     match result {
-        Ok(view) => Html(render_account_page(state, account, Some(&view), None)),
-        Err(error) => Html(render_account_page(
-            state,
-            account,
-            None,
-            Some(&error.message),
-        )),
+        Ok(view) => render_account_page(state, account, Some(&view), None),
+        Err(error) => render_account_page(state, account, None, Some(&error.message)),
     }
 }
 
@@ -1365,13 +1751,32 @@ fn render_app_shell(
 fn render_account_form() -> String {
     format!(
         r#"{}<section>
-  <h2>Create account</h2>
+  <h2>Sign in</h2>
   <form action="/app/account" method="post">
     <label>Email <input name="email" type="email" autocomplete="email" required></label>
-    <button type="submit">Continue</button>
+    <button type="submit">Send sign-in link</button>
   </form>
 </section>"#,
         render_start_form()
+    )
+}
+
+fn render_login_requested(debug_link: Option<&str>) -> String {
+    let debug_link = debug_link.map_or_else(String::new, |link| {
+        format!(
+            r#"<p class="muted"><a href="{}">Debug sign-in link</a></p>"#,
+            escape_html(link)
+        )
+    });
+
+    format!(
+        r#"{}<section class="compact">
+  <h2>Check your email</h2>
+  <p class="muted">If that address can sign in, a link is on the way.</p>
+  {}
+</section>"#,
+        render_start_form(),
+        debug_link
     )
 }
 
@@ -1401,7 +1806,7 @@ fn render_account_status(account: &AppAccount) -> String {
   </form>
 </section>"#,
         escape_html(&account.account_id),
-        hidden_account_inputs(account)
+        hidden_csrf_input(account)
     )
 }
 
@@ -1416,7 +1821,7 @@ fn render_source_form(account: &AppAccount) -> String {
     <button type="submit">Save source</button>
   </form>
 </section>"#,
-        hidden_account_inputs(account),
+        hidden_csrf_input(account),
         escape_html(DEFAULT_SOURCE_BODY)
     )
 }
@@ -1442,7 +1847,7 @@ fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
 </article>"#,
             escape_html(&source.title),
             escape_html(&source.body),
-            hidden_account_inputs(account),
+            hidden_csrf_input(account),
             escape_html(&source.source_id)
         )
         .expect("write source html");
@@ -1494,7 +1899,7 @@ fn render_drafts(account: &AppAccount, drafts: &[BetaStudyDraftRow]) -> String {
   <input type="hidden" name="draftId" value="{}">
   <button type="submit">Keep for review</button>
 </form>"#,
-                hidden_account_inputs(account),
+                hidden_csrf_input(account),
                 escape_html(&draft.id)
             )
         } else {
@@ -1540,7 +1945,7 @@ fn render_current_review(account: &AppAccount, current: Option<&BetaStudyCurrent
       <button type="submit">Next review</button>
     </form>"#,
             grade.verdict,
-            hidden_account_inputs(account)
+            hidden_csrf_input(account)
         )
     });
 
@@ -1571,20 +1976,18 @@ fn render_current_review(account: &AppAccount, current: Option<&BetaStudyCurrent
         escape_html(&current.prompt),
         expected,
         grade,
-        hidden_account_inputs(account),
+        hidden_csrf_input(account),
         escape_html(&current.review_unit_id.to_string()),
-        hidden_account_inputs(account),
+        hidden_csrf_input(account),
         escape_html(&current.review_unit_id.to_string()),
         escape_html(&current.review_unit_id.to_string())
     )
 }
 
-fn hidden_account_inputs(account: &AppAccount) -> String {
+fn hidden_csrf_input(account: &AppAccount) -> String {
     format!(
-        r#"<input type="hidden" name="accountId" value="{}">
-<input type="hidden" name="sessionToken" value="{}">"#,
-        escape_html(&account.account_id),
-        escape_html(&account.session_token)
+        r#"<input type="hidden" name="csrfToken" value="{}">"#,
+        escape_html(&account.csrf_token)
     )
 }
 
@@ -1760,6 +2163,13 @@ impl ApiFailure {
         }
     }
 
+    fn forbidden(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.to_owned(),
+        }
+    }
+
     fn internal(message: String) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1819,6 +2229,56 @@ fn read_session_token(headers: &HeaderMap) -> Result<&str, ApiFailure> {
         .ok_or_else(ApiFailure::missing_session)
 }
 
+fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == APP_SESSION_COOKIE_NAME && !value.trim().is_empty()).then_some(value)
+            })
+        })
+        .ok_or_else(ApiFailure::missing_session)
+}
+
+fn csrf_token(value: Option<&String>) -> &str {
+    value.map(String::as_str).map(str::trim).unwrap_or_default()
+}
+
+fn html_with_browser_session(account: &AppAccount, html: String) -> Response {
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&session_cookie_header(&account.browser_session_id))
+            .expect("session cookie header"),
+    );
+    response
+}
+
+fn session_cookie_header(session_id: &str) -> String {
+    format!(
+        "{APP_SESSION_COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={APP_SESSION_MAX_AGE_SECONDS}",
+        cookie_value(session_id)
+    )
+}
+
+fn cookie_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .collect()
+}
+
+fn secret_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("hash encoding");
+    }
+    encoded
+}
+
 fn require_account_session(account: &AccountRecord, session_token: &str) -> Result<(), ApiFailure> {
     if account.session_token == session_token {
         return Ok(());
@@ -1839,6 +2299,22 @@ fn new_session_token() -> String {
     format!("sess_{:032x}", rand::random::<u128>())
 }
 
+fn new_browser_session_id() -> String {
+    format!("browser_{:032x}", rand::random::<u128>())
+}
+
+fn new_csrf_token() -> String {
+    format!("csrf_{:032x}", rand::random::<u128>())
+}
+
+fn new_magic_link_token() -> String {
+    format!("magic_{:032x}", rand::random::<u128>())
+}
+
+const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
+const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
+const AUTH_CHALLENGE_TTL_MS: i64 = 10 * 60 * 1_000;
+
 fn source_id_for(account_id: &str, title: &str, body: &str) -> String {
     let stable = [account_id, title, body]
         .into_iter()
@@ -1856,6 +2332,20 @@ fn account_store_path(store_root: &FsPath, account_id: &str) -> PathBuf {
 
 fn account_session_path(store_root: &FsPath, account_id: &str) -> PathBuf {
     store_root.join(account_id).join("session.token")
+}
+
+fn browser_session_path(store_root: &FsPath, session_id: &str) -> PathBuf {
+    store_root
+        .join("_browser_sessions")
+        .join(secret_hash(session_id))
+        .join("session")
+}
+
+fn auth_challenge_path(store_root: &FsPath, challenge_hash: &str) -> PathBuf {
+    store_root
+        .join("_auth_challenges")
+        .join(cookie_value(challenge_hash))
+        .join("challenge")
 }
 
 fn open_study_session(path: &FsPath) -> Result<BetaStudySession, ApiFailure> {
@@ -1992,15 +2482,17 @@ fn require_current_review_postgres(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use axum::{
         body::{to_bytes, Body},
-        http::{Request, StatusCode},
+        http::{header::SET_COOKIE, Request, StatusCode},
     };
     use postgres::{Client, NoTls};
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::{router, AccountRegistry, ApiState};
+    use super::{router, AccountRegistry, ApiState, AuthConfig};
 
     #[tokio::test]
     async fn healthz_exposes_production_api_boundary() {
@@ -2056,25 +2548,22 @@ mod tests {
             .await
             .expect("start");
         assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
         let started = response_text(started).await;
         assert!(started.contains("Generated material"));
         assert!(started.contains("What is the NATO phonetic alphabet word for A?"));
         assert!(started.contains("Keep for review"));
 
-        let account_id = html_value(&started, "accountId");
-        let session_token = html_value(&started, "sessionToken");
+        let csrf_token = html_value(&started, "csrfToken");
         let draft_id = html_value(&started, "draftId");
 
         let approved = app
             .clone()
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/approve",
-                &[
-                    ("accountId", &account_id),
-                    ("sessionToken", &session_token),
-                    ("draftId", &draft_id),
-                ],
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
             ))
             .await
             .expect("approve");
@@ -2086,12 +2575,12 @@ mod tests {
 
         let revealed = app
             .clone()
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/reveal",
+                &cookie,
                 &[
-                    ("accountId", &account_id),
-                    ("sessionToken", &session_token),
+                    ("csrfToken", &csrf_token),
                     ("reviewUnitId", &review_unit_id),
                 ],
             ))
@@ -2103,12 +2592,12 @@ mod tests {
 
         let submitted = app
             .clone()
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/submit",
+                &cookie,
                 &[
-                    ("accountId", &account_id),
-                    ("sessionToken", &session_token),
+                    ("csrfToken", &csrf_token),
                     ("reviewUnitId", &review_unit_id),
                     ("answer", "ALFA"),
                     ("responseTimeMs", "1800"),
@@ -2124,16 +2613,253 @@ mod tests {
         assert!(submitted.contains("<strong>1</strong> attempts"));
 
         let next = app
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/next",
-                &[("accountId", &account_id), ("sessionToken", &session_token)],
+                &cookie,
+                &[("csrfToken", &csrf_token)],
             ))
             .await
             .expect("next");
         assert_eq!(next.status(), StatusCode::OK);
         let next = response_text(next).await;
         assert!(next.contains("Progress"));
+    }
+
+    #[tokio::test]
+    async fn auth_rendered_forms_do_not_expose_session_credentials() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+
+        assert!(
+            !started.contains(r#"name="accountId""#),
+            "rendered app forms must not expose account ids as credentials"
+        );
+        assert!(
+            !started.contains(r#"name="sessionToken""#),
+            "rendered app forms must not expose session tokens"
+        );
+        assert!(started.contains(r#"name="csrfToken""#));
+
+        let csrf_token = html_value(&started, "csrfToken");
+        let draft_id = html_value(&started, "draftId");
+        let rejected = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("draftId", &draft_id)],
+            ))
+            .await
+            .expect("approve without csrf");
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let approved = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("approve with csrf");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_text(approved).await;
+        assert!(!approved.contains(r#"name="sessionToken""#));
+        assert!(approved.contains("Reveal answer"));
+    }
+
+    #[tokio::test]
+    async fn auth_magic_link_cross_device_resume() {
+        let store_root = temp_store_root("magic-link-resume");
+        let app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root)
+                .with_auth_config(AuthConfig::default().with_debug_links(true)),
+        ));
+        let account = create_account(&app, "learner@example.com").await;
+        save_source(&app, &account, "NATO practice notes", &source_body()).await;
+
+        let requested = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/account",
+                &[("email", " Learner@Example.COM ")],
+            ))
+            .await
+            .expect("request magic link");
+        assert_eq!(requested.status(), StatusCode::OK);
+        let requested = response_text(requested).await;
+        assert!(requested.contains("Check your email"));
+        assert!(!requested.contains(r#"name="sessionToken""#));
+        let verify_path = debug_sign_in_path(&requested);
+
+        let restarted_app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root)
+                .with_auth_config(AuthConfig::default().with_debug_links(true)),
+        ));
+        let verified = restarted_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&verify_path)
+                    .body(Body::empty())
+                    .expect("verify request"),
+            )
+            .await
+            .expect("verify magic link");
+        assert_eq!(verified.status(), StatusCode::OK);
+        let cookie = session_cookie(&verified);
+        let verified = response_text(verified).await;
+        assert!(verified.contains("acct_fc9e1ff15d47bd67"));
+        assert!(verified.contains("NATO practice notes"));
+        assert!(!verified.contains(r#"name="sessionToken""#));
+        assert!(cookie.starts_with("__Host-memory_engine_session="));
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_magic_link_replay() {
+        let app = router(ApiState::new(
+            AccountRegistry::default()
+                .with_auth_config(AuthConfig::default().with_debug_links(true)),
+        ));
+        let requested = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/account",
+                &[("email", "learner@example.com")],
+            ))
+            .await
+            .expect("request magic link");
+        let verify_path = debug_sign_in_path(&response_text(requested).await);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&verify_path)
+                    .body(Body::empty())
+                    .expect("first verify request"),
+            )
+            .await
+            .expect("first verify");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&verify_path)
+                    .body(Body::empty())
+                    .expect("replay verify request"),
+            )
+            .await
+            .expect("replay verify");
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn auth_magic_link_writes_configured_outbox() {
+        let store_root = temp_store_root("magic-link-outbox");
+        let outbox_path = store_root.join("auth-outbox.tsv");
+        let app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root).with_auth_config(
+                AuthConfig::allow_emails(vec!["owner@example.com".to_owned()])
+                    .with_link_outbox(&outbox_path),
+            ),
+        ));
+
+        let requested = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/account",
+                &[("email", "owner@example.com")],
+            ))
+            .await
+            .expect("request owner magic link");
+        assert_eq!(requested.status(), StatusCode::OK);
+        let requested = response_text(requested).await;
+        assert!(requested.contains("Check your email"));
+        assert!(
+            !requested.contains("Debug sign-in link"),
+            "production delivery must not reveal the login link in HTML"
+        );
+
+        let outbox = fs::read_to_string(outbox_path).expect("outbox");
+        assert!(outbox.starts_with("owner@example.com\t/app/login/verify?token="));
+        let verify_path = outbox.trim().split('\t').nth(1).expect("outbox link");
+
+        let verified = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(verify_path)
+                    .body(Body::empty())
+                    .expect("verify request"),
+            )
+            .await
+            .expect("verify owner magic link");
+        assert_eq!(verified.status(), StatusCode::OK);
+        assert!(session_cookie(&verified).starts_with("__Host-memory_engine_session="));
+    }
+
+    #[tokio::test]
+    async fn auth_login_request_does_not_enumerate_emails() {
+        let store_root = temp_store_root("login-enumeration");
+        let outbox_path = store_root.join("auth-outbox.tsv");
+        let app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root).with_auth_config(
+                AuthConfig::allow_emails(vec!["owner@example.com".to_owned()])
+                    .with_link_outbox(&outbox_path),
+            ),
+        ));
+
+        let owner = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/account",
+                &[("email", "owner@example.com")],
+            ))
+            .await
+            .expect("owner login request");
+        assert_eq!(owner.status(), StatusCode::OK);
+        let owner = response_text(owner).await;
+
+        let stranger = app
+            .oneshot(form_request(
+                "POST",
+                "/app/account",
+                &[("email", "stranger@example.com")],
+            ))
+            .await
+            .expect("stranger login request");
+        assert_eq!(stranger.status(), StatusCode::OK);
+        let stranger = response_text(stranger).await;
+
+        assert_eq!(owner, stranger);
+        assert!(owner.contains("If that address can sign in, a link is on the way."));
+        assert!(!owner.contains("owner@example.com"));
+        assert!(!owner.contains("stranger@example.com"));
+        let outbox = fs::read_to_string(outbox_path).expect("outbox");
+        assert!(outbox.contains("owner@example.com"));
+        assert!(!outbox.contains("stranger@example.com"));
     }
 
     #[tokio::test]
@@ -2152,29 +2878,29 @@ mod tests {
             .await
             .expect("start");
         assert_eq!(started.status(), StatusCode::OK);
+        let guest_cookie = session_cookie(&started);
         let started = response_text(started).await;
-        let guest_account_id = html_value(&started, "accountId");
-        let guest_session_token = html_value(&started, "sessionToken");
+        let guest_csrf_token = html_value(&started, "csrfToken");
 
         let saved = app
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/save-account",
+                &guest_cookie,
                 &[
-                    ("accountId", &guest_account_id),
-                    ("sessionToken", &guest_session_token),
+                    ("csrfToken", &guest_csrf_token),
                     ("email", " Learner@Example.COM "),
                 ],
             ))
             .await
             .expect("save account");
         assert_eq!(saved.status(), StatusCode::OK);
+        let saved_cookie = session_cookie(&saved);
         let saved = response_text(saved).await;
         assert!(saved.contains("acct_fc9e1ff15d47bd67"));
         assert!(saved.contains("NATO practice notes"));
         assert!(saved.contains("Keep for review"));
-        let account_id = html_value(&saved, "accountId");
-        let session_token = html_value(&saved, "sessionToken");
+        let saved_csrf_token = html_value(&saved, "csrfToken");
         let source_id = html_value(&saved, "sourceId");
 
         let restarted_app = router(ApiState::new(super::AccountRegistry::with_store_root(
@@ -2191,17 +2917,15 @@ mod tests {
             .expect("email replay");
         assert_eq!(replay.status(), StatusCode::OK);
         let replay = response_text(replay).await;
-        assert!(replay.contains("Account already exists."));
+        assert!(replay.contains("Check your email"));
+        assert!(!replay.contains("Account already exists."));
 
         let generated = restarted_app
-            .oneshot(form_request(
+            .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/generate",
-                &[
-                    ("accountId", &account_id),
-                    ("sessionToken", &session_token),
-                    ("sourceId", &source_id),
-                ],
+                &saved_cookie,
+                &[("csrfToken", &saved_csrf_token), ("sourceId", &source_id)],
             ))
             .await
             .expect("generate after resume");
@@ -2605,6 +3329,47 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_backend_browser_session_resumes_after_restart() {
+        let Some(database) = PostgresTestDatabase::new("browser_session") else {
+            return;
+        };
+        let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+            database.scoped_url.clone(),
+        )));
+        let started = app
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        assert!(!started.contains(r#"name="sessionToken""#));
+        let csrf_token = html_value(&started, "csrfToken");
+        let draft_id = html_value(&started, "draftId");
+
+        let restarted_app = router(ApiState::new(AccountRegistry::with_postgres_url(
+            database.scoped_url.clone(),
+        )));
+        let approved = restarted_app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("approve after restart");
+
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_text(approved).await;
+        assert!(approved.contains("Reveal answer"));
+    }
+
     #[tokio::test]
     async fn source_routes_reject_blank_source_material() {
         let app = router(ApiState::default());
@@ -2935,6 +3700,47 @@ mod tests {
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from(form_body(fields)))
             .expect("request")
+    }
+
+    fn form_request_with_cookie(
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        fields: &[(&str, &str)],
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", cookie)
+            .body(Body::from(form_body(fields)))
+            .expect("request")
+    }
+
+    fn session_cookie(response: &axum::response::Response) -> String {
+        let set_cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .expect("session set-cookie")
+            .to_str()
+            .expect("session cookie header");
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("Secure"));
+        assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(set_cookie.contains("Path=/"));
+        assert!(!set_cookie.contains("Domain="));
+        set_cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned()
+    }
+
+    fn debug_sign_in_path(html: &str) -> String {
+        let marker = r#"<a href=""#;
+        let start = html.find(marker).expect("debug sign-in link") + marker.len();
+        let end = html[start..].find('"').expect("debug sign-in link end") + start;
+        html[start..end].replace("&amp;", "&")
     }
 
     fn form_body(fields: &[(&str, &str)]) -> String {
