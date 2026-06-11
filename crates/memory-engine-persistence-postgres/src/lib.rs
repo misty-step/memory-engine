@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
 CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
     ON memory_engine_browser_sessions(account_id, expires_at_ms);
 
+CREATE TABLE IF NOT EXISTS memory_engine_rate_limits (
+    rate_limit_key TEXT PRIMARY KEY,
+    window_start_ms BIGINT NOT NULL,
+    attempt_count INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_engine_auth_challenges (
     challenge_hash TEXT PRIMARY KEY,
     email_normalized TEXT NOT NULL,
@@ -378,6 +384,98 @@ impl PostgresStudyStore {
             csrf_token_hash: row.get(2),
             expires_at_ms: row.get(3),
         }))
+    }
+
+    /// Revoke a browser cookie session server-side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn revoke_browser_session(
+        &mut self,
+        session_id_hash: &str,
+        now_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "UPDATE memory_engine_browser_sessions
+             SET revoked_at_ms = $2
+             WHERE session_id_hash = $1",
+            &[&session_id_hash, &now_ms],
+        )?;
+
+        Ok(())
+    }
+
+    /// Record one rate-limit attempt across every supplied key in a fixed
+    /// window.
+    ///
+    /// Returns `true` when every key is still below the supplied limit and all
+    /// increments were committed. Returns `false` without incrementing any key
+    /// when one key is already exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn record_rate_limit_attempts(
+        &mut self,
+        keys: &[String],
+        now_ms: i64,
+        window_ms: i64,
+        max_attempts: i32,
+    ) -> Result<bool, PostgresStoreError> {
+        let reset_before_ms = now_ms.saturating_sub(window_ms);
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let mut sorted_keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        sorted_keys.sort_unstable();
+        sorted_keys.dedup();
+        let mut writes = Vec::with_capacity(sorted_keys.len());
+
+        for key in sorted_keys {
+            transaction.execute(
+                "SELECT pg_advisory_xact_lock(
+                    hashtext('memory_engine_rate_limits'),
+                    hashtext($1)
+                 )",
+                &[&key],
+            )?;
+            let row = transaction.query_opt(
+                "SELECT window_start_ms, attempt_count
+                 FROM memory_engine_rate_limits
+                 WHERE rate_limit_key = $1
+                 FOR UPDATE",
+                &[&key],
+            )?;
+            let (window_start_ms, attempt_count) = row.map_or((now_ms, 0), |row| {
+                let window_start_ms: i64 = row.get(0);
+                let attempt_count: i32 = row.get(1);
+                if window_start_ms <= reset_before_ms {
+                    (now_ms, 0)
+                } else {
+                    (window_start_ms, attempt_count)
+                }
+            });
+            if attempt_count >= max_attempts {
+                transaction.rollback()?;
+                return Ok(false);
+            }
+            writes.push((key.to_owned(), window_start_ms, attempt_count + 1));
+        }
+
+        for (key, window_start_ms, attempt_count) in writes {
+            transaction.execute(
+                "INSERT INTO memory_engine_rate_limits
+                    (rate_limit_key, window_start_ms, attempt_count)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (rate_limit_key) DO UPDATE
+                 SET window_start_ms = EXCLUDED.window_start_ms,
+                     attempt_count = EXCLUDED.attempt_count",
+                &[&key, &window_start_ms, &attempt_count],
+            )?;
+        }
+        transaction.commit()?;
+
+        Ok(true)
     }
 
     /// Save a single-use magic-link challenge.
@@ -1462,6 +1560,8 @@ mod tests {
         assert!(sql.contains("memory_engine_auth_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("consumed_at_ms BIGINT"));
+        assert!(sql.contains("memory_engine_rate_limits"));
+        assert!(sql.contains("rate_limit_key TEXT PRIMARY KEY"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
         assert!(sql.contains("ON DELETE CASCADE"));
     }
@@ -1511,17 +1611,36 @@ mod tests {
             .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
             .expect("create schema");
 
-        let scoped_url = format!(
-            "{}{}options=-csearch_path%3D{}",
-            database_url,
-            if database_url.contains('?') { '&' } else { '?' },
-            schema
-        );
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
         let result = run_live_postgres_store_contract(&scoped_url);
         admin
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres store contract");
+    }
+
+    #[test]
+    fn live_postgres_rate_limits_are_atomic_for_absent_rows() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_rate_limit_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = run_live_postgres_rate_limit_contract(&scoped_url);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live postgres rate limit contract");
     }
 
     fn run_live_postgres_store_contract(database_url: &str) -> Result<(), PostgresStoreError> {
@@ -1530,6 +1649,66 @@ mod tests {
 
         run_low_level_postgres_store_contract(&mut store)?;
         run_postgres_study_session_contract(&mut store)?;
+
+        Ok(())
+    }
+
+    fn scoped_postgres_url(database_url: &str, schema: &str) -> String {
+        format!(
+            "{}{}options=-csearch_path%3D{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema
+        )
+    }
+
+    fn run_live_postgres_rate_limit_contract(database_url: &str) -> Result<(), PostgresStoreError> {
+        const CONCURRENT_ATTEMPTS: usize = 12;
+        const MAX_ATTEMPTS: i32 = 5;
+
+        let mut store = PostgresStudyStore::connect(database_url)?;
+        store.migrate()?;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONCURRENT_ATTEMPTS));
+        let database_url = database_url.to_owned();
+        let mut handles = Vec::with_capacity(CONCURRENT_ATTEMPTS);
+        for attempt in 0..CONCURRENT_ATTEMPTS {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let database_url = database_url.clone();
+            handles.push(std::thread::spawn(move || -> Result<bool, String> {
+                let keys = vec![
+                    "app-account-email:race@example.com".to_owned(),
+                    "app-account-ip:203.0.113.11".to_owned(),
+                ];
+                let mut store = PostgresStudyStore::connect(&database_url)
+                    .map_err(|error| error.to_string())?;
+                barrier.wait();
+                store
+                    .record_rate_limit_attempts(
+                        &keys,
+                        NOW + i64::try_from(attempt).expect("attempt fits i64"),
+                        900_000,
+                        MAX_ATTEMPTS,
+                    )
+                    .map_err(|error| error.to_string())
+            }));
+        }
+
+        let accepted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("rate limit worker did not panic"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PostgresStoreError::StudySession)?;
+        assert_eq!(
+            accepted.iter().filter(|accepted| **accepted).count(),
+            usize::try_from(MAX_ATTEMPTS).expect("max attempts fits usize")
+        );
+
+        let keys = vec![
+            "app-account-email:race@example.com".to_owned(),
+            "app-account-ip:203.0.113.11".to_owned(),
+        ];
+        assert!(!store.record_rate_limit_attempts(&keys, NOW + 60_000, 900_000, MAX_ATTEMPTS)?);
 
         Ok(())
     }

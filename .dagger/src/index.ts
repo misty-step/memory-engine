@@ -6,10 +6,15 @@
  * corresponding Cargo command. The `check` function runs all gates in sequence
  * and is what CI and agents should invoke before proposing a merge.
  */
-import { type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
+import { CacheSharingMode, type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
 
 const GITLEAKS_IMAGE = 'zricethezav/gitleaks:v8.30.0';
 const RUST_IMAGE = 'rust:1.94-bookworm';
+const SOURCE_EXCLUDES = ['.git/', '.tmp/', 'target/'];
+
+function ciSource(source: Directory): Directory {
+  return source.filter({ gitignore: true, exclude: SOURCE_EXCLUDES });
+}
 
 @object()
 export class MemoryEngine {
@@ -21,7 +26,13 @@ export class MemoryEngine {
     return dag
       .container()
       .from(RUST_IMAGE)
-      .withMountedDirectory('/src', source)
+      .withMountedDirectory('/src', ciSource(source))
+      .withMountedCache('/usr/local/cargo/registry', dag.cacheVolume('memory-engine-cargo-registry'))
+      .withMountedCache('/usr/local/cargo/git', dag.cacheVolume('memory-engine-cargo-git'))
+      .withMountedCache('/cargo-target', dag.cacheVolume('memory-engine-cargo-target'), {
+        sharing: CacheSharingMode.Locked,
+      })
+      .withEnvVariable('CARGO_TARGET_DIR', '/cargo-target')
       .withWorkdir('/src')
       .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
   }
@@ -68,7 +79,7 @@ export class MemoryEngine {
     return dag
       .container()
       .from(GITLEAKS_IMAGE)
-      .withMountedDirectory('/src', source)
+      .withMountedDirectory('/src', ciSource(source))
       .withWorkdir('/src')
       .withExec(['gitleaks', 'dir', '/src', '--redact', '--no-banner'])
       .stdout();
