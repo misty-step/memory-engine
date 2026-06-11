@@ -2469,7 +2469,10 @@ fn new_magic_link_token() -> String {
 
 const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
 const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
-const AUTH_CHALLENGE_TTL_MS: i64 = 10 * 60 * 1_000;
+// 30 minutes: links travel through email, where spam checks and device
+// switches routinely burn ten minutes. Found in dogfood: a link expired
+// before the operator could click it.
+const AUTH_CHALLENGE_TTL_MS: i64 = 30 * 60 * 1_000;
 
 fn source_id_for(account_id: &str, title: &str, body: &str) -> String {
     let stable = [account_id, title, body]

@@ -214,10 +214,17 @@ fn tls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
 /// authenticates the server against the webpki roots, which is the property
 /// channel binding would add.
 ///
+/// Connection establishment is retried with a short backoff: this store
+/// opens a fresh connection per request, so without retry a single
+/// transient (a proxy blip, a handshake reset) becomes a user-visible 500.
+/// Seen live in dogfood: one "error performing TLS handshake" against a
+/// warm Neon compute failed a login. Connecting is idempotent, so retry is
+/// safe; queries are never retried here.
+///
 /// # Errors
 ///
-/// Returns the Postgres error when the URL is malformed or the connection
-/// fails.
+/// Returns the Postgres error when the URL is malformed or every connection
+/// attempt fails.
 ///
 /// # Panics
 ///
@@ -227,7 +234,26 @@ pub fn connect_client(url: &str) -> Result<Client, postgres::Error> {
     let mut config: postgres::Config = url.parse()?;
     config.channel_binding(postgres::config::ChannelBinding::Disable);
 
-    config.connect(tls_connector())
+    retry_connect(|| config.connect(tls_connector()))
+}
+
+const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn retry_connect<T, E>(mut connect: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    let mut attempt = 1;
+    loop {
+        match connect() {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                if attempt >= CONNECT_ATTEMPTS {
+                    return Err(error);
+                }
+                std::thread::sleep(CONNECT_BACKOFF * u32::try_from(attempt).unwrap_or(1));
+                attempt += 1;
+            }
+        }
+    }
 }
 
 impl PostgresStudyStore {
@@ -1369,6 +1395,32 @@ mod tests {
     use memory_engine_core::{
         ExactPrompt, ExactPromptKind, Prompt, ReviewUnitId, ScheduleState, ScheduleStatus,
     };
+
+    #[test]
+    fn retry_connect_recovers_from_transient_failures() {
+        let mut attempts = 0;
+        let result = super::retry_connect(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err("transient")
+            } else {
+                Ok("connected")
+            }
+        });
+        assert_eq!(result, Ok("connected"));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_connect_gives_up_after_the_attempt_budget() {
+        let mut attempts = 0;
+        let result: Result<(), &str> = super::retry_connect(|| {
+            attempts += 1;
+            Err("hard down")
+        });
+        assert_eq!(result, Err("hard down"));
+        assert_eq!(attempts, super::CONNECT_ATTEMPTS);
+    }
     use memory_engine_persistence::{
         BetaReviewUnitRecord, BetaStoreSnapshot, GeneratedLearningActivityKind,
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
