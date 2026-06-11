@@ -1,0 +1,27 @@
+#!/bin/sh
+# Magic-link mailer for memory-engine-api, invoked via
+# MEMORY_ENGINE_AUTH_MAILER_COMMAND. The API execs this with no arguments and
+# the contract env vars MEMORY_ENGINE_AUTH_EMAIL / MEMORY_ENGINE_AUTH_LINK
+# (a relative path). Sends through Resend.
+#
+# Inputs are trusted by construction: the API only delivers links for
+# allowlisted emails, and the link token is server-generated alphanumeric —
+# so plain interpolation into the JSON body is safe here.
+#
+# RESEND_API_URL is overridable for tests only.
+set -eu
+: "${RESEND_API_KEY:?RESEND_API_KEY is required}"
+: "${MEMORY_ENGINE_AUTH_EMAIL:?MEMORY_ENGINE_AUTH_EMAIL is required}"
+: "${MEMORY_ENGINE_AUTH_LINK:?MEMORY_ENGINE_AUTH_LINK is required}"
+
+base="${MEMORY_ENGINE_PUBLIC_BASE_URL:-https://memory-engine-api.fly.dev}"
+api="${RESEND_API_URL:-https://api.resend.com}"
+sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
+
+# onboarding@resend.dev delivers only to the Resend account owner — exactly
+# the solo-dogfood allowlist. Switch `from` after verifying a domain.
+curl -sf --max-time 10 "$api/emails" \
+    -H "Authorization: Bearer $RESEND_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"from\":\"Memory Engine <onboarding@resend.dev>\",\"to\":[\"$MEMORY_ENGINE_AUTH_EMAIL\"],\"subject\":\"Your Memory Engine sign-in link\",\"text\":\"Sign in: $sign_in_url\\n\\nThe link expires shortly. If you did not request it, ignore this email.\"}" \
+    > /dev/null

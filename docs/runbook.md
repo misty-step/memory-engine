@@ -85,15 +85,26 @@ Use a branch to rehearse risky migrations against real data, then delete it.
 The earlier Fly Managed Postgres cluster `memory-engine-api-pg` is superseded
 by Neon and awaits operator decommission.
 
-## Login (magic links, no email provider yet)
+## Login (magic links over email)
 
-Auth is allowlist + magic link. No email sender is wired; links are appended
-to the outbox file on the machine. To log in:
+Auth is allowlist + magic link, delivered by `bin/send-magic-link` (baked
+into the image at `/usr/local/bin/send-magic-link`), which sends through
+Resend from `onboarding@resend.dev` — deliverable only to the Resend account
+owner's address, which matches the solo-dogfood allowlist. Activate with:
+
+```sh
+flyctl secrets set --app memory-engine-api \
+  RESEND_API_KEY=<key> \
+  MEMORY_ENGINE_AUTH_MAILER_COMMAND=/usr/local/bin/send-magic-link
+```
+
+While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in
+the outbox file on the machine:
 
 ```sh
 flyctl ssh console --app memory-engine-api -C "tail -1 <outbox-path>"
 ```
 
-Open the link path against the production host. Wiring a real sender is just
-`MEMORY_ENGINE_AUTH_MAILER_COMMAND` (receives the email and link) once an
-email provider key exists.
+A failed send surfaces as a 500 and therefore lands in Canary. After
+verifying a domain in Resend, update the `from` address in
+`bin/send-magic-link`.
