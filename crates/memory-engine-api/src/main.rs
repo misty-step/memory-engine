@@ -1,9 +1,10 @@
 use std::{env, net::SocketAddr, process};
 
-use memory_engine_api::{router, AccountRegistry, ApiState, AuthConfig};
+use memory_engine_api::{init_error_reporting, router, AccountRegistry, ApiState, AuthConfig};
 
 #[tokio::main]
 async fn main() {
+    init_error_reporting();
     let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
     let port = env::var("PORT")
         .ok()

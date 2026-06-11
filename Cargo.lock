@@ -737,6 +737,7 @@ name = "memory-engine-api"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "memory-engine-canary",
  "memory-engine-generation",
  "memory-engine-openrouter",
  "memory-engine-persistence",
@@ -771,6 +772,14 @@ dependencies = [
  "memory-engine-study",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "memory-engine-canary"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

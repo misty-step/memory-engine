@@ -1,0 +1,13 @@
+[package]
+name = "memory-engine-canary"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Fire-and-forget error reporter for the Canary observability service."
+
+[dependencies]
+serde_json = "1.0.145"
+ureq = { version = "3.2.0", features = ["json"] }
+
+[lints]
+workspace = true

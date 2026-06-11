@@ -238,6 +238,17 @@ impl AccountRegistry {
     /// The first slice keeps this registry in-memory while the Postgres adapter
     /// is shaped behind the same account-scoped route contract.
     fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
+        // Found live during ticket-42 QA: this route issued a session token to
+        // any email, bypassing the allowlist the magic-link flow enforces.
+        let allowed = {
+            let data = self.inner.lock().expect("account registry lock");
+            data.auth_config.email_allowed(email)
+        };
+        if !allowed {
+            return Err(ApiFailure::forbidden(
+                "This email is not allowed to register.",
+            ));
+        }
         let account_id = account_id_for(email);
         if self.account_exists(&account_id)? {
             return Err(ApiFailure::conflict("Account already exists."));
@@ -270,6 +281,15 @@ impl AccountRegistry {
         source_session_token: &str,
         email: &str,
     ) -> Result<AccountCreated, ApiFailure> {
+        let allowed = {
+            let data = self.inner.lock().expect("account registry lock");
+            data.auth_config.email_allowed(email)
+        };
+        if !allowed {
+            return Err(ApiFailure::forbidden(
+                "This email is not allowed to register.",
+            ));
+        }
         let target_account_id = account_id_for(email);
         let target = AccountCreated {
             account_id: target_account_id.clone(),
@@ -2276,10 +2296,41 @@ impl ApiFailure {
     }
 
     fn internal(message: String) -> Self {
+        report_internal_error(&message);
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
         }
+    }
+}
+
+/// Process-wide Canary reporter, installed once by the binary entry point.
+/// Unset (tests, local dev without credentials) means reporting is a no-op.
+static CANARY: std::sync::OnceLock<Option<memory_engine_canary::CanaryReporter>> =
+    std::sync::OnceLock::new();
+
+/// Install the Canary reporter from the environment. Call once at startup;
+/// later calls are ignored.
+pub fn init_error_reporting() {
+    let _ = CANARY.set(
+        memory_engine_canary::CanaryConfig::from_env().map(|mut config| {
+            if let Ok(environment) = std::env::var("MEMORY_ENGINE_ENVIRONMENT") {
+                config.environment = environment;
+            }
+            memory_engine_canary::CanaryReporter::new(config)
+        }),
+    );
+}
+
+fn report_internal_error(message: &str) {
+    if let Some(reporter) = CANARY.get().and_then(Option::as_ref) {
+        reporter.report(&memory_engine_canary::ErrorEvent {
+            error_class: "ApiFailure::internal".to_owned(),
+            message: message.to_owned(),
+            severity: memory_engine_canary::Severity::Error,
+            context: None,
+            fingerprint: Vec::new(),
+        });
     }
 }
 
@@ -2511,8 +2562,7 @@ fn with_postgres_account<R>(
     operation: impl FnOnce(AccountStudyStore<'_>) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
     let run = || {
-        let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
-        store.migrate().map_err(postgres_failure)?;
+        let mut store = connect_postgres_migrated(database_url)?;
         let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
         let mut account = store.for_account(scope);
         account.ensure_account(now_ms).map_err(postgres_failure)?;
@@ -2532,8 +2582,7 @@ fn with_postgres_store<R>(
     operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
     let run = || {
-        let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
-        store.migrate().map_err(postgres_failure)?;
+        let mut store = connect_postgres_migrated(database_url)?;
 
         operation(&mut store)
     };
@@ -2555,6 +2604,32 @@ fn with_postgres_study<R>(
         let mut study = BetaStudySession::from_store(account, now);
         operation(&mut study)
     })
+}
+
+/// Connect to Postgres, running migrations only the first time this process
+/// sees a given database URL. Previously every request re-ran the DDL
+/// migration batch; at daily-use traffic that is pure overhead and DDL lock
+/// pressure. The set is keyed by URL so tests pointing at scratch databases
+/// still migrate each one.
+fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, ApiFailure> {
+    static MIGRATED_URLS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeSet<String>>,
+    > = std::sync::OnceLock::new();
+
+    let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
+    let migrated =
+        MIGRATED_URLS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    // A panic while migrating must not poison every later request into a
+    // panic; the set is a plain string collection, safe to keep using.
+    let mut migrated = migrated
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !migrated.contains(database_url) {
+        store.migrate().map_err(postgres_failure)?;
+        migrated.insert(database_url.to_owned());
+    }
+
+    Ok(store)
 }
 
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
@@ -3127,6 +3202,44 @@ mod tests {
             .as_str()
             .expect("session token")
             .starts_with("sess_"));
+    }
+
+    #[tokio::test]
+    async fn create_account_enforces_the_email_allowlist() {
+        let state = ApiState::new(
+            AccountRegistry::default()
+                .with_auth_config(AuthConfig::allow_emails(["owner@example.com".to_owned()])),
+        );
+        let app = router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"stranger@example.com"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let body = response_json(denied).await;
+        assert!(body.get("sessionToken").is_none());
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"owner@example.com"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(allowed.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

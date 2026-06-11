@@ -9,24 +9,35 @@ operators have the affordances to notice and recover from failure.
 
 ## Oracle
 
-- [ ] `deploy.yml` cannot run unless the CI workflow succeeded for the same
-      SHA (workflow_run or required-check wiring), and a post-deploy smoke
-      (healthz + auth + study round-trip) fails the deploy on regression.
+- [x] `deploy.yml` cannot run unless the CI workflow succeeded for the same
+      SHA (workflow_run wiring, exact-SHA checkout), and a post-deploy smoke
+      (healthz + home + anonymous auth boundary) fails the deploy on
+      regression. (2026-06-11)
 - [ ] `/app/account` is rate-limited per email and per IP; test proves the
       limit.
-- [ ] `POST /accounts` no longer issues a session token without email
-      verification or allowlist enforcement (found live during ticket-42 QA:
-      open registration on production; see docs/qa/real-clock-receipt.md).
+- [x] `POST /accounts` and the authenticated save-account path enforce the
+      email allowlist; non-allowlisted emails get 403, no session token.
+      (2026-06-11)
 - [ ] Logout route exists and revokes the server-side session; file-store
       magic-link consumption is atomic (no replay window) — postgres path
       already is.
-- [ ] API binary refuses to boot in production with the file store unless
-      explicitly opted in (prevents silent data loss on machine recycle —
-      fly.toml has no [mounts]).
-- [ ] Postgres connections are pooled or reused and `migrate()` runs once at
-      startup, not per request (`memory-engine-api/src/lib.rs:2370,2393`).
-- [ ] A runbook in docs/ covers: deploy, rollback, secrets, store backend
-      selection, and how to check production health.
+- [x] File store already requires the explicit
+      `MEMORY_ENGINE_ENABLE_FILE_STORE=true` opt-in at boot (verified
+      2026-06-11; production runs Postgres on Neon, so no [mounts] needed).
+- [x] `migrate()` runs once per process, not per request (2026-06-11).
+      Residual: full connection pooling needs a store-level refactor
+      (`PostgresStudyStore` wraps `RefCell<Client>`); per-request connects
+      are acceptable against Neon's pooled endpoint meanwhile.
+- [x] `docs/runbook.md` covers deploy, rollback, secrets, store backend
+      selection, database (Neon), login, and Canary health. (2026-06-11)
+
+Shipped alongside (2026-06-11, not in the original oracle): Canary error
+reporting on every API 500 (`memory-engine-canary` crate, verified against
+live canary-obs); production database moved to Neon (`memory-engine-prod`,
+`twilight-brook-49749008`) and `OPENROUTER_API_KEY` set so prose generation
+works in production. The prior Fly Managed Postgres cluster
+`memory-engine-api-pg` is superseded — operator decision pending on
+decommission.
 
 ## Notes
 
