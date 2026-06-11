@@ -6,7 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    fs,
+    fs, io,
     path::{Path as FsPath, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -319,12 +319,18 @@ impl AccountRegistry {
         Ok(target)
     }
 
-    fn request_magic_link(&self, email: &str) -> Result<MagicLinkRequest, ApiFailure> {
+    fn request_magic_link(
+        &self,
+        email: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<MagicLinkRequest, ApiFailure> {
         let Some(email) = normalize_email(email) else {
+            self.record_app_account_request(None, client_rate_limit_key)?;
             return Err(ApiFailure::bad_request(
                 "Account email must contain one @ and a domain.",
             ));
         };
+        self.record_app_account_request(Some(&email), client_rate_limit_key)?;
         let auth_config = {
             let data = self.inner.lock().expect("account registry lock");
             data.auth_config.clone()
@@ -357,6 +363,33 @@ impl AccountRegistry {
         let account = self.login_account(&email)?;
 
         self.create_browser_session(&account)
+    }
+
+    fn record_app_account_request(
+        &self,
+        email: Option<&str>,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let storage = self.storage();
+        let now_ms = self.now();
+        let mut keys = Vec::with_capacity(2);
+        if let Some(email) = email {
+            keys.push(format!("app-account-email:{email}"));
+        }
+        keys.push(format!("app-account-ip:{client_rate_limit_key}"));
+
+        if !storage.record_rate_limit_attempts(
+            &keys,
+            now_ms,
+            APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+            APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
+        )? {
+            return Err(ApiFailure::too_many_requests(
+                "Too many sign-in attempts. Try again later.",
+            ));
+        }
+
+        Ok(())
     }
 
     fn login_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
@@ -572,6 +605,20 @@ impl AccountRegistry {
             session_token: session.session_token,
             csrf_token: csrf_token.to_owned(),
         })
+    }
+
+    fn revoke_browser_session(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_browser_session(headers, csrf_token)?;
+        self.storage()
+            .revoke_browser_session(&account.browser_session_id, self.now())?;
+        let mut data = self.inner.lock().expect("account registry lock");
+        data.browser_sessions.remove(&account.browser_session_id);
+
+        Ok(())
     }
 
     fn storage(&self) -> StudyStorage {
@@ -808,6 +855,26 @@ impl StudyStorage {
         }
     }
 
+    fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
+                let path = browser_session_path(store_root, session_id);
+                match fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(ApiFailure::internal(error.to_string())),
+                }
+            }
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .revoke_browser_session(&secret_hash(session_id), now_ms)
+                        .map_err(postgres_failure)
+                })
+            }
+        }
+    }
+
     fn save_auth_challenge(
         &self,
         challenge_hash: &str,
@@ -842,9 +909,14 @@ impl StudyStorage {
         match &self.backend {
             StudyStorageBackend::File { store_root } => {
                 let path = auth_challenge_path(store_root, challenge_hash);
-                let Ok(saved) = fs::read_to_string(&path) else {
-                    return Ok(None);
-                };
+                let consumed_path = auth_challenge_consumed_path(store_root, challenge_hash);
+                match fs::rename(&path, &consumed_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(ApiFailure::internal(error.to_string())),
+                }
+                let saved = fs::read_to_string(&consumed_path)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
                 let mut lines = saved.lines();
                 let Some(email) = lines.next() else {
                     return Ok(None);
@@ -860,8 +932,11 @@ impl StudyStorage {
                 if consumed_at_ms.is_some() || expires_at_ms <= now_ms {
                     return Ok(None);
                 }
-                fs::write(path, format!("{email}\n{expires_at_ms}\n{now_ms}\n"))
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                fs::write(
+                    consumed_path,
+                    format!("{email}\n{expires_at_ms}\n{now_ms}\n"),
+                )
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
 
                 Ok(Some(email.to_owned()))
             }
@@ -869,6 +944,60 @@ impl StudyStorage {
                 with_postgres_store(database_url, |store| {
                     store
                         .consume_auth_challenge(challenge_hash, now_ms)
+                        .map_err(postgres_failure)
+                })
+            }
+        }
+    }
+
+    fn record_rate_limit_attempts(
+        &self,
+        keys: &[String],
+        now_ms: i64,
+        window_ms: i64,
+        max_attempts: u32,
+    ) -> Result<bool, ApiFailure> {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
+                let mut attempts_by_key = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let path = rate_limit_path(store_root, key);
+                    let (window_start_ms, attempts) = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|saved| {
+                            let mut lines = saved.lines();
+                            let window_start_ms = lines.next()?.parse::<i64>().ok()?;
+                            let attempts = lines.next()?.parse::<u32>().ok()?;
+                            Some((window_start_ms, attempts))
+                        })
+                        .filter(|(window_start_ms, _)| {
+                            now_ms.saturating_sub(*window_start_ms) < window_ms
+                        })
+                        .unwrap_or((now_ms, 0));
+                    if attempts >= max_attempts {
+                        return Ok(false);
+                    }
+                    attempts_by_key.push((path, window_start_ms, attempts.saturating_add(1)));
+                }
+                for (path, window_start_ms, attempts) in attempts_by_key {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                    }
+                    write_atomic(&path, &format!("{window_start_ms}\n{attempts}\n"))?;
+                }
+
+                Ok(true)
+            }
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .record_rate_limit_attempts(
+                            keys,
+                            now_ms,
+                            window_ms,
+                            i32::try_from(max_attempts).expect("rate limit fits i32"),
+                        )
                         .map_err(postgres_failure)
                 })
             }
@@ -1286,6 +1415,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/start", post(start_app_study))
         .route("/app/account", post(create_app_account))
         .route("/app/login/verify", get(verify_app_login))
+        .route("/app/logout", post(logout_app_session))
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
         .route("/app/generate", post(generate_app_source))
@@ -1513,9 +1643,12 @@ struct AppReviewSubmitForm {
 
 async fn create_app_account(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Form(form): Form<AppAccountForm>,
 ) -> Response {
-    let result = state.accounts.request_magic_link(&form.email);
+    let result = state
+        .accounts
+        .request_magic_link(&form.email, &client_rate_limit_key(&headers));
 
     match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
@@ -1538,6 +1671,20 @@ async fn verify_app_login(
                 render_account_page(&state, &account, view.as_ref(), None),
             )
         }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn logout_app_session(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppAccountActionForm>,
+) -> Response {
+    match state
+        .accounts
+        .revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, None)),
         Err(error) => error.into_response(),
     }
 }
@@ -1909,6 +2056,10 @@ fn render_account_status(account: &AppAccount) -> String {
         r#"<section class="compact">
   <h2>Account</h2>
   <p class="muted">Session ready for <code>{}</code>.</p>
+  <form action="/app/logout" method="post">
+    {}
+    <button type="submit">Sign out</button>
+  </form>
   <form action="/app/save-account" method="post">
     {}
     <label>Email <input name="email" type="email" autocomplete="email" required></label>
@@ -1916,6 +2067,7 @@ fn render_account_status(account: &AppAccount) -> String {
   </form>
 </section>"#,
         escape_html(&account.account_id),
+        hidden_csrf_input(account),
         hidden_csrf_input(account)
     )
 }
@@ -2295,6 +2447,13 @@ impl ApiFailure {
         }
     }
 
+    fn too_many_requests(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.to_owned(),
+        }
+    }
+
     fn internal(message: String) -> Self {
         report_internal_error(&message);
         Self {
@@ -2398,6 +2557,21 @@ fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
         .ok_or_else(ApiFailure::missing_session)
 }
 
+fn client_rate_limit_key(headers: &HeaderMap) -> String {
+    ["fly-client-ip", "x-real-ip", "x-forwarded-for"]
+        .into_iter()
+        .find_map(|header| {
+            headers
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn csrf_token(value: Option<&String>) -> &str {
     value.map(String::as_str).map(str::trim).unwrap_or_default()
 }
@@ -2412,11 +2586,24 @@ fn html_with_browser_session(account: &AppAccount, html: String) -> Response {
     response
 }
 
+fn html_with_cleared_browser_session(html: String) -> Response {
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&clear_session_cookie_header()).expect("clear cookie header"),
+    );
+    response
+}
+
 fn session_cookie_header(session_id: &str) -> String {
     format!(
         "{APP_SESSION_COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={APP_SESSION_MAX_AGE_SECONDS}",
         cookie_value(session_id)
     )
+}
+
+fn clear_session_cookie_header() -> String {
+    format!("{APP_SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
 }
 
 fn cookie_value(value: &str) -> String {
@@ -2469,6 +2656,8 @@ fn new_magic_link_token() -> String {
 
 const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
 const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
+const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
+const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // 30 minutes: links travel through email, where spam checks and device
 // switches routinely burn ten minutes. Found in dogfood: a link expired
 // before the operator could click it.
@@ -2505,6 +2694,23 @@ fn auth_challenge_path(store_root: &FsPath, challenge_hash: &str) -> PathBuf {
         .join("_auth_challenges")
         .join(cookie_value(challenge_hash))
         .join("challenge")
+}
+
+fn auth_challenge_consumed_path(store_root: &FsPath, challenge_hash: &str) -> PathBuf {
+    store_root
+        .join("_auth_challenges")
+        .join(cookie_value(challenge_hash))
+        .join("consumed")
+}
+
+fn rate_limit_path(store_root: &FsPath, key: &str) -> PathBuf {
+    store_root.join("_rate_limits").join(secret_hash(key))
+}
+
+fn write_atomic(path: &FsPath, contents: &str) -> Result<(), ApiFailure> {
+    let temp_path = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
+    fs::write(&temp_path, contents).map_err(|error| ApiFailure::internal(error.to_string()))?;
+    fs::rename(&temp_path, path).map_err(|error| ApiFailure::internal(error.to_string()))
 }
 
 /// Generate drafts for one source using the configured provider.
@@ -2704,7 +2910,11 @@ fn require_current_review_postgres(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use axum::{
         body::{to_bytes, Body},
@@ -3109,6 +3319,218 @@ mod tests {
         let outbox = fs::read_to_string(outbox_path).expect("outbox");
         assert!(outbox.contains("owner@example.com"));
         assert!(!outbox.contains("stranger@example.com"));
+    }
+
+    #[tokio::test]
+    async fn app_account_rate_limits_by_email_and_ip() {
+        let store_root = temp_store_root("login-rate-limit");
+        let outbox_path = store_root.join("auth-outbox.tsv");
+        let app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root).with_auth_config(
+                AuthConfig::allow_emails(vec![
+                    "owner@example.com".to_owned(),
+                    "other@example.com".to_owned(),
+                ])
+                .with_link_outbox(&outbox_path),
+            ),
+        ));
+
+        for _ in 0..super::APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS {
+            let response = app
+                .clone()
+                .oneshot(form_request_with_ip(
+                    "POST",
+                    "/app/account",
+                    "203.0.113.10",
+                    &[("email", "owner@example.com")],
+                ))
+                .await
+                .expect("allowed request");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let same_email_new_ip = app
+            .clone()
+            .oneshot(form_request_with_ip(
+                "POST",
+                "/app/account",
+                "203.0.113.11",
+                &[("email", "owner@example.com")],
+            ))
+            .await
+            .expect("email limited");
+        assert_eq!(same_email_new_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let same_ip_new_email = app
+            .oneshot(form_request_with_ip(
+                "POST",
+                "/app/account",
+                "203.0.113.10",
+                &[("email", "other@example.com")],
+            ))
+            .await
+            .expect("ip limited");
+        assert_eq!(same_ip_new_email.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let outbox = fs::read_to_string(outbox_path).expect("outbox");
+        assert_eq!(outbox.lines().count(), 5);
+        assert!(!outbox.contains("other@example.com"));
+    }
+
+    #[tokio::test]
+    async fn app_account_rejected_ip_does_not_spend_email_quota() {
+        let store_root = temp_store_root("login-rate-limit-poison");
+        let outbox_path = store_root.join("auth-outbox.tsv");
+        let app = router(ApiState::new(
+            AccountRegistry::with_store_root(&store_root).with_auth_config(
+                AuthConfig::allow_emails(vec![
+                    "blocked@example.com".to_owned(),
+                    "victim@example.com".to_owned(),
+                ])
+                .with_link_outbox(&outbox_path),
+            ),
+        ));
+
+        for _ in 0..super::APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS {
+            let response = app
+                .clone()
+                .oneshot(form_request_with_ip(
+                    "POST",
+                    "/app/account",
+                    "203.0.113.20",
+                    &[("email", "blocked@example.com")],
+                ))
+                .await
+                .expect("spend ip bucket");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        for _ in 0..super::APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS {
+            let rejected = app
+                .clone()
+                .oneshot(form_request_with_ip(
+                    "POST",
+                    "/app/account",
+                    "203.0.113.20",
+                    &[("email", "victim@example.com")],
+                ))
+                .await
+                .expect("blocked ip victim attempt");
+            assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        let clean_ip = app
+            .oneshot(form_request_with_ip(
+                "POST",
+                "/app/account",
+                "203.0.113.21",
+                &[("email", "victim@example.com")],
+            ))
+            .await
+            .expect("victim clean ip");
+        assert_eq!(clean_ip.status(), StatusCode::OK);
+
+        let outbox = fs::read_to_string(outbox_path).expect("outbox");
+        assert_eq!(
+            outbox
+                .lines()
+                .filter(|line| line.starts_with("victim@example.com\t"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn app_logout_revokes_the_browser_session() {
+        let store_root = temp_store_root("logout-revokes");
+        let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        assert!(started.contains(r#"action="/app/logout""#));
+
+        let logged_out = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/logout",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("logout");
+        assert_eq!(logged_out.status(), StatusCode::OK);
+        let set_cookie = logged_out
+            .headers()
+            .get(SET_COOKIE)
+            .expect("clear cookie")
+            .to_str()
+            .expect("set-cookie");
+        assert!(set_cookie.contains("__Host-memory_engine_session="));
+        assert!(set_cookie.contains("Max-Age=0"));
+
+        let restarted_app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+        let rejected = restarted_app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("next after logout");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn app_logout_requires_csrf_without_revoking_session() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+
+        let rejected = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/logout",
+                &cookie,
+                &[],
+            ))
+            .await
+            .expect("logout without csrf");
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let still_active = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("next after failed logout");
+        assert_eq!(still_active.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3989,6 +4411,21 @@ mod tests {
             .expect("request")
     }
 
+    fn form_request_with_ip(
+        method: &str,
+        uri: &str,
+        ip: &str,
+        fields: &[(&str, &str)],
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("fly-client-ip", ip)
+            .body(Body::from(form_body(fields)))
+            .expect("request")
+    }
+
     fn form_request_with_cookie(
         method: &str,
         uri: &str,
@@ -4263,6 +4700,46 @@ mod tests {
     }
 
     #[test]
+    fn file_store_magic_link_consumption_is_atomic() {
+        let store_root = temp_store_root("magic-link-atomic");
+        let storage = super::StudyStorage {
+            backend: super::StudyStorageBackend::File {
+                store_root: store_root.clone(),
+            },
+            now: expiry_clock,
+        };
+        storage
+            .save_auth_challenge(
+                "atomic-challenge",
+                "learner@example.com",
+                DEFAULT_BETA_STUDY_NOW + AUTH_CHALLENGE_TTL_MS,
+            )
+            .expect("save challenge");
+
+        let storage = Arc::new(storage);
+        let barrier = Arc::new(Barrier::new(64));
+        let mut workers = Vec::new();
+        for _ in 0..64 {
+            let storage = Arc::clone(&storage);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                storage
+                    .consume_auth_challenge("atomic-challenge", DEFAULT_BETA_STUDY_NOW)
+                    .expect("consume")
+                    .is_some()
+            }));
+        }
+
+        let consumed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .filter(|consumed| *consumed)
+            .count();
+        assert_eq!(consumed, 1, "only one caller may consume a magic link");
+    }
+
+    #[test]
     fn magic_link_is_rejected_after_its_ttl_elapses() {
         EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
         let registry = AccountRegistry::default()
@@ -4272,7 +4749,7 @@ mod tests {
             );
 
         let fresh = registry
-            .request_magic_link("learner@example.com")
+            .request_magic_link("learner@example.com", "test-client")
             .expect("fresh link")
             .debug_link
             .expect("debug link");
@@ -4280,7 +4757,7 @@ mod tests {
         assert!(registry.verify_magic_link(&fresh_token).is_ok());
 
         let stale = registry
-            .request_magic_link("learner@example.com")
+            .request_magic_link("learner@example.com", "test-client")
             .expect("stale link")
             .debug_link
             .expect("debug link");
@@ -4308,7 +4785,7 @@ mod tests {
                 AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
             );
         let link = registry
-            .request_magic_link("learner@example.com")
+            .request_magic_link("learner@example.com", "test-client")
             .expect("link")
             .debug_link
             .expect("debug link");

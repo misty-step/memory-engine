@@ -13,14 +13,14 @@ operators have the affordances to notice and recover from failure.
       SHA (workflow_run wiring, exact-SHA checkout), and a post-deploy smoke
       (healthz + home + anonymous auth boundary) fails the deploy on
       regression. (2026-06-11)
-- [ ] `/app/account` is rate-limited per email and per IP; test proves the
-      limit.
+- [x] `/app/account` is rate-limited per email and per IP; test proves the
+      limit. (2026-06-11)
 - [x] `POST /accounts` and the authenticated save-account path enforce the
       email allowlist; non-allowlisted emails get 403, no session token.
       (2026-06-11)
-- [ ] Logout route exists and revokes the server-side session; file-store
+- [x] Logout route exists and revokes the server-side session; file-store
       magic-link consumption is atomic (no replay window) — postgres path
-      already is.
+      already is. (2026-06-11)
 - [x] File store already requires the explicit
       `MEMORY_ENGINE_ENABLE_FILE_STORE=true` opt-in at boot (verified
       2026-06-11; production runs Postgres on Neon, so no [mounts] needed).

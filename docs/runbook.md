@@ -108,3 +108,15 @@ flyctl ssh console --app memory-engine-api -C "tail -1 <outbox-path>"
 A failed send surfaces as a 500 and therefore lands in Canary. After
 verifying a domain in Resend, update the `from` address in
 `bin/send-magic-link`.
+
+`POST /app/account` is abuse-limited in the API boundary before any magic link
+is sent. The fixed window is 5 attempts per 15 minutes per normalized email and
+per client IP (`fly-client-ip`, then `x-real-ip`, then the first
+`x-forwarded-for` value). Rejected requests return `429` with the generic
+message "Too many sign-in attempts. Try again later."; they do not write an
+outbox row or reveal whether an email is allowlisted.
+
+The browser session is server-side. `POST /app/logout` requires the same CSRF
+token as other app mutations, revokes the stored browser session, and clears
+the `__Host-memory_engine_session` cookie with `Max-Age=0`. Reusing the old
+cookie after logout must return `401`, including after a process restart.

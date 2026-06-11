@@ -34,7 +34,8 @@ fly secrets set MEMORY_ENGINE_POSTGRES_URL=postgres://...
 6. `POST /app/reveal`
 7. `POST /app/submit`
 8. `POST /app/next`
-9. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/approve`,
+9. `POST /app/logout`
+10. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/approve`,
    `/review/{review_unit_id}/reveal`, and `/review/{review_unit_id}/submit`
 
 Submit payloads must include `idempotencyKey`.
@@ -51,6 +52,20 @@ submit with no horizontal overflow. The revealed answer
 viewport drove source-first home, generation, account email save, keep, reveal,
 submit using the revealed answer, and `Next review`. Every
 checked page reported `scrollWidth == clientWidth == 390`.
+
+2026-06-11 local hardening route proof: `cargo test -p memory-engine-api
+-- --nocapture` covered `/app/account` rate limits by email and IP,
+`/app/logout` CSRF enforcement, persisted browser-session revocation across a
+file-backed router restart, and atomic file-store magic-link consumption. The
+same suite continued to cover magic-link replay rejection, non-enumerating
+login requests, allowlist enforcement, and Postgres browser-session resume.
+
+2026-06-11 local binary smoke: with
+`MEMORY_ENGINE_ENABLE_FILE_STORE=true MEMORY_ENGINE_API_STORE_DIR=.tmp/api-hardening-smoke MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-hardening-smoke/outbox.tsv HOST=127.0.0.1 PORT=18082 cargo run -p memory-engine-api`,
+curl drove production-style magic-link login through the local outbox, verified
+the link (`200`), posted `/app/logout` (`200` with `Max-Age=0`), retried
+`/app/next` with the old cookie (`401`), then posted `/app/account` from one
+client IP and saw attempts 1-5 return `200` and attempt 6 return `429`.
 
 ## Local Postgres Receipt
 
