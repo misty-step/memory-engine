@@ -14,6 +14,9 @@ operators have the affordances to notice and recover from failure.
       (healthz + auth + study round-trip) fails the deploy on regression.
 - [ ] `/app/account` is rate-limited per email and per IP; test proves the
       limit.
+- [ ] `POST /accounts` no longer issues a session token without email
+      verification or allowlist enforcement (found live during ticket-42 QA:
+      open registration on production; see docs/qa/real-clock-receipt.md).
 - [ ] Logout route exists and revokes the server-side session; file-store
       magic-link consumption is atomic (no replay window) — postgres path
       already is.
