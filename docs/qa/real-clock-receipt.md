@@ -35,5 +35,7 @@ review scheduling.
 - `POST /accounts` issues a session token with no email verification or
   allowlist check — open registration on production. Tracked under ticket
   044 (production hardening).
-- Postgres-path expiry behavior is asserted by inspection and unit tests
-  against the file store; postgres-in-CI is ticket 045.
+- Postgres-path route behavior now runs in canonical Dagger CI through the
+  `MEMORY_ENGINE_POSTGRES_TEST_URL` service binding added for ticket 045.
+  This receipt still predates that CI wiring, so treat its production smoke
+  evidence as historical rather than the current full proof packet.

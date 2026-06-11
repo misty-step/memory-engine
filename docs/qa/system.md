@@ -35,7 +35,9 @@ QA evidence is organized around product quality, not implementation folders:
 - Drift detection: evals and benchmark receipts expose behavior and performance
   changes before clients absorb them.
 - Handoff confidence: Rust formatting, tests, Clippy, rustdoc, Gitleaks, and
-  Dagger all pass.
+  Dagger all pass. Dagger's Rust test lane binds a Postgres service and sets
+  `MEMORY_ENGINE_POSTGRES_TEST_URL`, so live Postgres API/store contracts run
+  in the canonical gate instead of skipping as local-only opt-in tests.
 
 ## Executable Lanes
 
@@ -56,7 +58,7 @@ receipt after each lane:
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
 | `docs.rustdoc` | all public Rust crates | prove public API documentation compiles |
 | `performance.benchmarks` | Rust facade, scheduler, queue, service | expose migrated-runtime performance drift without brittle thresholds |
-| `ci.canonical` | Dagger CI | prove Rust fmt, test, Clippy, doc, and Gitleaks together |
+| `ci.canonical` | Dagger CI | prove Rust fmt, file/Postgres tests, Clippy, doc, and Gitleaks together |
 
 All lanes are gating except `performance.benchmarks`, which is receipt-only
 until the project has enough historical data to define stable budgets.

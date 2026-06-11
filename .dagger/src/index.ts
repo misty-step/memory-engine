@@ -6,14 +6,35 @@
  * corresponding Cargo command. The `check` function runs all gates in sequence
  * and is what CI and agents should invoke before proposing a merge.
  */
-import { CacheSharingMode, type Container, type Directory, dag, func, object } from '@dagger.io/dagger';
+import {
+  CacheSharingMode,
+  type Container,
+  type Directory,
+  type Service,
+  dag,
+  func,
+  object,
+} from '@dagger.io/dagger';
 
 const GITLEAKS_IMAGE = 'zricethezav/gitleaks:v8.30.0';
+const POSTGRES_IMAGE = 'postgres:17-alpine';
+const POSTGRES_TEST_URL = 'postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable';
 const RUST_IMAGE = 'rust:1.94-bookworm';
 const SOURCE_EXCLUDES = ['.git/', '.tmp/', 'target/'];
 
 function ciSource(source: Directory): Directory {
   return source.filter({ gitignore: true, exclude: SOURCE_EXCLUDES });
+}
+
+function postgresService(): Service {
+  return dag
+    .container()
+    .from(POSTGRES_IMAGE)
+    .withEnvVariable('POSTGRES_USER', 'postgres')
+    .withEnvVariable('POSTGRES_PASSWORD', 'postgres')
+    .withEnvVariable('POSTGRES_DB', 'postgres')
+    .withExposedPort(5432)
+    .asService();
 }
 
 @object()
@@ -50,7 +71,15 @@ export class MemoryEngine {
    */
   @func()
   async rustTest(source: Directory): Promise<string> {
-    return this.rustBase(source).withExec(['cargo', 'test', '--workspace']).stdout();
+    return this.rustBase(source)
+      .withServiceBinding('postgres', postgresService())
+      .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
+      .withExec([
+        'bash',
+        '-c',
+        'for attempt in $(seq 1 20); do (echo >/dev/tcp/postgres/5432) >/dev/null 2>&1 && break; sleep 1; done; cargo test --workspace',
+      ])
+      .stdout();
   }
 
   /**
