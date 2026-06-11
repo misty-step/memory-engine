@@ -1646,6 +1646,7 @@ mod tests {
             started_at: NOW - 1_000,
             completed_at: Some(NOW),
             validation_failures: Vec::new(),
+            usage: None,
         }
     }
 

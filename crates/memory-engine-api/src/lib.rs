@@ -22,6 +22,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
+use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::BetaPersistenceStore;
 use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
 use memory_engine_study::{
@@ -1012,9 +1014,7 @@ impl StudyStorage {
                     return Err(ApiFailure::not_found("Source not found."));
                 }
                 let mut study = open_study_session(store_path, self.now)?;
-                let view = study
-                    .generate(Some(vec![source_id.to_owned()]))
-                    .map_err(study_failure)?;
+                let view = run_source_generation(&mut study, source_id)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
@@ -1030,9 +1030,7 @@ impl StudyStorage {
                         return Err(ApiFailure::not_found("Source not found."));
                     }
                     let mut study = BetaStudySession::from_store(account, self.now);
-                    let view = study
-                        .generate(Some(vec![source_id.to_owned()]))
-                        .map_err(study_failure)?;
+                    let view = run_source_generation(&mut study, source_id)?;
 
                     Ok(StudyViewResponse::from_view(view))
                 })
@@ -1232,6 +1230,8 @@ pub struct StudyViewResponse {
     pub drafts: Vec<BetaStudyDraftRow>,
     pub current: Option<BetaStudyCurrent>,
     pub summary: BetaStudySummary,
+    #[serde(default)]
+    pub generation_notices: Vec<String>,
 }
 
 impl StudyViewResponse {
@@ -1240,6 +1240,7 @@ impl StudyViewResponse {
             drafts: view.drafts,
             current: view.current,
             summary: view.summary,
+            generation_notices: view.generation_notices,
         }
     }
 }
@@ -1948,10 +1949,25 @@ fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
 fn render_study(account: &AppAccount, view: &StudyViewResponse) -> String {
     [
         render_summary(&view.summary),
+        render_generation_notices(&view.generation_notices),
         render_drafts(account, &view.drafts),
         render_current_review(account, view.current.as_ref()),
     ]
     .join("")
+}
+
+fn render_generation_notices(notices: &[String]) -> String {
+    if notices.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for notice in notices {
+        write!(items, "<li>{}</li>", escape_html(notice)).expect("write notice html");
+    }
+
+    format!(
+        r#"<section class="compact notices"><h2>Generation notes</h2><ul>{items}</ul></section>"#
+    )
 }
 
 fn render_summary(summary: &BetaStudySummary) -> String {
@@ -2437,6 +2453,34 @@ fn auth_challenge_path(store_root: &FsPath, challenge_hash: &str) -> PathBuf {
         .join("challenge")
 }
 
+/// Generate drafts for one source using the configured provider.
+///
+/// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
+/// a [`FallbackProvider`] whose primary is the deterministic structured-block
+/// parser, so hand-written `Concept:/Question:/Answer:` blocks keep their free
+/// path. Without a key the structured parser runs alone, which is what CI and
+/// key-less deployments use.
+fn run_source_generation<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    let ids = Some(vec![source_id.to_owned()]);
+    match OpenRouterConfig::from_env() {
+        Ok(config) => {
+            let structured = StructuredBlockProvider;
+            let model = OpenRouterProvider::new(config);
+            let provider = FallbackProvider::new(&structured, &model);
+            study.generate_with_provider(ids, &provider)
+        }
+        Err(_) => study.generate(ids),
+    }
+    .map_err(study_failure)
+}
+
 fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
     BetaStudySession::open(BetaStudyOptions::new(path).with_clock(now)).map_err(study_failure)
 }
@@ -2596,7 +2640,10 @@ mod tests {
 
     use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
-    use super::{router, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS};
+    use super::{
+        render_generation_notices, router, AccountRegistry, ApiState, AuthConfig,
+        AUTH_CHALLENGE_TTL_MS,
+    };
 
     #[tokio::test]
     async fn healthz_exposes_production_api_boundary() {
@@ -2637,6 +2684,27 @@ mod tests {
             body.find("/app/start").expect("start form")
                 < body.find("/app/account").expect("account form")
         );
+    }
+
+    #[test]
+    fn generation_notices_render_as_a_visible_section() {
+        let html = render_generation_notices(&[
+            "No review items could be generated from this source yet.".to_owned(),
+        ]);
+        assert!(html.contains("Generation notes"));
+        assert!(html.contains("No review items could be generated"));
+
+        assert!(
+            render_generation_notices(&[]).is_empty(),
+            "a clean run renders nothing"
+        );
+    }
+
+    #[test]
+    fn generation_notices_escape_html() {
+        let html = render_generation_notices(&["<script>alert(1)</script>".to_owned()]);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 
     #[tokio::test]

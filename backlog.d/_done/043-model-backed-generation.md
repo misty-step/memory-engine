@@ -19,7 +19,11 @@ hand-written `Concept:/Question:/Answer:` block can satisfy.
       no live model calls.
 - [ ] Existing structured-block generation keeps working (it becomes one
       provider among several).
-- [ ] Per-source generation cost is logged; a typical source costs < $0.02.
+- [ ] Per-source generation cost is logged. (Budget note: the default model
+      `google/gemini-3.5-flash` runs ~$0.025/source — a deliberate
+      operator choice of quality over the original $0.02 estimate; the
+      `deepseek/deepseek-v4-flash` override hits $0.0004/source. See
+      docs/evals/generation-field-2026-06-11.md.)
 
 ## Notes
 

@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use memory_engine_core::{ScheduleStatus, Verdict};
+use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
 use memory_engine_study::{
     BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
 };
@@ -347,6 +348,75 @@ fn view_serializes_like_the_mobile_beta_api_contract() {
             .expect("apiPressure")
             .len(),
         3
+    );
+}
+
+#[test]
+fn generates_drafts_from_arbitrary_prose_via_model_provider() {
+    let directory = TempDirectory::new("prose-provider");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+
+    study.start().expect("start");
+    study
+        .add_source(BetaStudySourceInput {
+            id: "src-prose".to_owned(),
+            title: "Mitochondria".to_owned(),
+            body: "Mitochondria generate most of the cell's supply of adenosine triphosphate. \
+                   They are sometimes called the powerhouse of the cell."
+                .to_owned(),
+        })
+        .expect("source");
+
+    // Structured-block primary finds nothing in prose, so the model provider runs.
+    let structured = StructuredBlockProvider;
+    let model = FakeModelProvider;
+    let provider = FallbackProvider::new(&structured, &model);
+    let generated = study
+        .generate_with_provider(Some(vec!["src-prose".to_owned()]), &provider)
+        .expect("generate");
+
+    assert!(
+        !generated.drafts.is_empty(),
+        "arbitrary prose should yield drafts via the model provider"
+    );
+    assert!(
+        generated.generation_notices.is_empty(),
+        "a clean run must not raise notices: {:?}",
+        generated.generation_notices
+    );
+}
+
+#[test]
+fn surfaces_a_human_readable_notice_when_a_source_yields_no_drafts() {
+    let directory = TempDirectory::new("zero-draft-notice");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+
+    study.start().expect("start");
+    study
+        .add_source(BetaStudySourceInput {
+            id: "src-bare".to_owned(),
+            title: "Unparseable note".to_owned(),
+            body: "just some prose with no structured blocks".to_owned(),
+        })
+        .expect("source");
+
+    // Structured provider alone produces no drafts from prose.
+    let generated = study
+        .generate(Some(vec!["src-bare".to_owned()]))
+        .expect("generate");
+
+    assert!(generated.drafts.is_empty());
+    assert!(
+        generated
+            .generation_notices
+            .iter()
+            .any(|notice| notice.contains("No review items could be generated")),
+        "zero-draft run must explain itself: {:?}",
+        generated.generation_notices
     );
 }
 

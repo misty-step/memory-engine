@@ -552,6 +552,7 @@ fn generation_run(id: &str, source_document_ids: &[&str], draft_ids: &[&str]) ->
         started_at: NOW - 1_000,
         completed_at: Some(NOW),
         validation_failures: Vec::new(),
+        usage: None,
     }
 }
 

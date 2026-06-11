@@ -1,0 +1,11 @@
+{
+  "id": "water-boiling",
+  "title": "Boiling point of water",
+  "category": "tiny-fact",
+  "body": "Water boils at 100 degrees Celsius at sea-level atmospheric pressure. At higher altitudes the pressure is lower, so water boils at a lower temperature: roughly 90 degrees Celsius at 3,000 meters.",
+  "expect": {
+    "min_drafts": 1,
+    "max_drafts": 4,
+    "key_terms": ["100 degrees", "3,000 meters"]
+  }
+}

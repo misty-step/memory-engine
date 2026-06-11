@@ -1,0 +1,11 @@
+{
+  "id": "mitochondria",
+  "title": "Mitochondria",
+  "category": "science-prose",
+  "body": "Mitochondria are organelles that generate most of the cell's supply of adenosine triphosphate, the molecule cells use as chemical energy. They are sometimes called the powerhouse of the cell. Unlike most organelles, mitochondria carry their own small circular genome and reproduce by dividing in two, evidence that they descend from free-living bacteria absorbed by an ancestral cell — the endosymbiotic theory. The number of mitochondria in a cell varies widely: red blood cells have none, while liver cells can contain more than a thousand. Mitochondria also help regulate programmed cell death, known as apoptosis.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["adenosine triphosphate", "endosymbiotic", "apoptosis"]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "git-branching",
+  "title": "Git branches and merging",
+  "category": "product-doc",
+  "body": "A Git branch is a movable pointer to a commit; creating one writes a single 41-byte file, which is why branching is effectively free. The branch you are on is tracked by HEAD. Merging combines histories: a fast-forward merge simply moves the branch pointer when the target is a direct descendant, while a three-way merge creates a new merge commit with two parents using the common ancestor as the base. Rebasing replays commits on top of another branch, producing a linear history but rewriting commit hashes — which is why you should never rebase commits that others have already pulled.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["HEAD", "fast-forward", "rebase", "merge commit"]
+  }
+}

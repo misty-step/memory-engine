@@ -51,3 +51,30 @@ Current benchmark cases cover:
 Use benchmark output to compare branches manually. If a future regression is
 large and repeatable, shape a ticket with an explicit budget and enough history
 to avoid brittle thresholds.
+
+## Generation model evals
+
+The prose→quiz generation pipeline is scored by deterministic judges (no model
+in the judge loop) over a fixed corpus in
+`crates/memory-engine-bench/corpus/generation/`.
+
+Run against the deterministic fake provider (the CI-safe default — no network):
+
+```sh
+cargo run -p memory-engine-bench -- generation
+```
+
+Run a live model field comparison (requires `OPENROUTER_API_KEY`):
+
+```sh
+cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
+  --prompt principled --out docs/evals/generation-<model>-<date>.md
+```
+
+Judges score schema validity, provenance (evidence quote actually in source —
+the same predicate the production trust gate enforces), answerability,
+duplicate rate, count-in-range, and key-term coverage, alongside tokens,
+dollars, and latency p50/p95. CI never calls live models; field runs are
+explicit and local, and their dated receipts live in `docs/evals/`. The
+2026-06-11 field run that picked the default model is
+`docs/evals/generation-field-2026-06-11.md`.

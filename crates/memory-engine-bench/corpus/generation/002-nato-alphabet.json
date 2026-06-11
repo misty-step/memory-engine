@@ -1,0 +1,11 @@
+{
+  "id": "nato-alphabet",
+  "title": "NATO phonetic alphabet, letters A through H",
+  "category": "enumerable-list",
+  "body": "The NATO phonetic alphabet assigns a code word to each letter so spellings survive noisy radio channels. A is Alfa. B is Bravo. C is Charlie. D is Delta. E is Echo. F is Foxtrot. G is Golf. H is Hotel. The spellings Alfa and Juliett are deliberate: they prevent speakers of other languages from mispronouncing Alpha and Juliet.",
+  "expect": {
+    "min_drafts": 3,
+    "max_drafts": 8,
+    "key_terms": ["Alfa", "Foxtrot", "Hotel"]
+  }
+}

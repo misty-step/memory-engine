@@ -1,0 +1,11 @@
+{
+  "id": "pythagorean",
+  "title": "The Pythagorean theorem",
+  "category": "math-concept",
+  "body": "The Pythagorean theorem states that in a right triangle, the square of the hypotenuse equals the sum of the squares of the other two sides: a squared plus b squared equals c squared, where c is the side opposite the right angle. The converse also holds: any triangle whose sides satisfy the relation contains a right angle. Triples of whole numbers satisfying it, such as 3, 4, 5 and 5, 12, 13, are called Pythagorean triples. The theorem fails on curved surfaces; on a sphere, the angles of a triangle sum to more than 180 degrees and the relation no longer applies.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["hypotenuse", "right angle", "3, 4, 5"]
+  }
+}

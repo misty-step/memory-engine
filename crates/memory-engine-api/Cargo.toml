@@ -7,8 +7,11 @@ description = "Production HTTP API boundary for the memory-engine mobile study a
 
 [dependencies]
 axum = "0.8.7"
+memory-engine-generation = { path = "../memory-engine-generation" }
+memory-engine-openrouter = { path = "../memory-engine-openrouter" }
 memory-engine-persistence = { path = "../memory-engine-persistence" }
 memory-engine-persistence-postgres = { path = "../memory-engine-persistence-postgres" }
+memory-engine-service = { path = "../memory-engine-service" }
 memory-engine-study = { path = "../memory-engine-study" }
 rand = "0.9.3"
 serde = { version = "1.0.228", features = ["derive"] }

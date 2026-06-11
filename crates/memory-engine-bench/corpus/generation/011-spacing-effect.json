@@ -1,0 +1,11 @@
+{
+  "id": "spacing-effect",
+  "title": "The spacing effect and retrieval practice",
+  "category": "long-science-prose",
+  "body": "The spacing effect is one of the most replicated findings in cognitive psychology: information reviewed in sessions spread over time is retained far better than the same information massed into one session. Hermann Ebbinghaus first documented it in 1885 using lists of nonsense syllables, plotting forgetting curves that fall steeply at first and then flatten. Each successful recall after a delay slows subsequent forgetting, which is why review schedules expand: a card recalled correctly today might next appear in three days, then a week, then a month.\n\nRetrieval practice — actively producing an answer rather than rereading it — is the second pillar. Roediger and Karpicke's 2006 experiments showed students who repeatedly tested themselves on a passage outperformed students who repeatedly studied it, even though the studiers predicted the opposite. The effort of retrieval itself strengthens the memory trace, a phenomenon called the testing effect. Difficulty helps: recall that requires effort produces more durable learning than recall that is easy, which Robert Bjork termed a desirable difficulty.\n\nModern spaced repetition systems combine the two. Algorithms such as SM-2 and its successors estimate each item's memory half-life from the learner's review history and schedule the next review just before the predicted lapse. The free-recall grading step matters: systems that let learners rate their own answers leniently lose much of the testing effect, because recognition masquerades as recall. The practical upshot for system design is that honest grading, expanding intervals, and effortful retrieval are load-bearing; streak counters and gentle reminders are not.",
+  "expect": {
+    "min_drafts": 3,
+    "max_drafts": 8,
+    "key_terms": ["Ebbinghaus", "testing effect", "desirable difficulty", "SM-2"]
+  }
+}

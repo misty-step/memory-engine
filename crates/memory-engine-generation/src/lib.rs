@@ -1,18 +1,31 @@
-//! Deterministic beta content generation.
+//! Beta content generation behind a provider boundary.
 //!
-//! This crate owns source-block parsing, draft validation, cited reference
-//! creation, and generation-run bookkeeping for the repo-local beta workflow.
-//! Model clients remain outside this crate until repeated beta pressure proves
-//! a provider-neutral boundary.
+//! This crate owns the [`DraftProvider`] boundary, deterministic providers
+//! (structured-block parsing and a CI-safe fake model), draft validation,
+//! cited reference creation, and generation-run bookkeeping. Model-backed
+//! providers implement [`DraftProvider`] from their own boundary crates; this
+//! crate never talks to a network.
+//!
+//! Every provider's output passes the same trust gate before persistence:
+//! drafts must carry evidence quoting the source (verified by normalized
+//! substring match), duplicates are rejected, and exercises require worked
+//! solutions.
+
+mod provider;
 
 use std::{collections::BTreeSet, error::Error, fmt};
+
+pub use provider::{
+    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, ProviderDrafts,
+    ProviderFailure, ProviderUsage, StructuredBlockProvider,
+};
 
 use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaStoreError, BetaStoreSnapshot, GeneratedLearningActivityKind,
     GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
-    GeneratedPromptValidationStatus, GenerationRun, PersistedQueueCandidate, ReferenceSpan,
-    SourceDocument, SourceDocumentKind,
+    GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage, PersistedQueueCandidate,
+    ReferenceSpan, SourceDocument, SourceDocumentKind,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,7 +153,10 @@ impl BetaGenerationStore for BetaPersistenceStore {
     }
 }
 
-/// Generate deterministic beta drafts from source blocks.
+/// Generate deterministic beta drafts from structured source blocks.
+///
+/// Equivalent to [`run_beta_generation_with_provider`] with
+/// [`StructuredBlockProvider`]; kept as the zero-configuration entry point.
 ///
 /// # Errors
 ///
@@ -153,7 +169,28 @@ pub fn run_beta_generation<S>(
 where
     S: BetaGenerationStore,
 {
-    let model = request.model.unwrap_or_else(default_model);
+    run_beta_generation_with_provider(store, &StructuredBlockProvider, request)
+}
+
+/// Generate beta drafts from the given provider's candidates.
+///
+/// Provider transport failures do not abort the run: they are recorded as
+/// human-readable validation failures on the persisted run so the study UI
+/// can explain zero-draft outcomes.
+///
+/// # Errors
+///
+/// Returns [`BetaGenerationError`] when requested source documents are missing,
+/// have no text body, or when the beta store rejects a generated entity.
+pub fn run_beta_generation_with_provider<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    request: BetaGenerationRequest,
+) -> Result<BetaGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let model = request.model.clone().unwrap_or_else(|| provider.model());
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let sources = request
         .source_document_ids
@@ -166,59 +203,63 @@ where
     let mut draft_ids = Vec::new();
     let mut accepted_draft_ids = Vec::new();
     let mut rejected_draft_ids = Vec::new();
+    let mut usage: Option<GenerationRunUsage> = None;
+    // Tracks the distinct models that actually produced drafts so the run
+    // header is honest: one producer names it, several (a composite running
+    // different sub-providers across sources) fall back to the declared model
+    // rather than last-write-wins. Per-draft model stamping stays exact.
+    let mut producing_models: Vec<GeneratedPromptModel> = Vec::new();
 
     store
-        .save_generation_run(GenerationRun {
-            id: request.run_id.clone(),
-            source_document_ids: request.source_document_ids.clone(),
-            draft_ids: Vec::new(),
-            provider: model.provider.clone(),
-            model: model.name.clone(),
-            started_at: request.started_at,
-            completed_at: None,
-            validation_failures: Vec::new(),
-        })
+        .save_generation_run(run_receipt(&request, &model, RunProgress::Started))
         .map_err(BetaGenerationError::Store)?;
 
     let mut seen_signatures = existing_draft_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
-        let candidates = parse_source_document(source, &mut validation_failures);
-        for candidate in candidates {
-            let Some(reference) = candidate.reference.as_ref() else {
+        let drafts = match provider.generate_drafts(source) {
+            Ok(drafts) => drafts,
+            Err(failure) => {
+                validation_failures.push(format!("{}: {failure}", source.id));
+                continue;
+            }
+        };
+        validation_failures.extend(drafts.failures);
+        usage = merge_usage(usage, drafts.usage);
+        // Stamp drafts with the provider that actually generated them, not the
+        // composite's declared identity. A caller override still wins.
+        let source_model = request.model.clone().unwrap_or(drafts.model);
+        if !drafts.candidates.is_empty() && !producing_models.contains(&source_model) {
+            producing_models.push(source_model.clone());
+        }
+
+        for candidate in drafts.candidates {
+            let Some(evidence) = candidate
+                .evidence
+                .as_deref()
+                .filter(|quote| !normalize_for_match(quote).is_empty())
+            else {
                 validation_failures.push(format!(
                     "{} block {}: generated drafts require source provenance",
-                    source.id, candidate.block_index
+                    source.id, candidate.index
                 ));
                 continue;
             };
-
             let signature = candidate_signature(&candidate);
             let duplicate = seen_signatures.contains(&signature);
             seen_signatures.insert(signature);
 
-            let reference_span = store
-                .save_reference_span(ReferenceSpan {
-                    id: generated_id(&request.run_id, "ref", &candidate),
-                    source_document_id: source.id.clone(),
-                    label: format!("{} source evidence", candidate.concept),
-                    text: reference.clone(),
-                    locator: format!("block:{}", candidate.block_index),
-                    created_at: request.started_at,
-                })
-                .map_err(BetaGenerationError::Store)?;
-            let draft = store
-                .save_generated_prompt_draft(build_draft(
-                    &candidate,
-                    &DraftContext {
-                        run_id: &request.run_id,
-                        reference_span_id: &reference_span.id,
-                        model: &model,
-                        due: request.default_due,
-                        created_at: request.started_at,
-                        duplicate,
-                    },
-                ))
-                .map_err(BetaGenerationError::Store)?;
+            let draft = persist_candidate(
+                store,
+                source,
+                &candidate,
+                evidence,
+                &PersistParams {
+                    request: &request,
+                    model: &source_model,
+                    duplicate,
+                    quote_verified: source_contains_quote(source, evidence),
+                },
+            )?;
 
             draft_ids.push(draft.id.clone());
             if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
@@ -229,17 +270,20 @@ where
         }
     }
 
+    let run_model = match producing_models.as_slice() {
+        [single] => single.clone(),
+        _ => model.clone(),
+    };
     store
-        .save_generation_run(GenerationRun {
-            id: request.run_id.clone(),
-            source_document_ids: request.source_document_ids,
-            draft_ids: draft_ids.clone(),
-            provider: model.provider,
-            model: model.name,
-            started_at: request.started_at,
-            completed_at: Some(request.completed_at.unwrap_or(request.started_at)),
-            validation_failures: validation_failures.clone(),
-        })
+        .save_generation_run(run_receipt(
+            &request,
+            &run_model,
+            RunProgress::Completed {
+                draft_ids: draft_ids.clone(),
+                validation_failures: validation_failures.clone(),
+                usage,
+            },
+        ))
         .map_err(BetaGenerationError::Store)?;
 
     Ok(BetaGenerationResult {
@@ -251,19 +295,91 @@ where
     })
 }
 
-#[derive(Clone, Debug)]
-struct ParsedCandidate {
-    source: SourceDocument,
-    block_index: usize,
-    activity_kind: GeneratedLearningActivityKind,
-    activity_stage: String,
-    concept: String,
-    question: String,
-    answer: String,
-    reference: Option<String>,
-    distractors: Vec<String>,
-    worked_solution: Option<String>,
-    unsupported: bool,
+struct PersistParams<'a> {
+    request: &'a BetaGenerationRequest,
+    model: &'a GeneratedPromptModel,
+    duplicate: bool,
+    quote_verified: bool,
+}
+
+/// Save one candidate's reference span and draft, returning the stored draft.
+fn persist_candidate<S>(
+    store: &mut S,
+    source: &SourceDocument,
+    candidate: &DraftCandidate,
+    evidence: &str,
+    params: &PersistParams<'_>,
+) -> Result<GeneratedPromptDraft, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let reference_span = store
+        .save_reference_span(ReferenceSpan {
+            id: generated_id(&params.request.run_id, "ref", &source.id, candidate),
+            source_document_id: source.id.clone(),
+            label: format!("{} source evidence", candidate.concept),
+            text: evidence.to_owned(),
+            locator: format!("block:{}", candidate.index),
+            created_at: params.request.started_at,
+        })
+        .map_err(BetaGenerationError::Store)?;
+
+    store
+        .save_generated_prompt_draft(build_draft(
+            source,
+            candidate,
+            &DraftContext {
+                run_id: &params.request.run_id,
+                reference_span_id: &reference_span.id,
+                model: params.model,
+                due: params.request.default_due,
+                created_at: params.request.started_at,
+                duplicate: params.duplicate,
+                quote_verified: params.quote_verified,
+            },
+        ))
+        .map_err(BetaGenerationError::Store)
+}
+
+enum RunProgress {
+    Started,
+    Completed {
+        draft_ids: Vec<String>,
+        validation_failures: Vec<String>,
+        usage: Option<GenerationRunUsage>,
+    },
+}
+
+fn run_receipt(
+    request: &BetaGenerationRequest,
+    model: &GeneratedPromptModel,
+    progress: RunProgress,
+) -> GenerationRun {
+    let (draft_ids, completed_at, validation_failures, usage) = match progress {
+        RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::Completed {
+            draft_ids,
+            validation_failures,
+            usage,
+        } => (
+            draft_ids,
+            Some(request.completed_at.unwrap_or(request.started_at)),
+            validation_failures,
+            usage,
+        ),
+    };
+
+    GenerationRun {
+        id: request.run_id.clone(),
+        source_document_ids: request.source_document_ids.clone(),
+        draft_ids,
+        provider: model.provider.clone(),
+        model: model.name.clone(),
+        started_at: request.started_at,
+        completed_at,
+        validation_failures,
+        usage,
+    }
 }
 
 struct DraftContext<'a> {
@@ -273,14 +389,82 @@ struct DraftContext<'a> {
     due: i64,
     created_at: i64,
     duplicate: bool,
+    quote_verified: bool,
 }
 
-fn default_model() -> GeneratedPromptModel {
-    GeneratedPromptModel {
-        provider: "fixture".to_owned(),
-        name: "deterministic-beta-generator".to_owned(),
-        version: "v1".to_owned(),
+fn merge_usage(
+    total: Option<GenerationRunUsage>,
+    addition: Option<ProviderUsage>,
+) -> Option<GenerationRunUsage> {
+    let Some(addition) = addition else {
+        return total;
+    };
+    let total = total.unwrap_or(GenerationRunUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cost_usd_micros: None,
+        latency_ms: 0,
+    });
+
+    Some(GenerationRunUsage {
+        input_tokens: total.input_tokens + addition.input_tokens,
+        output_tokens: total.output_tokens + addition.output_tokens,
+        cost_usd_micros: match (total.cost_usd_micros, addition.cost_usd_micros) {
+            (None, None) => None,
+            (left, right) => Some(left.unwrap_or(0) + right.unwrap_or(0)),
+        },
+        latency_ms: total.latency_ms + addition.latency_ms,
+    })
+}
+
+fn source_contains_quote(source: &SourceDocument, quote: &str) -> bool {
+    evidence_quote_matches(source.body.as_deref().unwrap_or_default(), quote)
+}
+
+/// Minimum number of words an evidence quote must carry to count as proof.
+///
+/// A single-word quote like "the" substring-matches almost any prose, so it
+/// proves nothing about a fabricated answer; requiring a short phrase closes
+/// that hole without rejecting legitimately terse citations such as
+/// "100 degrees Celsius".
+const MIN_EVIDENCE_WORDS: usize = 3;
+
+/// Whether an evidence quote is substantive and appears in the source text
+/// after folding case, punctuation, and whitespace.
+///
+/// Cheap models paraphrase formatting even when quoting faithfully, so exact
+/// matching would reject grounded drafts — hence the normalization. A quote
+/// shorter than [`MIN_EVIDENCE_WORDS`] words is rejected outright: it would
+/// substring-match trivially and cannot support an answer. This is the same
+/// predicate the generation trust gate applies, exported so eval judges score
+/// exactly what production enforces.
+#[must_use]
+pub fn evidence_quote_matches(source_text: &str, quote: &str) -> bool {
+    let quote = normalize_for_match(quote);
+    if quote.split(' ').filter(|word| !word.is_empty()).count() < MIN_EVIDENCE_WORDS {
+        return false;
     }
+
+    normalize_for_match(source_text).contains(&quote)
+}
+
+fn normalize_for_match(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_space = true;
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            normalized.push(character);
+            previous_space = false;
+        } else if !previous_space {
+            normalized.push(' ');
+            previous_space = true;
+        }
+    }
+    while normalized.ends_with(' ') {
+        normalized.pop();
+    }
+
+    normalized
 }
 
 fn require_source<E>(
@@ -305,136 +489,18 @@ fn require_source<E>(
     Ok(source)
 }
 
-fn parse_source_document(
+fn build_draft(
     source: &SourceDocument,
-    validation_failures: &mut Vec<String>,
-) -> Vec<ParsedCandidate> {
-    source
-        .body
-        .as_deref()
-        .unwrap_or_default()
-        .split("\n\n")
-        .enumerate()
-        .filter_map(|(index, block)| {
-            parse_candidate_block(source, block, index + 1, validation_failures)
-        })
-        .collect()
-}
-
-fn parse_candidate_block(
-    source: &SourceDocument,
-    block: &str,
-    block_index: usize,
-    validation_failures: &mut Vec<String>,
-) -> Option<ParsedCandidate> {
-    let fields = parse_fields(block);
-    let concept = fields.iter().find_value("concept");
-    let question = fields.iter().find_value("question");
-    let answer = fields.iter().find_value("answer");
-
-    let (Some(concept), Some(question), Some(answer)) = (concept, question, answer) else {
-        validation_failures.push(format!(
-            "{} block {block_index}: concept, question, and answer are required",
-            source.id
-        ));
-        return None;
-    };
-
-    Some(ParsedCandidate {
-        source: source.clone(),
-        block_index,
-        activity_kind: parse_activity_kind(fields.iter().find_value("activity")),
-        activity_stage: fields
-            .iter()
-            .find_value("stage")
-            .unwrap_or("recognition")
-            .to_owned(),
-        concept: concept.to_owned(),
-        question: question.to_owned(),
-        answer: answer.to_owned(),
-        reference: fields.iter().find_value("reference").map(str::to_owned),
-        distractors: split_list(fields.iter().find_value("distractors")),
-        worked_solution: fields
-            .iter()
-            .find_value("worked solution")
-            .or_else(|| fields.iter().find_value("worked"))
-            .map(str::to_owned),
-        unsupported: parse_boolean(fields.iter().find_value("unsupported")).unwrap_or(false)
-            || parse_boolean(fields.iter().find_value("supported")) == Some(false),
-    })
-}
-
-fn parse_fields(block: &str) -> Vec<(String, String)> {
-    block
-        .lines()
-        .filter_map(|raw_line| {
-            let line = raw_line.trim();
-            let separator = line.find(':')?;
-            let key = line[..separator].trim().to_lowercase();
-            let value = line[separator + 1..].trim().to_owned();
-            if key.is_empty() || value.is_empty() {
-                None
-            } else {
-                Some((key, value))
-            }
-        })
-        .collect()
-}
-
-trait FindField<'a> {
-    fn find_value(self, key: &str) -> Option<&'a str>;
-}
-
-impl<'a, T> FindField<'a> for T
-where
-    T: Iterator<Item = &'a (String, String)>,
-{
-    fn find_value(self, key: &str) -> Option<&'a str> {
-        self.filter_map(|(candidate_key, value)| {
-            if candidate_key == key {
-                Some(value.as_str())
-            } else {
-                None
-            }
-        })
-        .last()
-    }
-}
-
-fn parse_activity_kind(value: Option<&str>) -> GeneratedLearningActivityKind {
-    if value.is_some_and(|value| value.eq_ignore_ascii_case("exercise")) {
-        GeneratedLearningActivityKind::Exercise
-    } else {
-        GeneratedLearningActivityKind::Quiz
-    }
-}
-
-fn parse_boolean(value: Option<&str>) -> Option<bool> {
-    match value?.to_lowercase().as_str() {
-        "true" | "yes" => Some(true),
-        "false" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn split_list(value: Option<&str>) -> Vec<String> {
-    value.map_or_else(Vec::new, |value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
-}
-
-fn build_draft(candidate: &ParsedCandidate, context: &DraftContext<'_>) -> GeneratedPromptDraft {
+    candidate: &DraftCandidate,
+    context: &DraftContext<'_>,
+) -> GeneratedPromptDraft {
     let unit_id = ReviewUnitId::new(generated_id(
         "generated",
         activity_kind_slug(&candidate.activity_kind),
+        &source.id,
         candidate,
     ));
-    let reasons = validation_reasons(candidate, context.duplicate);
+    let reasons = validation_reasons(candidate, context.duplicate, context.quote_verified);
     let status = if reasons.is_empty() {
         GeneratedPromptValidationStatus::Accepted
     } else {
@@ -450,8 +516,8 @@ fn build_draft(candidate: &ParsedCandidate, context: &DraftContext<'_>) -> Gener
     };
 
     GeneratedPromptDraft {
-        id: generated_id(context.run_id, "draft", candidate),
-        source_document_ids: vec![candidate.source.id.clone()],
+        id: generated_id(context.run_id, "draft", &source.id, candidate),
+        source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
@@ -467,8 +533,8 @@ fn build_draft(candidate: &ParsedCandidate, context: &DraftContext<'_>) -> Gener
                 supersedes: Vec::new(),
             }),
             concept_key: Some(slug(&candidate.concept)),
-            source_key: Some(candidate.source.id.clone()),
-            domain_key: Some(source_kind_key(&candidate.source.kind).to_owned()),
+            source_key: Some(source.id.clone()),
+            domain_key: Some(source_kind_key(&source.kind).to_owned()),
         },
         activity_kind: candidate.activity_kind.clone(),
         activity_stage: candidate.activity_stage.clone(),
@@ -480,7 +546,7 @@ fn build_draft(candidate: &ParsedCandidate, context: &DraftContext<'_>) -> Gener
     }
 }
 
-fn build_prompt(candidate: &ParsedCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
+fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
     if candidate.activity_kind == GeneratedLearningActivityKind::Quiz
         && candidate.distractors.len() >= 2
     {
@@ -515,10 +581,17 @@ fn build_prompt(candidate: &ParsedCandidate, review_unit_id: &ReviewUnitId) -> P
     })
 }
 
-fn validation_reasons(candidate: &ParsedCandidate, duplicate: bool) -> Vec<String> {
+fn validation_reasons(
+    candidate: &DraftCandidate,
+    duplicate: bool,
+    quote_verified: bool,
+) -> Vec<String> {
     let mut reasons = Vec::new();
     if candidate.unsupported {
         reasons.push("Unsupported by cited source material".to_owned());
+    }
+    if !quote_verified {
+        reasons.push("Evidence quote not found in cited source".to_owned());
     }
     if duplicate {
         reasons.push("Duplicate-ish generated draft".to_owned());
@@ -546,7 +619,7 @@ fn existing_draft_signatures(drafts: &[GeneratedPromptDraft]) -> BTreeSet<String
         .collect()
 }
 
-fn candidate_signature(candidate: &ParsedCandidate) -> String {
+fn candidate_signature(candidate: &DraftCandidate) -> String {
     [
         slug(&candidate.concept),
         candidate.question.to_lowercase(),
@@ -592,12 +665,12 @@ fn stage_order(stage: &str, activity_kind: &GeneratedLearningActivityKind) -> u3
     }
 }
 
-fn generated_id(prefix: &str, kind: &str, candidate: &ParsedCandidate) -> String {
+fn generated_id(prefix: &str, kind: &str, source_id: &str, candidate: &DraftCandidate) -> String {
     [
         prefix.to_owned(),
         kind.to_owned(),
-        slug(&candidate.source.id),
-        candidate.block_index.to_string(),
+        slug(source_id),
+        candidate.index.to_string(),
         slug(&candidate.concept),
     ]
     .join("-")
@@ -650,5 +723,52 @@ fn source_kind_key(kind: &SourceDocumentKind) -> &'static str {
         SourceDocumentKind::File => "file",
         SourceDocumentKind::Image => "image",
         SourceDocumentKind::VideoTranscript => "video-transcript",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_quote_matches;
+
+    const SOURCE: &str = "Photosynthesis occurs in the chloroplast and converts \
+                          light into chemical energy stored as glucose.";
+
+    #[test]
+    fn substantive_verbatim_quote_matches() {
+        assert!(evidence_quote_matches(SOURCE, "occurs in the chloroplast"));
+    }
+
+    #[test]
+    fn match_tolerates_case_and_punctuation() {
+        assert!(evidence_quote_matches(
+            SOURCE,
+            "OCCURS, in the! Chloroplast"
+        ));
+    }
+
+    #[test]
+    fn trivial_one_or_two_word_quote_is_rejected() {
+        // The fabrication B1 closes: a real source word that proves nothing.
+        assert!(!evidence_quote_matches(SOURCE, "the"));
+        assert!(!evidence_quote_matches(SOURCE, "in the"));
+    }
+
+    #[test]
+    fn three_word_quote_is_the_floor() {
+        assert!(evidence_quote_matches(SOURCE, "into chemical energy"));
+    }
+
+    #[test]
+    fn empty_quote_is_rejected() {
+        assert!(!evidence_quote_matches(SOURCE, ""));
+        assert!(!evidence_quote_matches(SOURCE, "   "));
+    }
+
+    #[test]
+    fn substantive_quote_absent_from_source_is_rejected() {
+        assert!(!evidence_quote_matches(
+            SOURCE,
+            "stored as fructose molecules"
+        ));
     }
 }

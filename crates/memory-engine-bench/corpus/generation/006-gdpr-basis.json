@@ -1,0 +1,11 @@
+{
+  "id": "gdpr-basis",
+  "title": "GDPR lawful bases for processing",
+  "category": "regulatory",
+  "body": "Article 6 of the GDPR makes processing of personal data lawful only when at least one of six bases applies: the data subject's consent; necessity for performing a contract with the data subject; compliance with a legal obligation; protection of someone's vital interests; performance of a task in the public interest; or the controller's legitimate interests, except where those are overridden by the data subject's rights. Consent must be freely given, specific, informed, and unambiguous, and withdrawing consent must be as easy as giving it. Legitimate interest is the most flexible basis but requires a documented balancing test against the data subject's reasonable expectations.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["Article 6", "consent", "legitimate interest"]
+  }
+}

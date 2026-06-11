@@ -11,12 +11,13 @@ use memory_engine_core::{
     GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
-    run_beta_generation, BetaGenerationError, BetaGenerationRequest, BetaGenerationStore,
+    run_beta_generation, run_beta_generation_with_provider, BetaGenerationError,
+    BetaGenerationRequest, BetaGenerationStore, DraftProvider,
 };
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptValidationStatus,
-    SourceDocument, SourceDocumentKind, SourcePermission,
+    BetaStoreSnapshot, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    GeneratedPromptValidationStatus, SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceStore, NextQueueCommand, NextQueueOptions,
@@ -76,6 +77,10 @@ pub struct BetaStudyView {
     pub current: Option<BetaStudyCurrent>,
     pub summary: BetaStudySummary,
     pub api_pressure: Vec<String>,
+    /// Human-readable explanations for the most recent generation run:
+    /// provider failures, rejected drafts, and an empty-result message when a
+    /// run produced no drafts. Empty when the last run yielded drafts cleanly.
+    pub generation_notices: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,7 +431,8 @@ where
         self.view()
     }
 
-    /// Generate deterministic drafts from all saved sources or the supplied ids.
+    /// Generate drafts from saved sources using the deterministic
+    /// structured-block provider.
     ///
     /// # Errors
     ///
@@ -436,6 +442,38 @@ where
         source_document_ids: Option<Vec<String>>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let request = self.generation_request(&snapshot, source_document_ids);
+        run_beta_generation(&mut self.store, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Generate drafts from saved sources using the supplied provider.
+    ///
+    /// Lets the consumer choose a model-backed provider for arbitrary prose
+    /// while the crate stays provider-neutral; the provenance trust gate runs
+    /// inside generation regardless of provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when generation or store writes fail.
+    pub fn generate_with_provider(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        provider: &dyn DraftProvider,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let request = self.generation_request(&snapshot, source_document_ids);
+        run_beta_generation_with_provider(&mut self.store, provider, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    fn generation_request(
+        &self,
+        snapshot: &BetaStoreSnapshot,
+        source_document_ids: Option<Vec<String>>,
+    ) -> BetaGenerationRequest {
         let ids = source_document_ids.unwrap_or_else(|| {
             snapshot
                 .source_documents
@@ -443,19 +481,15 @@ where
                 .map(|source| source.id.clone())
                 .collect()
         });
-        run_beta_generation(
-            &mut self.store,
-            BetaGenerationRequest {
-                run_id: format!("study-run-{}", snapshot.generation_runs.len() + 1),
-                source_document_ids: ids,
-                started_at: (self.now)(),
-                completed_at: Some((self.now)()),
-                default_due: (self.now)() - 60_000,
-                model: None,
-            },
-        )?;
-        self.status = BetaStudyStatus::Drafting;
-        self.view()
+
+        BetaGenerationRequest {
+            run_id: format!("study-run-{}", snapshot.generation_runs.len() + 1),
+            source_document_ids: ids,
+            started_at: (self.now)(),
+            completed_at: Some((self.now)()),
+            default_due: (self.now)() - 60_000,
+            model: None,
+        }
     }
 
     /// Approve one accepted draft and select the next candidate.
@@ -733,6 +767,7 @@ where
                 next_review_unit_id,
             },
             api_pressure: api_pressure(),
+            generation_notices: generation_notices(&snapshot),
         })
     }
 
@@ -935,6 +970,39 @@ fn project_required_schedule(schedule: &ScheduleState) -> ReviewStateProjection 
         state: schedule.state,
         last_review: schedule.last_review,
     }
+}
+
+/// Build human-readable notices for the most recent generation run so the
+/// study UI never shows a silent empty result. Surfaces run-level failures
+/// (provider errors, missing provenance) and, when the run accepted no
+/// drafts, an explicit empty-result sentence.
+fn generation_notices(snapshot: &BetaStoreSnapshot) -> Vec<String> {
+    let Some(run) = snapshot
+        .generation_runs
+        .iter()
+        .max_by_key(|run| (run.started_at, run.completed_at))
+    else {
+        return Vec::new();
+    };
+
+    let mut notices = run.validation_failures.clone();
+    let accepted = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| {
+            draft.generation_run_id.as_deref() == Some(run.id.as_str())
+                && draft.validation.status == GeneratedPromptValidationStatus::Accepted
+        })
+        .count();
+    if run.completed_at.is_some() && accepted == 0 {
+        notices.push(
+            "No review items could be generated from this source yet — \
+             try pasting more complete prose, or generate again."
+                .to_owned(),
+        );
+    }
+
+    notices
 }
 
 fn api_pressure() -> Vec<String> {

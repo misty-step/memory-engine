@@ -8,6 +8,7 @@ members = [
     "crates/memory-engine-core",
     "crates/memory-engine-generation",
     "crates/memory-engine-import",
+    "crates/memory-engine-openrouter",
     "crates/memory-engine-service",
     "crates/memory-engine-qa",
     "crates/memory-engine-persistence",

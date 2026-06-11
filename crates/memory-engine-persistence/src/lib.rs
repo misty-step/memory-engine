@@ -124,6 +124,22 @@ pub struct GenerationRun {
     pub started_at: i64,
     pub completed_at: Option<i64>,
     pub validation_failures: Vec<String>,
+    #[serde(default)]
+    pub usage: Option<GenerationRunUsage>,
+}
+
+/// Token and cost accounting for one generation run, summed across sources.
+///
+/// Cost is stored in integer micro-USD so run records stay `Eq` and JSON-safe;
+/// `None` means the provider did not report a cost (for example deterministic
+/// local providers).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationRunUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd_micros: Option<i64>,
+    pub latency_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -50,7 +50,11 @@ without a green `bun run ci`.
 - `crates/memory-engine` — facade exports and testkit surface.
 - `crates/memory-engine-service` — typed service command boundary.
 - `crates/memory-engine-persistence` — local beta persistence.
-- `crates/memory-engine-generation` — deterministic source-backed generation.
+- `crates/memory-engine-generation` — source-backed generation behind a
+  `DraftProvider` boundary, with deterministic structured-block and fake
+  providers and the provenance trust gate.
+- `crates/memory-engine-openrouter` — OpenRouter-dialect HTTP draft provider
+  (model-backed generation); the only crate that talks to a model network.
 - `crates/memory-engine-study` — beta session/API boundary.
 - `crates/memory-engine-beta-app` and `crates/memory-engine-web-shell` — local
   Rust HTTP dogfood hosts.

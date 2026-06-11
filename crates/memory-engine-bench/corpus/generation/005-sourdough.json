@@ -1,0 +1,11 @@
+{
+  "id": "sourdough",
+  "title": "Maintaining a sourdough starter",
+  "category": "how-to",
+  "body": "A sourdough starter is a stable culture of wild yeast and lactic acid bacteria living in a paste of flour and water. To maintain one, discard all but roughly 50 grams of the culture and feed the remainder with equal weights of flour and water, about 100 grams of each, once every 24 hours at room temperature. A healthy starter doubles in volume within 4 to 8 hours of feeding and smells pleasantly sour, like yogurt. If it smells of acetone or nail polish remover, it is underfed: shorten the feeding interval. Refrigeration slows the culture enough that one feeding per week suffices. Always let a refrigerated starter return to room temperature and pass the doubling test before baking with it.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["50 grams", "doubles", "acetone"]
+  }
+}

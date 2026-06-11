@@ -1,0 +1,11 @@
+{
+  "id": "http-caching",
+  "title": "HTTP caching headers",
+  "category": "technical-doc",
+  "body": "HTTP caching is controlled primarily by the Cache-Control response header. The max-age directive sets how many seconds a response stays fresh; after that the cache must revalidate. The no-store directive forbids caching entirely, while no-cache allows storage but requires revalidation before each reuse. Revalidation uses conditional requests: the client sends If-None-Match with the ETag it holds, and the server answers 304 Not Modified when the representation is unchanged, saving the body transfer. The Vary header tells caches which request headers participate in the cache key; Vary: Accept-Encoding keeps compressed and uncompressed variants separate. A common mistake is treating no-cache as if it meant no-store.",
+  "expect": {
+    "min_drafts": 3,
+    "max_drafts": 8,
+    "key_terms": ["max-age", "no-store", "ETag", "304"]
+  }
+}

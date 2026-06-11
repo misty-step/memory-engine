@@ -1,0 +1,11 @@
+{
+  "id": "rubicon",
+  "title": "Caesar crosses the Rubicon",
+  "category": "narrative-history",
+  "body": "In January of 49 BC, Julius Caesar led the Thirteenth Legion across the Rubicon, a shallow river marking the boundary between the province of Cisalpine Gaul and Italy proper. Roman law forbade a general from bringing an army into Italy; crossing under arms was treason and made civil war inevitable. Suetonius reports that Caesar said \"alea iacta est\" — the die is cast. Pompey and much of the Senate abandoned Rome rather than face him, retreating south to Brundisium and then across the Adriatic. Within three months Caesar controlled the whole Italian peninsula without a major battle.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["49 BC", "Thirteenth Legion", "alea iacta est", "Pompey"]
+  }
+}

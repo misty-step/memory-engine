@@ -160,7 +160,19 @@ impl MemoryServiceStore for BenchStore {
     }
 }
 
+mod generation;
+mod judge;
+
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("generation") {
+        if let Err(error) = generation::run(&arguments[1..]) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     match run_benchmarks() {
         Ok(receipts) => print_receipts(&receipts),
         Err(error) => {

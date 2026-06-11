@@ -1,0 +1,11 @@
+{
+  "id": "curie",
+  "title": "Marie Curie",
+  "category": "biography",
+  "body": "Marie Curie, born Maria Sklodowska in Warsaw in 1867, was the first person to win Nobel Prizes in two different sciences. She shared the 1903 Physics prize with Pierre Curie and Henri Becquerel for research on radiation, and won the 1911 Chemistry prize alone for discovering the elements polonium and radium. She coined the term radioactivity. During the First World War she equipped mobile X-ray units, nicknamed petites Curies, and drove them to the front herself. Her laboratory notebooks remain so contaminated with radium-226 that they are stored in lead-lined boxes and require protective equipment to consult.",
+  "expect": {
+    "min_drafts": 2,
+    "max_drafts": 8,
+    "key_terms": ["1903", "1911", "polonium", "radioactivity"]
+  }
+}
