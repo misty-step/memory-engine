@@ -172,6 +172,7 @@ pub struct BrowserSession {
     pub account_id: String,
     pub session_token: String,
     pub csrf_token_hash: String,
+    pub expires_at_ms: i64,
 }
 
 impl PostgresStudyStore {
@@ -282,7 +283,7 @@ impl PostgresStudyStore {
         now_ms: i64,
     ) -> Result<Option<BrowserSession>, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
-            "SELECT account_id, session_token, csrf_token_hash
+            "SELECT account_id, session_token, csrf_token_hash, expires_at_ms
              FROM memory_engine_browser_sessions
              WHERE session_id_hash = $1
                AND revoked_at_ms IS NULL
@@ -294,6 +295,7 @@ impl PostgresStudyStore {
             account_id: row.get(0),
             session_token: row.get(1),
             csrf_token_hash: row.get(2),
+            expires_at_ms: row.get(3),
         }))
     }
 

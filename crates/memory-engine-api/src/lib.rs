@@ -108,12 +108,10 @@ impl AccountRegistry {
     pub fn with_store_root(store_root: impl Into<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
-                accounts: BTreeMap::new(),
-                browser_sessions: BTreeMap::new(),
-                auth_config: AuthConfig::default(),
                 storage: StudyStorageBackend::File {
                     store_root: store_root.into(),
                 },
+                ..AccountRegistryData::default()
             })),
         }
     }
@@ -122,12 +120,10 @@ impl AccountRegistry {
     pub fn with_postgres_url(database_url: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
-                accounts: BTreeMap::new(),
-                browser_sessions: BTreeMap::new(),
-                auth_config: AuthConfig::default(),
                 storage: StudyStorageBackend::Postgres {
                     database_url: database_url.into(),
                 },
+                ..AccountRegistryData::default()
             })),
         }
     }
@@ -144,14 +140,52 @@ impl AccountRegistry {
         drop(data);
         self
     }
+
+    /// Replace the wall-clock time source, for tests that control time.
+    ///
+    /// Production constructors default to wall-clock milliseconds; every
+    /// schedule, auth-challenge, and session-expiry decision flows through
+    /// this clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account registry mutex is poisoned.
+    #[must_use]
+    pub fn with_clock(self, now_fn: fn() -> i64) -> Self {
+        let mut data = self.inner.lock().expect("account registry lock");
+        data.now_fn = now_fn;
+        drop(data);
+        self
+    }
+
+    fn clock(&self) -> fn() -> i64 {
+        self.inner.lock().expect("account registry lock").now_fn
+    }
+
+    fn now(&self) -> i64 {
+        (self.clock())()
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
     storage: StudyStorageBackend,
+    now_fn: fn() -> i64,
+}
+
+impl Default for AccountRegistryData {
+    fn default() -> Self {
+        Self {
+            accounts: BTreeMap::new(),
+            browser_sessions: BTreeMap::new(),
+            auth_config: AuthConfig::default(),
+            storage: StudyStorageBackend::default(),
+            now_fn: wall_clock_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -167,12 +201,21 @@ struct BrowserSessionRecord {
     account_id: String,
     session_token: String,
     csrf_token_hash: String,
+    expires_at_ms: i64,
 }
 
 #[derive(Clone, Debug)]
 enum StudyStorageBackend {
     File { store_root: PathBuf },
     Postgres { database_url: String },
+}
+
+/// Storage backend paired with the registry's time source, so every
+/// time-dependent persistence and scheduling decision shares one clock.
+#[derive(Clone, Debug)]
+struct StudyStorage {
+    backend: StudyStorageBackend,
+    now: fn() -> i64,
 }
 
 impl Default for StudyStorageBackend {
@@ -273,7 +316,7 @@ impl AccountRegistry {
         self.storage().save_auth_challenge(
             &token_hash,
             &email,
-            api_study_now() + AUTH_CHALLENGE_TTL_MS,
+            self.now().saturating_add(AUTH_CHALLENGE_TTL_MS),
         )?;
         let link = format!("/app/login/verify?token={token}");
         auth_config.deliver_magic_link(&email, &link)?;
@@ -287,7 +330,7 @@ impl AccountRegistry {
         let token_hash = secret_hash(token.trim());
         let email = self
             .storage()
-            .consume_auth_challenge(&token_hash, api_study_now())?
+            .consume_auth_challenge(&token_hash, self.now())?
             .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
         let account = self.login_account(&email)?;
 
@@ -455,6 +498,7 @@ impl AccountRegistry {
             account_id: account.account_id.clone(),
             session_token: account.session_token.clone(),
             csrf_token_hash: secret_hash(&csrf_token),
+            expires_at_ms: self.now().saturating_add(app_session_max_age_ms()),
         };
         self.storage()
             .save_browser_session(&browser_session_id, &session)?;
@@ -489,6 +533,12 @@ impl AccountRegistry {
             }
         }
         let session = session.ok_or_else(ApiFailure::missing_session)?;
+        if session.expires_at_ms <= self.now() {
+            let mut data = self.inner.lock().expect("account registry lock");
+            data.browser_sessions.remove(session_id);
+            drop(data);
+            return Err(ApiFailure::missing_session());
+        }
         if session.csrf_token_hash != secret_hash(csrf_token) {
             return Err(ApiFailure::forbidden("CSRF token does not match session."));
         }
@@ -502,9 +552,12 @@ impl AccountRegistry {
         })
     }
 
-    fn storage(&self) -> StudyStorageBackend {
+    fn storage(&self) -> StudyStorage {
         let data = self.inner.lock().expect("account registry lock");
-        data.storage.clone()
+        StudyStorage {
+            backend: data.storage.clone(),
+            now: data.now_fn,
+        }
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
@@ -578,11 +631,15 @@ impl AuthConfig {
     }
 }
 
-impl StudyStorageBackend {
+impl StudyStorage {
+    fn now_ms(&self) -> i64 {
+        (self.now)()
+    }
+
     fn account_store_path(&self, account_id: &str) -> PathBuf {
-        match self {
-            Self::File { store_root } => account_store_path(store_root, account_id),
-            Self::Postgres { .. } => PathBuf::new(),
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => account_store_path(store_root, account_id),
+            StudyStorageBackend::Postgres { .. } => PathBuf::new(),
         }
     }
 
@@ -591,8 +648,8 @@ impl StudyStorageBackend {
         account_id: &str,
         session_token: &str,
     ) -> Result<(), ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = account_session_path(store_root, account_id);
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)
@@ -601,10 +658,10 @@ impl StudyStorageBackend {
                 fs::write(path, session_token)
                     .map_err(|error| ApiFailure::internal(error.to_string()))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, |mut account| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_account(database_url, account_id, self.now_ms(), |mut account| {
                     account
-                        .save_api_session(session_token, api_study_now())
+                        .save_api_session(session_token, self.now_ms())
                         .map_err(postgres_failure)
                 })
             }
@@ -616,8 +673,8 @@ impl StudyStorageBackend {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = account_session_path(store_root, account_id);
                 let Ok(saved) = fs::read_to_string(path) else {
                     return Ok(false);
@@ -625,11 +682,13 @@ impl StudyStorageBackend {
 
                 Ok(saved.trim() == session_token)
             }
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store
-                    .api_session_matches(account_id, session_token)
-                    .map_err(postgres_failure)
-            }),
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .api_session_matches(account_id, session_token)
+                        .map_err(postgres_failure)
+                })
+            }
         }
     }
 
@@ -638,8 +697,8 @@ impl StudyStorageBackend {
         session_id: &str,
         session: &BrowserSessionRecord,
     ) -> Result<(), ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = browser_session_path(store_root, session_id);
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)
@@ -648,26 +707,29 @@ impl StudyStorageBackend {
                 fs::write(
                     path,
                     format!(
-                        "{}\n{}\n{}\n",
-                        session.account_id, session.session_token, session.csrf_token_hash
+                        "{}\n{}\n{}\n{}\n",
+                        session.account_id,
+                        session.session_token,
+                        session.csrf_token_hash,
+                        session.expires_at_ms
                     ),
                 )
                 .map_err(|error| ApiFailure::internal(error.to_string()))
             }
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store
-                    .save_browser_session(
-                        &secret_hash(session_id),
-                        &session.account_id,
-                        &session.session_token,
-                        &session.csrf_token_hash,
-                        api_study_now(),
-                        api_study_now()
-                            + i64::try_from(APP_SESSION_MAX_AGE_SECONDS).unwrap_or(i64::MAX)
-                                * 1_000,
-                    )
-                    .map_err(postgres_failure)
-            }),
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .save_browser_session(
+                            &secret_hash(session_id),
+                            &session.account_id,
+                            &session.session_token,
+                            &session.csrf_token_hash,
+                            self.now_ms(),
+                            session.expires_at_ms,
+                        )
+                        .map_err(postgres_failure)
+                })
+            }
         }
     }
 
@@ -675,8 +737,8 @@ impl StudyStorageBackend {
         &self,
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = browser_session_path(store_root, session_id);
                 let Ok(saved) = fs::read_to_string(path) else {
                     return Ok(None);
@@ -691,25 +753,36 @@ impl StudyStorageBackend {
                 let Some(csrf_token_hash) = lines.next() else {
                     return Ok(None);
                 };
+                let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok())
+                else {
+                    return Ok(None);
+                };
+                if expires_at_ms <= self.now_ms() {
+                    return Ok(None);
+                }
 
                 Ok(Some(BrowserSessionRecord {
                     account_id: account_id.to_owned(),
                     session_token: session_token.to_owned(),
                     csrf_token_hash: csrf_token_hash.to_owned(),
+                    expires_at_ms,
                 }))
             }
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store
-                    .browser_session(&secret_hash(session_id), api_study_now())
-                    .map(|session| {
-                        session.map(|session| BrowserSessionRecord {
-                            account_id: session.account_id,
-                            session_token: session.session_token,
-                            csrf_token_hash: session.csrf_token_hash,
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .browser_session(&secret_hash(session_id), self.now_ms())
+                        .map(|session| {
+                            session.map(|session| BrowserSessionRecord {
+                                account_id: session.account_id,
+                                session_token: session.session_token,
+                                csrf_token_hash: session.csrf_token_hash,
+                                expires_at_ms: session.expires_at_ms,
+                            })
                         })
-                    })
-                    .map_err(postgres_failure)
-            }),
+                        .map_err(postgres_failure)
+                })
+            }
         }
     }
 
@@ -719,8 +792,8 @@ impl StudyStorageBackend {
         email: &str,
         expires_at_ms: i64,
     ) -> Result<(), ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = auth_challenge_path(store_root, challenge_hash);
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)
@@ -729,11 +802,13 @@ impl StudyStorageBackend {
                 fs::write(path, format!("{email}\n{expires_at_ms}\n\n"))
                     .map_err(|error| ApiFailure::internal(error.to_string()))
             }
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store
-                    .save_auth_challenge(challenge_hash, email, expires_at_ms)
-                    .map_err(postgres_failure)
-            }),
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .save_auth_challenge(challenge_hash, email, expires_at_ms)
+                        .map_err(postgres_failure)
+                })
+            }
         }
     }
 
@@ -742,8 +817,8 @@ impl StudyStorageBackend {
         challenge_hash: &str,
         now_ms: i64,
     ) -> Result<Option<String>, ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let path = auth_challenge_path(store_root, challenge_hash);
                 let Ok(saved) = fs::read_to_string(&path) else {
                     return Ok(None);
@@ -768,21 +843,27 @@ impl StudyStorageBackend {
 
                 Ok(Some(email.to_owned()))
             }
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store
-                    .consume_auth_challenge(challenge_hash, now_ms)
-                    .map_err(postgres_failure)
-            }),
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store
+                        .consume_auth_challenge(challenge_hash, now_ms)
+                        .map_err(postgres_failure)
+                })
+            }
         }
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
-        match self {
-            Self::File { store_root } => Ok(account_session_path(store_root, account_id).exists()
-                || account_store_path(store_root, account_id).exists()),
-            Self::Postgres { database_url } => with_postgres_store(database_url, |store| {
-                store.account_exists(account_id).map_err(postgres_failure)
-            }),
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
+                Ok(account_session_path(store_root, account_id).exists()
+                    || account_store_path(store_root, account_id).exists())
+            }
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_store(database_url, |store| {
+                    store.account_exists(account_id).map_err(postgres_failure)
+                })
+            }
         }
     }
 
@@ -792,8 +873,8 @@ impl StudyStorageBackend {
         target_account_id: &str,
         source_store_path: &FsPath,
     ) -> Result<(), ApiFailure> {
-        match self {
-            Self::File { store_root } => {
+        match &self.backend {
+            StudyStorageBackend::File { store_root } => {
                 let target_store_path = account_store_path(store_root, target_account_id);
                 if source_store_path != target_store_path
                     && source_store_path.exists()
@@ -808,47 +889,55 @@ impl StudyStorageBackend {
                 }
                 Ok(())
             }
-            Self::Postgres { database_url } => {
-                let snapshot = with_postgres_account(database_url, source_account_id, |account| {
-                    account.snapshot().map_err(postgres_failure)
-                })?;
-                with_postgres_account(database_url, target_account_id, |mut account| {
-                    for document in snapshot.source_documents {
-                        account
-                            .save_source_document(&document)
-                            .map_err(postgres_failure)?;
-                    }
-                    for reference in snapshot.reference_spans {
-                        account
-                            .save_reference_span(&reference)
-                            .map_err(postgres_failure)?;
-                    }
-                    for run in snapshot.generation_runs {
-                        account
-                            .save_generation_run(&run)
-                            .map_err(postgres_failure)?;
-                    }
-                    for draft in snapshot.generated_prompt_drafts {
-                        account
-                            .save_generated_prompt_draft(&draft)
-                            .map_err(postgres_failure)?;
-                    }
-                    for review_unit in snapshot.review_units {
-                        account
-                            .save_review_unit(&review_unit)
-                            .map_err(postgres_failure)?;
-                    }
-                    for schedule in snapshot.schedules {
-                        account
-                            .set_schedule_state(
-                                &schedule.review_unit_id,
-                                Some(&schedule.state),
-                                api_study_now(),
-                            )
-                            .map_err(postgres_failure)?;
-                    }
-                    Ok(())
-                })
+            StudyStorageBackend::Postgres { database_url } => {
+                let snapshot = with_postgres_account(
+                    database_url,
+                    source_account_id,
+                    self.now_ms(),
+                    |account| account.snapshot().map_err(postgres_failure),
+                )?;
+                with_postgres_account(
+                    database_url,
+                    target_account_id,
+                    self.now_ms(),
+                    |mut account| {
+                        for document in snapshot.source_documents {
+                            account
+                                .save_source_document(&document)
+                                .map_err(postgres_failure)?;
+                        }
+                        for reference in snapshot.reference_spans {
+                            account
+                                .save_reference_span(&reference)
+                                .map_err(postgres_failure)?;
+                        }
+                        for run in snapshot.generation_runs {
+                            account
+                                .save_generation_run(&run)
+                                .map_err(postgres_failure)?;
+                        }
+                        for draft in snapshot.generated_prompt_drafts {
+                            account
+                                .save_generated_prompt_draft(&draft)
+                                .map_err(postgres_failure)?;
+                        }
+                        for review_unit in snapshot.review_units {
+                            account
+                                .save_review_unit(&review_unit)
+                                .map_err(postgres_failure)?;
+                        }
+                        for schedule in snapshot.schedules {
+                            account
+                                .set_schedule_state(
+                                    &schedule.review_unit_id,
+                                    Some(&schedule.state),
+                                    self.now_ms(),
+                                )
+                                .map_err(postgres_failure)?;
+                        }
+                        Ok(())
+                    },
+                )
             }
         }
     }
@@ -859,9 +948,9 @@ impl StudyStorageBackend {
         store_path: &FsPath,
         source: &SourceRecord,
     ) -> Result<(), ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let mut study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let mut study = open_study_session(store_path, self.now)?;
                 study
                     .add_source(BetaStudySourceInput {
                         id: source.source_id.clone(),
@@ -871,8 +960,8 @@ impl StudyStorageBackend {
                     .map_err(study_failure)?;
                 Ok(())
             }
-            Self::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, |study| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_study(database_url, account_id, self.now, |study| {
                     study
                         .add_source(BetaStudySourceInput {
                             id: source.source_id.clone(),
@@ -891,10 +980,10 @@ impl StudyStorageBackend {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        match self {
-            Self::File { .. } => persisted_sources(store_path),
-            Self::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, |account| {
+        match &self.backend {
+            StudyStorageBackend::File { .. } => persisted_sources(store_path),
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
                     Ok(account
                         .snapshot()
                         .map_err(postgres_failure)?
@@ -917,20 +1006,20 @@ impl StudyStorageBackend {
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
                 if !persisted_source_exists(store_path, source_id)? {
                     return Err(ApiFailure::not_found("Source not found."));
                 }
-                let mut study = open_study_session(store_path)?;
+                let mut study = open_study_session(store_path, self.now)?;
                 let view = study
                     .generate(Some(vec![source_id.to_owned()]))
                     .map_err(study_failure)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, |account| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
                     if !account
                         .snapshot()
                         .map_err(postgres_failure)?
@@ -940,7 +1029,7 @@ impl StudyStorageBackend {
                     {
                         return Err(ApiFailure::not_found("Source not found."));
                     }
-                    let mut study = BetaStudySession::from_store(account, api_study_now);
+                    let mut study = BetaStudySession::from_store(account, self.now);
                     let view = study
                         .generate(Some(vec![source_id.to_owned()]))
                         .map_err(study_failure)?;
@@ -957,15 +1046,15 @@ impl StudyStorageBackend {
         store_path: &FsPath,
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let mut study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let mut study = open_study_session(store_path, self.now)?;
                 let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, |study| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_study(database_url, account_id, self.now, |study| {
                     let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
                     Ok(StudyViewResponse::from_view(view))
@@ -979,15 +1068,15 @@ impl StudyStorageBackend {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let mut study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let mut study = open_study_session(store_path, self.now)?;
                 let view = study.start().map_err(study_failure)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, |study| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_study(database_url, account_id, self.now, |study| {
                     let view = study.start().map_err(study_failure)?;
 
                     Ok(StudyViewResponse::from_view(view))
@@ -1001,15 +1090,15 @@ impl StudyStorageBackend {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let study = open_study_session(store_path, self.now)?;
                 let view = study.view().map_err(study_failure)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, |study| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_study(database_url, account_id, self.now, |study| {
                     let view = study.view().map_err(study_failure)?;
 
                     Ok(StudyViewResponse::from_view(view))
@@ -1024,16 +1113,16 @@ impl StudyStorageBackend {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let mut study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let mut study = open_study_session(store_path, self.now)?;
                 require_current_review(&mut study, review_unit_id)?;
                 let view = study.reveal().map_err(study_failure)?;
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, |study| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_study(database_url, account_id, self.now, |study| {
                     require_current_review_postgres(study, review_unit_id)?;
                     let view = study.reveal().map_err(study_failure)?;
 
@@ -1052,9 +1141,9 @@ impl StudyStorageBackend {
         response_time_ms: u32,
         idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        match self {
-            Self::File { .. } => {
-                let mut study = open_study_session(store_path)?;
+        match &self.backend {
+            StudyStorageBackend::File { .. } => {
+                let mut study = open_study_session(store_path, self.now)?;
                 require_current_review(&mut study, review_unit_id)?;
                 let view = study
                     .submit_answer_with_idempotency_key(
@@ -1066,19 +1155,19 @@ impl StudyStorageBackend {
 
                 Ok(StudyViewResponse::from_view(view))
             }
-            Self::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, |account| {
+            StudyStorageBackend::Postgres { database_url } => {
+                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
                     if account
                         .applied_review_idempotency_key_exists(&idempotency_key)
                         .map_err(postgres_failure)?
                     {
-                        let study = BetaStudySession::from_store(account, api_study_now);
+                        let study = BetaStudySession::from_store(account, self.now);
                         let view = study.view().map_err(study_failure)?;
 
                         return Ok(StudyViewResponse::from_view(view));
                     }
 
-                    let mut study = BetaStudySession::from_store(account, api_study_now);
+                    let mut study = BetaStudySession::from_store(account, self.now);
                     require_current_review_postgres(&mut study, review_unit_id)?;
                     let view = study
                         .submit_answer_with_idempotency_key(
@@ -2348,21 +2437,33 @@ fn auth_challenge_path(store_root: &FsPath, challenge_hash: &str) -> PathBuf {
         .join("challenge")
 }
 
-fn open_study_session(path: &FsPath) -> Result<BetaStudySession, ApiFailure> {
-    BetaStudySession::open(BetaStudyOptions::new(path)).map_err(study_failure)
+fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
+    BetaStudySession::open(BetaStudyOptions::new(path).with_clock(now)).map_err(study_failure)
 }
 
 fn open_persistence_store(path: &FsPath) -> Result<BetaPersistenceStore, ApiFailure> {
     BetaPersistenceStore::open(path).map_err(|error| ApiFailure::internal(error.to_string()))
 }
 
-fn api_study_now() -> i64 {
-    memory_engine_study::DEFAULT_BETA_STUDY_NOW
+/// Wall-clock milliseconds since the Unix epoch: the production time source.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn app_session_max_age_ms() -> i64 {
+    i64::try_from(APP_SESSION_MAX_AGE_SECONDS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000)
 }
 
 fn with_postgres_account<R>(
     database_url: &str,
     account_id: &str,
+    now_ms: i64,
     operation: impl FnOnce(AccountStudyStore<'_>) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
     let run = || {
@@ -2370,9 +2471,7 @@ fn with_postgres_account<R>(
         store.migrate().map_err(postgres_failure)?;
         let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
         let mut account = store.for_account(scope);
-        account
-            .ensure_account(api_study_now())
-            .map_err(postgres_failure)?;
+        account.ensure_account(now_ms).map_err(postgres_failure)?;
 
         operation(account)
     };
@@ -2405,10 +2504,11 @@ fn with_postgres_store<R>(
 fn with_postgres_study<R>(
     database_url: &str,
     account_id: &str,
+    now: fn() -> i64,
     operation: impl FnOnce(&mut BetaStudySession<AccountStudyStore<'_>>) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
-    with_postgres_account(database_url, account_id, |account| {
-        let mut study = BetaStudySession::from_store(account, api_study_now);
+    with_postgres_account(database_url, account_id, now(), |account| {
+        let mut study = BetaStudySession::from_store(account, now);
         operation(&mut study)
     })
 }
@@ -2492,7 +2592,11 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::{router, AccountRegistry, ApiState, AuthConfig};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
+
+    use super::{router, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS};
 
     #[tokio::test]
     async fn healthz_exposes_production_api_boundary() {
@@ -3947,5 +4051,187 @@ mod tests {
             .await
             .expect("body");
         String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    #[test]
+    fn default_registry_clock_is_wall_time() {
+        let wall = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("epoch")
+                .as_millis(),
+        )
+        .expect("ms fits i64");
+        let now = (AccountRegistry::default().clock())();
+
+        assert!(
+            (now - wall).abs() < 60_000,
+            "default clock {now} is not wall time {wall}"
+        );
+    }
+
+    static EXPIRY_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+    fn expiry_clock() -> i64 {
+        EXPIRY_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn magic_link_is_rejected_after_its_ttl_elapses() {
+        EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+        let registry = AccountRegistry::default()
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
+            );
+
+        let fresh = registry
+            .request_magic_link("learner@example.com")
+            .expect("fresh link")
+            .debug_link
+            .expect("debug link");
+        let fresh_token = fresh.split("token=").nth(1).expect("token").to_owned();
+        assert!(registry.verify_magic_link(&fresh_token).is_ok());
+
+        let stale = registry
+            .request_magic_link("learner@example.com")
+            .expect("stale link")
+            .debug_link
+            .expect("debug link");
+        let stale_token = stale.split("token=").nth(1).expect("token").to_owned();
+        EXPIRY_CLOCK.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
+
+        assert!(
+            registry.verify_magic_link(&stale_token).is_err(),
+            "magic link must expire once its TTL elapses"
+        );
+    }
+
+    static SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+    fn session_clock() -> i64 {
+        SESSION_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn browser_session_is_rejected_after_it_expires() {
+        SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+        let registry = AccountRegistry::default()
+            .with_clock(session_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
+            );
+        let link = registry
+            .request_magic_link("learner@example.com")
+            .expect("link")
+            .debug_link
+            .expect("debug link");
+        let token = link.split("token=").nth(1).expect("token").to_owned();
+        let session = registry.verify_magic_link(&token).expect("session");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!(
+                "{}={}",
+                super::APP_SESSION_COOKIE_NAME,
+                session.browser_session_id
+            )
+            .parse()
+            .expect("cookie header"),
+        );
+        assert!(registry
+            .require_browser_session(&headers, &session.csrf_token)
+            .is_ok());
+
+        SESSION_CLOCK.fetch_add(
+            super::app_session_max_age_ms().saturating_add(1),
+            Ordering::SeqCst,
+        );
+        assert!(
+            registry
+                .require_browser_session(&headers, &session.csrf_token)
+                .is_err(),
+            "an expired browser session must be rejected server-side"
+        );
+        assert!(
+            registry
+                .require_browser_session(&headers, &session.csrf_token)
+                .is_err(),
+            "an expired session reloaded from storage must also be rejected"
+        );
+    }
+
+    static SCHEDULE_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+    fn schedule_clock() -> i64 {
+        SCHEDULE_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn correct_answer_is_not_due_again_until_real_time_passes() {
+        SCHEDULE_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+        let registry = AccountRegistry::default().with_clock(schedule_clock);
+        let account = registry
+            .create_account("learner@example.com")
+            .expect("account");
+
+        let source = registry
+            .save_source(
+                &account.account_id,
+                &account.session_token,
+                &super::CreateSourceRequest {
+                    title: "NATO practice notes".to_owned(),
+                    body: source_body(),
+                },
+            )
+            .expect("source");
+        let generated = registry
+            .generate_source(
+                &account.account_id,
+                &account.session_token,
+                &source.source_id,
+            )
+            .expect("generate");
+        let draft_id = generated.drafts.first().expect("draft").id.clone();
+        registry
+            .approve_draft(&account.account_id, &account.session_token, &draft_id)
+            .expect("approve");
+
+        let due = registry
+            .next_review(&account.account_id, &account.session_token)
+            .expect("next review");
+        let current = due.current.expect("approved unit is due");
+        let review_unit_id = current.review_unit_id.to_string();
+        let answered = registry
+            .submit_review(
+                &account.account_id,
+                &account.session_token,
+                &review_unit_id,
+                &super::SubmitReviewRequest {
+                    answer: "ALFA".to_owned(),
+                    response_time_ms: 1_500,
+                    idempotency_key: "clock-test-1".to_owned(),
+                },
+            )
+            .expect("submit");
+        assert_eq!(answered.summary.attempt_count, 1);
+
+        let same_moment = registry
+            .next_review(&account.account_id, &account.session_token)
+            .expect("next review");
+        assert!(
+            same_moment.current.is_none(),
+            "a correctly answered unit must not be due again at the same moment"
+        );
+
+        SCHEDULE_CLOCK.fetch_add(30 * 86_400_000, Ordering::SeqCst);
+        let later = registry
+            .next_review(&account.account_id, &account.session_token)
+            .expect("next review");
+        assert!(
+            later.current.is_some(),
+            "the unit must come due again once enough real time passes"
+        );
     }
 }
