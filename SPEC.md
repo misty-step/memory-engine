@@ -808,3 +808,20 @@ Main reason:
 
 The canaries proved enough semantic stability to move from package adoption to
 service form-factor discovery.
+
+## Strategy Update — 2026-06-10
+
+Direction confirmed in grooming session:
+
+1. **Model-backed generation is the key unlock.** Cheap structured-output
+   models (DeepSeek V4-flash, GPT-5.4-nano, Gemini Flash-Lite/Flash, Qwen
+   flash, Haiku 4.5 — $0.0006–$0.01 per typical source) make arbitrary-prose
+   → quiz generation affordable at volume. Default model is chosen by eval
+   receipts (ticket 047), not vibes.
+2. **The interface here is a prototype; Scry is the destination.** Scry
+   (`../scry`, currently parked) is the original hypersimplicity vision and
+   the likely resurrected client. Memory-engine prototypes the interface
+   (ticket 048), hardens into a versioned learning-science API/microservice
+   (tickets 049, 050), and Scry consumes it, owning experience and opinion.
+3. **Engine owns the science.** Scheduling, grading, and item design trace
+   to the cognitive-science literature with citations and evals (ticket 050).
