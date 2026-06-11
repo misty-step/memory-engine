@@ -15,7 +15,7 @@ use memory_engine_persistence::{
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::BetaStudyStore;
-use postgres::{Client, NoTls};
+use postgres::Client;
 
 pub const MIGRATION_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS memory_engine_accounts (
@@ -175,14 +175,69 @@ pub struct BrowserSession {
     pub expires_at_ms: i64,
 }
 
+/// TLS connector for Postgres, with Mozilla's compiled-in roots.
+///
+/// Managed providers (Neon) require TLS; the previous `NoTls` connector
+/// failed their handshake outright in production. Postgres negotiates TLS
+/// per the URL's `sslmode` (default `prefer`), so this connector also serves
+/// plaintext local and test databases by falling back when the server does
+/// not offer TLS.
+///
+/// # Panics
+///
+/// Panics only if rustls rejects its own default protocol versions, which
+/// would be a build-level misconfiguration.
+fn tls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
+    static CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        std::sync::Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+
+    tokio_postgres_rustls::MakeRustlsConnect::new(rustls::ClientConfig::clone(config))
+}
+
+/// Open a Postgres client, negotiating TLS per the URL's `sslmode`.
+///
+/// SCRAM channel binding is disabled: Neon's proxy advertises it but the
+/// handshake fails with "server did not use channel binding"; rustls already
+/// authenticates the server against the webpki roots, which is the property
+/// channel binding would add.
+///
+/// # Errors
+///
+/// Returns the Postgres error when the URL is malformed or the connection
+/// fails.
+///
+/// # Panics
+///
+/// Panics only if rustls rejects its own default protocol versions, which
+/// would be a build-level misconfiguration.
+pub fn connect_client(url: &str) -> Result<Client, postgres::Error> {
+    let mut config: postgres::Config = url.parse()?;
+    config.channel_binding(postgres::config::ChannelBinding::Disable);
+
+    config.connect(tls_connector())
+}
+
 impl PostgresStudyStore {
-    /// Connect to Postgres.
+    /// Connect to Postgres, negotiating TLS per the URL's `sslmode`.
     ///
     /// # Errors
     ///
     /// Returns [`PostgresStoreError`] when the connection fails.
     pub fn connect(url: &str) -> Result<Self, PostgresStoreError> {
-        let client = Client::connect(url, NoTls)?;
+        let client = connect_client(url)?;
 
         Ok(Self {
             client: RefCell::new(client),
@@ -1322,7 +1377,6 @@ mod tests {
     };
     use memory_engine_service::ServiceAttemptRecord;
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
-    use postgres::{Client, NoTls};
 
     use super::{
         applied_review_receipt_key, migration_sql, AccountScope, MemoryServiceStore,
@@ -1400,7 +1454,7 @@ mod tests {
             return;
         };
         let schema = format!("memory_engine_test_{}_{}", std::process::id(), NOW);
-        let mut admin = Client::connect(&database_url, NoTls).expect("connect admin postgres");
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
         admin
             .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
             .expect("create schema");

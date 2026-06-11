@@ -2707,7 +2707,6 @@ mod tests {
         body::{to_bytes, Body},
         http::{header::SET_COOKIE, Request, StatusCode},
     };
-    use postgres::{Client, NoTls};
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -4188,7 +4187,8 @@ mod tests {
                 rand::random::<u64>()
             );
             tokio::task::block_in_place(|| {
-                let mut client = Client::connect(&admin_url, NoTls).expect("postgres test connect");
+                let mut client = memory_engine_persistence_postgres::connect_client(&admin_url)
+                    .expect("postgres test connect");
                 client
                     .batch_execute(&format!("CREATE SCHEMA {schema}"))
                     .expect("create postgres test schema");
@@ -4207,7 +4207,9 @@ mod tests {
     impl Drop for PostgresTestDatabase {
         fn drop(&mut self) {
             let drop_schema = || {
-                if let Ok(mut client) = Client::connect(&self.admin_url, NoTls) {
+                if let Ok(mut client) =
+                    memory_engine_persistence_postgres::connect_client(&self.admin_url)
+                {
                     let _ = client
                         .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema));
                 }
