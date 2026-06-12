@@ -801,6 +801,23 @@ impl AccountStudyStore<'_> {
         Ok(())
     }
 
+    /// Hide source material from learner-facing flows while preserving receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the source is unknown or persistence fails.
+    pub fn archive_source_document(
+        &mut self,
+        source_document_id: &str,
+        archived_at: i64,
+    ) -> Result<SourceDocument, PostgresStoreError> {
+        let mut document = self.source_document(source_document_id)?;
+        document.archived_at = Some(archived_at);
+        self.save_source_document(&document)?;
+
+        Ok(document)
+    }
+
     /// Save or replace a source reference span for the scoped account.
     ///
     /// # Errors
@@ -968,6 +985,25 @@ impl AccountStudyStore<'_> {
         )
     }
 
+    fn source_document(
+        &self,
+        source_document_id: &str,
+    ) -> Result<SourceDocument, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT document FROM memory_engine_source_documents
+             WHERE account_id = $1 AND source_document_id = $2",
+            &[&self.scope.account_id, &source_document_id],
+        )?;
+        let Some(row) = row else {
+            return Err(PostgresStoreError::UnknownSourceDocument(
+                source_document_id.to_owned(),
+            ));
+        };
+        let value: serde_json::Value = row.get(0);
+
+        Ok(serde_json::from_value(value)?)
+    }
+
     fn reference_spans(&self) -> Result<Vec<ReferenceSpan>, PostgresStoreError> {
         query_json_column(
             self.client,
@@ -1107,6 +1143,14 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         AccountStudyStore::save_source_document(self, &document)?;
 
         Ok(document)
+    }
+
+    fn archive_source_document(
+        &mut self,
+        source_document_id: &str,
+        archived_at: i64,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::archive_source_document(self, source_document_id, archived_at)
     }
 
     fn approve_generated_prompt_draft(
@@ -1335,6 +1379,7 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 #[derive(Debug)]
 pub enum PostgresStoreError {
     BlankAccountId,
+    UnknownSourceDocument(String),
     UnknownReviewUnit(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
     RejectedGeneratedPromptDraft,
@@ -1352,6 +1397,7 @@ impl fmt::Display for PostgresStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BlankAccountId => formatter.write_str("Account id must not be blank"),
+            Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
                 write!(formatter, "Unknown generated prompt draft: {id}")
@@ -1385,6 +1431,7 @@ impl Error for PostgresStoreError {
             Self::Postgres(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::BlankAccountId
+            | Self::UnknownSourceDocument(_)
             | Self::UnknownReviewUnit(_)
             | Self::UnknownGeneratedPromptDraft(_)
             | Self::RejectedGeneratedPromptDraft
@@ -1875,6 +1922,7 @@ mod tests {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         }
     }
 

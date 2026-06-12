@@ -154,6 +154,7 @@ fn prose_source() -> SourceDocument {
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
         created_at: NOW,
+        archived_at: None,
     }
 }
 

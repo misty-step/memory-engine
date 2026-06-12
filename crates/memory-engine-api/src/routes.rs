@@ -2,7 +2,7 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -26,6 +26,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/logout", post(logout_app_session))
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
+        .route("/app/source/archive", post(archive_app_source))
         .route("/app/generate", post(generate_app_source))
         .route("/app/approve", post(approve_app_draft))
         .route("/app/next", post(next_app_review))
@@ -34,6 +35,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/accounts/{account_id}/sources",
             get(list_sources).post(create_source),
+        )
+        .route(
+            "/accounts/{account_id}/sources/{source_id}",
+            delete(archive_source),
         )
         .route(
             "/accounts/{account_id}/sources/{source_id}/generate",
@@ -115,6 +120,19 @@ async fn generate_source(
         session_token,
         &source_id,
     )?))
+}
+
+async fn archive_source(
+    State(state): State<ApiState>,
+    Path((account_id, source_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state
+        .accounts
+        .archive_source(&account_id, session_token, &source_id)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn approve_draft(
@@ -403,22 +421,15 @@ async fn create_app_source(
                 body: form.body,
             },
         )
-        .and_then(|_| {
-            state
-                .accounts
-                .list_sources(&account.account_id, &account.session_token)
+        .and_then(|source| {
+            state.accounts.generate_source(
+                &account.account_id,
+                &account.session_token,
+                &source.source_id,
+            )
         });
 
-    match result {
-        Ok(sources) => Html(render_app_shell(Some(&account), &sources, None, None)).into_response(),
-        Err(error) => Html(render_account_page(
-            &state,
-            &account,
-            None,
-            Some(&error.message),
-        ))
-        .into_response(),
-    }
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn generate_app_source(
@@ -440,6 +451,41 @@ async fn generate_app_source(
     );
 
     Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn archive_app_source(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppSourceActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result =
+        state
+            .accounts
+            .archive_source(&account.account_id, &account.session_token, &form.source_id);
+
+    match result {
+        Ok(view) => Html(render_account_page(
+            &state,
+            &account,
+            Some(&view),
+            Some("Source removed."),
+        ))
+        .into_response(),
+        Err(error) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some(&error.message),
+        ))
+        .into_response(),
+    }
 }
 
 async fn approve_app_draft(

@@ -5,7 +5,7 @@
 //! queue advancement. It composes the generation, persistence, and service
 //! crates without moving filesystem, HTTP, or UI concerns into the pure core.
 
-use std::{error::Error, fmt, path::PathBuf};
+use std::{collections::BTreeSet, error::Error, fmt, path::PathBuf};
 
 use memory_engine_core::{
     GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
@@ -74,6 +74,7 @@ pub struct BetaStudyView {
     pub sources: Vec<BetaStudySourceRow>,
     pub drafts: Vec<BetaStudyDraftRow>,
     pub queue: Vec<BetaStudyQueueRow>,
+    pub due_count: usize,
     pub current: Option<BetaStudyCurrent>,
     pub summary: BetaStudySummary,
     pub api_pressure: Vec<String>,
@@ -236,6 +237,17 @@ pub trait BetaStudyStore:
         document: SourceDocument,
     ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
 
+    /// Hide source material from learner-facing generation and study views.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the source is unknown or cannot be archived.
+    fn archive_source_document(
+        &mut self,
+        source_document_id: &str,
+        archived_at: i64,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
+
     /// Promote an accepted generated draft into a review unit.
     ///
     /// # Errors
@@ -292,6 +304,14 @@ impl BetaStudyStore for BetaPersistenceStore {
         document: SourceDocument,
     ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
         BetaPersistenceStore::save_source_document(self, document)
+    }
+
+    fn archive_source_document(
+        &mut self,
+        source_document_id: &str,
+        archived_at: i64,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::archive_source_document(self, source_document_id, archived_at)
     }
 
     fn approve_generated_prompt_draft(
@@ -378,7 +398,7 @@ where
     #[must_use]
     pub fn from_store(store: S, now: fn() -> i64) -> Self {
         let status = match store.snapshot() {
-            Ok(snapshot) if snapshot.source_documents.is_empty() => BetaStudyStatus::Empty,
+            Ok(snapshot) if !has_active_sources(&snapshot) => BetaStudyStatus::Empty,
             Ok(_) | Err(_) => BetaStudyStatus::Drafting,
         };
 
@@ -425,9 +445,65 @@ where
                 permission: SourcePermission::ModelEligible,
                 freshness: Some((self.now)()),
                 created_at: (self.now)(),
+                archived_at: None,
             })
             .map_err(BetaStudyError::Store)?;
         self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Archive source material and remove its generated reviews from the active queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the source is unknown or persistence fails.
+    pub fn archive_source(
+        &mut self,
+        source_document_id: &str,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let archived_at = (self.now)();
+        let related_review_unit_ids = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .filter(|draft| draft_references_source(draft, source_document_id))
+            .map(|draft| draft.review_unit_id.clone())
+            .collect::<Vec<_>>();
+
+        self.store
+            .archive_source_document(source_document_id, archived_at)
+            .map_err(BetaStudyError::Store)?;
+
+        for review_unit_id in related_review_unit_ids {
+            if snapshot
+                .review_units
+                .iter()
+                .any(|unit| unit.review_unit_id == review_unit_id && unit.archived_at.is_none())
+            {
+                self.store
+                    .archive_review_unit(&review_unit_id, archived_at)
+                    .map_err(BetaStudyError::Store)?;
+            }
+        }
+
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|draft| draft_references_source(draft, source_document_id))
+        {
+            self.current = None;
+            self.expected_answer = None;
+            self.reference_text = None;
+            self.grade = None;
+            self.schedule_change = None;
+        }
+
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        self.status = if has_active_sources(&snapshot) {
+            BetaStudyStatus::Drafting
+        } else {
+            BetaStudyStatus::Empty
+        };
         self.view()
     }
 
@@ -474,13 +550,17 @@ where
         snapshot: &BetaStoreSnapshot,
         source_document_ids: Option<Vec<String>>,
     ) -> BetaGenerationRequest {
-        let ids = source_document_ids.unwrap_or_else(|| {
-            snapshot
-                .source_documents
+        let active_source_ids = active_source_ids(snapshot);
+        let requested_ids = source_document_ids.unwrap_or_else(|| {
+            active_source_ids
                 .iter()
-                .map(|source| source.id.clone())
+                .map(std::string::ToString::to_string)
                 .collect()
         });
+        let ids = requested_ids
+            .into_iter()
+            .filter(|source_id| active_source_ids.contains(source_id))
+            .collect();
 
         BetaGenerationRequest {
             run_id: format!("study-run-{}", snapshot.generation_runs.len() + 1),
@@ -708,12 +788,39 @@ where
             .list_queue_candidates()
             .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
         queue.sort_by_key(|candidate| candidate.due);
-        let next_review_unit_id = queue
+        let active_source_ids = active_source_ids(&snapshot);
+        let active_sources = snapshot
+            .source_documents
+            .iter()
+            .filter(|source| source_is_active(source))
+            .collect::<Vec<_>>();
+        let active_drafts = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .filter(|draft| draft_has_active_source(draft, &active_source_ids))
+            .collect::<Vec<_>>();
+        let active_queue = queue
+            .iter()
+            .filter(|candidate| {
+                queue_candidate_has_active_source(
+                    &snapshot.generated_prompt_drafts,
+                    candidate,
+                    &active_source_ids,
+                )
+            })
+            .collect::<Vec<_>>();
+        let next_review_unit_id = active_queue
             .first()
             .map(|candidate| candidate.review_unit_id.clone());
+        let now = (self.now)();
+        let due_count = active_queue
+            .iter()
+            .filter(|candidate| candidate.due <= now)
+            .count();
         let current = self
             .current
             .as_ref()
+            .filter(|draft| draft_has_active_source(draft, &active_source_ids))
             .map(|draft| {
                 self.store
                     .read_schedule_state(&draft.review_unit_id)
@@ -733,21 +840,17 @@ where
 
         Ok(BetaStudyView {
             status: self.status,
-            sources: snapshot.source_documents.iter().map(source_row).collect(),
-            drafts: snapshot
-                .generated_prompt_drafts
-                .iter()
-                .map(draft_row)
-                .collect(),
-            queue: queue
+            sources: active_sources.iter().copied().map(source_row).collect(),
+            drafts: active_drafts.iter().copied().map(draft_row).collect(),
+            queue: active_queue
                 .iter()
                 .map(|candidate| queue_row(&snapshot.generated_prompt_drafts, candidate))
                 .collect(),
+            due_count,
             current,
             summary: BetaStudySummary {
-                source_count: snapshot.source_documents.len(),
-                accepted_draft_count: snapshot
-                    .generated_prompt_drafts
+                source_count: active_sources.len(),
+                accepted_draft_count: active_drafts
                     .iter()
                     .filter(|draft| {
                         draft.validation.status == GeneratedPromptValidationStatus::Accepted
@@ -756,7 +859,14 @@ where
                 approved_review_unit_count: snapshot
                     .review_units
                     .iter()
-                    .filter(|unit| unit.archived_at.is_none())
+                    .filter(|unit| {
+                        unit.archived_at.is_none()
+                            && review_unit_has_active_source(
+                                &snapshot.generated_prompt_drafts,
+                                unit,
+                                &active_source_ids,
+                            )
+                    })
                     .count(),
                 attempt_count: snapshot.attempts.len(),
                 last_outcome: snapshot
@@ -780,10 +890,34 @@ where
             })?
         };
         let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let active_source_ids = active_source_ids(&snapshot);
+        let now = (self.now)();
         self.current = selected
             .candidate
             .as_ref()
+            .filter(|candidate| candidate.due <= now)
             .and_then(|candidate| find_approved_draft(&snapshot, candidate));
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|draft| !draft_has_active_source(draft, &active_source_ids))
+        {
+            self.current = None;
+        }
+        if self.current.is_none() {
+            let mut queue = self
+                .store
+                .list_queue_candidates()
+                .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
+            queue.sort_by_key(|candidate| candidate.due);
+            self.current = queue
+                .iter()
+                .filter(|candidate| candidate.due <= now)
+                .find_map(|candidate| {
+                    find_approved_draft(&snapshot, candidate)
+                        .filter(|draft| draft_has_active_source(draft, &active_source_ids))
+                });
+        }
         self.status = if self.current.is_some() {
             BetaStudyStatus::Answering
         } else {
@@ -805,11 +939,13 @@ where
             self.current = None;
             return;
         };
+        let active_source_ids = active_source_ids(&snapshot);
         self.current = snapshot
             .review_units
             .iter()
             .find(|unit| unit.review_unit_id == active.review_unit_id)
-            .and_then(|unit| approved_draft_from_unit(&snapshot.generated_prompt_drafts, unit));
+            .and_then(|unit| approved_draft_from_unit(&snapshot.generated_prompt_drafts, unit))
+            .filter(|draft| draft_has_active_source(draft, &active_source_ids));
     }
 }
 
@@ -834,6 +970,60 @@ fn source_row(source: &SourceDocument) -> BetaStudySourceRow {
         kind: source.kind.clone(),
         created_at: source.created_at,
     }
+}
+
+fn has_active_sources(snapshot: &BetaStoreSnapshot) -> bool {
+    snapshot.source_documents.iter().any(source_is_active)
+}
+
+fn active_source_ids(snapshot: &BetaStoreSnapshot) -> BTreeSet<String> {
+    snapshot
+        .source_documents
+        .iter()
+        .filter(|source| source_is_active(source))
+        .map(|source| source.id.clone())
+        .collect()
+}
+
+fn source_is_active(source: &SourceDocument) -> bool {
+    source.archived_at.is_none()
+}
+
+fn draft_references_source(draft: &GeneratedPromptDraft, source_document_id: &str) -> bool {
+    draft
+        .source_document_ids
+        .iter()
+        .any(|id| id == source_document_id)
+}
+
+fn draft_has_active_source(
+    draft: &GeneratedPromptDraft,
+    active_source_ids: &BTreeSet<String>,
+) -> bool {
+    draft
+        .source_document_ids
+        .iter()
+        .any(|source_id| active_source_ids.contains(source_id))
+}
+
+fn queue_candidate_has_active_source(
+    drafts: &[GeneratedPromptDraft],
+    candidate: &QueueCandidate,
+    active_source_ids: &BTreeSet<String>,
+) -> bool {
+    drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == candidate.review_unit_id)
+        .is_none_or(|draft| draft_has_active_source(draft, active_source_ids))
+}
+
+fn review_unit_has_active_source(
+    drafts: &[GeneratedPromptDraft],
+    review_unit: &memory_engine_persistence::BetaReviewUnitRecord,
+    active_source_ids: &BTreeSet<String>,
+) -> bool {
+    approved_draft_from_unit(drafts, review_unit)
+        .is_none_or(|draft| draft_has_active_source(&draft, active_source_ids))
 }
 
 fn draft_row(draft: &GeneratedPromptDraft) -> BetaStudyDraftRow {

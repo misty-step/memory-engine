@@ -265,6 +265,7 @@ pub struct StudyViewResponse {
     pub drafts: Vec<BetaStudyDraftRow>,
     pub current: Option<BetaStudyCurrent>,
     pub summary: BetaStudySummary,
+    pub due_count: usize,
     #[serde(default)]
     pub generation_notices: Vec<String>,
 }
@@ -275,6 +276,7 @@ impl StudyViewResponse {
             drafts: view.drafts,
             current: view.current,
             summary: view.summary,
+            due_count: view.due_count,
             generation_notices: view.generation_notices,
         }
     }
@@ -763,6 +765,7 @@ fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
         .snapshot()
         .source_documents
         .into_iter()
+        .filter(|source| source.archived_at.is_none())
         .map(|source| SourceRecord {
             source_id: source.id,
             title: source.title,
@@ -777,7 +780,7 @@ fn persisted_source_exists(path: &FsPath, source_id: &str) -> Result<bool, ApiFa
         .snapshot()
         .source_documents
         .iter()
-        .any(|source| source.id == source_id))
+        .any(|source| source.id == source_id && source.archived_at.is_none()))
 }
 
 fn study_failure<E: std::fmt::Display>(
@@ -875,8 +878,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains(r#"<form action="/app/start" method="post">"#));
-        assert!(body.contains("Generate study material"));
+        assert!(body.contains("Add something you want to learn"));
+        assert!(body.contains("Create review"));
+        assert!(body.contains(r#"placeholder="Paste anything worth remembering.""#));
         assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+        assert!(!body.contains("NATO practice notes"));
+        assert!(!body.contains("Concept: NATO letter A"));
         assert!(
             body.find("/app/start").expect("start form")
                 < body.find("/app/account").expect("account form")
@@ -919,9 +926,7 @@ mod tests {
         assert_eq!(started.status(), StatusCode::OK);
         let cookie = session_cookie(&started);
         let started = response_text(started).await;
-        assert!(started.contains("Generated material"));
-        assert!(started.contains("What is the NATO phonetic alphabet word for A?"));
-        assert!(started.contains("Keep for review"));
+        assert_keep_flow_html(&started);
 
         let csrf_token = html_value(&started, "csrfToken");
         let draft_id = html_value(&started, "draftId");
@@ -938,8 +943,7 @@ mod tests {
             .expect("approve");
         assert_eq!(approved.status(), StatusCode::OK);
         let approved = response_text(approved).await;
-        assert!(approved.contains("Review"));
-        assert!(approved.contains("Reveal answer"));
+        assert_due_review_html(&approved);
         let review_unit_id = html_value(&approved, "reviewUnitId");
 
         let revealed = app
@@ -977,9 +981,7 @@ mod tests {
             .expect("submit");
         assert_eq!(submitted.status(), StatusCode::OK);
         let submitted = response_text(submitted).await;
-        assert!(submitted.contains("Last result: Correct"));
-        assert!(submitted.contains("Next review"));
-        assert!(submitted.contains("<strong>1</strong> attempts"));
+        assert_submitted_review_html(&submitted);
 
         let next = app
             .oneshot(form_request_with_cookie(
@@ -992,7 +994,9 @@ mod tests {
             .expect("next");
         assert_eq!(next.status(), StatusCode::OK);
         let next = response_text(next).await;
-        assert!(next.contains("Progress"));
+        assert!(next.contains("0 due"));
+        assert!(next.contains("Add something you want to learn"));
+        assert!(!next.contains("Progress"));
     }
 
     #[tokio::test]
@@ -1047,6 +1051,7 @@ mod tests {
         assert_eq!(approved.status(), StatusCode::OK);
         let approved = response_text(approved).await;
         assert!(!approved.contains(r#"name="sessionToken""#));
+        assert!(!approved.contains("acct_"));
         assert!(approved.contains("Reveal answer"));
     }
 
@@ -1078,6 +1083,14 @@ mod tests {
                 ("body", "Poena means punishment."),
             ],
             "source without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/source/archive",
+            &[("sourceId", &source_id)],
+            "archive without csrf",
         )
         .await;
         assert_forbidden_form(
@@ -1201,8 +1214,10 @@ mod tests {
         assert_eq!(verified.status(), StatusCode::OK);
         let cookie = session_cookie(&verified);
         let verified = response_text(verified).await;
-        assert!(verified.contains("acct_fc9e1ff15d47bd67"));
         assert!(verified.contains("NATO practice notes"));
+        assert!(!verified.contains("acct_fc9e1ff15d47bd67"));
+        assert!(!verified.contains("Save account email"));
+        assert!(!verified.contains(r#"name="email""#));
         assert!(!verified.contains(r#"name="sessionToken""#));
         assert!(cookie.starts_with("__Host-memory_engine_session="));
     }
@@ -1587,9 +1602,10 @@ mod tests {
         assert_eq!(saved.status(), StatusCode::OK);
         let saved_cookie = session_cookie(&saved);
         let saved = response_text(saved).await;
-        assert!(saved.contains("acct_fc9e1ff15d47bd67"));
         assert!(saved.contains("NATO practice notes"));
-        assert!(saved.contains("Keep for review"));
+        assert!(saved.contains("Keep this"));
+        assert!(!saved.contains("acct_fc9e1ff15d47bd67"));
+        assert!(!saved.contains("Save account email"));
         let saved_csrf_token = html_value(&saved, "csrfToken");
         let source_id = html_value(&saved, "sourceId");
 
@@ -1621,7 +1637,58 @@ mod tests {
             .expect("generate after resume");
         assert_eq!(generated.status(), StatusCode::OK);
         let generated = response_text(generated).await;
-        assert!(generated.contains("Generated material"));
+        assert!(generated.contains("Choose what to keep"));
+    }
+
+    #[tokio::test]
+    async fn mobile_source_archive_hides_source_and_blocks_regeneration() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        assert!(started.contains("NATO practice notes"));
+
+        let archived = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/source/archive",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("archive source");
+        assert_eq!(archived.status(), StatusCode::OK);
+        let archived = response_text(archived).await;
+        assert!(archived.contains("Source removed"));
+        assert!(archived.contains("Add something you want to learn"));
+        assert!(!archived.contains("NATO practice notes"));
+        assert!(!archived.contains("What is the NATO phonetic alphabet word for A?"));
+
+        let regenerated = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("generate archived source");
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let regenerated = response_text(regenerated).await;
+        assert!(regenerated.contains("Source not found."));
+        assert!(!regenerated.contains("Choose what to keep"));
     }
 
     #[tokio::test]
@@ -1957,6 +2024,103 @@ mod tests {
             generated["drafts"][0]["prompt"],
             json!("What is the NATO phonetic alphabet word for A?")
         );
+    }
+
+    #[tokio::test]
+    async fn source_archive_hides_source_and_blocks_api_generation() {
+        let app = router(ApiState::default());
+        let account = create_account(&app, "learner@example.com").await;
+        let source = save_source(&app, &account, "NATO practice notes", &source_body()).await;
+        let source_id = source["sourceId"].as_str().expect("source id").to_owned();
+
+        let archived = app
+            .clone()
+            .oneshot(empty_request(
+                "DELETE",
+                &format!("/accounts/{}/sources/{source_id}", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("archive source");
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+
+        let sources = app
+            .clone()
+            .oneshot(empty_request(
+                "GET",
+                &format!("/accounts/{}/sources", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("sources after archive");
+        assert_eq!(sources.status(), StatusCode::OK);
+        let sources = response_json(sources).await;
+        assert_eq!(sources["sources"], json!([]));
+
+        let generated = app
+            .oneshot(empty_request(
+                "POST",
+                &format!(
+                    "/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate archived source");
+        assert_eq!(generated.status(), StatusCode::NOT_FOUND);
+        let generated = response_json(generated).await;
+        assert_eq!(generated["error"], json!("Source not found."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_backend_source_archive_hides_source_and_blocks_generation() {
+        let Some(database) = PostgresTestDatabase::new("source_archive") else {
+            return;
+        };
+        let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+            database.scoped_url.clone(),
+        )));
+        let account = create_account(&app, "learner@example.com").await;
+        let source = save_source(&app, &account, "NATO practice notes", &source_body()).await;
+        let source_id = source["sourceId"].as_str().expect("source id").to_owned();
+
+        let archived = app
+            .clone()
+            .oneshot(empty_request(
+                "DELETE",
+                &format!("/accounts/{}/sources/{source_id}", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("archive source");
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+
+        let sources = app
+            .clone()
+            .oneshot(empty_request(
+                "GET",
+                &format!("/accounts/{}/sources", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("sources after archive");
+        assert_eq!(sources.status(), StatusCode::OK);
+        let sources = response_json(sources).await;
+        assert_eq!(sources["sources"], json!([]));
+
+        let generated = app
+            .oneshot(empty_request(
+                "POST",
+                &format!(
+                    "/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate archived source");
+        assert_eq!(generated.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2653,6 +2817,61 @@ mod tests {
         let start = html.find(&marker).expect("field marker") + marker.len();
         let end = html[start..].find('"').expect("field end") + start;
         html[start..end].to_owned()
+    }
+
+    fn assert_keep_flow_html(body: &str) {
+        assert!(body.contains("Choose what to keep"));
+        assert!(body.contains("What is the NATO phonetic alphabet word for A?"));
+        assert!(body.contains("Keep this"));
+        assert_not_contains_any(
+            body,
+            &[
+                "Generated material",
+                "validation",
+                "recognition-3",
+                "activity_stage",
+                "Save account email",
+                "Session ready for",
+                "acct_",
+            ],
+        );
+    }
+
+    fn assert_due_review_html(body: &str) {
+        assert!(body.contains("1 due"));
+        assert!(body.contains("Reveal answer"));
+        assert!(body.contains("What is the NATO phonetic alphabet word for A?"));
+        assert_not_contains_any(
+            body,
+            &[
+                "Sources",
+                "Generated material",
+                "Choose what to keep",
+                "Progress",
+                "drafts",
+                "attempts",
+                "validation",
+                "recognition-3",
+                "Save account email",
+                "Session ready for",
+                "acct_",
+            ],
+        );
+    }
+
+    fn assert_submitted_review_html(body: &str) {
+        assert!(body.contains("Correct"));
+        assert!(body.contains("Next"));
+        assert_not_contains_any(body, &["Last result", "attempts", "Progress", "Correct("]);
+    }
+
+    fn assert_not_contains_any(body: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(
+                !body.contains(needle),
+                "body unexpectedly contained {needle:?}"
+            );
+        }
     }
 
     async fn save_source(

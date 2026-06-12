@@ -203,6 +203,15 @@ impl StudyStorage {
             .generate_source(account_id, store_path, source_id)
     }
 
+    pub(crate) fn archive_source(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner.archive_source(account_id, store_path, source_id)
+    }
+
     pub(crate) fn approve_draft(
         &self,
         account_id: &str,
@@ -314,6 +323,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure>;
     fn generate_source(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn archive_source(
         &self,
         account_id: &str,
         store_path: &FsPath,
@@ -611,6 +626,21 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(StudyViewResponse::from_view(view))
     }
 
+    fn archive_source(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        if !persisted_source_exists(store_path, source_id)? {
+            return Err(ApiFailure::not_found("Source not found."));
+        }
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        let view = study.archive_source(source_id).map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
     fn approve_draft(
         &self,
         _account_id: &str,
@@ -902,6 +932,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 .map_err(postgres_failure)?
                 .source_documents
                 .into_iter()
+                .filter(|source| source.archived_at.is_none())
                 .map(|source| SourceRecord {
                     source_id: source.id,
                     title: source.title,
@@ -923,12 +954,35 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 .map_err(postgres_failure)?
                 .source_documents
                 .iter()
-                .any(|source| source.id == source_id)
+                .any(|source| source.id == source_id && source.archived_at.is_none())
             {
                 return Err(ApiFailure::not_found("Source not found."));
             }
             let mut study = BetaStudySession::from_store(account, self.now);
             let view = run_source_generation(&mut study, source_id)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn archive_source(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            if !account
+                .snapshot()
+                .map_err(postgres_failure)?
+                .source_documents
+                .iter()
+                .any(|source| source.id == source_id && source.archived_at.is_none())
+            {
+                return Err(ApiFailure::not_found("Source not found."));
+            }
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study.archive_source(source_id).map_err(study_failure)?;
 
             Ok(StudyViewResponse::from_view(view))
         })

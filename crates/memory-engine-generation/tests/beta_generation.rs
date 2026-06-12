@@ -24,6 +24,7 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("source");
 
@@ -154,6 +155,7 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
             permission: SourcePermission::LocalOnly,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("source");
 
@@ -215,6 +217,7 @@ fn records_missing_provenance_failures_without_saving_malformed_drafts() {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("source");
 
@@ -276,6 +279,7 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("source");
     let empty = run_beta_generation(
