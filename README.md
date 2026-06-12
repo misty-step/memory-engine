@@ -40,7 +40,7 @@ boundary crates until dogfood evidence proves a stable reusable contract.
 
 ## Status
 
-The Rust migration has cut over the main runtime:
+The Rust migration is complete for the main runtime:
 
 - canonical types
 - FSRS scheduler wrapper
@@ -54,18 +54,29 @@ The Rust migration has cut over the main runtime:
 - Rust QA and benchmark receipt runners
 - historical Scry and Vault SRS canary branches
 
-Roadmap and shaping docs:
+The current production dogfood surface is `memory-engine-api`, a Rust binary
+deployed to Fly in `ord`. Agent-facing deployment, environment, auth, storage,
+and smoke-test details live in [docs/runbook.md](./docs/runbook.md).
+
+Current strategy and verification docs:
 
 - [SPEC.md](./SPEC.md)
+- [docs/qa/system.md](./docs/qa/system.md)
+- [docs/runbook.md](./docs/runbook.md)
+- [docs/rust-migration.md](./docs/rust-migration.md)
+
+Historical extraction packets, retained as boundary evidence rather than
+active delivery oracles:
+
 - [SLICE-1-KERNEL.md](./SLICE-1-KERNEL.md)
 - [SLICE-2-PROGRESSION.md](./SLICE-2-PROGRESSION.md)
 - [SLICE-3-RUBRIC.md](./SLICE-3-RUBRIC.md)
 - [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
+- [exemplars.md](./exemplars.md)
 
-Active backlog now tracks beta usefulness, service hardening, graduated
-activity support, and extraction decisions on top of the Rust stack.
-
-The active Rust migration ledger is [docs/rust-migration.md](./docs/rust-migration.md).
+Active backlog now tracks production dogfood usefulness, service hardening,
+learning-science quality, input capture, and extraction decisions on top of the
+Rust stack.
 
 ## Usage
 
@@ -144,7 +155,11 @@ Test fixtures for contract and interface tests:
 use memory_engine::testkit::{grading_fixtures, scheduler_fixtures};
 ```
 
-## Development
+## Quickstart
+
+Prerequisites: a Rust toolchain, Bun, and Dagger for the canonical CI handoff.
+
+Set the repository hook and run the local Rust verification loop:
 
 ```sh
 git config core.hooksPath .githooks
@@ -152,12 +167,25 @@ cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
-cargo run -p memory-engine-beta-app
-cargo run -p memory-engine-cli
-cargo run -p memory-engine-import
-cargo run -p memory-engine-web-shell
+bun run ci:local
+```
+
+Run the canonical gate before handoff:
+
+```sh
 bun run ci
-dagger call check --source=.
+```
+
+Run the production-shaped API locally with a file store:
+
+```sh
+MEMORY_ENGINE_ENABLE_FILE_STORE=true MEMORY_ENGINE_API_STORE_DIR=.tmp/api-dev MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-dev/outbox.tsv HOST=127.0.0.1 PORT=18080 cargo run -p memory-engine-api
+```
+
+From another shell, verify the local health route:
+
+```sh
+curl -fsS http://127.0.0.1:18080/healthz
 ```
 
 ## License

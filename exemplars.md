@@ -1,8 +1,16 @@
 # Exemplars
 
-External patterns this repo lifts or follows. Study these files before
-implementing the corresponding feature. Copy the semantics; only rename
-where `SLICE-1-KERNEL.md` documents a rename.
+> Historical note (2026-06-11): This file is archival extraction context for
+> the original learning-kernel lift. It is not active ground truth for current
+> delivery, and its source-system paths are historical boundary evidence rather
+> than required canary targets. Current strategy lives in `SPEC.md`; current
+> gates and deployed surface live in `AGENTS.md`, `README.md`,
+> `docs/qa/system.md`, and `docs/runbook.md`.
+
+External patterns this repo originally lifted or followed. Use them as
+historical explanation for why the Rust kernel looks the way it does; use live
+Rust tests, active backlog tickets, and current architecture docs before
+implementing new work.
 
 ## Deterministic grading (primary exemplar)
 

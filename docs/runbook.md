@@ -5,6 +5,39 @@ Everything here is CLI/API-driven; no dashboards required. The app is
 JSON API and the server-rendered study UI from one Rust binary at
 `https://memory-engine-api.fly.dev`.
 
+## Agent surface summary
+
+- App: `memory-engine-api`.
+- Platform: Fly Machines, org `misty-step`, primary region `ord`.
+- URL: `https://memory-engine-api.fly.dev`.
+- Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
+- Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
+  requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
+- Auth contract: allowlist plus magic links; production account creation and
+  magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
+  `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path.
+- Smoke contract: deploys run health, home-page, and anonymous mutation
+  boundary checks from `.github/workflows/deploy.yml`; agents can repeat the
+  exact commands below.
+
+## Deployed smoke
+
+These commands mirror the post-deploy smoke in `.github/workflows/deploy.yml`.
+
+```sh
+base="https://memory-engine-api.fly.dev"
+
+status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}" "$base/healthz")
+test "$status" = "200"
+grep -q '"status":"ok"' /tmp/memory-engine-healthz
+
+status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-home -w "%{http_code}" "$base/")
+test "$status" = "200"
+
+status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_code}" -X POST "$base/app/generate")
+case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
+```
+
 ## Deploy and rollback
 
 Deploys are automatic and gated: pushing `master` runs the `ci` workflow;

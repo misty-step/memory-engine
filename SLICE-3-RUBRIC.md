@@ -3,10 +3,16 @@ shaping: true
 slice: 3
 parent: SPEC.md
 date: 2026-04-17
-status: shaped-awaiting-slice-2-completion
+status: historical
 ---
 
 # Context Packet: Memory Engine — Slice 3 (Rubric Contract + Adapter Surface)
+
+> Historical note (2026-06-11): This slice packet is archival boundary evidence
+> from the TypeScript-era extraction work. It is not active ground truth, and
+> its Bun and consumer-canary commands are not current delivery oracles. Current
+> strategy lives in `SPEC.md`; current gates and deployed surface live in
+> `AGENTS.md`, `README.md`, `docs/qa/system.md`, and `docs/runbook.md`.
 
 ## Goal
 
