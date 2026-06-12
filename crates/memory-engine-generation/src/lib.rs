@@ -434,7 +434,7 @@ const MIN_EVIDENCE_WORDS: usize = 3;
 ///
 /// Cheap models paraphrase formatting even when quoting faithfully, so exact
 /// matching would reject grounded drafts — hence the normalization. A quote
-/// shorter than [`MIN_EVIDENCE_WORDS`] words is rejected outright: it would
+/// shorter than the minimum evidence-word threshold is rejected outright: it would
 /// substring-match trivially and cannot support an answer. This is the same
 /// predicate the generation trust gate applies, exported so eval judges score
 /// exactly what production enforces.

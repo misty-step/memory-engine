@@ -13,13 +13,15 @@ identity, analytics, and model clients until repeated proof justifies promotion.
 ## Ground Truth
 
 - `SPEC.md` is the strategy document.
-- `SLICE-*.md` files define shaped slice context.
+- `SLICE-*.md` files and `exemplars.md` are historical extraction context,
+  not current delivery oracles.
 - `backlog.d/` contains active work; `backlog.d/_done/` contains closed work.
-- `exemplars.md` names consumer/source systems to lift from.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
   consumer-facing Rust facade and module exports.
 - `docs/qa/system.md`, `docs/dogfood/`, and `docs/beta/` record executable QA and dogfood evidence.
+- `docs/runbook.md` documents the deployed Fly surface and production smoke
+  contract for agents.
 
 ## Gate Contract
 
@@ -48,13 +50,13 @@ runs Rust formatting, workspace tests, Clippy, rustdoc, and Gitleaks.
 
 Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`. Work references use `Refs-backlog: NN`; closure uses `Closes-backlog: NN` or `Ships-backlog: NN`. Archive by sourcing `scripts/lib/backlog.sh` and using `backlog_archive`.
 
-`/deliver` stops at merge-ready. `/settle` stops at ship-ready. `/ship` archives tickets, preserves closure trailers, merges, verifies archive state, writes final trace when available, and invokes bounded `/reflect`. `/groom` always reconciles tracker truth before strategy.
+`/deliver` stops at merge-ready. `/ship` archives tickets, preserves closure trailers, merges, verifies archive state, writes final trace when available, and invokes bounded `/reflect`. `/groom` always reconciles tracker truth before strategy.
 
 ## Known Debt
 
-- Complete the Rust cutover before adding new product scope: no non-Dagger
-  TypeScript runtime/test files should remain, and operator docs must point at
-  Rust crates and Cargo commands.
+- Keep the Rust cutover complete: no non-Dagger TypeScript runtime/test files
+  should return, and operator docs must point at Rust crates, Cargo commands,
+  Dagger CI, and the Fly runbook.
 - After cutover, prioritize repeated phone-sized dogfood receipts over new
   abstractions. Beta app extraction or promotion needs repeated evidence from
   the Rust app, not archived TypeScript-era tickets.
