@@ -31,5 +31,54 @@ Acceptance notes:
 - The review viewport omits source lists, generated-card lists, account ids, email re-entry, pipeline counts, validation details, and raw activity stages.
 - Source archive remains available from the management surface, outside the review viewport.
 
-Live deployed critique and Lighthouse receipts should be appended after PR merge
-and deploy.
+## Live deployed receipt
+
+Production deploy `27388646397` shipped master commit `7f25b19` to
+`https://memory-engine-api.fly.dev` on 2026-06-12. The deployed health check
+returned `{"status":"ok","service":"memory-engine-api"}`.
+
+Live phone critique:
+
+- Hierarchy: the first viewport opens on the empty capture loop, with the
+  capture form before sign-in and no account/source/review pipeline chrome.
+- Type: the mobile-emulated Lighthouse screenshot wraps the headline and keeps
+  form labels, placeholders, and button text readable at 390 x 844.
+- Spacing and density: the form is sparse enough for first contact, and the
+  sign-in surface is visually secondary below the capture action.
+- Vocabulary: deployed home HTML contains "Add something you want to learn",
+  "Paste anything worth remembering.", and "Create review"; it does not contain
+  NATO demo text, account ids, draft/attempt/validation language, or raw
+  activity-stage values.
+
+Lighthouse mobile run:
+
+```sh
+npx -y lighthouse@latest https://memory-engine-api.fly.dev/ \
+  --quiet \
+  --chrome-flags="--headless=new --no-sandbox" \
+  --form-factor=mobile \
+  --screenEmulation.mobile=true \
+  --screenEmulation.width=390 \
+  --screenEmulation.height=844 \
+  --screenEmulation.deviceScaleFactor=2 \
+  --only-categories=performance,accessibility \
+  --output=json \
+  --output-path=.tmp/048-live-proof/lighthouse-home.json
+```
+
+Result: performance 100, accessibility 100, first contentful paint 0.8 s,
+largest contentful paint 0.8 s, total blocking time 0 ms, cumulative layout
+shift 0.
+
+Production QA seed purge:
+
+- Identified the old deployment seed source in production account
+  `acct_48e443e2719d6f90`: `src_5fc8aff3662135d7`, title
+  "Antikythera mechanism".
+- Called the deployed source archive API:
+  `DELETE /accounts/acct_48e443e2719d6f90/sources/src_5fc8aff3662135d7`;
+  response `204`.
+- Verified the deployed source list reports `sourceCount: 0` and
+  `hasAntikythera: false`.
+- Verified Neon state has `archivedSourceCount: 1`, `relatedDrafts: 3`,
+  `relatedReviewUnitRows: 0`, and `activeRelatedReviewUnitRows: 0`.
