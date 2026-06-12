@@ -1,0 +1,33 @@
+# Learning Science Doctrine
+
+Refs-backlog: 050
+
+This is the living bibliography for decisions that belong in
+`memory-engine` rather than in one client experiment. A principle is adopted
+only when it names the source evidence, the product or kernel decision it
+drives, and an executable oracle that can fail when the behavior drifts.
+
+## Adopted Principles
+
+| Principle | Source evidence | Engine decision | Executable oracle |
+| --- | --- | --- | --- |
+| Retrieval practice is the primary learning event. | Roediger and Karpicke (2006), "Test-enhanced learning: taking memory tests improves long-term retention," DOI `10.1111/j.1467-9280.2006.01693.x`, [PubMed](https://pubmed.ncbi.nlm.nih.gov/16507066/). | Attempts and graded review outcomes are canonical learning evidence. Reveals, rereads, and passive exposure may help a client explain material, but they do not become mastery events without an attempt result. | `cargo test -p memory-engine-service grades_and_applies_review_as_one_store_commit -- --exact` proves one service command records the attempt, grade, and schedule update together. `cargo test -p memory-engine-core rating_policy_matches_the_typescript_matrix -- --exact` keeps `revealed` mapped away from successful retrieval. |
+| Spacing is robust, but timing stays an explicit policy. | Cepeda, Pashler, Vul, Wixted, and Rohrer (2006), "Distributed practice in verbal recall tasks," DOI `10.1037/0033-2909.132.3.354`, [PubMed](https://pubmed.ncbi.nlm.nih.gov/16719566/). | The pure scheduler owns replayable `ScheduleState` transitions. The current FSRS constants are a deterministic baseline, not a claim of universal optimality. | `cargo test -p memory-engine-core` runs scheduler parity and JSON-safe schedule-shape checks. `cargo run -p memory-engine-bench` now prints `scheduling.fsrs.synthetic_histories`, which compares steady successful review histories against repaired-lapse histories. |
+| Interleaving should mix intentional contrasts, not randomize the queue. | Brunmair and Richter (2019), "A meta-analysis of interleaved learning and its moderators," [PubMed](https://pubmed.ncbi.nlm.nih.gov/31556629/). The abstract-level conclusion is conditional: setting and material type matter. | Queue selection avoids recent concept/source/domain clumps while still preserving due urgency and progression locks. Same-domain alternatives are useful contrasts; global randomization is not the doctrine. | `cargo test -p memory-engine-core queue::tests::avoids_same_source_clumps_when_equally_urgent_alternative_exists -- --exact` pins the kernel behavior. `cargo run -p memory-engine-bench` prints `queue.interleaving.anti_clump`, a receipt-scale scenario over repeated same-domain alternatives. |
+| Desirable difficulty means staged retrieval depth, not arbitrary friction. | Bjork and Bjork, "Creating Desirable Difficulties to Enhance Learning," [UCLA Bjork Lab PDF](https://bjorklab.psych.ucla.edu/wp-content/uploads/sites/13/2016/04/EBjork_RBjork_2011.pdf); Maddox and Balota (2015), "Retrieval Practice and Spacing Effects in Young and Older Adults," [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC4480221/). | Generated activities should preserve a ladder from recognition to cued recall to free recall to composition. Friction that is not tied to retrieval strength, transfer, or calibration is out of scope. | `cargo test -p memory-engine-generation generation_preserves_retrieval_depth_progression_tiers -- --exact` proves structured generation persists stages with stage orders 1, 2, 3, and 4. |
+| FSRS personalization needs history, versioning, and simulation before promotion. | The official `fsrs4anki` README says the optimizer fits parameters to review history, [GitHub](https://github.com/open-spaced-repetition/fsrs4anki). The Rust FSRS project documents optimizer input as review-history items, [fsrs-rs](https://github.com/open-spaced-repetition/fsrs-rs). | `memory-engine-core` keeps fixed default parameters until the boundary has enough persisted review history and an explicit scheduler-version contract. Per-user optimization belongs behind a shaped analytics or boundary-crate slice, not as a silent kernel mutation. | `cargo run -p memory-engine-bench` prints `scheduling.fsrs.synthetic_histories`; future optimizer work must extend this into versioned replay fixtures before replacing defaults. |
+
+## Rejected Principles
+
+| Rejected principle | Source evidence | Why rejected here | Guardrail |
+| --- | --- | --- | --- |
+| Learning-style matching or "meshing" instruction to visual/auditory/etc. learner profiles. | Pashler, McDaniel, Rohrer, and Bjork, "Learning Styles: Concepts and Evidence," DOI `10.1111/j.1539-6053.2009.01038.x`, [SAGE](https://journals.sagepub.com/doi/abs/10.1111/j.1539-6053.2009.01038.x), [PubMed](https://pubmed.ncbi.nlm.nih.gov/26162104/). | The claim would add identity/profile branches without a strong enough outcome oracle. `memory-engine` should personalize from demonstrated review behavior, source difficulty, and item history before learner-style labels. | Do not add scheduler or generation branches for learner-style labels without a shaped ticket, cited contrary evidence, and a behavior eval that compares outcomes against the current retrieval/spacing/interleaving baseline. |
+
+## Review Checklist
+
+- A new science-backed feature must add or update one row above.
+- Every adopted row must name at least one executable oracle.
+- Every scheduler policy change must say whether it changes the FSRS default,
+  per-user fitting, or only boundary/client behavior.
+- Every generation policy change must preserve source provenance and identify
+  the retrieval depth it is trying to exercise.

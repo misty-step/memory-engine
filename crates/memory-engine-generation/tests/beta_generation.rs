@@ -247,6 +247,73 @@ fn records_missing_provenance_failures_without_saving_malformed_drafts() {
 }
 
 #[test]
+fn generation_preserves_retrieval_depth_progression_tiers() {
+    let directory = TempDirectory::new("retrieval-depths");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-depths".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Retrieval depth notes".to_owned(),
+            body: Some(retrieval_depth_body()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "run-depths".to_owned(),
+            source_document_ids: vec!["src-depths".to_owned()],
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 4);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+
+    let drafts = store.snapshot().generated_prompt_drafts;
+    let tiers = drafts
+        .iter()
+        .map(|draft| {
+            (
+                draft.activity_stage.as_str(),
+                draft
+                    .queue
+                    .progression
+                    .as_ref()
+                    .expect("progression")
+                    .stage_order,
+                &draft.prompt,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(tiers[0].0, "recognition");
+    assert_eq!(tiers[0].1, 1);
+    assert!(matches!(tiers[0].2, Prompt::Mcq { .. }));
+    assert_eq!(tiers[1].0, "cued-recall");
+    assert_eq!(tiers[1].1, 2);
+    assert!(matches!(tiers[1].2, Prompt::Exact(_)));
+    assert_eq!(tiers[2].0, "free-recall");
+    assert_eq!(tiers[2].1, 3);
+    assert!(matches!(tiers[2].2, Prompt::Exact(_)));
+    assert_eq!(tiers[3].0, "composition");
+    assert_eq!(tiers[3].1, 4);
+    assert!(matches!(tiers[3].2, Prompt::Exact(_)));
+}
+
+#[test]
 fn reports_unknown_and_empty_sources_before_starting_generation() {
     let directory = TempDirectory::new("source-errors");
     let path = directory.path().join("store.json");
@@ -318,6 +385,41 @@ fn source_body() -> String {
         "Answer: CHARLIE ALFA TANGO",
         "Worked Solution: C is CHARLIE, A is ALFA, and T is TANGO.",
         "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
+    ]
+    .join("\n")
+}
+
+fn retrieval_depth_body() -> String {
+    [
+        "Concept: Retrieval depth",
+        "Activity: quiz",
+        "Stage: recognition",
+        "Question: Which retrieval depth asks the learner to identify an answer?",
+        "Answer: recognition",
+        "Distractors: cued recall, composition",
+        "Reference: Recognition asks the learner to identify the answer among options.",
+        "",
+        "Concept: Retrieval depth",
+        "Activity: quiz",
+        "Stage: cued-recall",
+        "Question: With the cue 'identify among options', which depth is this?",
+        "Answer: recognition",
+        "Reference: Recognition asks the learner to identify the answer among options.",
+        "",
+        "Concept: Retrieval depth",
+        "Activity: quiz",
+        "Stage: free-recall",
+        "Question: Name the retrieval depth that asks the learner to identify an answer among options.",
+        "Answer: recognition",
+        "Reference: Recognition asks the learner to identify the answer among options.",
+        "",
+        "Concept: Retrieval depth transfer",
+        "Activity: exercise",
+        "Stage: composition",
+        "Question: Compose a study progression from recognizing a term to using it in a scenario.",
+        "Answer: recognition to cued recall to free recall to composition",
+        "Worked Solution: Start with recognition, remove options for cued recall, ask unaided free recall, then require composition in context.",
+        "Reference: A study progression can move from recognition to cued recall to free recall to composition in context.",
     ]
     .join("\n")
 }
