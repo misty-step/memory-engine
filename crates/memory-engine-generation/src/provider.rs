@@ -722,16 +722,31 @@ fn parse_source_document(
     source: &SourceDocument,
     validation_failures: &mut Vec<String>,
 ) -> Vec<DraftCandidate> {
-    source
-        .body
-        .as_deref()
-        .unwrap_or_default()
-        .split("\n\n")
+    structured_blocks(source.body.as_deref().unwrap_or_default())
         .enumerate()
         .filter_map(|(index, block)| {
-            parse_candidate_block(source, block, index + 1, validation_failures)
+            parse_candidate_block(source, &block, index + 1, validation_failures)
         })
         .collect()
+}
+
+fn structured_blocks(body: &str) -> impl Iterator<Item = String> + '_ {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current.join("\n"));
+    }
+    blocks.into_iter()
 }
 
 fn parse_candidate_block(

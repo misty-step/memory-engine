@@ -122,6 +122,48 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
 }
 
 #[test]
+fn browser_form_line_endings_preserve_multiple_structured_blocks() {
+    let directory = TempDirectory::new("browser-line-endings");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-browser".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Browser textarea source".to_owned(),
+            body: Some(source_body().replace('\n', "\r\n")),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "run-browser".to_owned(),
+            source_document_ids: vec!["src-browser".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(
+        result.accepted_draft_ids,
+        [
+            "run-browser-draft-src-browser-1-nato-letter-a",
+            "run-browser-draft-src-browser-2-nato-cat-composition"
+        ]
+    );
+}
+
+#[test]
 fn persists_rejected_unsupported_and_duplicate_drafts() {
     let directory = TempDirectory::new("rejected");
     let path = directory.path().join("store.json");

@@ -27,6 +27,9 @@ Covered behaviors:
 - answer submission for quiz prompts and worked-solution entry for exercises;
 - reveal display with expected answer and worked solution;
 - grade/apply-review with persisted schedule change;
+- post-answer feedback with this-item history and concept health derived from
+  the attempt log;
+- worst-first concept health list for the simple management surface;
 - next-item projection;
 - restart/resume from persisted state without regenerating content;
 - duplicate submit protection after a graded answer.
@@ -67,8 +70,9 @@ Browser smoke receipt on May 22, 2026:
   clearer rubric/result display before provider-backed generation.
 - Reveal remains UI-owned. The service has no reveal command and should not gain
   one until repeated beta evidence says reveal has scheduling consequences.
-- Review state is compactly projected for the interface, but the projection is
-  still assembled in beta-study code rather than a stable DTO.
+- Review state, post-answer feedback, and concept health are compactly projected
+  for the interface, but the projection is still assembled in beta-study code
+  rather than promoted into the pure kernel.
 
 ## API Pressure
 
@@ -76,6 +80,9 @@ Browser smoke receipt on May 22, 2026:
   generation, approval, attempts, schedules, and applied-review receipts.
 - `memory-engine-service` is sufficient for `next-queue` and
   `grade/apply-review`; no package export or runtime persistence was needed.
+- Result analytics currently scan the persisted attempt log in the study
+  boundary. That is the right v1 shape: no new analytics store, no scheduler
+  changes, and no concept meaning inferred from review-unit ids.
 - Worked solutions and activity kind/stage remain beta metadata. They should not
   move into `crates/memory-engine-core` until the graduated ladder ticket proves
   provider-neutral semantics across more than one fixture.

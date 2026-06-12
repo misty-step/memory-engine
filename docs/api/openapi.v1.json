@@ -520,6 +520,7 @@
         "required": [
           "drafts",
           "current",
+          "conceptProgress",
           "summary",
           "dueCount",
           "generationNotices"
@@ -541,6 +542,12 @@
               }
             ]
           },
+          "conceptProgress": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConceptProgress"
+            }
+          },
           "summary": {
             "$ref": "#/components/schemas/StudySummary"
           },
@@ -560,15 +567,20 @@
         "type": "object",
         "required": [
           "id",
+          "reviewUnitId",
           "activityKind",
           "activityStage",
           "prompt",
           "validationStatus",
           "validationReasons",
-          "workedSolution"
+          "workedSolution",
+          "approved"
         ],
         "properties": {
           "id": {
+            "type": "string"
+          },
+          "reviewUnitId": {
             "type": "string"
           },
           "activityKind": {
@@ -598,6 +610,9 @@
                 "type": "null"
               }
             ]
+          },
+          "approved": {
+            "type": "boolean"
           }
         }
       },
@@ -615,7 +630,8 @@
           "workedSolution",
           "grade",
           "reviewState",
-          "scheduleChange"
+          "scheduleChange",
+          "feedback"
         ],
         "properties": {
           "reviewUnitId": {
@@ -695,6 +711,131 @@
                 "type": "null"
               }
             ]
+          },
+          "feedback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StudyFeedback"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "StudyFeedback": {
+        "type": "object",
+        "required": [
+          "verdict",
+          "expectedAnswer",
+          "itemHistory",
+          "conceptProgress"
+        ],
+        "properties": {
+          "verdict": {
+            "type": "string"
+          },
+          "expectedAnswer": {
+            "type": "string"
+          },
+          "itemHistory": {
+            "$ref": "#/components/schemas/StudyItemHistory"
+          },
+          "conceptProgress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConceptProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "StudyItemHistory": {
+        "type": "object",
+        "required": [
+          "attempts",
+          "correct",
+          "successRate",
+          "lastSeen",
+          "lastSeenSummary",
+          "stage",
+          "nextReview"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "correct": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "successRate": {
+            "type": "string"
+          },
+          "lastSeen": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastSeenSummary": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "nextReview": {
+            "type": "string"
+          }
+        }
+      },
+      "ConceptProgress": {
+        "type": "object",
+        "required": [
+          "conceptKey",
+          "conceptLabel",
+          "attempts",
+          "correct",
+          "successRate",
+          "trend",
+          "health",
+          "summary"
+        ],
+        "properties": {
+          "conceptKey": {
+            "type": "string"
+          },
+          "conceptLabel": {
+            "type": "string"
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "correct": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "successRate": {
+            "type": "string"
+          },
+          "trend": {
+            "type": "string"
+          },
+          "health": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
           }
         }
       },

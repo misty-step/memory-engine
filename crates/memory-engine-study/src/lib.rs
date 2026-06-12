@@ -5,7 +5,12 @@
 //! queue advancement. It composes the generation, persistence, and service
 //! crates without moving filesystem, HTTP, or UI concerns into the pure core.
 
-use std::{collections::BTreeSet, error::Error, fmt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::PathBuf,
+};
 
 use memory_engine_core::{
     GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
@@ -93,6 +98,7 @@ pub struct BetaStudyView {
     pub queue: Vec<BetaStudyQueueRow>,
     pub due_count: usize,
     pub current: Option<BetaStudyCurrent>,
+    pub concept_progress: Vec<BetaStudyConceptProgress>,
     pub summary: BetaStudySummary,
     pub api_pressure: Vec<String>,
     /// Human-readable explanations for the most recent generation run:
@@ -114,12 +120,14 @@ pub struct BetaStudySourceRow {
 #[serde(rename_all = "camelCase")]
 pub struct BetaStudyDraftRow {
     pub id: String,
+    pub review_unit_id: ReviewUnitId,
     pub activity_kind: GeneratedLearningActivityKind,
     pub activity_stage: String,
     pub prompt: String,
     pub validation_status: GeneratedPromptValidationStatus,
     pub validation_reasons: Vec<String>,
     pub worked_solution: Option<String>,
+    pub approved: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -148,6 +156,7 @@ pub struct BetaStudyCurrent {
     pub grade: Option<BetaStudyGrade>,
     pub review_state: Option<ReviewStateProjection>,
     pub schedule_change: Option<ScheduleChange>,
+    pub feedback: Option<BetaStudyFeedback>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -172,6 +181,40 @@ pub struct ReviewStateProjection {
 pub struct ScheduleChange {
     pub before: Option<ReviewStateProjection>,
     pub after: ReviewStateProjection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BetaStudyFeedback {
+    pub verdict: String,
+    pub expected_answer: String,
+    pub item_history: BetaStudyItemHistory,
+    pub concept_progress: Option<BetaStudyConceptProgress>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BetaStudyItemHistory {
+    pub attempts: usize,
+    pub correct: usize,
+    pub success_rate: String,
+    pub last_seen: Option<i64>,
+    pub last_seen_summary: String,
+    pub stage: String,
+    pub next_review: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BetaStudyConceptProgress {
+    pub concept_key: String,
+    pub concept_label: String,
+    pub attempts: usize,
+    pub correct: usize,
+    pub success_rate: String,
+    pub trend: String,
+    pub health: String,
+    pub summary: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -643,7 +686,7 @@ where
             return self.view();
         }
 
-        let concept_key = concept_key_for_draft(active);
+        let (concept_key, concept_label) = concept_identity_for_draft(active);
         if let Some(note) = snapshot
             .concept_reference_notes
             .iter()
@@ -656,7 +699,7 @@ where
         let note = provider
             .explain_concept(&ReferenceNoteRequest {
                 concept_key: concept_key.clone(),
-                concept_label: concept_label_for_key(&concept_key),
+                concept_label,
                 prompt: prompt_text(&active.prompt).to_owned(),
                 expected_answer: prompt_expected_answer(&active.prompt),
                 recent_performance: Vec::new(),
@@ -984,37 +1027,25 @@ where
             .iter()
             .filter(|candidate| candidate.due <= now)
             .count();
-        let current = self
-            .current
-            .as_ref()
-            .filter(|draft| draft_has_active_source(draft, &active_source_ids))
-            .map(|draft| {
-                self.store
-                    .read_schedule_state(&draft.review_unit_id)
-                    .map(|schedule| {
-                        current_view(
-                            draft,
-                            schedule.as_ref(),
-                            self.expected_answer.clone(),
-                            self.reference_text.clone(),
-                            self.grade.clone(),
-                            self.schedule_change.clone(),
-                        )
-                    })
-            })
-            .transpose()
-            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
+        let concept_progress = concept_progress(&snapshot);
+        let current =
+            self.current_projection(&snapshot, &active_source_ids, &concept_progress, now)?;
 
         Ok(BetaStudyView {
             status: self.status,
             sources: active_sources.iter().copied().map(source_row).collect(),
-            drafts: active_drafts.iter().copied().map(draft_row).collect(),
+            drafts: active_drafts
+                .iter()
+                .copied()
+                .map(|draft| draft_row(draft, &snapshot.review_units))
+                .collect(),
             queue: active_queue
                 .iter()
                 .map(|candidate| queue_row(&snapshot.generated_prompt_drafts, candidate))
                 .collect(),
             due_count,
             current,
+            concept_progress,
             summary: BetaStudySummary {
                 source_count: active_sources.len(),
                 accepted_draft_count: active_drafts
@@ -1046,6 +1077,45 @@ where
             api_pressure: api_pressure(),
             generation_notices: generation_notices(&snapshot),
         })
+    }
+
+    fn current_projection(
+        &self,
+        snapshot: &BetaStoreSnapshot,
+        active_source_ids: &BTreeSet<String>,
+        concept_progress: &[BetaStudyConceptProgress],
+        now: i64,
+    ) -> Result<Option<BetaStudyCurrent>, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.current
+            .as_ref()
+            .filter(|draft| draft_has_active_source(draft, active_source_ids))
+            .map(|draft| {
+                self.store
+                    .read_schedule_state(&draft.review_unit_id)
+                    .map(|schedule| {
+                        let feedback = self.grade.as_ref().map(|grade| {
+                            feedback_for_current(
+                                snapshot,
+                                draft,
+                                schedule.as_ref(),
+                                grade,
+                                concept_progress,
+                                now,
+                            )
+                        });
+                        current_view(
+                            draft,
+                            schedule.as_ref(),
+                            self.expected_answer.clone(),
+                            self.reference_text.clone(),
+                            self.grade.clone(),
+                            self.schedule_change.clone(),
+                            feedback,
+                        )
+                    })
+            })
+            .transpose()
+            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))
     }
 
     fn select_next(&mut self) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
@@ -1249,15 +1319,22 @@ fn review_unit_has_active_source(
         .is_none_or(|draft| draft_has_active_source(&draft, active_source_ids))
 }
 
-fn draft_row(draft: &GeneratedPromptDraft) -> BetaStudyDraftRow {
+fn draft_row(
+    draft: &GeneratedPromptDraft,
+    review_units: &[memory_engine_persistence::BetaReviewUnitRecord],
+) -> BetaStudyDraftRow {
     BetaStudyDraftRow {
         id: draft.id.clone(),
+        review_unit_id: draft.review_unit_id.clone(),
         activity_kind: draft.activity_kind.clone(),
         activity_stage: draft.activity_stage.clone(),
         prompt: prompt_text(&draft.prompt).to_owned(),
         validation_status: draft.validation.status.clone(),
         validation_reasons: draft.validation.reasons.clone(),
         worked_solution: draft.worked_solution.clone(),
+        approved: review_units
+            .iter()
+            .any(|unit| unit.generated_prompt_draft_id.as_deref() == Some(draft.id.as_str())),
     }
 }
 
@@ -1286,6 +1363,7 @@ fn current_view(
     reference_text: Option<String>,
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
+    feedback: Option<BetaStudyFeedback>,
 ) -> BetaStudyCurrent {
     BetaStudyCurrent {
         review_unit_id: draft.review_unit_id.clone(),
@@ -1302,6 +1380,313 @@ fn current_view(
         grade,
         review_state: project_schedule(schedule),
         schedule_change,
+        feedback,
+    }
+}
+
+fn feedback_for_current(
+    snapshot: &BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+    schedule: Option<&ScheduleState>,
+    grade: &BetaStudyGrade,
+    concept_progress: &[BetaStudyConceptProgress],
+    now: i64,
+) -> BetaStudyFeedback {
+    let item_history = item_history(snapshot, &draft.review_unit_id, schedule, now);
+    let (concept_key, _) = concept_identity_for_draft(draft);
+    let concept_progress = concept_progress
+        .iter()
+        .find(|concept| concept.concept_key == concept_key)
+        .cloned();
+
+    BetaStudyFeedback {
+        verdict: verdict_label(grade.verdict).to_owned(),
+        expected_answer: prompt_expected_answer(&draft.prompt),
+        item_history,
+        concept_progress,
+    }
+}
+
+fn item_history(
+    snapshot: &BetaStoreSnapshot,
+    review_unit_id: &ReviewUnitId,
+    schedule: Option<&ScheduleState>,
+    now: i64,
+) -> BetaStudyItemHistory {
+    let attempts = snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.review_unit_id == *review_unit_id)
+        .collect::<Vec<_>>();
+    let correct = attempts
+        .iter()
+        .filter(|attempt| attempt.grade.as_ref().is_some_and(|grade| grade.is_correct))
+        .count();
+
+    let last_seen = attempts.iter().map(|attempt| attempt.occurred_at).max();
+
+    BetaStudyItemHistory {
+        attempts: attempts.len(),
+        correct,
+        success_rate: success_rate(correct, attempts.len()),
+        last_seen,
+        last_seen_summary: last_seen.map_or_else(
+            || "not seen before".to_owned(),
+            |last_seen| last_seen_phrase(last_seen, now),
+        ),
+        stage: schedule.map_or_else(|| "New".to_owned(), schedule_stage),
+        next_review: schedule.map_or_else(
+            || "no review is scheduled yet".to_owned(),
+            |schedule| next_review_phrase(schedule.due, now),
+        ),
+    }
+}
+
+fn concept_progress(snapshot: &BetaStoreSnapshot) -> Vec<BetaStudyConceptProgress> {
+    let mut rows: BTreeMap<String, ConceptAccumulator> = BTreeMap::new();
+    for attempt in snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.grade.is_some())
+    {
+        let (concept_key, concept_label) =
+            concept_identity_for_review_unit(snapshot, &attempt.review_unit_id);
+        let row = rows
+            .entry(concept_key.clone())
+            .or_insert_with(|| ConceptAccumulator::new(concept_key, concept_label));
+        row.record(attempt);
+    }
+
+    let mut progress = rows
+        .into_values()
+        .map(ConceptAccumulator::into_progress)
+        .collect::<Vec<_>>();
+    progress.sort_by(|left, right| {
+        health_sort_key(left)
+            .cmp(&health_sort_key(right))
+            .then_with(|| right.attempts.cmp(&left.attempts))
+            .then_with(|| left.concept_label.cmp(&right.concept_label))
+    });
+    progress
+}
+
+#[derive(Debug)]
+struct ConceptAccumulator {
+    concept_key: String,
+    concept_label: String,
+    attempts: usize,
+    correct: usize,
+    outcomes: Vec<bool>,
+}
+
+impl ConceptAccumulator {
+    fn new(concept_key: String, concept_label: String) -> Self {
+        Self {
+            concept_key,
+            concept_label,
+            attempts: 0,
+            correct: 0,
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, attempt: &memory_engine_service::ServiceAttemptRecord) {
+        self.attempts += 1;
+        let is_correct = attempt.grade.as_ref().is_some_and(|grade| grade.is_correct);
+        if is_correct {
+            self.correct += 1;
+        }
+        self.outcomes.push(is_correct);
+    }
+
+    fn into_progress(self) -> BetaStudyConceptProgress {
+        let success_rate = success_rate(self.correct, self.attempts);
+        let trend = trend(&self.outcomes);
+        let health = health(self.correct, self.attempts).to_owned();
+        let summary = concept_summary(&self.concept_label, &health, &success_rate, &trend);
+
+        BetaStudyConceptProgress {
+            concept_key: self.concept_key,
+            concept_label: self.concept_label,
+            attempts: self.attempts,
+            correct: self.correct,
+            success_rate,
+            trend,
+            health,
+            summary,
+        }
+    }
+}
+
+fn concept_identity_for_review_unit(
+    snapshot: &BetaStoreSnapshot,
+    review_unit_id: &ReviewUnitId,
+) -> (String, String) {
+    let unit = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == *review_unit_id);
+    let key = unit
+        .and_then(|unit| unit.queue.concept_key.clone())
+        .or_else(|| {
+            unit.and_then(|unit| {
+                unit.generated_prompt_draft_id
+                    .as_ref()
+                    .and_then(|draft_id| {
+                        snapshot
+                            .generated_prompt_drafts
+                            .iter()
+                            .find(|draft| &draft.id == draft_id)
+                            .and_then(|draft| draft.queue.concept_key.clone())
+                    })
+            })
+        })
+        .or_else(|| unit.and_then(|unit| unit.concept_reference_note_key.clone()));
+
+    if let Some(key) = key {
+        let label = concept_label_for_key(&key);
+        (key, label)
+    } else {
+        let label = unit.map_or_else(
+            || "this item".to_owned(),
+            |unit| prompt_text(&unit.prompt).to_owned(),
+        );
+        (review_unit_id.as_str().to_owned(), label)
+    }
+}
+
+fn health_sort_key(progress: &BetaStudyConceptProgress) -> usize {
+    if progress.attempts == 0 {
+        usize::MAX
+    } else {
+        progress.correct.saturating_mul(10_000) / progress.attempts
+    }
+}
+
+fn success_rate(correct: usize, attempts: usize) -> String {
+    if attempts == 0 {
+        return "0 of 0 correct (0.0%)".to_owned();
+    }
+    let percent_tenths = correct.saturating_mul(1_000).saturating_add(attempts / 2) / attempts;
+    format!(
+        "{correct} of {attempts} correct ({}.{:01}%)",
+        percent_tenths / 10,
+        percent_tenths % 10
+    )
+}
+
+fn trend(outcomes: &[bool]) -> String {
+    match outcomes {
+        [] | [_] => "not enough data".to_owned(),
+        values => {
+            let previous = values[values.len() - 2];
+            let latest = values[values.len() - 1];
+            match (previous, latest) {
+                (false, true) => "improving".to_owned(),
+                (true, false) => "declining".to_owned(),
+                (true, true) => "steady correct".to_owned(),
+                (false, false) => "still missing".to_owned(),
+            }
+        }
+    }
+}
+
+fn health(correct: usize, attempts: usize) -> &'static str {
+    if attempts == 0 {
+        return "untried";
+    }
+    if correct.saturating_mul(2) < attempts {
+        "struggling"
+    } else if correct.saturating_mul(5) < attempts.saturating_mul(4) {
+        "mixed"
+    } else {
+        "solid"
+    }
+}
+
+fn concept_summary(label: &str, health: &str, success_rate: &str, trend: &str) -> String {
+    format!("{label} is {health}: {success_rate}; trend is {trend}.")
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Correct => "Correct",
+        Verdict::Close => "Close",
+        Verdict::Wrong => "Try again",
+        Verdict::Revealed => "Revealed",
+    }
+}
+
+fn schedule_stage(schedule: &ScheduleState) -> String {
+    let state = match schedule.state {
+        ScheduleStatus::New => "New",
+        ScheduleStatus::Learning => "Learning",
+        ScheduleStatus::Review => "Review",
+        ScheduleStatus::Relearning => "Relearning",
+    };
+    format!(
+        "{state}, interval {}",
+        interval_phrase(schedule.scheduled_days)
+    )
+}
+
+fn next_review_phrase(due: i64, now: i64) -> String {
+    if due <= now {
+        return "you'll see this again now".to_owned();
+    }
+    let delta_ms = due.saturating_sub(now);
+    let rounded_days = rounded_time_units(delta_ms, DAY_MS);
+    if rounded_days >= 1 {
+        return format!(
+            "you'll see this again in ~{} {}",
+            rounded_days,
+            if rounded_days == 1 { "day" } else { "days" }
+        );
+    }
+    let rounded_hours = rounded_time_units(delta_ms, HOUR_MS).max(1);
+    format!(
+        "you'll see this again in ~{} {}",
+        rounded_hours,
+        if rounded_hours == 1 { "hour" } else { "hours" }
+    )
+}
+
+fn last_seen_phrase(last_seen: i64, now: i64) -> String {
+    if last_seen >= now {
+        return "last seen just now".to_owned();
+    }
+    let delta_ms = now.saturating_sub(last_seen);
+    let rounded_days = rounded_time_units(delta_ms, DAY_MS);
+    if rounded_days >= 1 {
+        return format!(
+            "last seen ~{} {} ago",
+            rounded_days,
+            if rounded_days == 1 { "day" } else { "days" }
+        );
+    }
+    let rounded_hours = rounded_time_units(delta_ms, HOUR_MS);
+    if rounded_hours >= 1 {
+        return format!(
+            "last seen ~{} {} ago",
+            rounded_hours,
+            if rounded_hours == 1 { "hour" } else { "hours" }
+        );
+    }
+    "last seen just now".to_owned()
+}
+
+const HOUR_MS: i64 = 3_600_000;
+const DAY_MS: i64 = 86_400_000;
+
+fn rounded_time_units(delta_ms: i64, unit_ms: i64) -> i64 {
+    delta_ms.saturating_add(unit_ms / 2) / unit_ms
+}
+
+fn interval_phrase(days: i64) -> String {
+    match days {
+        0 => "under a day".to_owned(),
+        1 => "~1 day".to_owned(),
+        days => format!("~{days} days"),
     }
 }
 
@@ -1378,13 +1763,23 @@ fn reference_text(snapshot: &BetaStoreSnapshot, draft: &GeneratedPromptDraft) ->
         .filter(|body| !body.is_empty())
 }
 
-fn concept_key_for_draft(draft: &GeneratedPromptDraft) -> String {
-    draft
+fn concept_identity_for_draft(draft: &GeneratedPromptDraft) -> (String, String) {
+    let key = draft
         .queue
         .concept_key
         .clone()
-        .or_else(|| draft.concept_reference_note_key.clone())
-        .unwrap_or_else(|| draft.review_unit_id.as_str().to_owned())
+        .or_else(|| draft.concept_reference_note_key.clone());
+
+    match key {
+        Some(key) => {
+            let label = concept_label_for_key(&key);
+            (key, label)
+        }
+        None => (
+            draft.review_unit_id.as_str().to_owned(),
+            prompt_text(&draft.prompt).to_owned(),
+        ),
+    }
 }
 
 fn concept_label_for_key(key: &str) -> String {
