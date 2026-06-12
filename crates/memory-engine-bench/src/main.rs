@@ -46,6 +46,7 @@ struct BenchCase {
 enum BenchError {
     Store(BenchStoreError),
     Service(String),
+    Invariant(String),
 }
 
 impl fmt::Display for BenchError {
@@ -53,6 +54,7 @@ impl fmt::Display for BenchError {
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
             Self::Service(error) => write!(formatter, "service error: {error}"),
+            Self::Invariant(error) => write!(formatter, "benchmark invariant failed: {error}"),
         }
     }
 }
@@ -202,12 +204,22 @@ fn benchmark_cases() -> Vec<BenchCase> {
             run: bench_scheduling,
         },
         BenchCase {
+            name: "scheduling.fsrs.synthetic_histories",
+            operations: 1_000,
+            run: bench_fsrs_synthetic_histories,
+        },
+        BenchCase {
             name: "queue.pick_next.1000",
             operations: 1_000,
             run: |operations| {
                 bench_queue(operations);
                 Ok(())
             },
+        },
+        BenchCase {
+            name: "queue.interleaving.anti_clump",
+            operations: 1_000,
+            run: bench_interleaving_anti_clump,
         },
         BenchCase {
             name: "service.grade_apply_review.next_queue",
@@ -272,6 +284,62 @@ fn bench_scheduling(operations: u32) -> Result<(), BenchError> {
     Ok(())
 }
 
+fn bench_fsrs_synthetic_histories(operations: u32) -> Result<(), BenchError> {
+    for index in 0_i64..i64::from(operations) {
+        let steady_good = replay_synthetic_history(
+            NOW + index * 60_000,
+            &[Rating::Good, Rating::Good, Rating::Good, Rating::Good],
+        )?;
+        let lapse_repaired = replay_synthetic_history(
+            NOW + index * 60_000,
+            &[Rating::Good, Rating::Good, Rating::Again, Rating::Good],
+        )?;
+
+        if steady_good.state != ScheduleStatus::Review
+            || lapse_repaired.state != ScheduleStatus::Review
+        {
+            return Err(BenchError::Invariant(
+                "synthetic histories must return to review state".to_owned(),
+            ));
+        }
+        if steady_good.lapses != 0 {
+            return Err(BenchError::Invariant(
+                "steady-good synthetic history recorded an unexpected lapse".to_owned(),
+            ));
+        }
+        if lapse_repaired.lapses == 0 {
+            return Err(BenchError::Invariant(
+                "lapse-repair synthetic history did not record a lapse".to_owned(),
+            ));
+        }
+        if steady_good.scheduled_days <= lapse_repaired.scheduled_days {
+            return Err(BenchError::Invariant(format!(
+                "steady-good interval {} did not exceed repaired-lapse interval {}",
+                steady_good.scheduled_days, lapse_repaired.scheduled_days
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn replay_synthetic_history(
+    started_at: i64,
+    ratings: &[Rating],
+) -> Result<ScheduleState, BenchError> {
+    let mut state = None;
+    let mut now = started_at;
+
+    for rating in ratings {
+        let next_state = memory_engine::next(state.as_ref(), *rating, now)
+            .map_err(|error| BenchError::Service(error.to_string()))?;
+        now = next_state.due.max(now + 60_000);
+        state = Some(next_state);
+    }
+
+    state.ok_or_else(|| BenchError::Invariant("synthetic history was empty".to_owned()))
+}
+
 fn bench_queue(operations: u32) {
     let candidates = bench_candidates(operations.max(3) as usize, "bench");
     let mastery_policy =
@@ -290,6 +358,81 @@ fn bench_queue(operations: u32) {
             },
         );
     }
+}
+
+fn bench_interleaving_anti_clump(operations: u32) -> Result<(), BenchError> {
+    let mastery_policy =
+        |schedule: &ScheduleState| schedule.state == ScheduleStatus::Review && schedule.reps >= 3;
+    let recent = [science_queue_candidate(
+        "recent-biology",
+        "photosynthesis",
+        "biology-notes",
+        "biology",
+        NOW - 60_000,
+    )];
+    let candidates = [
+        science_queue_candidate(
+            "aaa-same-biology-source",
+            "chloroplast",
+            "biology-notes",
+            "biology",
+            NOW - 120_000,
+        ),
+        science_queue_candidate(
+            "zzz-contrast-biology-source",
+            "cellular respiration",
+            "respiration-notes",
+            "biology",
+            NOW - 120_000,
+        ),
+    ];
+    let expected = &candidates[1].review_unit_id;
+    let no_separation = [memory_engine::queue::QueueSeparationPass {
+        concept: false,
+        source: false,
+        domain: false,
+    }];
+    let control = memory_engine::pick_next_queue_candidate(
+        &candidates,
+        mastery_policy,
+        &memory_engine::queue::QueueSelectionOptions {
+            now: NOW,
+            recent_candidates: &recent,
+            separation_passes: &no_separation,
+            ..memory_engine::queue::QueueSelectionOptions::default()
+        },
+    )
+    .ok_or_else(|| BenchError::Invariant("anti-clump control returned no candidate".to_owned()))?;
+    if control.review_unit_id.as_str() != candidates[0].review_unit_id.as_str() {
+        return Err(BenchError::Invariant(format!(
+            "expected no-separation control to select {}, selected {}",
+            candidates[0].review_unit_id, control.review_unit_id
+        )));
+    }
+
+    for _ in 0..operations {
+        let selected = memory_engine::pick_next_queue_candidate(
+            &candidates,
+            mastery_policy,
+            &memory_engine::queue::QueueSelectionOptions {
+                now: NOW,
+                recent_candidates: &recent,
+                ..memory_engine::queue::QueueSelectionOptions::default()
+            },
+        )
+        .ok_or_else(|| {
+            BenchError::Invariant("anti-clump queue returned no candidate".to_owned())
+        })?;
+
+        if selected.review_unit_id.as_str() != expected.as_str() {
+            return Err(BenchError::Invariant(format!(
+                "expected {expected}, selected {}",
+                selected.review_unit_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn bench_service(operations: u32) -> Result<(), BenchError> {
@@ -377,6 +520,24 @@ fn queue_candidate(prefix: &str, index: usize) -> QueueCandidate {
     }
 }
 
+fn science_queue_candidate(
+    review_unit_id: &str,
+    concept_key: &str,
+    source_key: &str,
+    domain_key: &str,
+    due: i64,
+) -> QueueCandidate {
+    QueueCandidate {
+        review_unit_id: ReviewUnitId::new(review_unit_id),
+        schedule_state: Some(schedule_state(3, 8, due)),
+        due,
+        progression: None,
+        concept_key: Some(concept_key.to_owned()),
+        source_key: Some(source_key.to_owned()),
+        domain_key: Some(domain_key.to_owned()),
+    }
+}
+
 fn schedule_state(reps: u32, scheduled_days: i64, due: i64) -> ScheduleState {
     ScheduleState {
         due,
@@ -394,6 +555,17 @@ fn schedule_state(reps: u32, scheduled_days: i64, due: i64) -> ScheduleState {
 #[cfg(test)]
 mod tests {
     use super::{benchmark_cases, run_benchmark_cases, smoke_benchmark_cases};
+
+    #[test]
+    fn benchmark_catalog_includes_learning_science_oracles() {
+        let names = benchmark_cases()
+            .iter()
+            .map(|bench_case| bench_case.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"queue.interleaving.anti_clump"));
+        assert!(names.contains(&"scheduling.fsrs.synthetic_histories"));
+    }
 
     #[test]
     fn benchmark_receipts_cover_the_migrated_runtime_surfaces() {

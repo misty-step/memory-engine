@@ -1,6 +1,7 @@
 # Evals And Benchmarks
 
 Refs-backlog: 20
+Refs-backlog: 050
 
 `memory-engine` uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI
@@ -45,8 +46,15 @@ Current benchmark cases cover:
 
 - deterministic short-answer grading
 - FSRS schedule transitions
+- FSRS synthetic histories for steady-success versus repaired-lapse behavior
 - queue selection over 1,000 candidates
+- queue interleaving anti-clumping over same-domain alternatives
 - service command composition for grade/apply-review plus next-queue
+
+The learning-science rationale for the FSRS and interleaving benchmark receipts
+lives in `docs/science/README.md`. Keep that file synchronized when a benchmark
+case exists primarily to protect a learning-science claim rather than a raw
+runtime surface.
 
 Use benchmark output to compare branches manually. If a future regression is
 large and repeatable, shape a ticket with an explicit budget and enough history
