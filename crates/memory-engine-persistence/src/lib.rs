@@ -47,6 +47,8 @@ pub struct SourceDocument {
     pub permission: SourcePermission,
     pub freshness: Option<i64>,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -450,6 +452,30 @@ impl BetaPersistenceStore {
         self.commit(next)?;
 
         Ok(document)
+    }
+
+    /// Hide source material from learner-facing flows while preserving receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the source document is unknown or cannot
+    /// be persisted.
+    pub fn archive_source_document(
+        &mut self,
+        source_document_id: &str,
+        archived_at: i64,
+    ) -> Result<SourceDocument, BetaStoreError> {
+        let mut next = self.data.clone();
+        let source = next
+            .source_documents
+            .iter_mut()
+            .find(|source| source.id == source_document_id)
+            .ok_or_else(|| BetaStoreError::UnknownSourceDocument(source_document_id.to_owned()))?;
+        source.archived_at = Some(archived_at);
+        let archived = source.clone();
+        self.commit(next)?;
+
+        Ok(archived)
     }
 
     /// Save or replace a cited source span.

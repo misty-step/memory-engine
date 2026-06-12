@@ -247,6 +247,17 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
+    pub(crate) fn archive_source(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .archive_source(account_id, &account.store_path, source_id)
+    }
+
     pub(crate) fn approve_draft(
         &self,
         account_id: &str,

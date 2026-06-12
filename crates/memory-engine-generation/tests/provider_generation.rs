@@ -226,6 +226,7 @@ fn fallback_stamps_drafts_with_the_provider_that_actually_ran() {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("structured source");
 
@@ -295,6 +296,7 @@ fn open_store_with_prose(directory: &TempDirectory) -> BetaPersistenceStore {
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
             created_at: NOW,
+            archived_at: None,
         })
         .expect("source");
 

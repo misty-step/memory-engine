@@ -484,6 +484,7 @@ fn source_document(id: &str) -> SourceDocument {
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
         created_at: NOW,
+        archived_at: None,
     }
 }
 

@@ -221,6 +221,7 @@ fn score_source(
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
         created_at: NOW,
+        archived_at: None,
     };
 
     match provider.generate_drafts(&document) {
