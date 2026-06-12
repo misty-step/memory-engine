@@ -10,9 +10,9 @@ use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
     browser_session_path, persisted_source_exists, persisted_sources, postgres_failure,
     rate_limit_path, require_current_review, require_current_review_postgres,
-    run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, SourceRecord,
-    StudyViewResponse,
+    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
+    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
+    ApiFailure, BrowserSessionRecord, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -247,6 +247,46 @@ impl StudyStorage {
             .reveal_review(account_id, store_path, review_unit_id)
     }
 
+    pub(crate) fn learn_more_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .learn_more_review(account_id, store_path, review_unit_id)
+    }
+
+    pub(crate) fn skip_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .skip_review(account_id, store_path, review_unit_id)
+    }
+
+    pub(crate) fn snooze_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .snooze_review(account_id, store_path, review_unit_id)
+    }
+
+    pub(crate) fn bridge_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .bridge_review(account_id, store_path, review_unit_id)
+    }
+
     pub(crate) fn submit_review(
         &self,
         account_id: &str,
@@ -351,6 +391,30 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn reveal_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn learn_more_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn skip_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn snooze_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn bridge_review(
         &self,
         account_id: &str,
         store_path: &FsPath,
@@ -688,6 +752,58 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(StudyViewResponse::from_view(view))
     }
 
+    fn learn_more_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = run_reference_generation(&mut study)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn skip_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = study.skip_current().map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn snooze_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = study.snooze_current().map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn bridge_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = run_bridge_generation(&mut study)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
     fn submit_review(
         &self,
         _account_id: &str,
@@ -874,6 +990,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         .save_reference_span(&reference)
                         .map_err(postgres_failure)?;
                 }
+                for note in snapshot.concept_reference_notes {
+                    account
+                        .save_concept_reference_note(&note)
+                        .map_err(postgres_failure)?;
+                }
                 for run in snapshot.generation_runs {
                     account
                         .save_generation_run(&run)
@@ -1034,6 +1155,62 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
             let view = study.reveal().map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn learn_more_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = run_reference_generation(study)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn skip_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = study.skip_current().map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn snooze_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = study.snooze_current().map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn bridge_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = run_bridge_generation(study)?;
 
             Ok(StudyViewResponse::from_view(view))
         })

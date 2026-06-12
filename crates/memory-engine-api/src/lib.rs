@@ -667,6 +667,52 @@ where
     .map_err(study_failure)
 }
 
+fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    #[cfg(test)]
+    {
+        study.learn_more().map_err(study_failure)
+    }
+
+    #[cfg(not(test))]
+    {
+        match OpenRouterConfig::from_env() {
+            Ok(config) => {
+                let model = OpenRouterProvider::new(config);
+                study.learn_more_with_provider(&model)
+            }
+            Err(_) => study.learn_more(),
+        }
+        .map_err(study_failure)
+    }
+}
+
+fn run_bridge_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    #[cfg(test)]
+    {
+        study.generate_bridge_material().map_err(study_failure)
+    }
+
+    #[cfg(not(test))]
+    {
+        match OpenRouterConfig::from_env() {
+            Ok(config) => {
+                let model = OpenRouterProvider::new(config);
+                study.generate_bridge_material_with_provider(&model)
+            }
+            Err(_) => study.generate_bridge_material(),
+        }
+        .map_err(study_failure)
+    }
+}
+
 fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
     BetaStudySession::open(BetaStudyOptions::new(path).with_clock(now)).map_err(study_failure)
 }
@@ -1102,8 +1148,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+        let draft_ids = html_values(&generated, "draftId");
+        let exercise_draft_id = draft_ids
+            .iter()
+            .find(|id| id.contains("nato-cat-composition"))
+            .expect("exercise draft");
+        let approved = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", exercise_draft_id)],
+            ))
+            .await
+            .expect("approve exercise");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_text(approved).await;
+        assert!(approved.contains("1 due"));
+        assert!(approved.contains("Reveal answer"));
+        assert!(approved.contains("Spell CAT over the phone"));
+        assert!(approved.contains("Reference"));
+        assert!(approved.contains("Skip"));
+        assert!(approved.contains("Snooze"));
+        assert!(approved.contains("Bridge"));
+        let parent_id = html_value(&approved, "reviewUnitId");
+
+        let referenced = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/reference",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("reviewUnitId", &parent_id)],
+            ))
+            .await
+            .expect("reference");
+        assert_eq!(referenced.status(), StatusCode::OK);
+        let referenced = response_text(referenced).await;
+        assert!(referenced.contains("Reference"));
+        assert!(referenced.contains("C is CHARLIE"));
+
+        let bridged = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/bridge",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("reviewUnitId", &parent_id)],
+            ))
+            .await
+            .expect("bridge");
+        assert_eq!(bridged.status(), StatusCode::OK);
+        let bridged = response_text(bridged).await;
+        let bridge_id = html_value(&bridged, "reviewUnitId");
+        assert!(bridge_id.starts_with("bridge-"));
+
+        let skipped = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/skip",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("reviewUnitId", &bridge_id)],
+            ))
+            .await
+            .expect("skip");
+        assert_eq!(skipped.status(), StatusCode::OK);
+        let skipped = response_text(skipped).await;
+        let next_bridge_id = html_value(&skipped, "reviewUnitId");
+        assert!(next_bridge_id.starts_with("bridge-"));
+        assert_ne!(next_bridge_id, bridge_id);
+
+        let snoozed = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/snooze",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &next_bridge_id),
+                ],
+            ))
+            .await
+            .expect("snooze");
+        assert_eq!(snoozed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn app_session_mutations_require_csrf() {
         let app = router(ApiState::default());
+        let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+        assert_source_session_mutations_require_csrf(&app, &cookie, &source_id).await;
+        let review_unit_id = approve_review_for_csrf(&app, &cookie, &csrf_token, &source_id).await;
+        assert_review_mutations_require_csrf(&app, &cookie, &review_unit_id).await;
+    }
+
+    async fn start_app_session_for_csrf(app: &axum::Router) -> (String, String, String) {
         let started = app
             .clone()
             .oneshot(form_request(
@@ -1119,9 +1278,17 @@ mod tests {
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
 
+        (cookie, csrf_token, source_id)
+    }
+
+    async fn assert_source_session_mutations_require_csrf(
+        app: &axum::Router,
+        cookie: &str,
+        source_id: &str,
+    ) {
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/source",
             &[
                 ("title", "Latin notes"),
@@ -1131,40 +1298,47 @@ mod tests {
         )
         .await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/source/archive",
-            &[("sourceId", &source_id)],
+            &[("sourceId", source_id)],
             "archive without csrf",
         )
         .await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/generate",
-            &[("sourceId", &source_id)],
+            &[("sourceId", source_id)],
             "generate without csrf",
         )
         .await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/approve",
             &[("draftId", "draft-withheld")],
             "approve without csrf",
         )
         .await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/save-account",
             &[("email", "learner@example.com")],
             "save without csrf",
         )
         .await;
-        assert_forbidden_form(&app, &cookie, "/app/logout", &[], "logout without csrf").await;
+        assert_forbidden_form(app, cookie, "/app/logout", &[], "logout without csrf").await;
+    }
 
-        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+    async fn approve_review_for_csrf(
+        app: &axum::Router,
+        cookie: &str,
+        csrf_token: &str,
+        source_id: &str,
+    ) -> String {
+        let generated = generate_source_html(app, cookie, csrf_token, source_id).await;
         let draft_id = html_value(&generated, "draftId");
 
         let approved = app
@@ -1172,30 +1346,68 @@ mod tests {
             .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/approve",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+                cookie,
+                &[("csrfToken", csrf_token), ("draftId", &draft_id)],
             ))
             .await
             .expect("approve with csrf");
         assert_eq!(approved.status(), StatusCode::OK);
         let approved = response_text(approved).await;
-        let review_unit_id = html_value(&approved, "reviewUnitId");
+        html_value(&approved, "reviewUnitId")
+    }
 
-        assert_forbidden_form(&app, &cookie, "/app/next", &[], "next without csrf").await;
+    async fn assert_review_mutations_require_csrf(
+        app: &axum::Router,
+        cookie: &str,
+        review_unit_id: &str,
+    ) {
+        assert_forbidden_form(app, cookie, "/app/next", &[], "next without csrf").await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
             "/app/reveal",
-            &[("reviewUnitId", &review_unit_id)],
+            &[("reviewUnitId", review_unit_id)],
             "reveal without csrf",
         )
         .await;
         assert_forbidden_form(
-            &app,
-            &cookie,
+            app,
+            cookie,
+            "/app/reference",
+            &[("reviewUnitId", review_unit_id)],
+            "reference without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            app,
+            cookie,
+            "/app/skip",
+            &[("reviewUnitId", review_unit_id)],
+            "skip without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            app,
+            cookie,
+            "/app/snooze",
+            &[("reviewUnitId", review_unit_id)],
+            "snooze without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            app,
+            cookie,
+            "/app/bridge",
+            &[("reviewUnitId", review_unit_id)],
+            "bridge without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            app,
+            cookie,
             "/app/submit",
             &[
-                ("reviewUnitId", &review_unit_id),
+                ("reviewUnitId", review_unit_id),
                 ("answer", "ALFA"),
                 ("responseTimeMs", "1800"),
                 ("idempotencyKey", "csrf-matrix-submit"),
@@ -2590,6 +2802,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_json_api_exposes_review_escape_hatches() {
+        let app = router(ApiState::default());
+        let account = create_account_v1(&app, "bridge@example.com").await;
+        let source_id =
+            create_source_v1(&app, &account, "NATO practice notes", &source_body()).await;
+        let generated = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate source");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_json(generated).await;
+        let exercise_draft_id = generated["drafts"]
+            .as_array()
+            .expect("drafts")
+            .iter()
+            .find_map(|draft| {
+                let id = draft["id"].as_str()?;
+                id.contains("nato-cat-composition").then_some(id.to_owned())
+            })
+            .expect("exercise draft");
+        let parent_id = approve_draft_v1(&app, &account, &exercise_draft_id);
+        let parent_id = parent_id.await;
+
+        let referenced = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{parent_id}/reference",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("reference");
+        assert_eq!(referenced.status(), StatusCode::OK);
+        let referenced = response_json(referenced).await;
+        assert!(referenced["current"]["referenceText"]
+            .as_str()
+            .expect("reference text")
+            .contains("C is CHARLIE"));
+
+        let bridged = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{parent_id}/bridge",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("bridge");
+        assert_eq!(bridged.status(), StatusCode::OK);
+        let bridged = response_json(bridged).await;
+        let bridge_id = bridged["current"]["reviewUnitId"]
+            .as_str()
+            .expect("bridge id");
+        assert!(bridge_id.starts_with("bridge-"));
+        assert_eq!(bridged["summary"]["attemptCount"], json!(0));
+
+        let skipped = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{bridge_id}/skip",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("skip");
+        assert_eq!(skipped.status(), StatusCode::OK);
+        let skipped = response_json(skipped).await;
+        let next_bridge_id = skipped["current"]["reviewUnitId"]
+            .as_str()
+            .expect("next bridge id");
+        assert!(next_bridge_id.starts_with("bridge-"));
+        assert_ne!(next_bridge_id, bridge_id);
+
+        let snoozed = app
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{next_bridge_id}/snooze",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("snooze");
+        assert_eq!(snoozed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn v1_openapi_artifact_matches_registered_routes() {
         let response = router(ApiState::default())
             .oneshot(
@@ -3174,6 +3491,19 @@ mod tests {
         let start = html.find(&marker).expect("field marker") + marker.len();
         let end = html[start..].find('"').expect("field end") + start;
         html[start..end].to_owned()
+    }
+
+    fn html_values(html: &str, name: &str) -> Vec<String> {
+        let marker = format!(r#"name="{name}" value=""#);
+        let mut values = Vec::new();
+        let mut remaining = html;
+        while let Some(index) = remaining.find(&marker) {
+            let start = index + marker.len();
+            let end = remaining[start..].find('"').expect("field end") + start;
+            values.push(remaining[start..end].to_owned());
+            remaining = &remaining[end..];
+        }
+        values
     }
 
     fn assert_keep_flow_html(body: &str) {

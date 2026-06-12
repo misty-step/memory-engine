@@ -933,6 +933,7 @@ dependencies = [
 name = "memory-engine-openrouter"
 version = "0.0.0"
 dependencies = [
+ "memory-engine-core",
  "memory-engine-generation",
  "memory-engine-persistence",
  "serde",

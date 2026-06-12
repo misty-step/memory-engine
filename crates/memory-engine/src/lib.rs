@@ -9,17 +9,21 @@ pub mod beta {
 
     pub mod generation {
         pub use memory_engine_generation::{
-            run_beta_generation, BetaGenerationError, BetaGenerationRequest, BetaGenerationResult,
+            run_beta_generation, run_bridge_generation_with_provider, BetaGenerationError,
+            BetaGenerationRequest, BetaGenerationResult, BridgeGenerationRequest,
+            BridgeGenerationResult, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
+            ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
         };
     }
 
     pub mod persistence {
         pub use memory_engine_persistence::{
             AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions, BetaPersistenceStore,
-            BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot, GeneratedLearningActivityKind,
-            GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
-            GeneratedPromptValidationStatus, GenerationRun, PersistedQueueCandidate, ReferenceSpan,
-            ScheduleRecord, SourceDocument, SourceDocumentKind, SourcePermission,
+            BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot, ConceptReferenceNote,
+            GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
+            GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
+            PersistedQueueCandidate, ReferenceSpan, ScheduleRecord, SourceDocument,
+            SourceDocumentKind, SourcePermission,
         };
     }
 
@@ -28,7 +32,8 @@ pub mod beta {
             BetaStudyCurrent, BetaStudyDraftRow, BetaStudyError, BetaStudyGrade, BetaStudyOptions,
             BetaStudyQueueRow, BetaStudySession, BetaStudySourceInput, BetaStudySourceRow,
             BetaStudyStatus, BetaStudySummary, BetaStudyView, ReviewStateProjection,
-            ScheduleChange, DEFAULT_BETA_STUDY_NOW,
+            ScheduleChange, DEFAULT_BETA_STUDY_NOW, DEFAULT_BRIDGE_PARENT_DEFER_MS,
+            DEFAULT_SKIP_DEFER_MS, DEFAULT_SNOOZE_DEFER_MS,
         };
     }
 }
@@ -87,8 +92,8 @@ pub mod queue {
     //! Queue candidate filtering and priority selection.
 
     pub use memory_engine_core::{
-        compare_queue_priority, pick_next_queue_candidate, reviewable_queue_candidates,
-        QueueCandidate, QueueSelectionOptions, QueueSeparationPass,
+        compare_queue_priority, defer_queue_availability, pick_next_queue_candidate,
+        reviewable_queue_candidates, QueueCandidate, QueueSelectionOptions, QueueSeparationPass,
     };
 }
 
@@ -133,7 +138,10 @@ pub use progression::{
     filter_eligible_candidates, filter_eligible_candidates_with_fallback, is_mastered,
     ProgressionCandidate, ProgressionFilterResult, ProgressionMetadata,
 };
-pub use queue::{compare_queue_priority, pick_next_queue_candidate, reviewable_queue_candidates};
+pub use queue::{
+    compare_queue_priority, defer_queue_availability, pick_next_queue_candidate,
+    reviewable_queue_candidates,
+};
 pub use scheduling::next;
 pub use types::{
     GradeContext, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus,

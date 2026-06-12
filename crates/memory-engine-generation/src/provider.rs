@@ -58,6 +58,48 @@ pub struct ProviderDrafts {
     pub usage: Option<ProviderUsage>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewPerformanceContext {
+    pub review_unit_id: String,
+    pub submitted_answer: String,
+    pub verdict: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceNoteRequest {
+    pub concept_key: String,
+    pub concept_label: String,
+    pub prompt: String,
+    pub expected_answer: String,
+    pub recent_performance: Vec<ReviewPerformanceContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceNoteDraft {
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeMaterialRequest {
+    pub concept_key: String,
+    pub concept_label: String,
+    pub parent_review_unit_id: memory_engine_core::ReviewUnitId,
+    pub parent_prompt: String,
+    pub parent_expected_answer: String,
+    pub parent_stage_order: u32,
+    pub cached_reference_note: Option<String>,
+    pub recent_performance: Vec<ReviewPerformanceContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeMaterial {
+    pub model: GeneratedPromptModel,
+    pub reference_note: ReferenceNoteDraft,
+    pub candidates: Vec<DraftCandidate>,
+    pub usage: Option<ProviderUsage>,
+}
+
 /// A transport- or provider-level failure that prevented draft generation.
 ///
 /// The message is shown to learners verbatim, so providers must phrase it as
@@ -98,6 +140,34 @@ pub trait DraftProvider {
     /// output for the source (transport failure, malformed response). The
     /// message is surfaced to the learner.
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure>;
+}
+
+/// Produces a short concept-level explanation when no source span exists.
+pub trait ReferenceNoteProvider {
+    fn model(&self) -> GeneratedPromptModel;
+
+    /// Generate one short note for the concept behind a review item.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderFailure`] when the provider cannot produce a note.
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure>;
+}
+
+/// Produces easier bridge material for a struggling parent item.
+pub trait BridgeMaterialProvider: ReferenceNoteProvider {
+    /// Generate a reference note plus easier draft candidates for the parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderFailure`] when the provider cannot produce bridge material.
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,10 +344,100 @@ impl DraftProvider for FakeModelProvider {
         };
 
         Ok(ProviderDrafts {
-            model: self.model(),
+            model: DraftProvider::model(self),
             learning_intent: Some(classification.intent),
             candidates,
             failures: Vec::new(),
+            usage: None,
+        })
+    }
+}
+
+impl ReferenceNoteProvider for FakeModelProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        DraftProvider::model(self)
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: format!("Reference: {}", request.concept_label),
+            body: format!(
+                "{} connects the prompt \"{}\" to the expected answer \"{}\". \
+                 Start by recognizing the smaller cue, then answer the original item.",
+                request.concept_label, request.prompt, request.expected_answer
+            ),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for FakeModelProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        let note = request.cached_reference_note.as_ref().map_or_else(
+            || {
+                self.explain_concept(&ReferenceNoteRequest {
+                    concept_key: request.concept_key.clone(),
+                    concept_label: request.concept_label.clone(),
+                    prompt: request.parent_prompt.clone(),
+                    expected_answer: request.parent_expected_answer.clone(),
+                    recent_performance: request.recent_performance.clone(),
+                })
+            },
+            |body| {
+                Ok(ReferenceNoteDraft {
+                    title: format!("Reference: {}", request.concept_label),
+                    body: body.clone(),
+                })
+            },
+        )?;
+        let answer = request.parent_expected_answer.clone();
+        let cue = lead_words(&answer, 5);
+
+        Ok(BridgeMaterial {
+            model: ReferenceNoteProvider::model(self),
+            reference_note: note,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: request.concept_label.clone(),
+                    question: format!(
+                        "Which smaller cue helps with \"{}\"?",
+                        request.parent_prompt
+                    ),
+                    answer: cue.clone(),
+                    evidence: None,
+                    distractors: vec![
+                        "A different source detail".to_owned(),
+                        "An unrelated answer".to_owned(),
+                    ],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition-bridge".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: request.concept_label.clone(),
+                    question: format!(
+                        "Use the cue \"{cue}\" to answer the original item in one step."
+                    ),
+                    answer,
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: Some(format!(
+                        "The bridge cue points back to: {}",
+                        request.parent_expected_answer
+                    )),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "cued-recall-bridge".to_owned(),
+                    unsupported: false,
+                },
+            ],
             usage: None,
         })
     }

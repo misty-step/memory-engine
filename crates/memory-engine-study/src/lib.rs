@@ -11,12 +11,14 @@ use memory_engine_core::{
     GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
-    run_beta_generation, run_beta_generation_with_provider, BetaGenerationError,
-    BetaGenerationRequest, BetaGenerationStore, DraftProvider,
+    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
+    BetaGenerationError, BetaGenerationRequest, BetaGenerationStore, BridgeGenerationRequest,
+    BridgeMaterialProvider, DraftProvider, FakeModelProvider, ReferenceNoteProvider,
+    ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    BetaStoreSnapshot, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptValidationStatus, SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use memory_engine_service::{
@@ -26,6 +28,9 @@ use memory_engine_service::{
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BETA_STUDY_NOW: i64 = 1_779_465_600_000;
+pub const DEFAULT_SKIP_DEFER_MS: i64 = 15 * 60 * 1_000;
+pub const DEFAULT_SNOOZE_DEFER_MS: i64 = 86_400_000;
+pub const DEFAULT_BRIDGE_PARENT_DEFER_MS: i64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 pub struct BetaStudyOptions {
@@ -579,6 +584,7 @@ where
         BetaGenerationRequest {
             run_id: format!("study-run-{}", snapshot.generation_runs.len() + 1),
             source_document_ids: ids,
+            parent_review_unit_id: None,
             started_at: (self.now)(),
             completed_at: Some((self.now)()),
             default_due: (self.now)() - 60_000,
@@ -610,12 +616,68 @@ where
     pub fn learn_more(
         &mut self,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.learn_more_with_provider(&FakeModelProvider)
+    }
+
+    /// Show reference material, generating and caching a concept note when no source span exists.
+    ///
+    /// Source-backed items always prefer their cited source spans. Generated
+    /// fallback notes are cached by concept key, so repeated reference views do
+    /// not call the provider again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError::NoActiveReviewUnit`] when no item is active,
+    /// or a generation/store error when fallback note creation fails.
+    pub fn learn_more_with_provider(
+        &mut self,
+        provider: &dyn ReferenceNoteProvider,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
-        self.reference_text = reference_text(&snapshot.reference_spans, active);
+        if let Some(text) = reference_text(&snapshot, active) {
+            self.reference_text = Some(text);
+            return self.view();
+        }
+
+        let concept_key = concept_key_for_draft(active);
+        if let Some(note) = snapshot
+            .concept_reference_notes
+            .iter()
+            .find(|note| note.concept_key == concept_key)
+        {
+            self.reference_text = Some(note.body.clone());
+            return self.view();
+        }
+
+        let note = provider
+            .explain_concept(&ReferenceNoteRequest {
+                concept_key: concept_key.clone(),
+                concept_label: concept_label_for_key(&concept_key),
+                prompt: prompt_text(&active.prompt).to_owned(),
+                expected_answer: prompt_expected_answer(&active.prompt),
+                recent_performance: Vec::new(),
+            })
+            .map_err(|failure| {
+                BetaStudyError::Generation(BetaGenerationError::ProviderFailure(
+                    failure.to_string(),
+                ))
+            })?;
+        let note = self
+            .store
+            .save_concept_reference_note(ConceptReferenceNote {
+                concept_key,
+                title: note.title,
+                body: note.body,
+                model: provider.model(),
+                created_at: (self.now)(),
+                updated_at: (self.now)(),
+            })
+            .map_err(BetaStudyError::Store)?;
+        self.reference_text = Some(note.body);
         self.view()
     }
 
@@ -683,6 +745,97 @@ where
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         self.store
             .snooze_review_unit_until(&active.review_unit_id, snoozed_until)
+            .map_err(BetaStudyError::Store)?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Skip the active review item briefly without grading it.
+    ///
+    /// Skipping is queue deferral only: it records no attempt and leaves
+    /// `ScheduleState` unchanged. The item becomes available again after the
+    /// default short skip interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or persistence fails.
+    pub fn skip_current(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.snooze_current_until((self.now)() + DEFAULT_SKIP_DEFER_MS)
+    }
+
+    /// Snooze the active review item for the default long interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active or persistence fails.
+    pub fn snooze_current(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.snooze_current_until((self.now)() + DEFAULT_SNOOZE_DEFER_MS)
+    }
+
+    /// Generate bridge material using the deterministic CI-safe provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active, generation fails, or
+    /// persistence rejects the bridge drafts.
+    pub fn generate_bridge_material(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.generate_bridge_material_with_provider(&FakeModelProvider)
+    }
+
+    /// Generate easier bridge items for the active review and defer the parent.
+    ///
+    /// The bridge drafts are due immediately and cite the cached concept
+    /// reference note. The parent item is snoozed after draft persistence so
+    /// the next queue selection naturally surfaces bridge material first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active, generation fails, or
+    /// persistence rejects the bridge drafts.
+    pub fn generate_bridge_material_with_provider(
+        &mut self,
+        provider: &dyn BridgeMaterialProvider,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let active = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?
+            .clone();
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let now = (self.now)();
+        let bridge_due = snapshot
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == active.review_unit_id)
+            .map_or(now - 60_000, |unit| unit.queue.due.saturating_sub(1_000));
+        let bridge = run_bridge_generation_with_provider(
+            &mut self.store,
+            provider,
+            BridgeGenerationRequest {
+                run_id: format!("bridge-run-{}", snapshot.generation_runs.len() + 1),
+                parent_review_unit_id: active.review_unit_id.clone(),
+                started_at: now,
+                completed_at: Some(now),
+                default_due: bridge_due,
+                model: None,
+            },
+        )?;
+        for draft_id in bridge.accepted_draft_ids {
+            self.store
+                .approve_generated_prompt_draft(
+                    &draft_id,
+                    ApproveGeneratedPromptDraftOptions::default(),
+                )
+                .map_err(BetaStudyError::Store)?;
+        }
+        self.store
+            .snooze_review_unit_until(&active.review_unit_id, now + DEFAULT_BRIDGE_PARENT_DEFER_MS)
             .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
@@ -1066,6 +1219,10 @@ fn draft_has_active_source(
     draft: &GeneratedPromptDraft,
     active_source_ids: &BTreeSet<String>,
 ) -> bool {
+    if draft.source_document_ids.is_empty() && draft.concept_reference_note_key.is_some() {
+        return true;
+    }
+
     draft
         .source_document_ids
         .iter()
@@ -1195,23 +1352,46 @@ fn prompt_expected_answer(prompt: &Prompt) -> String {
     }
 }
 
-fn reference_text(
-    spans: &[memory_engine_persistence::ReferenceSpan],
-    draft: &GeneratedPromptDraft,
-) -> Option<String> {
+fn reference_text(snapshot: &BetaStoreSnapshot, draft: &GeneratedPromptDraft) -> Option<String> {
     let text = draft
         .reference_span_ids
         .iter()
-        .filter_map(|id| spans.iter().find(|span| &span.id == id))
+        .filter_map(|id| snapshot.reference_spans.iter().find(|span| &span.id == id))
         .map(|span| span.text.trim())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
+    if !text.is_empty() {
+        return Some(text);
     }
+
+    draft
+        .concept_reference_note_key
+        .as_ref()
+        .and_then(|key| {
+            snapshot
+                .concept_reference_notes
+                .iter()
+                .find(|note| &note.concept_key == key)
+        })
+        .map(|note| note.body.trim().to_owned())
+        .filter(|body| !body.is_empty())
+}
+
+fn concept_key_for_draft(draft: &GeneratedPromptDraft) -> String {
+    draft
+        .queue
+        .concept_key
+        .clone()
+        .or_else(|| draft.concept_reference_note_key.clone())
+        .unwrap_or_else(|| draft.review_unit_id.as_str().to_owned())
+}
+
+fn concept_label_for_key(key: &str) -> String {
+    key.split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn project_schedule(schedule: Option<&ScheduleState>) -> Option<ReviewStateProjection> {

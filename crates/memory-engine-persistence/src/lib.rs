@@ -10,7 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use memory_engine_core::{Prompt, QueueCandidate, ReviewUnitId, ScheduleState};
+use memory_engine_core::{
+    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ScheduleState,
+};
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +103,8 @@ pub struct GeneratedPromptDraft {
     pub id: String,
     pub source_document_ids: Vec<String>,
     pub reference_span_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_reference_note_key: Option<String>,
     pub generation_run_id: Option<String>,
     pub review_unit_id: ReviewUnitId,
     pub prompt_id: String,
@@ -120,6 +124,8 @@ pub struct GeneratedPromptDraft {
 pub struct GenerationRun {
     pub id: String,
     pub source_document_ids: Vec<String>,
+    #[serde(default)]
+    pub parent_review_unit_id: Option<ReviewUnitId>,
     pub draft_ids: Vec<String>,
     pub provider: String,
     pub model: String,
@@ -144,6 +150,17 @@ pub struct GenerationRunUsage {
     pub latency_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConceptReferenceNote {
+    pub concept_key: String,
+    pub title: String,
+    pub body: String,
+    pub model: GeneratedPromptModel,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BetaReviewUnitRecord {
@@ -152,6 +169,8 @@ pub struct BetaReviewUnitRecord {
     pub prompt: Prompt,
     pub queue: PersistedQueueCandidate,
     pub reference_span_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept_reference_note_key: Option<String>,
     pub generated_prompt_draft_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<i64>,
@@ -226,6 +245,8 @@ pub struct BetaStoreSnapshot {
     pub attempts: Vec<ServiceAttemptRecord>,
     pub generation_runs: Vec<GenerationRun>,
     pub applied_reviews: Vec<AppliedReviewReceipt>,
+    #[serde(default)]
+    pub concept_reference_notes: Vec<ConceptReferenceNote>,
 }
 
 impl Default for BetaStoreSnapshot {
@@ -240,6 +261,7 @@ impl Default for BetaStoreSnapshot {
             attempts: Vec::new(),
             generation_runs: Vec::new(),
             applied_reviews: Vec::new(),
+            concept_reference_notes: Vec::new(),
         }
     }
 }
@@ -257,6 +279,7 @@ pub enum BetaStoreError {
     Blank { label: &'static str },
     UnknownSourceDocument(String),
     UnknownReferenceSpan(String),
+    UnknownConceptReferenceNote(String),
     UnknownReviewUnit(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
     RejectedGeneratedPromptDraft,
@@ -288,6 +311,9 @@ impl fmt::Display for BetaStoreError {
             Self::Blank { label } => write!(formatter, "{label} must not be blank"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReferenceSpan(id) => write!(formatter, "Unknown reference span: {id}"),
+            Self::UnknownConceptReferenceNote(id) => {
+                write!(formatter, "Unknown concept reference note: {id}")
+            }
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
                 write!(formatter, "Unknown generated prompt draft: {id}")
@@ -350,6 +376,7 @@ impl PartialEq for BetaStoreError {
             (Self::Blank { label: left }, Self::Blank { label: right }) => left == right,
             (Self::UnknownSourceDocument(left), Self::UnknownSourceDocument(right))
             | (Self::UnknownReferenceSpan(left), Self::UnknownReferenceSpan(right))
+            | (Self::UnknownConceptReferenceNote(left), Self::UnknownConceptReferenceNote(right))
             | (Self::UnknownGeneratedPromptDraft(left), Self::UnknownGeneratedPromptDraft(right))
             | (Self::DuplicateAppliedReview(left), Self::DuplicateAppliedReview(right)) => {
                 left == right
@@ -517,6 +544,27 @@ impl BetaPersistenceStore {
         Ok(run)
     }
 
+    /// Save or replace a generated concept-level reference note.
+    ///
+    /// Concept notes are not source evidence. They cache provider-written
+    /// explanations for items that have no source span, and generated bridge
+    /// drafts may cite them instead of a [`ReferenceSpan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] for validation or commit failures.
+    pub fn save_concept_reference_note(
+        &mut self,
+        note: ConceptReferenceNote,
+    ) -> Result<ConceptReferenceNote, BetaStoreError> {
+        assert_concept_reference_note_contract(&note)?;
+        let mut next = self.data.clone();
+        upsert_concept_reference_note(&mut next.concept_reference_notes, note.clone());
+        self.commit(next)?;
+
+        Ok(note)
+    }
+
     /// Save or replace a generated prompt draft.
     ///
     /// # Errors
@@ -563,6 +611,7 @@ impl BetaPersistenceStore {
             prompt: draft.prompt.clone(),
             queue: draft.queue.clone(),
             reference_span_ids: draft.reference_span_ids.clone(),
+            concept_reference_note_key: draft.concept_reference_note_key.clone(),
             generated_prompt_draft_id: Some(draft.id.clone()),
             archived_at: None,
             snoozed_until: None,
@@ -809,7 +858,7 @@ impl MemoryServiceStore for BetaPersistenceStore {
                     .map(|record| record.state.clone());
                 let mut candidate = review_unit.queue.with_schedule(schedule_state);
                 if let Some(snoozed_until) = review_unit.snoozed_until {
-                    candidate.due = candidate.due.max(snoozed_until);
+                    candidate = defer_queue_availability(&candidate, snoozed_until);
                 }
                 candidate
             })
@@ -873,6 +922,23 @@ fn assert_known_reference(
     }
 }
 
+fn assert_known_concept_reference_note(
+    snapshot: &BetaStoreSnapshot,
+    concept_key: &str,
+) -> Result<(), BetaStoreError> {
+    if snapshot
+        .concept_reference_notes
+        .iter()
+        .any(|note| note.concept_key == concept_key)
+    {
+        Ok(())
+    } else {
+        Err(BetaStoreError::UnknownConceptReferenceNote(
+            concept_key.to_owned(),
+        ))
+    }
+}
+
 fn assert_known_review_unit(
     snapshot: &BetaStoreSnapshot,
     review_unit_id: &ReviewUnitId,
@@ -916,10 +982,15 @@ fn assert_draft_contract(
     assert_non_blank(&draft.model.provider, "Generated prompt draft provider")?;
     assert_non_blank(&draft.model.name, "Generated prompt draft model")?;
     assert_non_blank(&draft.model.version, "Generated prompt draft model version")?;
-    if draft.source_document_ids.is_empty() {
+    let cites_concept_note = draft.concept_reference_note_key.is_some();
+    let provider_generated = draft.generation_run_id.is_some();
+    if provider_generated && draft.source_document_ids.is_empty() && !cites_concept_note {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresSource);
     }
-    if draft.reference_span_ids.is_empty() {
+    if provider_generated && !cites_concept_note && draft.reference_span_ids.is_empty() {
+        return Err(BetaStoreError::GeneratedPromptDraftRequiresReference);
+    }
+    if provider_generated && cites_concept_note && !draft.source_document_ids.is_empty() {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresReference);
     }
     if prompt_review_unit_id(&draft.prompt) != &draft.review_unit_id
@@ -932,6 +1003,9 @@ fn assert_draft_contract(
     }
     for reference_span_id in &draft.reference_span_ids {
         assert_known_reference(snapshot, reference_span_id)?;
+    }
+    if let Some(concept_key) = &draft.concept_reference_note_key {
+        assert_known_concept_reference_note(snapshot, concept_key)?;
     }
 
     Ok(())
@@ -949,6 +1023,9 @@ fn assert_review_unit_contract(
     for reference_span_id in &review_unit.reference_span_ids {
         assert_known_reference(snapshot, reference_span_id)?;
     }
+    if let Some(concept_key) = &review_unit.concept_reference_note_key {
+        assert_known_concept_reference_note(snapshot, concept_key)?;
+    }
     if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
         if find_by_id(&snapshot.generated_prompt_drafts, draft_id).is_none() {
             return Err(BetaStoreError::UnknownGeneratedPromptDraft(
@@ -958,6 +1035,17 @@ fn assert_review_unit_contract(
     }
 
     Ok(())
+}
+
+fn assert_concept_reference_note_contract(
+    note: &ConceptReferenceNote,
+) -> Result<(), BetaStoreError> {
+    assert_non_blank(&note.concept_key, "Concept reference note key")?;
+    assert_non_blank(&note.title, "Concept reference note title")?;
+    assert_non_blank(&note.body, "Concept reference note body")?;
+    assert_non_blank(&note.model.provider, "Concept reference note provider")?;
+    assert_non_blank(&note.model.name, "Concept reference note model")?;
+    assert_non_blank(&note.model.version, "Concept reference note model version")
 }
 
 fn prompt_review_unit_id(prompt: &Prompt) -> &ReviewUnitId {
@@ -1026,6 +1114,20 @@ impl HasId for GeneratedPromptDraft {
 impl HasId for GenerationRun {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+fn upsert_concept_reference_note(
+    items: &mut Vec<ConceptReferenceNote>,
+    item: ConceptReferenceNote,
+) {
+    if let Some(index) = items
+        .iter()
+        .position(|candidate| candidate.concept_key == item.concept_key)
+    {
+        items[index] = item;
+    } else {
+        items.push(item);
     }
 }
 

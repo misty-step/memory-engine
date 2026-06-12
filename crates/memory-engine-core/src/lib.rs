@@ -21,7 +21,10 @@ pub use progression::{
     filter_eligible_candidates, filter_eligible_candidates_with_fallback, is_mastered,
     ProgressionCandidate, ProgressionFilterResult, ProgressionLike,
 };
-pub use queue::{compare_queue_priority, pick_next_queue_candidate, reviewable_queue_candidates};
+pub use queue::{
+    compare_queue_priority, defer_queue_availability, pick_next_queue_candidate,
+    reviewable_queue_candidates,
+};
 pub use rubric::{
     resolve_rubric_grade, AsyncGrader, GradeablePrompt, NoRubricGrader, RubricGradeError,
     RubricGraderAdapter, StaticRubricGrader, DEFAULT_RUBRIC_CONFIDENCE_FLOOR,

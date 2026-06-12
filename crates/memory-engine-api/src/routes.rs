@@ -34,6 +34,10 @@ enum V1Route {
     Approve,
     Next,
     Reveal,
+    Reference,
+    Skip,
+    Snooze,
+    Bridge,
     Submit,
 }
 
@@ -46,6 +50,10 @@ const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/ge
 const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
 const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
+const V1_REFERENCE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reference";
+const V1_SKIP_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/skip";
+const V1_SNOOZE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/snooze";
+const V1_BRIDGE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/bridge";
 const V1_SUBMIT_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/submit";
 
 const V1_ROUTES: &[V1Route] = &[
@@ -57,6 +65,10 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Approve,
     V1Route::Next,
     V1Route::Reveal,
+    V1Route::Reference,
+    V1Route::Skip,
+    V1Route::Snooze,
+    V1Route::Bridge,
     V1Route::Submit,
 ];
 
@@ -71,6 +83,10 @@ impl V1Route {
             Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
             Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
+            Self::Reference => router.route(V1_REFERENCE_PATH, post(reference_review)),
+            Self::Skip => router.route(V1_SKIP_PATH, post(skip_review)),
+            Self::Snooze => router.route(V1_SNOOZE_PATH, post(snooze_review)),
+            Self::Bridge => router.route(V1_BRIDGE_PATH, post(bridge_review)),
             Self::Submit => router.route(V1_SUBMIT_PATH, post(submit_review)),
         }
     }
@@ -116,6 +132,22 @@ impl V1Route {
                 method: "POST",
                 path: V1_REVEAL_PATH,
             }],
+            Self::Reference => &[V1ContractOperation {
+                method: "POST",
+                path: V1_REFERENCE_PATH,
+            }],
+            Self::Skip => &[V1ContractOperation {
+                method: "POST",
+                path: V1_SKIP_PATH,
+            }],
+            Self::Snooze => &[V1ContractOperation {
+                method: "POST",
+                path: V1_SNOOZE_PATH,
+            }],
+            Self::Bridge => &[V1ContractOperation {
+                method: "POST",
+                path: V1_BRIDGE_PATH,
+            }],
             Self::Submit => &[V1ContractOperation {
                 method: "POST",
                 path: V1_SUBMIT_PATH,
@@ -159,6 +191,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/approve", post(approve_app_draft))
         .route("/app/next", post(next_app_review))
         .route("/app/reveal", post(reveal_app_review))
+        .route("/app/reference", post(reference_app_review))
+        .route("/app/skip", post(skip_app_review))
+        .route("/app/snooze", post(snooze_app_review))
+        .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
         .route(
             "/accounts/{account_id}/sources",
@@ -180,6 +216,22 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/reveal",
             post(reveal_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/reference",
+            post(reference_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/skip",
+            post(skip_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/snooze",
+            post(snooze_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/bridge",
+            post(bridge_review),
         )
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/submit",
@@ -301,6 +353,62 @@ async fn reveal_review(
     let session_token = read_session_token(&headers)?;
 
     Ok(Json(state.accounts.reveal_review(
+        &account_id,
+        session_token,
+        &review_unit_id,
+    )?))
+}
+
+async fn reference_review(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.accounts.learn_more_review(
+        &account_id,
+        session_token,
+        &review_unit_id,
+    )?))
+}
+
+async fn skip_review(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.accounts.skip_review(
+        &account_id,
+        session_token,
+        &review_unit_id,
+    )?))
+}
+
+async fn snooze_review(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.accounts.snooze_review(
+        &account_id,
+        session_token,
+        &review_unit_id,
+    )?))
+}
+
+async fn bridge_review(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.accounts.bridge_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -686,6 +794,90 @@ async fn reveal_app_review(
         Err(error) => return error.into_response(),
     };
     let result = state.accounts.reveal_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn reference_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.learn_more_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn skip_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.skip_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn snooze_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.snooze_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn bridge_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.bridge_review(
         &account.account_id,
         &account.session_token,
         &form.review_unit_id,

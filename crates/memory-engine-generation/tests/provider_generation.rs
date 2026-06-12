@@ -443,6 +443,7 @@ fn request(run_id: &str, source_id: &str) -> BetaGenerationRequest {
     BetaGenerationRequest {
         run_id: run_id.to_owned(),
         source_document_ids: vec![source_id.to_owned()],
+        parent_review_unit_id: None,
         started_at: NOW,
         completed_at: Some(NOW + 1_000),
         default_due: NOW - 60_000,
