@@ -228,6 +228,106 @@
         }
       }
     },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/reference": {
+      "post": {
+        "summary": "Show reference material for the current review",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with source-backed or generated reference material",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/skip": {
+      "post": {
+        "summary": "Briefly defer the current review without grading it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with the skipped item deferred and the next due item selected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/snooze": {
+      "post": {
+        "summary": "Snooze the current review without grading it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with the snoozed item deferred and the next due item selected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/bridge": {
+      "post": {
+        "summary": "Generate easier bridge material for the current review",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with generated bridge items queued ahead of the parent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/review/{review_unit_id}/submit": {
       "post": {
         "summary": "Submit an answer and apply scheduling",

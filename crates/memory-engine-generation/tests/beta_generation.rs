@@ -1,10 +1,16 @@
 use std::{fs, path::PathBuf};
 
-use memory_engine_core::Prompt;
-use memory_engine_generation::{run_beta_generation, BetaGenerationError, BetaGenerationRequest};
+use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
+use memory_engine_generation::{
+    run_beta_generation, run_bridge_generation_with_provider, BetaGenerationError,
+    BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial, BridgeMaterialProvider,
+    BridgeMaterialRequest, DraftCandidate, ProviderFailure, ReferenceNoteDraft,
+    ReferenceNoteProvider, ReferenceNoteRequest,
+};
 use memory_engine_persistence::{
-    BetaPersistenceStore, GeneratedLearningActivityKind, GeneratedPromptValidationStatus,
-    SourceDocument, SourceDocumentKind, SourcePermission,
+    BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
+    GeneratedPromptModel, GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument,
+    SourceDocumentKind, SourcePermission,
 };
 
 const NOW: i64 = 1_780_162_400_000;
@@ -33,6 +39,7 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
         BetaGenerationRequest {
             run_id: "run-nato".to_owned(),
             source_document_ids: vec!["src-nato".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
@@ -164,6 +171,7 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
         BetaGenerationRequest {
             run_id: "run-options".to_owned(),
             source_document_ids: vec!["src-options".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: None,
             default_due: NOW,
@@ -191,6 +199,49 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
     assert_eq!(
         drafts[2].validation.reasons,
         ["Unsupported by cited source material"]
+    );
+}
+
+#[test]
+fn bridge_generation_rejects_duplicate_of_manual_parent_review_unit() {
+    let directory = TempDirectory::new("manual-parent-duplicate");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+
+    let failure = run_bridge_generation_with_provider(
+        &mut store,
+        &DuplicateParentBridgeProvider,
+        BridgeGenerationRequest {
+            run_id: "bridge-run-manual-parent".to_owned(),
+            parent_review_unit_id: parent,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 10_000,
+            model: None,
+        },
+    )
+    .expect_err("duplicate manual parent bridge should have no accepted drafts");
+
+    assert!(
+        failure
+            .to_string()
+            .contains("Duplicate-ish generated draft"),
+        "unexpected failure: {failure}"
+    );
+    let snapshot = store.snapshot();
+    let bridge_draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.id.starts_with("bridge-run-manual-parent"))
+        .expect("bridge draft persisted");
+    assert_eq!(
+        bridge_draft.validation.status,
+        GeneratedPromptValidationStatus::Rejected
+    );
+    assert_eq!(
+        bridge_draft.validation.reasons,
+        ["Duplicate-ish generated draft"]
     );
 }
 
@@ -226,6 +277,7 @@ fn records_missing_provenance_failures_without_saving_malformed_drafts() {
         BetaGenerationRequest {
             run_id: "run-missing".to_owned(),
             source_document_ids: vec!["src-missing-provenance".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: None,
             default_due: NOW,
@@ -270,6 +322,7 @@ fn generation_preserves_retrieval_depth_progression_tiers() {
         BetaGenerationRequest {
             run_id: "run-depths".to_owned(),
             source_document_ids: vec!["src-depths".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
@@ -324,6 +377,7 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
         BetaGenerationRequest {
             run_id: "run-missing".to_owned(),
             source_document_ids: vec!["missing-source".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: None,
             default_due: NOW,
@@ -354,6 +408,7 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
         BetaGenerationRequest {
             run_id: "run-empty".to_owned(),
             source_document_ids: vec!["empty-source".to_owned()],
+            parent_review_unit_id: None,
             started_at: NOW,
             completed_at: None,
             default_due: NOW,
@@ -422,6 +477,100 @@ fn retrieval_depth_body() -> String {
         "Reference: A study progression can move from recognition to cued recall to free recall to composition in context.",
     ]
     .join("\n")
+}
+
+fn save_manual_parent(store: &mut BetaPersistenceStore) -> ReviewUnitId {
+    let review_unit_id = ReviewUnitId::new("manual-nato-cat-parent");
+    let prompt = Prompt::Exact(ExactPrompt {
+        kind: ExactPromptKind::ShortAnswer,
+        review_unit_id: review_unit_id.clone(),
+        prompt: "Spell CAT over the phone using the NATO phonetic alphabet.".to_owned(),
+        accepted_answers: vec!["CHARLIE ALFA TANGO".to_owned()],
+        equivalence_groups: Vec::new(),
+        ignored_tokens: Vec::new(),
+    });
+    store
+        .save_review_unit(BetaReviewUnitRecord {
+            review_unit_id: review_unit_id.clone(),
+            prompt_id: "manual-nato-cat-parent-prompt".to_owned(),
+            prompt,
+            queue: PersistedQueueCandidate {
+                review_unit_id: review_unit_id.clone(),
+                due: NOW - 60_000,
+                progression: Some(ProgressionMetadata {
+                    progression_group: Some("nato-cat-composition".to_owned()),
+                    stage_order: 4,
+                    requires: Vec::new(),
+                    supersedes: Vec::new(),
+                }),
+                concept_key: Some("nato-cat-composition".to_owned()),
+                source_key: Some("manual-source".to_owned()),
+                domain_key: Some("nato".to_owned()),
+            },
+            reference_span_ids: Vec::new(),
+            concept_reference_note_key: None,
+            generated_prompt_draft_id: None,
+            archived_at: None,
+            snoozed_until: None,
+            created_at: NOW,
+        })
+        .expect("manual parent");
+
+    review_unit_id
+}
+
+struct DuplicateParentBridgeProvider;
+
+impl ReferenceNoteProvider for DuplicateParentBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "duplicate-parent".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: "NATO CAT composition".to_owned(),
+            body: "CAT is spelled CHARLIE ALFA TANGO.".to_owned(),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for DuplicateParentBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Ok(BridgeMaterial {
+            model: GeneratedPromptModel {
+                provider: "fixture".to_owned(),
+                name: "duplicate-parent".to_owned(),
+                version: "v1".to_owned(),
+            },
+            reference_note: ReferenceNoteDraft {
+                title: "NATO CAT composition".to_owned(),
+                body: "CAT is spelled CHARLIE ALFA TANGO.".to_owned(),
+            },
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: request.concept_label.clone(),
+                question: request.parent_prompt.clone(),
+                answer: request.parent_expected_answer.clone(),
+                evidence: None,
+                distractors: vec!["BRAVO ECHO ECHO".to_owned(), "DELTA OSCAR GOLF".to_owned()],
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "recognition-bridge".to_owned(),
+                unsupported: false,
+            }],
+            usage: None,
+        })
+    }
 }
 
 struct TempDirectory {

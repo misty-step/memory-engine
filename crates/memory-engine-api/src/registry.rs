@@ -298,6 +298,50 @@ impl AccountRegistry {
             .reveal_review(account_id, &account.store_path, review_unit_id)
     }
 
+    pub(crate) fn learn_more_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .learn_more_review(account_id, &account.store_path, review_unit_id)
+    }
+
+    pub(crate) fn skip_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .skip_review(account_id, &account.store_path, review_unit_id)
+    }
+
+    pub(crate) fn snooze_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .snooze_review(account_id, &account.store_path, review_unit_id)
+    }
+
+    pub(crate) fn bridge_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .bridge_review(account_id, &account.store_path, review_unit_id)
+    }
+
     pub(crate) fn submit_review(
         &self,
         account_id: &str,

@@ -16,23 +16,27 @@ mod provider;
 use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
-    classify_learning_intent, DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider,
-    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
+    classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
+    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, LearningIntent,
+    LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
+    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
     StructuredBlockProvider,
 };
 
 use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaStoreError, BetaStoreSnapshot, GeneratedLearningActivityKind,
-    GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
-    GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage, PersistedQueueCandidate,
-    ReferenceSpan, SourceDocument, SourceDocumentKind,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
+    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
+    GenerationRun, GenerationRunUsage, PersistedQueueCandidate, ReferenceSpan, SourceDocument,
+    SourceDocumentKind,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BetaGenerationRequest {
     pub run_id: String,
     pub source_document_ids: Vec<String>,
+    pub parent_review_unit_id: Option<ReviewUnitId>,
     pub started_at: i64,
     pub completed_at: Option<i64>,
     pub default_due: i64,
@@ -48,11 +52,33 @@ pub struct BetaGenerationResult {
     pub validation_failures: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeGenerationRequest {
+    pub run_id: String,
+    pub parent_review_unit_id: ReviewUnitId,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub default_due: i64,
+    pub model: Option<GeneratedPromptModel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeGenerationResult {
+    pub run_id: String,
+    pub concept_key: String,
+    pub reference_note_created: bool,
+    pub accepted_draft_ids: Vec<String>,
+    pub rejected_draft_ids: Vec<String>,
+    pub validation_failures: Vec<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum BetaGenerationError<E = BetaStoreError> {
     Store(E),
     UnknownSourceDocument(String),
+    UnknownReviewUnit(ReviewUnitId),
     SourceDocumentHasNoTextBody(String),
+    ProviderFailure(String),
 }
 
 impl<E> fmt::Display for BetaGenerationError<E>
@@ -63,9 +89,11 @@ where
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::SourceDocumentHasNoTextBody(id) => {
                 write!(formatter, "Source document has no text body: {id}")
             }
+            Self::ProviderFailure(message) => formatter.write_str(message),
         }
     }
 }
@@ -77,7 +105,10 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(error) => Some(error),
-            Self::UnknownSourceDocument(_) | Self::SourceDocumentHasNoTextBody(_) => None,
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::SourceDocumentHasNoTextBody(_)
+            | Self::ProviderFailure(_) => None,
         }
     }
 }
@@ -117,6 +148,16 @@ pub trait BetaGenerationStore {
         reference: ReferenceSpan,
     ) -> Result<ReferenceSpan, Self::Error>;
 
+    /// Save provider-generated concept reference material.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the note is rejected or cannot be persisted.
+    fn save_concept_reference_note(
+        &mut self,
+        note: ConceptReferenceNote,
+    ) -> Result<ConceptReferenceNote, Self::Error>;
+
     /// Save a generated prompt draft.
     ///
     /// # Errors
@@ -144,6 +185,13 @@ impl BetaGenerationStore for BetaPersistenceStore {
         reference: ReferenceSpan,
     ) -> Result<ReferenceSpan, Self::Error> {
         BetaPersistenceStore::save_reference_span(self, reference)
+    }
+
+    fn save_concept_reference_note(
+        &mut self,
+        note: ConceptReferenceNote,
+    ) -> Result<ConceptReferenceNote, Self::Error> {
+        BetaPersistenceStore::save_concept_reference_note(self, note)
     }
 
     fn save_generated_prompt_draft(
@@ -296,6 +344,308 @@ where
     })
 }
 
+/// Generate bridge material for one approved parent review unit.
+///
+/// Bridge generation is concept-backed rather than source-backed: if the
+/// concept has no cached reference note, the provider writes one first; easier
+/// bridge drafts cite that concept note and enter the queue with the supplied
+/// due timestamp. The caller owns deferring the parent item.
+///
+/// # Errors
+///
+/// Returns [`BetaGenerationError`] when the parent is unknown or store writes
+/// fail.
+pub fn run_bridge_generation_with_provider<S>(
+    store: &mut S,
+    provider: &dyn BridgeMaterialProvider,
+    request: BridgeGenerationRequest,
+) -> Result<BridgeGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
+    let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
+    let provider_request = bridge_material_request(&snapshot, &context);
+    let material = provider
+        .generate_bridge_material(&provider_request)
+        .map_err(|failure| BetaGenerationError::ProviderFailure(failure.to_string()))?;
+    let model = request
+        .model
+        .clone()
+        .unwrap_or_else(|| material.model.clone());
+    let (note, note_body, reference_note_created) =
+        bridge_reference_note(&context, &material, &model, request.started_at);
+
+    let run_request = bridge_run_request(&request);
+    store
+        .save_generation_run(run_receipt(&run_request, &model, RunProgress::Started))
+        .map_err(BetaGenerationError::Store)?;
+    store
+        .save_concept_reference_note(note)
+        .map_err(BetaGenerationError::Store)?;
+
+    let bridge_drafts = save_bridge_drafts(
+        store,
+        &snapshot,
+        material.candidates,
+        &BridgeDraftBaseContext {
+            run_id: &request.run_id,
+            concept_key: &context.concept_key,
+            reference_note_body: &note_body,
+            model: &model,
+            due: request.default_due,
+            created_at: request.started_at,
+            parent_review_unit_id: &context.parent.review_unit_id,
+            parent_progression: context.parent.queue.progression.as_ref(),
+            parent_stage_order: context.parent_stage_order,
+        },
+    )?;
+
+    store
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Completed {
+                draft_ids: bridge_drafts.draft_ids,
+                validation_failures: bridge_drafts.validation_failures.clone(),
+                usage: material.usage.as_ref().map(provider_usage_to_run_usage),
+            },
+        ))
+        .map_err(BetaGenerationError::Store)?;
+
+    if bridge_drafts.accepted_draft_ids.is_empty() {
+        return Err(BetaGenerationError::ProviderFailure(format!(
+            "Bridge material produced no accepted drafts: {}",
+            bridge_drafts.validation_failures.join("; ")
+        )));
+    }
+
+    Ok(BridgeGenerationResult {
+        run_id: request.run_id,
+        concept_key: context.concept_key,
+        reference_note_created,
+        accepted_draft_ids: bridge_drafts.accepted_draft_ids,
+        rejected_draft_ids: bridge_drafts.rejected_draft_ids,
+        validation_failures: bridge_drafts.validation_failures,
+    })
+}
+
+struct BridgeGenerationContext {
+    parent: BetaReviewUnitRecord,
+    concept_key: String,
+    concept_label: String,
+    cached_note: Option<ConceptReferenceNote>,
+    parent_stage_order: u32,
+}
+
+fn bridge_generation_context<E>(
+    snapshot: &BetaStoreSnapshot,
+    parent_review_unit_id: &ReviewUnitId,
+) -> Result<BridgeGenerationContext, BetaGenerationError<E>> {
+    let parent = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == *parent_review_unit_id)
+        .cloned()
+        .ok_or_else(|| BetaGenerationError::UnknownReviewUnit(parent_review_unit_id.clone()))?;
+    let parent_draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == parent.review_unit_id);
+    let concept_key = parent
+        .queue
+        .concept_key
+        .clone()
+        .or_else(|| parent_draft.and_then(|draft| draft.queue.concept_key.clone()))
+        .unwrap_or_else(|| parent.review_unit_id.as_str().to_owned());
+    let cached_note = snapshot
+        .concept_reference_notes
+        .iter()
+        .find(|note| note.concept_key == concept_key)
+        .cloned();
+    let parent_stage_order = parent
+        .queue
+        .progression
+        .as_ref()
+        .map_or(1, |progression| progression.stage_order);
+
+    Ok(BridgeGenerationContext {
+        parent,
+        concept_label: concept_key.replace('-', " "),
+        concept_key,
+        cached_note,
+        parent_stage_order,
+    })
+}
+
+fn bridge_material_request(
+    snapshot: &BetaStoreSnapshot,
+    context: &BridgeGenerationContext,
+) -> BridgeMaterialRequest {
+    BridgeMaterialRequest {
+        concept_key: context.concept_key.clone(),
+        concept_label: context.concept_label.clone(),
+        parent_review_unit_id: context.parent.review_unit_id.clone(),
+        parent_prompt: prompt_text(&context.parent.prompt),
+        parent_expected_answer: expected_answer(&context.parent.prompt),
+        parent_stage_order: context.parent_stage_order,
+        cached_reference_note: context.cached_note.as_ref().map(|note| note.body.clone()),
+        recent_performance: recent_performance_for_concept(snapshot, &context.concept_key),
+    }
+}
+
+fn bridge_reference_note(
+    context: &BridgeGenerationContext,
+    material: &BridgeMaterial,
+    model: &GeneratedPromptModel,
+    created_at: i64,
+) -> (ConceptReferenceNote, String, bool) {
+    let created = context.cached_note.is_none();
+    let body = context.cached_note.as_ref().map_or_else(
+        || material.reference_note.body.clone(),
+        |note| note.body.clone(),
+    );
+    let note = context
+        .cached_note
+        .clone()
+        .unwrap_or_else(|| ConceptReferenceNote {
+            concept_key: context.concept_key.clone(),
+            title: material.reference_note.title.clone(),
+            body: material.reference_note.body.clone(),
+            model: model.clone(),
+            created_at,
+            updated_at: created_at,
+        });
+
+    (note, body, created)
+}
+
+struct BridgeDraftBaseContext<'a> {
+    run_id: &'a str,
+    concept_key: &'a str,
+    reference_note_body: &'a str,
+    model: &'a GeneratedPromptModel,
+    due: i64,
+    created_at: i64,
+    parent_review_unit_id: &'a ReviewUnitId,
+    parent_progression: Option<&'a ProgressionMetadata>,
+    parent_stage_order: u32,
+}
+
+struct BridgeDraftPersistence {
+    draft_ids: Vec<String>,
+    accepted_draft_ids: Vec<String>,
+    rejected_draft_ids: Vec<String>,
+    validation_failures: Vec<String>,
+}
+
+fn save_bridge_drafts<S>(
+    store: &mut S,
+    snapshot: &BetaStoreSnapshot,
+    candidates: Vec<DraftCandidate>,
+    base: &BridgeDraftBaseContext<'_>,
+) -> Result<BridgeDraftPersistence, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let mut result = BridgeDraftPersistence {
+        draft_ids: Vec::new(),
+        accepted_draft_ids: Vec::new(),
+        rejected_draft_ids: Vec::new(),
+        validation_failures: Vec::new(),
+    };
+    let mut seen_signatures = existing_draft_signatures(&snapshot.generated_prompt_drafts);
+    seen_signatures.extend(existing_review_unit_signatures(&snapshot.review_units));
+    let mut drafts = Vec::new();
+
+    for candidate in candidates {
+        let signature = candidate_signature(&candidate);
+        let duplicate = seen_signatures.contains(&signature);
+        seen_signatures.insert(signature);
+        let easier = stage_order(&candidate.activity_stage, &candidate.activity_kind)
+            < base.parent_stage_order;
+        let draft = bridge_draft(
+            &candidate,
+            &BridgeDraftContext {
+                run_id: base.run_id,
+                concept_key: base.concept_key,
+                reference_note_body: base.reference_note_body,
+                model: base.model,
+                due: base.due,
+                created_at: base.created_at,
+                duplicate,
+                easier,
+                parent_review_unit_id: base.parent_review_unit_id,
+                parent_progression: base.parent_progression,
+            },
+        );
+        drafts.push(draft);
+    }
+
+    enforce_bridge_pack_ladder(&mut drafts);
+    for draft in drafts {
+        record_bridge_draft(&mut result, &draft);
+        store
+            .save_generated_prompt_draft(draft)
+            .map_err(BetaGenerationError::Store)?;
+    }
+
+    Ok(result)
+}
+
+fn enforce_bridge_pack_ladder(drafts: &mut [GeneratedPromptDraft]) {
+    let accepted_stage_orders = drafts
+        .iter()
+        .filter(|draft| draft.validation.status == GeneratedPromptValidationStatus::Accepted)
+        .map(|draft| stage_order(&draft.activity_stage, &draft.activity_kind))
+        .collect::<BTreeSet<_>>();
+    let accepted_count = drafts
+        .iter()
+        .filter(|draft| draft.validation.status == GeneratedPromptValidationStatus::Accepted)
+        .count();
+    if accepted_count <= 1 || accepted_stage_orders.len() >= 2 {
+        return;
+    }
+
+    for draft in drafts
+        .iter_mut()
+        .filter(|draft| draft.validation.status == GeneratedPromptValidationStatus::Accepted)
+    {
+        draft.validation.status = GeneratedPromptValidationStatus::Rejected;
+        draft
+            .validation
+            .reasons
+            .push("Bridge drafts must form a scaffold ladder".to_owned());
+        draft
+            .critique_notes
+            .push("Rejected: Bridge drafts must form a scaffold ladder".to_owned());
+    }
+}
+
+fn record_bridge_draft(result: &mut BridgeDraftPersistence, draft: &GeneratedPromptDraft) {
+    if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
+        result.accepted_draft_ids.push(draft.id.clone());
+    } else {
+        result
+            .validation_failures
+            .extend(draft.validation.reasons.clone());
+        result.rejected_draft_ids.push(draft.id.clone());
+    }
+    result.draft_ids.push(draft.id.clone());
+}
+
+fn bridge_run_request(request: &BridgeGenerationRequest) -> BetaGenerationRequest {
+    BetaGenerationRequest {
+        run_id: request.run_id.clone(),
+        source_document_ids: Vec::new(),
+        parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
+        started_at: request.started_at,
+        completed_at: request.completed_at,
+        default_due: request.default_due,
+        model: request.model.clone(),
+    }
+}
+
 struct PersistParams<'a> {
     request: &'a BetaGenerationRequest,
     model: &'a GeneratedPromptModel,
@@ -373,6 +723,7 @@ fn run_receipt(
     GenerationRun {
         id: request.run_id.clone(),
         source_document_ids: request.source_document_ids.clone(),
+        parent_review_unit_id: request.parent_review_unit_id.clone(),
         draft_ids,
         provider: model.provider.clone(),
         model: model.name.clone(),
@@ -416,6 +767,15 @@ fn merge_usage(
         },
         latency_ms: total.latency_ms + addition.latency_ms,
     })
+}
+
+fn provider_usage_to_run_usage(usage: &ProviderUsage) -> GenerationRunUsage {
+    GenerationRunUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cost_usd_micros: usage.cost_usd_micros,
+        latency_ms: usage.latency_ms,
+    }
 }
 
 fn source_contains_quote(source: &SourceDocument, quote: &str) -> bool {
@@ -526,6 +886,7 @@ fn build_draft(
         id: generated_id(context.run_id, "draft", &source.id, candidate),
         source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
+        concept_reference_note_key: None,
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
@@ -551,6 +912,115 @@ fn build_draft(
         critique_notes,
         created_at: context.created_at,
     }
+}
+
+struct BridgeDraftContext<'a> {
+    run_id: &'a str,
+    concept_key: &'a str,
+    reference_note_body: &'a str,
+    model: &'a GeneratedPromptModel,
+    due: i64,
+    created_at: i64,
+    duplicate: bool,
+    easier: bool,
+    parent_review_unit_id: &'a ReviewUnitId,
+    parent_progression: Option<&'a ProgressionMetadata>,
+}
+
+fn bridge_draft(
+    candidate: &DraftCandidate,
+    context: &BridgeDraftContext<'_>,
+) -> GeneratedPromptDraft {
+    let unit_id = ReviewUnitId::new(bridge_generated_id(
+        "bridge",
+        activity_kind_slug(&candidate.activity_kind),
+        context.parent_review_unit_id,
+        candidate,
+    ));
+    let reasons = bridge_validation_reasons(candidate, context);
+    let status = if reasons.is_empty() {
+        GeneratedPromptValidationStatus::Accepted
+    } else {
+        GeneratedPromptValidationStatus::Rejected
+    };
+    let critique_notes = if status == GeneratedPromptValidationStatus::Accepted {
+        vec![format!(
+            "Grounded in concept reference note {}.",
+            context.concept_key
+        )]
+    } else {
+        reasons
+            .iter()
+            .map(|reason| format!("Rejected: {reason}"))
+            .collect()
+    };
+    let stage_order = stage_order(&candidate.activity_stage, &candidate.activity_kind);
+    let parent_group = context
+        .parent_progression
+        .and_then(|progression| progression.progression_group.clone())
+        .unwrap_or_else(|| context.concept_key.to_owned());
+
+    GeneratedPromptDraft {
+        id: bridge_generated_id(
+            context.run_id,
+            "draft",
+            context.parent_review_unit_id,
+            candidate,
+        ),
+        source_document_ids: Vec::new(),
+        reference_span_ids: Vec::new(),
+        concept_reference_note_key: Some(context.concept_key.to_owned()),
+        generation_run_id: Some(context.run_id.to_owned()),
+        review_unit_id: unit_id.clone(),
+        prompt_id: format!("{unit_id}-prompt"),
+        prompt: build_prompt(candidate, &unit_id),
+        queue: PersistedQueueCandidate {
+            review_unit_id: unit_id.clone(),
+            due: context.due.saturating_add(i64::from(stage_order)),
+            progression: Some(ProgressionMetadata {
+                progression_group: Some(parent_group),
+                stage_order,
+                requires: Vec::new(),
+                supersedes: vec![context.parent_review_unit_id.clone()],
+            }),
+            concept_key: Some(context.concept_key.to_owned()),
+            source_key: None,
+            domain_key: Some("bridge".to_owned()),
+        },
+        activity_kind: candidate.activity_kind.clone(),
+        activity_stage: candidate.activity_stage.clone(),
+        worked_solution: candidate.worked_solution.clone(),
+        model: context.model.clone(),
+        validation: GeneratedPromptValidation { status, reasons },
+        critique_notes,
+        created_at: context.created_at,
+    }
+}
+
+fn bridge_validation_reasons(
+    candidate: &DraftCandidate,
+    context: &BridgeDraftContext<'_>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if candidate.unsupported {
+        reasons.push("Unsupported by bridge context".to_owned());
+    }
+    if context.reference_note_body.trim().is_empty() {
+        reasons.push("Bridge drafts require a concept reference note".to_owned());
+    }
+    if !context.easier {
+        reasons.push("Bridge drafts must target a lower progression stage".to_owned());
+    }
+    if context.duplicate {
+        reasons.push("Duplicate-ish generated draft".to_owned());
+    }
+    if candidate.activity_kind == GeneratedLearningActivityKind::Exercise
+        && candidate.worked_solution.is_none()
+    {
+        reasons.push("Exercises require a worked solution".to_owned());
+    }
+
+    reasons
 }
 
 fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
@@ -626,6 +1096,20 @@ fn existing_draft_signatures(drafts: &[GeneratedPromptDraft]) -> BTreeSet<String
         .collect()
 }
 
+fn existing_review_unit_signatures(review_units: &[BetaReviewUnitRecord]) -> BTreeSet<String> {
+    review_units
+        .iter()
+        .map(|unit| {
+            [
+                unit.queue.concept_key.clone().unwrap_or_default(),
+                prompt_text(&unit.prompt).to_lowercase(),
+                expected_answer(&unit.prompt).to_lowercase(),
+            ]
+            .join("\0")
+        })
+        .collect()
+}
+
 fn candidate_signature(candidate: &DraftCandidate) -> String {
     [
         slug(&candidate.concept),
@@ -633,6 +1117,34 @@ fn candidate_signature(candidate: &DraftCandidate) -> String {
         candidate.answer.to_lowercase(),
     ]
     .join("\0")
+}
+
+fn recent_performance_for_concept(
+    snapshot: &BetaStoreSnapshot,
+    concept_key: &str,
+) -> Vec<ReviewPerformanceContext> {
+    snapshot
+        .attempts
+        .iter()
+        .rev()
+        .filter(|attempt| {
+            snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == attempt.review_unit_id)
+                .and_then(|unit| unit.queue.concept_key.as_ref())
+                .is_some_and(|key| key == concept_key)
+        })
+        .take(5)
+        .map(|attempt| ReviewPerformanceContext {
+            review_unit_id: attempt.review_unit_id.to_string(),
+            submitted_answer: attempt.submitted_answer.clone(),
+            verdict: attempt
+                .grade
+                .as_ref()
+                .map(|grade| format!("{:?}", grade.verdict).to_lowercase()),
+        })
+        .collect()
 }
 
 fn prompt_text(prompt: &Prompt) -> String {
@@ -653,6 +1165,12 @@ fn expected_answer(prompt: &Prompt) -> String {
 
 fn stage_order(stage: &str, activity_kind: &GeneratedLearningActivityKind) -> u32 {
     let normalized = stage.to_lowercase();
+    if normalized.contains("bridge") && normalized.contains("recognition") {
+        return 0;
+    }
+    if normalized.contains("bridge") && normalized.contains("cued") {
+        return 1;
+    }
     if normalized.contains("recognition") {
         return 1;
     }
@@ -677,6 +1195,22 @@ fn generated_id(prefix: &str, kind: &str, source_id: &str, candidate: &DraftCand
         prefix.to_owned(),
         kind.to_owned(),
         slug(source_id),
+        candidate.index.to_string(),
+        slug(&candidate.concept),
+    ]
+    .join("-")
+}
+
+fn bridge_generated_id(
+    prefix: &str,
+    kind: &str,
+    parent_review_unit_id: &ReviewUnitId,
+    candidate: &DraftCandidate,
+) -> String {
+    [
+        prefix.to_owned(),
+        kind.to_owned(),
+        slug(parent_review_unit_id.as_str()),
         candidate.index.to_string(),
         slug(&candidate.concept),
     ]

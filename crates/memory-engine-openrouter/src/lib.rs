@@ -12,7 +12,9 @@
 use std::time::{Duration, Instant};
 
 use memory_engine_generation::{
-    DraftCandidate, DraftProvider, LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
+    BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
+    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft,
+    ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
@@ -224,12 +226,56 @@ impl DraftProvider for OpenRouterProvider {
         }
 
         Ok(ProviderDrafts {
-            model: self.model(),
+            model: DraftProvider::model(self),
             learning_intent: Some(learning_intent),
             candidates,
             failures,
             usage: response.usage,
         })
+    }
+}
+
+impl ReferenceNoteProvider for OpenRouterProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        DraftProvider::model(self)
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        let response = self.complete_structured(
+            &build_reference_note_prompt(request),
+            "reference_note",
+            &reference_note_schema(),
+        )?;
+        let parsed: ReferenceNotePayload =
+            serde_json::from_str(&response.content).map_err(|_| {
+                ProviderFailure::new(
+                    "The model's reference note could not be read; please try again.",
+                )
+            })?;
+        parsed.into_note()
+    }
+}
+
+impl BridgeMaterialProvider for OpenRouterProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        let response = self.complete_structured(
+            &build_bridge_prompt(request),
+            "bridge_material",
+            &bridge_material_schema(),
+        )?;
+        let parsed: BridgeMaterialPayload =
+            serde_json::from_str(&response.content).map_err(|_| {
+                ProviderFailure::new(
+                    "The model's bridge material could not be read; please try again.",
+                )
+            })?;
+        parsed.into_bridge_material(DraftProvider::model(self), response.usage)
     }
 }
 
@@ -313,6 +359,79 @@ Return JSON only.",
     )
 }
 
+fn build_reference_note_prompt(request: &ReferenceNoteRequest) -> String {
+    format!(
+        "Write a short reference note for a learner who is stuck on one review item.
+
+CONCEPT KEY: {concept_key}
+CONCEPT LABEL: {concept_label}
+PROMPT: {prompt}
+EXPECTED ANSWER: {answer}
+
+Rules:
+- Explain the underlying concept, not the UI.
+- Keep it under 120 words.
+- Do not reveal unrelated facts.
+- Return JSON only.",
+        concept_key = request.concept_key,
+        concept_label = request.concept_label,
+        prompt = request.prompt,
+        answer = request.expected_answer,
+    )
+}
+
+fn build_bridge_prompt(request: &BridgeMaterialRequest) -> String {
+    let cached_note = request.cached_reference_note.as_deref().unwrap_or("");
+    let recent_performance = bridge_performance_context(request);
+    format!(
+        "Generate bridge material for a learner struggling with a review item.
+
+CONCEPT KEY: {concept_key}
+CONCEPT LABEL: {concept_label}
+PARENT STAGE ORDER: {stage_order}
+PARENT PROMPT: {prompt}
+PARENT EXPECTED ANSWER: {answer}
+RECENT PERFORMANCE:
+{recent_performance}
+CACHED REFERENCE NOTE:
+{cached_note}
+
+Rules:
+- Write or reuse a short reference note for the concept.
+- Generate exactly 2 easier drafts than the parent.
+- Draft 1 must be a recognition quiz with activity_stage recognition-bridge.
+- Draft 2 must be a cued-recall exercise with activity_stage cued-recall-bridge and a worked_solution.
+- Every draft must test the same concept and avoid duplicating the parent prompt.
+- Return JSON only.",
+        concept_key = request.concept_key,
+        concept_label = request.concept_label,
+        stage_order = request.parent_stage_order,
+        prompt = request.parent_prompt,
+        answer = request.parent_expected_answer,
+        recent_performance = recent_performance,
+    )
+}
+
+fn bridge_performance_context(request: &BridgeMaterialRequest) -> String {
+    if request.recent_performance.is_empty() {
+        return "No recent attempts recorded for this concept.".to_owned();
+    }
+
+    request
+        .recent_performance
+        .iter()
+        .map(|attempt| {
+            format!(
+                "- {}: answer {:?}, verdict {}",
+                attempt.review_unit_id,
+                attempt.submitted_answer,
+                attempt.verdict.as_deref().unwrap_or("ungraded")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn drafts_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -360,6 +479,63 @@ fn drafts_schema() -> serde_json::Value {
     })
 }
 
+fn reference_note_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "title": { "type": "string" },
+            "body": { "type": "string" }
+        },
+        "required": ["title", "body"],
+        "additionalProperties": false
+    })
+}
+
+fn bridge_material_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "reference_note": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["title", "body"],
+                "additionalProperties": false
+            },
+            "drafts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "concept": { "type": "string" },
+                        "question": { "type": "string" },
+                        "answer": { "type": "string" },
+                        "distractors": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "activity_kind": {
+                            "type": "string",
+                            "enum": ["quiz", "exercise"]
+                        },
+                        "activity_stage": {
+                            "type": "string",
+                            "description": "Use recognition-bridge for the first quiz and cued-recall-bridge for the second exercise."
+                        },
+                        "worked_solution": { "type": "string" }
+                    },
+                    "required": ["concept", "question", "answer", "distractors", "activity_kind", "activity_stage", "worked_solution"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["reference_note", "drafts"],
+        "additionalProperties": false
+    })
+}
+
 #[derive(Deserialize)]
 struct Completion {
     #[serde(default)]
@@ -396,6 +572,61 @@ struct DraftsPayload {
 }
 
 #[derive(Deserialize)]
+struct ReferenceNotePayload {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+impl ReferenceNotePayload {
+    fn into_note(self) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        if self.title.trim().is_empty() || self.body.trim().is_empty() {
+            return Err(ProviderFailure::new(
+                "The model's reference note was incomplete; please try again.",
+            ));
+        }
+
+        Ok(ReferenceNoteDraft {
+            title: self.title,
+            body: self.body,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct BridgeMaterialPayload {
+    reference_note: ReferenceNotePayload,
+    #[serde(default)]
+    drafts: Vec<ModelBridgeDraft>,
+}
+
+impl BridgeMaterialPayload {
+    fn into_bridge_material(
+        self,
+        model: GeneratedPromptModel,
+        usage: Option<ProviderUsage>,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        let mut candidates = Vec::new();
+        for (position, draft) in self.drafts.into_iter().enumerate() {
+            candidates.push(draft.into_candidate(position + 1)?);
+        }
+        if candidates.is_empty() {
+            return Err(ProviderFailure::new(
+                "The model did not produce bridge items; please try again.",
+            ));
+        }
+
+        Ok(BridgeMaterial {
+            model,
+            reference_note: self.reference_note.into_note()?,
+            candidates,
+            usage,
+        })
+    }
+}
+
+#[derive(Deserialize)]
 struct ModelDraft {
     #[serde(default)]
     concept: String,
@@ -413,6 +644,70 @@ struct ModelDraft {
     activity_stage: String,
     #[serde(default)]
     worked_solution: String,
+}
+
+#[derive(Deserialize)]
+struct ModelBridgeDraft {
+    #[serde(default)]
+    concept: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    answer: String,
+    #[serde(default)]
+    distractors: Vec<String>,
+    #[serde(default)]
+    activity_kind: String,
+    #[serde(default)]
+    activity_stage: String,
+    #[serde(default)]
+    worked_solution: String,
+}
+
+impl ModelBridgeDraft {
+    fn into_candidate(self, index: usize) -> Result<DraftCandidate, ProviderFailure> {
+        for (field, value) in [
+            ("concept", &self.concept),
+            ("question", &self.question),
+            ("answer", &self.answer),
+            ("activity_kind", &self.activity_kind),
+            ("activity_stage", &self.activity_stage),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ProviderFailure::new(format!(
+                    "The model omitted {field} from a bridge item; please try again."
+                )));
+            }
+        }
+        let activity_kind = parse_activity_kind(&self.activity_kind)
+            .map_err(|reason| ProviderFailure::new(format!("{reason}; please try again.")))?;
+        let activity_stage = parse_bridge_stage(&self.activity_stage)
+            .map_err(|reason| ProviderFailure::new(format!("{reason}; please try again.")))?;
+
+        Ok(DraftCandidate {
+            index,
+            concept: self.concept,
+            question: self.question,
+            answer: self.answer,
+            evidence: None,
+            distractors: self.distractors,
+            worked_solution: non_empty(&self.worked_solution),
+            activity_kind,
+            activity_stage,
+            unsupported: false,
+        })
+    }
+}
+
+fn parse_bridge_stage(stage: &str) -> Result<String, String> {
+    let normalized = stage.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "recognition-bridge" | "recognition bridge" => Ok("recognition-bridge".to_owned()),
+        "cued-recall-bridge" | "cued recall bridge" => Ok("cued-recall-bridge".to_owned()),
+        other => Err(format!(
+            "bridge activity_stage must be recognition-bridge or cued-recall-bridge, got {other}"
+        )),
+    }
 }
 
 impl ModelDraft {
@@ -469,7 +764,7 @@ fn non_empty(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_json_object;
+    use super::{extract_json_object, parse_bridge_stage};
 
     #[test]
     fn unwraps_markdown_fenced_json() {
@@ -491,5 +786,19 @@ mod tests {
     #[test]
     fn returns_original_when_no_object_present() {
         assert_eq!(extract_json_object("not json"), "not json");
+    }
+
+    #[test]
+    fn parses_only_explicit_bridge_stage_rungs() {
+        assert_eq!(
+            parse_bridge_stage("recognition-bridge").expect("recognition"),
+            "recognition-bridge"
+        );
+        assert_eq!(
+            parse_bridge_stage("cued recall bridge").expect("cued"),
+            "cued-recall-bridge"
+        );
+        assert!(parse_bridge_stage("0.3").is_err());
+        assert!(parse_bridge_stage("composition").is_err());
     }
 }

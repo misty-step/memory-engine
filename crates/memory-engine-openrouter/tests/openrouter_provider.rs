@@ -6,7 +6,11 @@ use std::{
     time::Duration,
 };
 
-use memory_engine_generation::{DraftProvider, LearningIntent};
+use memory_engine_core::ReviewUnitId;
+use memory_engine_generation::{
+    BridgeMaterialProvider, BridgeMaterialRequest, DraftProvider, LearningIntent,
+    ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
+};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
 
@@ -141,6 +145,178 @@ fn http_error_status_is_a_human_readable_failure() {
         message.contains("The model provider rejected the request"),
         "expected human-readable message, got: {message}"
     );
+}
+
+#[test]
+fn maps_model_json_to_reference_note() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "title": "NATO letter A",
+                    "body": "The NATO code word for A is Alfa."
+                }).to_string()
+            }
+        }]
+    });
+    let (base_url, request) = serve_once(200, &body.to_string());
+
+    let provider = OpenRouterProvider::new(test_config(base_url));
+    let note = provider
+        .explain_concept(&ReferenceNoteRequest {
+            concept_key: "nato-letter-a".to_owned(),
+            concept_label: "NATO letter A".to_owned(),
+            prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
+            expected_answer: "ALFA".to_owned(),
+            recent_performance: Vec::new(),
+        })
+        .expect("reference note");
+
+    assert_eq!(note.title, "NATO letter A");
+    assert!(note.body.contains("Alfa"));
+    let request = request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request");
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        payload["response_format"]["json_schema"]["name"],
+        "reference_note"
+    );
+    let prompt = payload["messages"][0]["content"].as_str().expect("prompt");
+    assert!(prompt.contains("NATO letter A"));
+    assert!(prompt.contains("ALFA"));
+}
+
+#[test]
+fn maps_model_json_to_bridge_material_candidates() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "reference_note": {
+                        "title": "NATO letter A",
+                        "body": "The NATO code word for A is Alfa."
+                    },
+                    "drafts": [
+                        {
+                            "concept": "NATO letter A",
+                            "question": "Which word cues the letter A?",
+                            "answer": "Alfa",
+                            "distractors": ["Bravo", "Charlie"],
+                            "activity_kind": "quiz",
+                            "activity_stage": "recognition-bridge",
+                            "worked_solution": ""
+                        },
+                        {
+                            "concept": "NATO letter A",
+                            "question": "Use the cue Alfa to answer the original item.",
+                            "answer": "Alfa",
+                            "distractors": [],
+                            "activity_kind": "exercise",
+                            "activity_stage": "cued-recall-bridge",
+                            "worked_solution": "Alfa maps to the letter A."
+                        }
+                    ]
+                }).to_string()
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 500,
+            "completion_tokens": 125,
+            "cost": 0.000_2
+        }
+    });
+    let (base_url, request) = serve_once(200, &body.to_string());
+
+    let provider = OpenRouterProvider::new(test_config(base_url));
+    let material = provider
+        .generate_bridge_material(&BridgeMaterialRequest {
+            concept_key: "nato-letter-a".to_owned(),
+            concept_label: "NATO letter A".to_owned(),
+            parent_review_unit_id: ReviewUnitId::new("parent-nato-a"),
+            parent_prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
+            parent_expected_answer: "ALFA".to_owned(),
+            parent_stage_order: 4,
+            cached_reference_note: None,
+            recent_performance: vec![ReviewPerformanceContext {
+                review_unit_id: "parent-nato-a".to_owned(),
+                submitted_answer: "BRAVO".to_owned(),
+                verdict: Some("wrong".to_owned()),
+            }],
+        })
+        .expect("bridge material");
+
+    assert_eq!(material.reference_note.title, "NATO letter A");
+    assert_eq!(material.candidates.len(), 2);
+    assert_eq!(material.candidates[0].activity_stage, "recognition-bridge");
+    assert_eq!(material.candidates[1].activity_stage, "cued-recall-bridge");
+    assert_eq!(
+        material.candidates[1].worked_solution.as_deref(),
+        Some("Alfa maps to the letter A.")
+    );
+    assert_eq!(material.usage.expect("usage").cost_usd_micros, Some(200));
+    let request = request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request");
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        payload["response_format"]["json_schema"]["name"],
+        "bridge_material"
+    );
+    let prompt = payload["messages"][0]["content"].as_str().expect("prompt");
+    assert!(prompt.contains("PARENT EXPECTED ANSWER: ALFA"));
+    assert!(prompt.contains("RECENT PERFORMANCE:"));
+    assert!(prompt.contains("parent-nato-a"));
+    assert!(prompt.contains("BRAVO"));
+    assert!(prompt.contains("Generate exactly 2 easier drafts"));
+    assert!(prompt.contains("recognition-bridge"));
+    assert!(prompt.contains("cued-recall-bridge"));
+}
+
+#[test]
+fn rejects_bridge_material_without_explicit_bridge_stages() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "reference_note": {
+                        "title": "NATO letter A",
+                        "body": "The NATO code word for A is Alfa."
+                    },
+                    "drafts": [{
+                        "concept": "NATO letter A",
+                        "question": "Which word cues the letter A?",
+                        "answer": "Alfa",
+                        "distractors": ["Bravo", "Charlie"],
+                        "activity_kind": "quiz",
+                        "activity_stage": "0.3",
+                        "worked_solution": ""
+                    }]
+                }).to_string()
+            }
+        }]
+    });
+    let (base_url, _request) = serve_once(200, &body.to_string());
+
+    let provider = OpenRouterProvider::new(test_config(base_url));
+    let failure = provider
+        .generate_bridge_material(&BridgeMaterialRequest {
+            concept_key: "nato-letter-a".to_owned(),
+            concept_label: "NATO letter A".to_owned(),
+            parent_review_unit_id: ReviewUnitId::new("parent-nato-a"),
+            parent_prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
+            parent_expected_answer: "ALFA".to_owned(),
+            parent_stage_order: 4,
+            cached_reference_note: None,
+            recent_performance: Vec::new(),
+        })
+        .expect_err("numeric bridge stages must not be normalized into easier rungs");
+
+    assert!(failure
+        .to_string()
+        .contains("bridge activity_stage must be recognition-bridge or cued-recall-bridge"));
 }
 
 fn test_config(base_url: String) -> OpenRouterConfig {

@@ -6,12 +6,14 @@
 
 use std::{cell::RefCell, error::Error, fmt};
 
-use memory_engine_core::{Prompt, QueueCandidate, ReviewUnitId, ScheduleState};
+use memory_engine_core::{
+    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ScheduleState,
+};
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions, BetaReviewUnitRecord,
-    BetaStoreSnapshot, GeneratedPromptDraft, GeneratedPromptValidationStatus, GenerationRun,
-    ReferenceSpan, ScheduleRecord, SourceDocument,
+    BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus,
+    GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::BetaStudyStore;
@@ -81,6 +83,14 @@ CREATE TABLE IF NOT EXISTS memory_engine_generation_runs (
     run JSONB NOT NULL,
     started_at_ms BIGINT NOT NULL,
     PRIMARY KEY (account_id, generation_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_engine_concept_reference_notes (
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    concept_key TEXT NOT NULL,
+    note JSONB NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (account_id, concept_key)
 );
 
 CREATE TABLE IF NOT EXISTS memory_engine_generated_prompt_drafts (
@@ -560,6 +570,7 @@ impl AccountStudyStore<'_> {
             attempts: self.attempts()?,
             generation_runs: self.generation_runs()?,
             applied_reviews: self.applied_reviews()?,
+            concept_reference_notes: self.concept_reference_notes()?,
         })
     }
 
@@ -703,6 +714,7 @@ impl AccountStudyStore<'_> {
             prompt: draft.prompt.clone(),
             queue: draft.queue.clone(),
             reference_span_ids: draft.reference_span_ids.clone(),
+            concept_reference_note_key: draft.concept_reference_note_key.clone(),
             generated_prompt_draft_id: Some(draft.id.clone()),
             archived_at: None,
             snoozed_until: None,
@@ -795,6 +807,34 @@ impl AccountStudyStore<'_> {
                 &document.id,
                 &value,
                 &document.created_at,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Save or replace a generated concept-level reference note for the scoped account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when serialization or persistence fails.
+    pub fn save_concept_reference_note(
+        &mut self,
+        note: &ConceptReferenceNote,
+    ) -> Result<(), PostgresStoreError> {
+        let value = serde_json::to_value(note)?;
+        self.client.borrow_mut().execute(
+            "INSERT INTO memory_engine_concept_reference_notes
+                (account_id, concept_key, note, updated_at_ms)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (account_id, concept_key) DO UPDATE
+             SET note = EXCLUDED.note,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &self.scope.account_id,
+                &note.concept_key,
+                &value,
+                &note.updated_at,
             ],
         )?;
 
@@ -1014,6 +1054,16 @@ impl AccountStudyStore<'_> {
         )
     }
 
+    fn concept_reference_notes(&self) -> Result<Vec<ConceptReferenceNote>, PostgresStoreError> {
+        query_json_column(
+            self.client,
+            "SELECT note FROM memory_engine_concept_reference_notes
+             WHERE account_id = $1
+             ORDER BY updated_at_ms, concept_key",
+            &self.scope.account_id,
+        )
+    }
+
     fn generated_prompt_drafts(&self) -> Result<Vec<GeneratedPromptDraft>, PostgresStoreError> {
         query_json_column(
             self.client,
@@ -1123,6 +1173,15 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
         AccountStudyStore::save_reference_span(self, &reference)?;
 
         Ok(reference)
+    }
+
+    fn save_concept_reference_note(
+        &mut self,
+        note: ConceptReferenceNote,
+    ) -> Result<ConceptReferenceNote, Self::Error> {
+        AccountStudyStore::save_concept_reference_note(self, &note)?;
+
+        Ok(note)
     }
 
     fn save_generated_prompt_draft(
@@ -1370,7 +1429,11 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
                 let value: serde_json::Value = row.get(0);
                 let record: BetaReviewUnitRecord = serde_json::from_value(value)?;
                 let schedule_state = self.read_schedule_state(&record.review_unit_id)?;
-                Ok(record.queue.with_schedule(schedule_state))
+                let mut candidate = record.queue.with_schedule(schedule_state);
+                if let Some(snoozed_until) = record.snoozed_until {
+                    candidate = defer_queue_availability(&candidate, snoozed_until);
+                }
+                Ok(candidate)
             })
             .collect()
     }
@@ -1973,6 +2036,7 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            parent_review_unit_id: None,
             draft_ids: draft_ids.iter().map(|value| (*value).to_owned()).collect(),
             provider: "fixture".to_owned(),
             model: "deterministic-draft".to_owned(),
@@ -2000,6 +2064,7 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
+            concept_reference_note_key: None,
             generation_run_id: generation_run_id.map(str::to_owned),
             review_unit_id: review_unit_id.clone(),
             prompt_id: "prompt-live-a".to_owned(),
@@ -2029,6 +2094,7 @@ mod tests {
             prompt: draft.prompt.clone(),
             queue: draft.queue.clone(),
             reference_span_ids: draft.reference_span_ids.clone(),
+            concept_reference_note_key: None,
             generated_prompt_draft_id: Some(draft.id.clone()),
             archived_at: None,
             snoozed_until: None,

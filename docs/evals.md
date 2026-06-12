@@ -3,6 +3,7 @@
 Refs-backlog: 20
 Refs-backlog: 050
 Refs-backlog: 051
+Refs-backlog: 052
 
 `memory-engine` uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI
@@ -87,8 +88,11 @@ Intent shape match is the 051 capture-anything oracle: fixtures annotate
 verbatim memorization, concept understanding, fact recall, and
 procedure/process sources, and the provider must emit different activity
 kinds, stages, and distractor shapes rather than collapsing them into generic
-recognition quizzes. The receipt also reports tokens, dollars, and latency
-p50/p95.
+recognition quizzes. The receipt also runs the selected provider through a
+bridge-material fixture that must use the recent failed attempt context,
+produce lower-stage items, stay faithful to the parent concept, and avoid
+duplicates against the parent item. The receipt also reports tokens, dollars,
+and latency p50/p95.
 
 CI never calls live models; field runs are explicit and local, and their dated
 receipts live in `docs/evals/`. The 2026-06-11 field run that picked the

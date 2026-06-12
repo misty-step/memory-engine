@@ -12,8 +12,10 @@
 
 use std::{fmt::Write as _, fs, path::PathBuf};
 
+use memory_engine::types::ReviewUnitId;
 use memory_engine_generation::{
-    evidence_quote_matches, DraftCandidate, DraftProvider, FakeModelProvider, LearningIntent,
+    evidence_quote_matches, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
+    DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
@@ -80,12 +82,25 @@ pub struct SourceScore {
     pub judge_error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct BridgeQualityScore {
+    pub drafts: usize,
+    pub easier_than_parent: f64,
+    pub faithful_to_concept: f64,
+    pub duplicate_rate: f64,
+    pub passes: bool,
+}
+
 pub struct GenerationBenchArgs {
     pub model: Option<String>,
     pub prompt: PromptVariant,
     pub judge: Option<String>,
     pub out: Option<PathBuf>,
 }
+
+trait GenerationProvider: DraftProvider + BridgeMaterialProvider {}
+
+impl<T> GenerationProvider for T where T: DraftProvider + BridgeMaterialProvider {}
 
 /// Parse `generation` subcommand arguments.
 ///
@@ -155,7 +170,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
     let parsed = parse_args(arguments)?;
     let corpus = load_corpus()?;
 
-    let (provider, label): (Box<dyn DraftProvider>, String) = match &parsed.model {
+    let (provider, label): (Box<dyn GenerationProvider>, String) = match &parsed.model {
         None => (Box::new(FakeModelProvider), "fixture/fake-model".to_owned()),
         Some(model) => {
             let mut config = OpenRouterConfig::from_env()?;
@@ -187,7 +202,8 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .iter()
         .map(|source| score_source(provider.as_ref(), judge.as_ref(), source))
         .collect();
-    let receipt = render_receipt(&label, &scores);
+    let bridge = bridge_quality_fixture(provider.as_ref());
+    let receipt = render_receipt(&label, &scores, &bridge);
     println!("{receipt}");
     if let Some(path) = parsed.out {
         if let Some(parent) = path.parent() {
@@ -221,11 +237,14 @@ fn load_corpus() -> Result<Vec<CorpusSource>, String> {
         .collect()
 }
 
-fn score_source(
-    provider: &dyn DraftProvider,
+fn score_source<P>(
+    provider: &P,
     model_judge: Option<&OpenRouterProvider>,
     source: &CorpusSource,
-) -> SourceScore {
+) -> SourceScore
+where
+    P: DraftProvider + ?Sized,
+{
     let document = SourceDocument {
         id: source.id.clone(),
         kind: SourceDocumentKind::Text,
@@ -578,7 +597,11 @@ fn render_model_judge(receipt: &mut String, scores: &[SourceScore]) {
     let _ = writeln!(receipt);
 }
 
-fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
+fn render_receipt(
+    label: &str,
+    scores: &[SourceScore],
+    bridge: &Result<BridgeQualityScore, String>,
+) -> String {
     let mut receipt = String::new();
     let _ = writeln!(receipt, "# Generation eval receipt");
     let _ = writeln!(receipt);
@@ -593,6 +616,15 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
         receipt,
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
+    render_score_rows(&mut receipt, scores);
+    let _ = writeln!(receipt);
+    render_model_judge(&mut receipt, scores);
+    render_receipt_totals(&mut receipt, scores, bridge);
+
+    receipt
+}
+
+fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
     for score in scores {
         if let Some(error) = &score.provider_error {
             let _ = writeln!(
@@ -621,9 +653,13 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
             score.latency_ms,
         );
     }
-    let _ = writeln!(receipt);
-    render_model_judge(&mut receipt, scores);
+}
 
+fn render_receipt_totals(
+    receipt: &mut String,
+    scores: &[SourceScore],
+    bridge: &Result<BridgeQualityScore, String>,
+) {
     let judged: Vec<&SourceScore> = scores
         .iter()
         .filter(|score| score.provider_error.is_none())
@@ -660,6 +696,7 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
         "- Intent shape matches: {shaped}/{} sources",
         judged.len()
     );
+    render_bridge_totals(receipt, bridge);
     let _ = writeln!(
         receipt,
         "- Total cost: {} · mean per source: {}",
@@ -676,8 +713,24 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
         percentile(&latencies, 50),
         percentile(&latencies, 95),
     );
+}
 
-    receipt
+fn render_bridge_totals(receipt: &mut String, bridge: &Result<BridgeQualityScore, String>) {
+    match bridge {
+        Ok(bridge) => {
+            let _ = writeln!(
+                receipt,
+                "- Bridge fixture: easier {:.0}% · faithful {:.0}% · duplicate {:.0}% · {}",
+                bridge.easier_than_parent * 100.0,
+                bridge.faithful_to_concept * 100.0,
+                bridge.duplicate_rate * 100.0,
+                if bridge.passes { "pass" } else { "FAIL" },
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(receipt, "- Bridge fixture: FAILED: {error}");
+        }
+    }
 }
 
 fn mean(scores: &[&SourceScore], value: impl Fn(&SourceScore) -> f64) -> f64 {
@@ -688,6 +741,120 @@ fn mean(scores: &[&SourceScore], value: impl Fn(&SourceScore) -> f64) -> f64 {
     let count = scores.len() as f64;
 
     scores.iter().map(|score| value(score)).sum::<f64>() / count
+}
+
+fn bridge_quality_fixture<P>(provider: &P) -> Result<BridgeQualityScore, String>
+where
+    P: BridgeMaterialProvider + ?Sized,
+{
+    let request = BridgeMaterialRequest {
+        concept_key: "nato-cat-composition".to_owned(),
+        concept_label: "nato cat composition".to_owned(),
+        parent_review_unit_id: ReviewUnitId::new("parent-nato-cat"),
+        parent_prompt: "Spell CAT over the phone using the NATO phonetic alphabet.".to_owned(),
+        parent_expected_answer: "CHARLIE ALFA TANGO".to_owned(),
+        parent_stage_order: 4,
+        cached_reference_note: None,
+        recent_performance: vec![ReviewPerformanceContext {
+            review_unit_id: "parent-nato-cat".to_owned(),
+            submitted_answer: "CHARLIE TANGO".to_owned(),
+            verdict: Some("wrong".to_owned()),
+        }],
+    };
+    let material = provider
+        .generate_bridge_material(&request)
+        .map_err(|failure| failure.to_string())?;
+    Ok(bridge_quality_judges(
+        request.parent_stage_order,
+        &request.concept_key,
+        &[(
+            request.concept_key.as_str(),
+            request.parent_prompt.as_str(),
+            request.parent_expected_answer.as_str(),
+        )],
+        &material.candidates,
+    ))
+}
+
+fn bridge_quality_judges(
+    parent_stage_order: u32,
+    concept_key: &str,
+    existing: &[(&str, &str, &str)],
+    candidates: &[DraftCandidate],
+) -> BridgeQualityScore {
+    let drafts = candidates.len();
+    let easier = candidates
+        .iter()
+        .filter(|candidate| {
+            bench_stage_order(&candidate.activity_stage, &candidate.activity_kind)
+                < parent_stage_order
+        })
+        .count();
+    let concept = normalize(concept_key);
+    let faithful = candidates
+        .iter()
+        .filter(|candidate| normalize(&candidate.concept).contains(&concept))
+        .count();
+    let existing_signatures = existing
+        .iter()
+        .map(|(concept, question, answer)| {
+            [normalize(concept), normalize(question), normalize(answer)].join("\0")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let duplicates = candidates
+        .iter()
+        .filter(|candidate| {
+            let signature = [
+                normalize(&candidate.concept),
+                normalize(&candidate.question),
+                normalize(&candidate.answer),
+            ]
+            .join("\0");
+            existing_signatures.contains(&signature) || !seen.insert(signature)
+        })
+        .count();
+    let easier_than_parent = fraction(easier, drafts);
+    let faithful_to_concept = fraction(faithful, drafts);
+    let duplicate_rate = fraction(duplicates, drafts);
+
+    BridgeQualityScore {
+        drafts,
+        easier_than_parent,
+        faithful_to_concept,
+        duplicate_rate,
+        passes: drafts > 0
+            && (easier_than_parent - 1.0).abs() < f64::EPSILON
+            && (faithful_to_concept - 1.0).abs() < f64::EPSILON
+            && duplicate_rate.abs() < f64::EPSILON,
+    }
+}
+
+fn bench_stage_order(stage: &str, activity_kind: &GeneratedLearningActivityKind) -> u32 {
+    let normalized = stage.to_lowercase();
+    if normalized.contains("bridge") && normalized.contains("recognition") {
+        return 0;
+    }
+    if normalized.contains("bridge") && normalized.contains("cued") {
+        return 1;
+    }
+    if normalized.contains("recognition") {
+        return 1;
+    }
+    if normalized.contains("cued") {
+        return 2;
+    }
+    if normalized.contains("free") {
+        return 3;
+    }
+    if normalized.contains("composition") {
+        return 4;
+    }
+    if activity_kind == &GeneratedLearningActivityKind::Exercise {
+        5
+    } else {
+        1
+    }
 }
 
 fn percentile(sorted: &[u64], percent: usize) -> u64 {
@@ -709,7 +876,11 @@ fn format_cost(micros: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use memory_engine_persistence::GeneratedLearningActivityKind;
+    use memory_engine_generation::{
+        BridgeMaterial, ProviderFailure, ReferenceNoteDraft, ReferenceNoteProvider,
+        ReferenceNoteRequest,
+    };
+    use memory_engine_persistence::{GeneratedLearningActivityKind, GeneratedPromptModel};
 
     use super::*;
 
@@ -772,6 +943,54 @@ mod tests {
         assert!((score.provenance - 2.0 / 3.0).abs() < 0.01);
         assert!((score.duplicate_rate - 1.0 / 3.0).abs() < 0.01);
         assert!(score.count_in_range, "3 drafts sits inside [1, 3]");
+    }
+
+    #[test]
+    fn bridge_quality_scenario_requires_easier_faithful_non_duplicate_items() {
+        let clean = bridge_quality_fixture(&FakeModelProvider).expect("fake bridge fixture");
+
+        assert_eq!(clean.drafts, 2);
+        assert!((clean.easier_than_parent - 1.0).abs() < f64::EPSILON);
+        assert!((clean.faithful_to_concept - 1.0).abs() < f64::EPSILON);
+        assert!(clean.duplicate_rate.abs() < f64::EPSILON);
+        assert!(clean.passes);
+
+        let duplicate_parent = DraftCandidate {
+            index: 1,
+            concept: "nato cat composition".to_owned(),
+            question: "Spell CAT over the phone using the NATO phonetic alphabet.".to_owned(),
+            answer: "CHARLIE ALFA TANGO".to_owned(),
+            evidence: None,
+            distractors: Vec::new(),
+            worked_solution: Some("Use the NATO mapping.".to_owned()),
+            activity_kind: GeneratedLearningActivityKind::Exercise,
+            activity_stage: "composition".to_owned(),
+            unsupported: false,
+        };
+        let failed = bridge_quality_judges(
+            4,
+            "nato-cat-composition",
+            &[(
+                "nato-cat-composition",
+                "Spell CAT over the phone using the NATO phonetic alphabet.",
+                "CHARLIE ALFA TANGO",
+            )],
+            &[duplicate_parent],
+        );
+
+        assert!(!failed.passes);
+        assert!((failed.duplicate_rate - 1.0).abs() < f64::EPSILON);
+        assert!(failed.easier_than_parent.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bridge_quality_fixture_scores_the_selected_provider() {
+        let score =
+            bridge_quality_fixture(&DuplicateBridgeProvider).expect("duplicate bridge fixture");
+
+        assert_eq!(score.drafts, 1);
+        assert!(!score.passes);
+        assert!((score.duplicate_rate - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -882,5 +1101,58 @@ mod tests {
             signatures.len() >= 4,
             "intent fixtures should not collapse into one generic item shape: {signatures:?}"
         );
+    }
+
+    struct DuplicateBridgeProvider;
+
+    impl ReferenceNoteProvider for DuplicateBridgeProvider {
+        fn model(&self) -> GeneratedPromptModel {
+            GeneratedPromptModel {
+                provider: "fixture".to_owned(),
+                name: "duplicate-bridge".to_owned(),
+                version: "v1".to_owned(),
+            }
+        }
+
+        fn explain_concept(
+            &self,
+            _request: &ReferenceNoteRequest,
+        ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+            Ok(ReferenceNoteDraft {
+                title: "Duplicate bridge".to_owned(),
+                body: "CAT is CHARLIE ALFA TANGO.".to_owned(),
+            })
+        }
+    }
+
+    impl BridgeMaterialProvider for DuplicateBridgeProvider {
+        fn generate_bridge_material(
+            &self,
+            request: &BridgeMaterialRequest,
+        ) -> Result<BridgeMaterial, ProviderFailure> {
+            Ok(BridgeMaterial {
+                model: self.model(),
+                reference_note: self.explain_concept(&ReferenceNoteRequest {
+                    concept_key: request.concept_key.clone(),
+                    concept_label: request.concept_label.clone(),
+                    prompt: request.parent_prompt.clone(),
+                    expected_answer: request.parent_expected_answer.clone(),
+                    recent_performance: request.recent_performance.clone(),
+                })?,
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: request.concept_label.clone(),
+                    question: request.parent_prompt.clone(),
+                    answer: request.parent_expected_answer.clone(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: Some("Duplicate of the parent.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "composition".to_owned(),
+                    unsupported: false,
+                }],
+                usage: None,
+            })
+        }
     }
 }

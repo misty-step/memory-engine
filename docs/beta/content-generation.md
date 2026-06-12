@@ -2,6 +2,7 @@
 
 Refs-backlog: 27
 Refs-backlog: 051
+Refs-backlog: 052
 
 ## Purpose
 
@@ -28,12 +29,19 @@ QA spine that real provider calls must satisfy later.
 4. Parse deterministic source blocks into candidate learning activities when
    the source is already written in fixture format.
 5. Create `ReferenceSpan` records for cited source evidence.
-6. Save a `GenerationRun` receipt with provider/model/version metadata.
-7. Save generated drafts with source ids, reference span ids, activity kind,
-   activity stage, validation status, critique notes, and optional worked
-   solution.
+6. Save a `GenerationRun` receipt with provider/model/version metadata. Bridge
+   generation runs also persist the parent `ReviewUnitId` so QA and later
+   analysis can trace generated scaffold items back to the failed item.
+7. Save generated drafts with source ids and/or concept reference note keys,
+   reference span ids when source evidence exists, activity kind, activity
+   stage, validation status, critique notes, and optional worked solution.
 8. Approve only accepted drafts into review units consumed by the existing
    service, queue, and scheduling path.
+9. For review escape hatches, cache provider-written `ConceptReferenceNote`
+   records by concept key. Source-backed reference views use `ReferenceSpan`
+   text first; spanless items generate the concept note once and reuse it on
+   later views. Bridge material cites that note and creates lower-stage queue
+   items while the parent is deferred.
 
 ## Capture Contract
 
@@ -86,7 +94,7 @@ Supported fields:
 The probe saves accepted and rejected drafts when provenance exists, and records
 malformed candidates as generation-run failures when provenance is missing.
 
-Accepted drafts require:
+Accepted provider-generated source-backed drafts require:
 
 - persisted source document id;
 - source reference span;
@@ -96,9 +104,24 @@ Accepted drafts require:
 - no unsupported-generation marker;
 - worked solution for exercises.
 
+Accepted bridge drafts require:
+
+- a persisted concept reference note key;
+- no source document ids unless they also cite source reference spans;
+- question, answer, concept, activity kind, and lower activity stage than the
+  parent item;
+- model/provider metadata;
+- no duplicate-ish signature against existing items or sibling bridge drafts;
+- worked solution for bridge exercises.
+
+Concept-note-backed bridge drafts are intentionally source-less. They cite the
+cached note instead of pretending to have source spans. Provider-generated
+source drafts that have source ids but no reference spans are rejected before
+promotion.
+
 Rejected drafts remain useful evidence. They preserve source ids, reference
-span ids, critique notes, and rejection reasons so later model-backed
-generation can be evaluated rather than hand-waved.
+span ids or concept reference note keys, critique notes, and rejection reasons
+so later model-backed generation can be evaluated rather than hand-waved.
 
 ## Kernel Boundary
 
@@ -122,6 +145,7 @@ The beta generation layer owns:
 - generation run receipts;
 - rejection/critique policy;
 - source parsing and provenance.
+- concept reference notes and bridge-material validation.
 
 ## Eval Gaps
 
@@ -137,18 +161,26 @@ Before model-backed generation can be trusted, add evals for:
 - answer leakage in hints or feedback;
 - stage calibration, such as whether a generated exercise is actually harder
   than a recognition quiz;
+- bridge material quality: easier than the parent, faithful to the same
+  concept, and non-duplicate against existing review items;
 - latency and cost per generation run.
 
 ## Verification
 
 ```sh
 cargo test -p memory-engine-generation
+cargo test -p memory-engine-openrouter
+cargo test -p memory-engine-study bridge_material_creates_easier_due_items_before_the_parent
+cargo test -p memory-engine-bench bridge_quality_scenario_requires_easier_faithful_non_duplicate_items
 bun run ci
 ```
 
 The focused suite covers accepted quiz drafts, accepted exercise drafts,
 promotion into review units, rejected unsupported drafts, duplicate-ish drafts,
-and missing-provenance failures.
+missing-provenance failures, concept-note fallback, and bridge material.
+`memory-engine-openrouter` contract tests cover reference-note payloads and the
+bridge-material prompt/schema mapping, including the two-step scaffold ladder
+(`recognition-bridge` then `cued-recall-bridge`).
 
 The former TypeScript `experiments/beta-generation/` runtime oracle was deleted
 after the Rust crate covered deterministic generation and fixture parity.

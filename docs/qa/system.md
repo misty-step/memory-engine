@@ -2,6 +2,7 @@
 
 Refs-backlog: 25
 Refs-backlog: 051
+Refs-backlog: 052
 
 ## Purpose
 
@@ -53,11 +54,11 @@ receipt after each lane:
 | `static.rustfmt` | all Rust crates | keep checked-in Rust in canonical format |
 | `static.clippy` | all Rust targets | catch correctness, maintainability, and API-shape warnings |
 | `api.facade` | `memory-engine` facade crate | prove consumers can compose root, modular, testkit, and dogfood surfaces |
-| `kernel.core` | `memory-engine-core` | protect pure learning semantics and adapter contracts |
+| `kernel.core` | `memory-engine-core` | protect pure learning semantics, queue deferral semantics, and adapter contracts |
 | `service.prototype` | `memory-engine-service` command boundary | prove command flow, injected persistence, and failure semantics |
 | `persistence.beta-store` | `memory-engine-persistence` durable beta store | prove persisted snapshots, restart, conflict, and validation semantics |
 | `generation.beta` | `memory-engine-generation` deterministic generation probe | prove source parsing, provenance, draft validation, and promotion behavior |
-| `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, queue, and resume flow |
+| `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, skip/snooze, reference, bridge, queue, and resume flow |
 | `app.beta-http` | `memory-engine-beta-app` local HTTP routes | prove mobile routes and validation run through the Rust study session |
 | `api.v1-contract` | versioned public JSON contract and consumer proof binary | run the Scry-facing client against a local HTTP API and prove contract fixtures stay executable |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
@@ -77,7 +78,8 @@ cargo run -p memory-engine-bench -- generation
 That receipt is still local and deterministic, but it is not a raw performance
 benchmark: its `shape` column must stay green for the intent fixtures that
 cover verbatim memorization, concept understanding, fact recall, and
-procedure/process capture.
+procedure/process capture, and its bridge fixture must stay green for
+lower-stage, same-concept, non-duplicate bridge material.
 
 ## Operating Procedure
 
@@ -95,6 +97,9 @@ harness. Examples:
 cargo test -p memory-engine-core
 cargo test -p memory-engine
 cargo test -p memory-engine-study
+cargo test -p memory-engine-api review_escape_hatches
+cargo test -p memory-engine-openrouter
+cargo run -p memory-engine-bench -- generation
 ```
 
 Report QA evidence with exact commands, final status, surfaces exercised, and

@@ -22,6 +22,13 @@ impl ProgressionLike<ScheduleState> for QueueCandidate {
 }
 
 #[must_use]
+pub fn defer_queue_availability(candidate: &QueueCandidate, deferred_until: i64) -> QueueCandidate {
+    let mut deferred = candidate.clone();
+    deferred.due = deferred.due.max(deferred_until);
+    deferred
+}
+
+#[must_use]
 pub fn reviewable_queue_candidates(
     candidates: &[QueueCandidate],
     mastery_policy: impl Fn(&ScheduleState) -> bool + Copy,
@@ -291,6 +298,23 @@ mod tests {
             population,
             ..QueueSelectionOptions::default()
         }
+    }
+
+    #[test]
+    fn queue_deferral_moves_availability_without_rewriting_schedule_state() {
+        let schedule_state = state(ScheduleStatus::Review, 2, 7, NOW - 3_600_000);
+        let due = candidate(
+            "review",
+            Some(schedule_state.clone()),
+            schedule_state.due,
+            Some("nato"),
+        );
+
+        let deferred = defer_queue_availability(&due, NOW + 86_400_000);
+
+        assert_eq!(deferred.schedule_state, Some(schedule_state));
+        assert_eq!(deferred.due, NOW + 86_400_000);
+        assert!(reviewable_queue_candidates(&[deferred], mastered, &options(&[], None)).is_empty());
     }
 
     #[test]

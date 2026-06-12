@@ -4,9 +4,10 @@ use memory_engine_core::{
 };
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
-    GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
-    PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind, SourcePermission,
+    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
+    GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
+    SourcePermission,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
@@ -308,6 +309,22 @@ fn validates_generated_drafts_before_promotion() {
         BetaStoreError::UnknownReferenceSpan("missing-reference".to_owned())
     );
 
+    let source_backed_without_span = accepted_draft(
+        "draft-generated-without-reference",
+        "generated-without-reference",
+        &["src-generated"],
+        &[],
+        Some("run-without-reference"),
+    );
+    assert_eq!(
+        store
+            .save_generated_prompt_draft(source_backed_without_span)
+            .expect_err("generated source draft requires reference span"),
+        BetaStoreError::GeneratedPromptDraftRequiresReference
+    );
+
+    save_concept_backed_bridge_draft(&mut store);
+
     let accepted_without_run = accepted_draft(
         "draft-missing-generation-run",
         "accepted-without-run",
@@ -457,12 +474,15 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
         schedules: Vec::new(),
         attempts: Vec::new(),
         generation_runs: Vec::new(),
+        concept_reference_notes: Vec::new(),
         applied_reviews: Vec::new(),
     };
     let encoded = serde_json::to_value(snapshot).expect("snapshot json");
 
     assert!(encoded.get("sourceDocuments").is_some());
+    assert!(encoded.get("conceptReferenceNotes").is_some());
     assert!(encoded.get("source_documents").is_none());
+    assert!(encoded.get("concept_reference_notes").is_none());
     assert_eq!(encoded["sourceDocuments"][0]["createdAt"], NOW);
     assert_eq!(
         encoded["sourceDocuments"][0]["permission"],
@@ -499,6 +519,42 @@ fn reference_span(id: &str, source_document_id: &str) -> ReferenceSpan {
     }
 }
 
+fn concept_reference_note(concept_key: &str) -> ConceptReferenceNote {
+    ConceptReferenceNote {
+        concept_key: concept_key.to_owned(),
+        title: "NATO letter A".to_owned(),
+        body: "A is Alfa.".to_owned(),
+        model: GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "reference-note".to_owned(),
+            version: "v1".to_owned(),
+        },
+        created_at: NOW,
+        updated_at: NOW,
+    }
+}
+
+fn save_concept_backed_bridge_draft(store: &mut BetaPersistenceStore) {
+    store
+        .save_concept_reference_note(concept_reference_note("nato-letter-a"))
+        .expect("concept note");
+    let concept_backed_bridge = GeneratedPromptDraft {
+        source_document_ids: Vec::new(),
+        reference_span_ids: Vec::new(),
+        concept_reference_note_key: Some("nato-letter-a".to_owned()),
+        ..accepted_draft(
+            "draft-bridge-concept-backed",
+            "bridge-concept-backed",
+            &[],
+            &[],
+            Some("bridge-run"),
+        )
+    };
+    store
+        .save_generated_prompt_draft(concept_backed_bridge)
+        .expect("concept-backed bridge draft persists");
+}
+
 fn accepted_draft(
     id: &str,
     unit_id: &str,
@@ -518,6 +574,7 @@ fn accepted_draft(
             .iter()
             .map(|value| (*value).to_owned())
             .collect(),
+        concept_reference_note_key: None,
         generation_run_id: generation_run_id.map(str::to_owned),
         review_unit_id: review_unit_id.clone(),
         prompt_id: "pater-translation".to_owned(),
@@ -547,6 +604,7 @@ fn generation_run(id: &str, source_document_ids: &[&str], draft_ids: &[&str]) ->
             .iter()
             .map(|value| (*value).to_owned())
             .collect(),
+        parent_review_unit_id: None,
         draft_ids: draft_ids.iter().map(|value| (*value).to_owned()).collect(),
         provider: "fixture".to_owned(),
         model: "deterministic-draft".to_owned(),
@@ -569,6 +627,7 @@ fn review_unit(
         prompt,
         queue,
         reference_span_ids: Vec::new(),
+        concept_reference_note_key: None,
         generated_prompt_draft_id: None,
         archived_at: None,
         snoozed_until: None,

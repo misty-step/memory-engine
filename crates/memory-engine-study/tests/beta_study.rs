@@ -1,9 +1,23 @@
 use std::{fs, path::PathBuf};
 
-use memory_engine_core::{ScheduleStatus, Verdict};
-use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
+use memory_engine_core::{
+    ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId, ScheduleStatus,
+    Verdict,
+};
+use memory_engine_generation::{
+    BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
+    FakeModelProvider, FallbackProvider, ProviderFailure, ReferenceNoteDraft,
+    ReferenceNoteProvider, ReferenceNoteRequest, StructuredBlockProvider,
+};
+use memory_engine_persistence::{
+    BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
+    GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
+    GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument, SourceDocumentKind,
+    SourcePermission,
+};
 use memory_engine_study::{
     infer_capture_title, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
+    DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_SKIP_DEFER_MS,
 };
 use serde_json::json;
 
@@ -320,6 +334,180 @@ fn snoozes_and_deletes_active_review_items_without_touching_schedule_history() {
 }
 
 #[test]
+fn skip_defers_current_item_without_recording_a_review_attempt() {
+    let directory = TempDirectory::new("skip");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let started = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz");
+    let skipped_id = started.current.expect("current").review_unit_id;
+
+    let skipped = study.skip_current().expect("skip");
+
+    assert_eq!(skipped.summary.attempt_count, 0);
+    assert_eq!(
+        skipped.current.expect("next current").prompt,
+        "What is the NATO phonetic alphabet word for A?"
+    );
+    let skipped_row = skipped
+        .queue
+        .iter()
+        .find(|row| row.review_unit_id == skipped_id)
+        .expect("skipped row");
+    assert_eq!(skipped_row.due, NOW + DEFAULT_SKIP_DEFER_MS);
+    assert_eq!(skipped_row.reps, 0);
+    assert_eq!(skipped_row.state, None);
+}
+
+#[test]
+fn learn_more_generates_and_caches_concept_note_when_source_span_is_missing() {
+    let directory = TempDirectory::new("reference-fallback");
+    let path = directory.path().join("study.json");
+    seed_spanless_review(&path);
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.start().expect("start");
+
+    let explained = study.learn_more().expect("learn more");
+    let current = explained.current.expect("current");
+    assert_eq!(current.expected_answer, None);
+    assert!(current
+        .reference_text
+        .as_deref()
+        .expect("generated note")
+        .contains("ALFA"));
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert_eq!(snapshot.concept_reference_notes.len(), 1);
+    assert_eq!(
+        snapshot.concept_reference_notes[0].concept_key,
+        "nato-letter-a"
+    );
+
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    resumed.start().expect("start");
+    let cached = resumed
+        .learn_more_with_provider(&PanicReferenceProvider)
+        .expect("cached learn more");
+    assert!(cached
+        .current
+        .expect("current")
+        .reference_text
+        .as_deref()
+        .expect("cached note")
+        .contains("ALFA"));
+}
+
+#[test]
+fn bridge_material_creates_easier_due_items_before_the_parent() {
+    let directory = TempDirectory::new("bridge");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz sibling");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    let bridged = study.generate_bridge_material().expect("bridge");
+    let current = bridged.current.expect("bridge current");
+
+    assert!(current.review_unit_id.as_str().starts_with("bridge-"));
+    assert_eq!(current.activity_stage, "recognition-bridge");
+    assert_eq!(bridged.summary.attempt_count, 0);
+    assert_eq!(bridged.summary.approved_review_unit_count, 4);
+    let bridge_rows = bridged
+        .queue
+        .iter()
+        .filter(|row| {
+            row.activity_stage
+                .as_deref()
+                .is_some_and(|stage| stage.contains("bridge"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bridge_rows.len(), 2);
+    assert_eq!(
+        bridge_rows
+            .iter()
+            .filter_map(|row| row.activity_stage.as_deref())
+            .collect::<Vec<_>>(),
+        ["recognition-bridge", "cued-recall-bridge"]
+    );
+    let parent_row = bridged
+        .queue
+        .iter()
+        .find(|row| row.review_unit_id == parent_id)
+        .expect("parent row");
+    assert_eq!(parent_row.due, NOW + DEFAULT_BRIDGE_PARENT_DEFER_MS);
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert_eq!(
+        snapshot
+            .generation_runs
+            .iter()
+            .find(|run| run.id == "bridge-run-2")
+            .expect("bridge run")
+            .parent_review_unit_id
+            .as_ref(),
+        Some(&parent_id)
+    );
+    let sibling_row = bridged
+        .queue
+        .iter()
+        .find(|row| row.review_unit_id.as_str() == "generated-quiz-src-nato-1-nato-letter-a")
+        .expect("sibling row");
+    assert!(
+        bridge_rows.iter().all(|row| row.due < sibling_row.due),
+        "bridge rows should sort ahead of existing due siblings: {:?}",
+        bridged.queue
+    );
+}
+
+#[test]
+fn bridge_material_failure_keeps_the_parent_current() {
+    let directory = TempDirectory::new("bridge-rejected");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let parent = approved.current.expect("parent");
+
+    let failure = study
+        .generate_bridge_material_with_provider(&RejectedBridgeProvider)
+        .expect_err("flat or harder bridge pack should fail");
+    assert!(failure.to_string().contains("no accepted drafts"));
+
+    let view = study.view().expect("view");
+    assert_eq!(
+        view.current.expect("current").review_unit_id,
+        parent.review_unit_id
+    );
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let parent_row = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == parent.review_unit_id)
+        .expect("parent row");
+    assert_eq!(parent_row.snoozed_until, None);
+}
+
+#[test]
 fn view_serializes_like_the_mobile_beta_api_contract() {
     let directory = TempDirectory::new("wire");
     let path = directory.path().join("study.json");
@@ -470,6 +658,170 @@ fn source_body() -> String {
         "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
     ]
     .join("\n")
+}
+
+fn seed_spanless_review(path: &std::path::Path) {
+    let mut store = BetaPersistenceStore::open(path).expect("store");
+    let source = SourceDocument {
+        id: "src-spanless".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "NATO note".to_owned(),
+        body: Some("The NATO phonetic alphabet word for A is ALFA.".to_owned()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        created_at: NOW,
+        archived_at: None,
+    };
+    store.save_source_document(source).expect("source");
+    let review_unit_id = ReviewUnitId::new("spanless-nato-a");
+    let prompt = Prompt::Exact(ExactPrompt {
+        kind: ExactPromptKind::ShortAnswer,
+        review_unit_id: review_unit_id.clone(),
+        prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
+        accepted_answers: vec!["ALFA".to_owned()],
+        equivalence_groups: Vec::new(),
+        ignored_tokens: Vec::new(),
+    });
+    store
+        .save_generated_prompt_draft(GeneratedPromptDraft {
+            id: "spanless-draft".to_owned(),
+            source_document_ids: vec!["src-spanless".to_owned()],
+            reference_span_ids: Vec::new(),
+            concept_reference_note_key: None,
+            generation_run_id: None,
+            review_unit_id: review_unit_id.clone(),
+            prompt_id: "spanless-nato-a-prompt".to_owned(),
+            prompt: prompt.clone(),
+            queue: PersistedQueueCandidate {
+                review_unit_id: review_unit_id.clone(),
+                due: NOW - 60_000,
+                progression: Some(ProgressionMetadata {
+                    progression_group: Some("nato-letter-a".to_owned()),
+                    stage_order: 1,
+                    requires: Vec::new(),
+                    supersedes: Vec::new(),
+                }),
+                concept_key: Some("nato-letter-a".to_owned()),
+                source_key: Some("src-spanless".to_owned()),
+                domain_key: Some("text".to_owned()),
+            },
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "recognition".to_owned(),
+            worked_solution: None,
+            model: GeneratedPromptModel {
+                provider: "fixture".to_owned(),
+                name: "manual-spanless".to_owned(),
+                version: "v1".to_owned(),
+            },
+            validation: GeneratedPromptValidation {
+                status: GeneratedPromptValidationStatus::Accepted,
+                reasons: Vec::new(),
+            },
+            critique_notes: Vec::new(),
+            created_at: NOW,
+        })
+        .expect("draft");
+    store
+        .save_review_unit(BetaReviewUnitRecord {
+            review_unit_id: review_unit_id.clone(),
+            prompt_id: "spanless-nato-a-prompt".to_owned(),
+            prompt,
+            queue: PersistedQueueCandidate {
+                review_unit_id,
+                due: NOW - 60_000,
+                progression: Some(ProgressionMetadata {
+                    progression_group: Some("nato-letter-a".to_owned()),
+                    stage_order: 1,
+                    requires: Vec::new(),
+                    supersedes: Vec::new(),
+                }),
+                concept_key: Some("nato-letter-a".to_owned()),
+                source_key: Some("src-spanless".to_owned()),
+                domain_key: Some("text".to_owned()),
+            },
+            reference_span_ids: Vec::new(),
+            concept_reference_note_key: None,
+            generated_prompt_draft_id: Some("spanless-draft".to_owned()),
+            archived_at: None,
+            snoozed_until: None,
+            created_at: NOW,
+        })
+        .expect("review unit");
+}
+
+struct PanicReferenceProvider;
+
+impl ReferenceNoteProvider for PanicReferenceProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "panic-reference".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Err(ProviderFailure::new(
+            "reference provider should not run when a cached concept note exists",
+        ))
+    }
+}
+
+struct RejectedBridgeProvider;
+
+impl ReferenceNoteProvider for RejectedBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "rejected-bridge".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: format!("Reference: {}", request.concept_label),
+            body: "Use the full original answer.".to_owned(),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for RejectedBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Ok(BridgeMaterial {
+            model: ReferenceNoteProvider::model(self),
+            reference_note: self.explain_concept(&ReferenceNoteRequest {
+                concept_key: request.concept_key.clone(),
+                concept_label: request.concept_label.clone(),
+                prompt: request.parent_prompt.clone(),
+                expected_answer: request.parent_expected_answer.clone(),
+                recent_performance: Vec::new(),
+            })?,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: request.concept_label.clone(),
+                question: request.parent_prompt.clone(),
+                answer: request.parent_expected_answer.clone(),
+                evidence: None,
+                distractors: Vec::new(),
+                worked_solution: Some("This repeats the parent.".to_owned()),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "composition".to_owned(),
+                unsupported: false,
+            }],
+            usage: None,
+        })
+    }
 }
 
 fn now() -> i64 {

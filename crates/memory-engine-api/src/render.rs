@@ -281,19 +281,23 @@ fn render_keep_flow(account: &AppAccount, drafts: &[BetaStudyDraftRow]) -> Strin
 
 fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> String {
     let current = view.current.as_ref().expect("review view has current item");
+    let reference = render_reference(current);
     let answer = render_answer(current);
     let result = render_grade(account, current);
     let reveal = render_reveal_form(account, current);
     let submit = render_submit_form(account, current);
+    let escape_hatches = render_escape_hatches(account, current);
 
     format!(
         r#"{}
 <section class="review">
   <p class="prompt">{}</p>
+  {reference}
   {answer}
   {result}
   {reveal}
   {submit}
+  {escape_hatches}
 </section>"#,
         render_due_status(view.due_count),
         escape_html(&current.prompt)
@@ -312,6 +316,18 @@ fn render_answer(current: &BetaStudyCurrent) -> String {
         })
 }
 
+fn render_reference(current: &BetaStudyCurrent) -> String {
+    current
+        .reference_text
+        .as_ref()
+        .map_or_else(String::new, |reference| {
+            format!(
+                r#"<div class="reference"><span>Reference</span><p>{}</p></div>"#,
+                escape_html(reference)
+            )
+        })
+}
+
 fn render_grade(account: &AppAccount, current: &BetaStudyCurrent) -> String {
     current.grade.as_ref().map_or_else(String::new, |grade| {
         format!(
@@ -324,6 +340,38 @@ fn render_grade(account: &AppAccount, current: &BetaStudyCurrent) -> String {
             hidden_csrf_input(account)
         )
     })
+}
+
+fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> String {
+    format!(
+        r#"<div class="secondary-actions">
+  {}
+  {}
+  {}
+  {}
+</div>"#,
+        render_review_action(account, current, "/app/reference", "Reference"),
+        render_review_action(account, current, "/app/skip", "Skip"),
+        render_review_action(account, current, "/app/snooze", "Snooze"),
+        render_review_action(account, current, "/app/bridge", "Bridge")
+    )
+}
+
+fn render_review_action(
+    account: &AppAccount,
+    current: &BetaStudyCurrent,
+    action: &str,
+    label: &str,
+) -> String {
+    format!(
+        r#"<form action="{action}" method="post">
+  {}
+  <input type="hidden" name="reviewUnitId" value="{}">
+  <button class="quiet" type="submit">{label}</button>
+</form>"#,
+        hidden_csrf_input(account),
+        escape_html(&current.review_unit_id.to_string())
+    )
 }
 
 fn render_reveal_form(account: &AppAccount, current: &BetaStudyCurrent) -> String {
@@ -462,11 +510,41 @@ section {
   color: #61706b;
   font-size: 0.92rem;
 }
+.reference {
+  margin: 10px 0 16px;
+  padding: 12px 0;
+  border-top: 1px solid #d9d5ca;
+  border-bottom: 1px solid #d9d5ca;
+}
+.reference span {
+  display: block;
+  margin-bottom: 6px;
+  color: #61706b;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+.reference p {
+  margin: 0;
+  line-height: 1.5;
+}
 .result {
   margin: 12px 0;
   font-size: 1.1rem;
   font-weight: 700;
   color: #315f53;
+}
+.secondary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+.secondary-actions form {
+  margin: 0;
+}
+.secondary-actions button {
+  min-height: 38px;
 }
 form {
   display: grid;
