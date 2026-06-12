@@ -1,0 +1,759 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Memory Engine API",
+    "version": "1.0.0",
+    "description": "Versioned JSON API for external learning clients such as Scry. The engine owns memory, generation, scheduling, and grading; clients own product experience."
+  },
+  "servers": [
+    {
+      "url": "https://memory-engine-api.fly.dev"
+    }
+  ],
+  "security": [
+    {
+      "bearerSession": []
+    }
+  ],
+  "paths": {
+    "/v1/openapi.json": {
+      "get": {
+        "summary": "Read the v1 OpenAPI contract",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI contract"
+          }
+        }
+      }
+    },
+    "/v1/accounts": {
+      "post": {
+        "summary": "Create an account session",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Account session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountCreated"
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/sources": {
+      "get": {
+        "summary": "List active sources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Source list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceList"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create source material",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSourceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceRecord"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/sources/{source_id}": {
+      "delete": {
+        "summary": "Archive source material",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/SourceId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Source archived"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/sources/{source_id}/generate": {
+      "post": {
+        "summary": "Generate draft review items from one source",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/SourceId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with generated drafts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/approve": {
+      "post": {
+        "summary": "Keep one generated draft as a review unit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/next": {
+      "post": {
+        "summary": "Select the next due review",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with the next due review if available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/reveal": {
+      "post": {
+        "summary": "Reveal the current review answer",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with expected answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/submit": {
+      "post": {
+        "summary": "Submit an answer and apply scheduling",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Study view with grade and schedule result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerSession": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Use the sessionToken returned by /v1/accounts or a pre-provisioned account session."
+      }
+    },
+    "parameters": {
+      "AccountId": {
+        "name": "account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^acct_[a-f0-9]+$"
+        }
+      },
+      "SourceId": {
+        "name": "source_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "DraftId": {
+        "name": "draft_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ReviewUnitId": {
+        "name": "review_unit_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "JSON API error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CreateAccountRequest": {
+        "type": "object",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          }
+        }
+      },
+      "AccountCreated": {
+        "type": "object",
+        "required": [
+          "accountId",
+          "sessionToken"
+        ],
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "sessionToken": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateSourceRequest": {
+        "type": "object",
+        "required": [
+          "title",
+          "body"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        }
+      },
+      "SourceList": {
+        "type": "object",
+        "required": [
+          "sources"
+        ],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceRecord"
+            }
+          }
+        }
+      },
+      "SourceRecord": {
+        "type": "object",
+        "required": [
+          "sourceId",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "sourceId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        }
+      },
+      "SubmitReviewRequest": {
+        "type": "object",
+        "required": [
+          "answer",
+          "responseTimeMs",
+          "idempotencyKey"
+        ],
+        "properties": {
+          "answer": {
+            "type": "string"
+          },
+          "responseTimeMs": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "idempotencyKey": {
+            "type": "string"
+          }
+        }
+      },
+      "StudyViewResponse": {
+        "type": "object",
+        "required": [
+          "drafts",
+          "current",
+          "summary",
+          "dueCount",
+          "generationNotices"
+        ],
+        "properties": {
+          "drafts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StudyDraft"
+            }
+          },
+          "current": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StudyCurrent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/StudySummary"
+          },
+          "dueCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "generationNotices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StudyDraft": {
+        "type": "object",
+        "required": [
+          "id",
+          "activityKind",
+          "activityStage",
+          "prompt",
+          "validationStatus",
+          "validationReasons",
+          "workedSolution"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "activityKind": {
+            "type": "string"
+          },
+          "activityStage": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "validationStatus": {
+            "type": "string"
+          },
+          "validationReasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "workedSolution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "StudyCurrent": {
+        "type": "object",
+        "required": [
+          "reviewUnitId",
+          "promptId",
+          "activityKind",
+          "activityStage",
+          "prompt",
+          "revisionExpectedAnswer",
+          "expectedAnswer",
+          "referenceText",
+          "workedSolution",
+          "grade",
+          "reviewState",
+          "scheduleChange"
+        ],
+        "properties": {
+          "reviewUnitId": {
+            "type": "string"
+          },
+          "promptId": {
+            "type": "string"
+          },
+          "activityKind": {
+            "type": "string"
+          },
+          "activityStage": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "revisionExpectedAnswer": {
+            "type": "string"
+          },
+          "expectedAnswer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "referenceText": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workedSolution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "grade": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StudyGrade"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reviewState": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scheduleChange": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScheduleChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "StudyGrade": {
+        "type": "object",
+        "required": [
+          "verdict",
+          "rating",
+          "isCorrect"
+        ],
+        "properties": {
+          "verdict": {
+            "$ref": "#/components/schemas/Verdict"
+          },
+          "rating": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ]
+          },
+          "isCorrect": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ReviewState": {
+        "type": "object",
+        "required": [
+          "due",
+          "reps",
+          "lapses",
+          "state",
+          "last_review"
+        ],
+        "properties": {
+          "due": {
+            "type": "integer"
+          },
+          "reps": {
+            "type": "integer"
+          },
+          "lapses": {
+            "type": "integer"
+          },
+          "state": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3
+            ]
+          },
+          "last_review": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ScheduleChange": {
+        "type": "object",
+        "required": [
+          "before",
+          "after"
+        ],
+        "properties": {
+          "before": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "after": {
+            "$ref": "#/components/schemas/ReviewState"
+          }
+        }
+      },
+      "StudySummary": {
+        "type": "object",
+        "required": [
+          "sourceCount",
+          "acceptedDraftCount",
+          "approvedReviewUnitCount",
+          "attemptCount",
+          "lastOutcome",
+          "nextReviewUnitId"
+        ],
+        "properties": {
+          "sourceCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acceptedDraftCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "approvedReviewUnitCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attemptCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastOutcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Verdict"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "nextReviewUnitId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Verdict": {
+        "type": "string",
+        "enum": [
+          "correct",
+          "close",
+          "wrong",
+          "revealed"
+        ]
+      },
+      "ApiError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

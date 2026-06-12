@@ -184,6 +184,16 @@ fn boundary_lanes() -> Vec<QaLane> {
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
+            id: "api.v1-contract",
+            title: "External v1 API contract runner",
+            surface: "versioned public JSON contract and consumer proof binary",
+            purpose:
+                "Prove the Scry-facing client compiles and its contract fixtures stay executable.",
+            command: &["cargo", "test", "-p", "memory-engine-contract"],
+            gating: true,
+            modes: &[QaMode::Local, QaMode::Full],
+        },
+        QaLane {
             id: "dogfood.rust-receipts",
             title: "Rust dogfood client receipts",
             surface: "Rust CLI review, import probe, web shell",
@@ -383,8 +393,8 @@ mod tests {
         let local = selected_lanes(QaMode::Local);
         let full = selected_lanes(QaMode::Full);
 
-        assert_eq!(local.len(), 12);
-        assert_eq!(full.len(), 13);
+        assert_eq!(local.len(), 13);
+        assert_eq!(full.len(), 14);
         assert_eq!(local.first().map(|lane| lane.id), Some("static.rustfmt"));
         assert_eq!(full.last().map(|lane| lane.id), Some("ci.canonical"));
         assert!(!local.iter().any(|lane| lane.id == "ci.canonical"));

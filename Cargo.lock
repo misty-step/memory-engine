@@ -889,6 +889,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-contract"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "memory-engine-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "memory-engine-core"
 version = "0.0.0"
 dependencies = [

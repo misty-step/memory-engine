@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     http::{
-        header::{COOKIE, SET_COOKIE},
+        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{Html, IntoResponse, Response},
@@ -453,7 +453,21 @@ fn read_session_token(headers: &HeaderMap) -> Result<&str, ApiFailure> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| read_bearer_session_token(headers))
         .ok_or_else(ApiFailure::missing_session)
+}
+
+fn read_bearer_session_token(headers: &HeaderMap) -> Option<&str> {
+    let authorization = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = authorization.split_once(char::is_whitespace)?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    None
 }
 
 fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
@@ -841,7 +855,7 @@ mod tests {
     use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
     use super::{
-        render_generation_notices, router, AccountRegistry, ApiState, AuthConfig,
+        render_generation_notices, router, routes, AccountRegistry, ApiState, AuthConfig,
         AUTH_CHALLENGE_TTL_MS,
     };
 
@@ -2481,6 +2495,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_json_api_drives_full_loop_with_bearer_token() {
+        let app = router(ApiState::default());
+        let account = create_account_v1(&app, "scry@example.com").await;
+        let source_id =
+            create_source_v1(&app, &account, "NATO practice notes", &source_body()).await;
+        let draft_id = generate_source_v1(&app, &account, &source_id).await;
+        let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+
+        assert_eq!(
+            next_review_v1(&app, &account).await,
+            review_unit_id,
+            "v1 queue/next must expose the approved review unit"
+        );
+        assert_eq!(
+            reveal_review_v1(&app, &account, &review_unit_id).await,
+            "ALFA"
+        );
+        assert_eq!(
+            submit_review_v1(&app, &account, &review_unit_id, "ALFA").await,
+            (String::from("correct"), 1)
+        );
+
+        archive_source_v1(&app, &account, &source_id).await;
+    }
+
+    #[tokio::test]
+    async fn v1_openapi_artifact_matches_registered_routes() {
+        let response = router(ApiState::default())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/openapi.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("openapi response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let contract = response_json(response).await;
+        assert_eq!(contract["openapi"], json!("3.1.0"));
+        assert_eq!(contract["info"]["version"], json!("1.0.0"));
+
+        let paths = contract["paths"].as_object().expect("paths object");
+        let actual = paths
+            .iter()
+            .flat_map(|(path, methods)| {
+                methods
+                    .as_object()
+                    .expect("methods object")
+                    .keys()
+                    .map(move |method| (method.to_ascii_uppercase(), path.clone()))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = routes::v1_contract_operations()
+            .iter()
+            .map(|operation| (operation.method.to_owned(), operation.path.to_owned()))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn duplicate_review_submit_does_not_double_count_attempts() {
         let app = router(ApiState::default());
         let account = create_account(&app, "learner@example.com").await;
@@ -2701,6 +2777,218 @@ mod tests {
             .uri("/accounts")
             .header("content-type", "application/json")
             .body(Body::from(json!({ "email": email }).to_string()))
+            .expect("request")
+    }
+
+    async fn create_account_v1(app: &axum::Router, email: &str) -> TestAccount {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "email": email }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("v1 account response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = response_json(response).await;
+        TestAccount {
+            account_id: body["accountId"].as_str().expect("account id").to_owned(),
+            session_token: body["sessionToken"]
+                .as_str()
+                .expect("session token")
+                .to_owned(),
+        }
+    }
+
+    async fn create_source_v1(
+        app: &axum::Router,
+        account: &TestAccount,
+        title: &str,
+        body: &str,
+    ) -> String {
+        let response = app
+            .clone()
+            .oneshot(v1_json_request(
+                "POST",
+                &format!("/v1/accounts/{}/sources", account.account_id),
+                &account.session_token,
+                &json!({ "title": title, "body": body }),
+            ))
+            .await
+            .expect("create source");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        response_json(response).await["sourceId"]
+            .as_str()
+            .expect("source id")
+            .to_owned()
+    }
+
+    async fn generate_source_v1(
+        app: &axum::Router,
+        account: &TestAccount,
+        source_id: &str,
+    ) -> String {
+        let response = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate source");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        response_json(response).await["drafts"][0]["id"]
+            .as_str()
+            .expect("draft id")
+            .to_owned()
+    }
+
+    async fn approve_draft_v1(app: &axum::Router, account: &TestAccount, draft_id: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/drafts/{draft_id}/approve",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("approve draft");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        response_json(response).await["current"]["reviewUnitId"]
+            .as_str()
+            .expect("review unit id")
+            .to_owned()
+    }
+
+    async fn next_review_v1(app: &axum::Router, account: &TestAccount) -> String {
+        let response = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!("/v1/accounts/{}/review/next", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("next review");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        response_json(response).await["current"]["reviewUnitId"]
+            .as_str()
+            .expect("review unit id")
+            .to_owned()
+    }
+
+    async fn reveal_review_v1(
+        app: &axum::Router,
+        account: &TestAccount,
+        review_unit_id: &str,
+    ) -> String {
+        let response = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{review_unit_id}/reveal",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("reveal");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        response_json(response).await["current"]["expectedAnswer"]
+            .as_str()
+            .expect("expected answer")
+            .to_owned()
+    }
+
+    async fn submit_review_v1(
+        app: &axum::Router,
+        account: &TestAccount,
+        review_unit_id: &str,
+        answer: &str,
+    ) -> (String, u64) {
+        let response = app
+            .clone()
+            .oneshot(v1_json_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{review_unit_id}/submit",
+                    account.account_id
+                ),
+                &account.session_token,
+                &json!({
+                    "answer": answer,
+                    "responseTimeMs": 1800,
+                    "idempotencyKey": "v1-scry-loop-nato-a"
+                }),
+            ))
+            .await
+            .expect("submit");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response_json(response).await;
+        (
+            body["current"]["grade"]["verdict"]
+                .as_str()
+                .expect("verdict")
+                .to_owned(),
+            body["summary"]["attemptCount"]
+                .as_u64()
+                .expect("attempt count"),
+        )
+    }
+
+    async fn archive_source_v1(app: &axum::Router, account: &TestAccount, source_id: &str) {
+        let response = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "DELETE",
+                &format!("/v1/accounts/{}/sources/{source_id}", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("archive source");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    fn v1_json_request(
+        method: &str,
+        uri: &str,
+        session_token: &str,
+        body: &Value,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {session_token}"))
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    fn v1_empty_request(method: &str, uri: &str, session_token: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {session_token}"))
+            .body(Body::empty())
             .expect("request")
     }
 
