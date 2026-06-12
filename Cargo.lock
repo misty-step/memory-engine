@@ -865,6 +865,7 @@ dependencies = [
 name = "memory-engine-beta-app"
 version = "0.0.0"
 dependencies = [
+ "memory-engine-generation",
  "memory-engine-study",
  "serde",
  "serde_json",

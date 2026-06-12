@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use memory_engine_core::{ScheduleStatus, Verdict};
 use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
 use memory_engine_study::{
-    BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
+    infer_capture_title, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
 };
 use serde_json::json;
 
@@ -385,6 +385,29 @@ fn generates_drafts_from_arbitrary_prose_via_model_provider() {
         generated.generation_notices.is_empty(),
         "a clean run must not raise notices: {:?}",
         generated.generation_notices
+    );
+}
+
+#[test]
+fn infers_a_title_when_capture_does_not_provide_one() {
+    let directory = TempDirectory::new("capture-title");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+
+    let view = study
+        .add_source(BetaStudySourceInput {
+            id: "src-capture".to_owned(),
+            title: String::new(),
+            body: "  Mitochondria generate ATP for cells. The second sentence stays body text.  "
+                .to_owned(),
+        })
+        .expect("source");
+
+    assert_eq!(view.sources[0].title, "Mitochondria generate ATP for cells");
+    assert_eq!(
+        infer_capture_title("\"Hope\" is the thing with feathers -\nThat perches in the soul -"),
+        "\"Hope\" is the thing with feathers -"
     );
 }
 

@@ -1,6 +1,7 @@
 # Beta Content Generation
 
 Refs-backlog: 27
+Refs-backlog: 051
 
 ## Purpose
 
@@ -15,15 +16,42 @@ QA spine that real provider calls must satisfy later.
 ## Workflow
 
 1. Ingest source material into `BetaPersistenceStore` as `SourceDocument`
-   records.
-2. Parse deterministic source blocks into candidate learning activities.
-3. Create `ReferenceSpan` records for cited source evidence.
-4. Save a `GenerationRun` receipt with provider/model/version metadata.
-5. Save generated drafts with source ids, reference span ids, activity kind,
+   records. User-facing app flows accept one free-form capture field; title is
+   inferred from the first meaningful source text and may be edited in later
+   source-management work, but it is not required up front.
+2. Classify the source learning intent as one of `verbatim memorization`,
+   `concept understanding`, `fact recall`, or `procedure/process`.
+3. Branch generation by intent before creating candidate learning activities:
+   verbatim sources produce recitation-ladder exercises, concept sources
+   produce explanation/application prompts, fact sources produce recognition
+   and recall checks, and process sources produce ordered-step prompts.
+4. Parse deterministic source blocks into candidate learning activities when
+   the source is already written in fixture format.
+5. Create `ReferenceSpan` records for cited source evidence.
+6. Save a `GenerationRun` receipt with provider/model/version metadata.
+7. Save generated drafts with source ids, reference span ids, activity kind,
    activity stage, validation status, critique notes, and optional worked
    solution.
-6. Approve only accepted drafts into review units consumed by the existing
+8. Approve only accepted drafts into review units consumed by the existing
    service, queue, and scheduling path.
+
+## Capture Contract
+
+The beta app and production app shell expose a single capture affordance named
+`capture`. It accepts anything from one word to a pasted article. Existing
+machine clients may still send `title` and `body`, but learner-facing forms do
+not split the task into title/body fields or reveal structured fixture syntax.
+When the title is absent, the study boundary infers a short title from the first
+meaningful sentence or line and stores the capture as an ordinary text
+`SourceDocument`. App posts save that source first and render the saved material
+list with a separate review-creation action, so learners can leave and return
+to the captured source even if generation is slow or fails.
+
+Image capture is scoped out for this ticket. OCR introduces a second provider
+with different latency, cost, privacy, and quality failure modes; accepting
+pasted text keeps 051 focused on the capture and intent-generation contract.
+The call changes when there is an OCR boundary with corpus fixtures for image
+quality, cost ceilings, and human-readable failure notices.
 
 ## Fixture Format
 

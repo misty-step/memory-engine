@@ -13,10 +13,12 @@
 use std::{fmt::Write as _, fs, path::PathBuf};
 
 use memory_engine_generation::{
-    evidence_quote_matches, DraftCandidate, DraftProvider, FakeModelProvider,
+    evidence_quote_matches, DraftCandidate, DraftProvider, FakeModelProvider, LearningIntent,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
-use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
+use memory_engine_persistence::{
+    GeneratedLearningActivityKind, SourceDocument, SourceDocumentKind, SourcePermission,
+};
 use serde::Deserialize;
 
 const NOW: i64 = 1_780_162_400_000;
@@ -35,6 +37,16 @@ struct Expectations {
     min_drafts: usize,
     max_drafts: usize,
     key_terms: Vec<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    required_activity_kinds: Vec<String>,
+    #[serde(default)]
+    required_activity_stage_terms: Vec<String>,
+    #[serde(default)]
+    forbidden_activity_kinds: Vec<String>,
+    #[serde(default)]
+    requires_distractors: bool,
 }
 
 /// Deterministic judge scores for one source's provider output.
@@ -55,6 +67,8 @@ pub struct SourceScore {
     pub count_in_range: bool,
     /// Fraction of annotated key terms covered by at least one draft.
     pub key_term_coverage: f64,
+    /// Whether intent-specific activity kind/stage expectations were met.
+    pub intent_shape_match: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: Option<i64>,
@@ -226,7 +240,12 @@ fn score_source(
 
     match provider.generate_drafts(&document) {
         Ok(drafts) => {
-            let mut score = deterministic_judges(&source.body, &source.expect, &drafts.candidates);
+            let mut score = deterministic_judges(
+                &source.body,
+                &source.expect,
+                drafts.learning_intent,
+                &drafts.candidates,
+            );
             score.source_id.clone_from(&source.id);
             score.category.clone_from(&source.category);
             let emitted = drafts.candidates.len() + drafts.failures.len();
@@ -264,6 +283,7 @@ fn score_source(
             duplicate_rate: 0.0,
             count_in_range: false,
             key_term_coverage: 0.0,
+            intent_shape_match: source.expect.intent.is_none(),
             input_tokens: 0,
             output_tokens: 0,
             cost_usd_micros: None,
@@ -281,6 +301,7 @@ fn score_source(
 fn deterministic_judges(
     body: &str,
     expect: &Expectations,
+    learning_intent: Option<LearningIntent>,
     candidates: &[DraftCandidate],
 ) -> SourceScore {
     let drafts = candidates.len();
@@ -341,6 +362,7 @@ fn deterministic_judges(
         duplicate_rate: fraction(duplicates, drafts),
         count_in_range: drafts >= expect.min_drafts && drafts <= expect.max_drafts,
         key_term_coverage: fraction(covered_terms, expect.key_terms.len()),
+        intent_shape_match: intent_shape_matches(expect, learning_intent, candidates),
         input_tokens: 0,
         output_tokens: 0,
         cost_usd_micros: None,
@@ -348,6 +370,81 @@ fn deterministic_judges(
         provider_error: None,
         judge: None,
         judge_error: None,
+    }
+}
+
+fn intent_shape_matches(
+    expect: &Expectations,
+    learning_intent: Option<LearningIntent>,
+    candidates: &[DraftCandidate],
+) -> bool {
+    if expect.intent.is_none()
+        && expect.required_activity_kinds.is_empty()
+        && expect.required_activity_stage_terms.is_empty()
+        && expect.forbidden_activity_kinds.is_empty()
+        && !expect.requires_distractors
+    {
+        return true;
+    }
+
+    let intent_label_matches = expect
+        .intent
+        .as_deref()
+        .is_none_or(|expected| learning_intent.is_some_and(|actual| actual.label() == expected));
+    let required_kinds_match = expect.required_activity_kinds.iter().all(|kind| {
+        candidates
+            .iter()
+            .any(|candidate| activity_kind_label(&candidate.activity_kind) == kind)
+    });
+    let required_stages_match = expect.required_activity_stage_terms.iter().all(|term| {
+        candidates.iter().any(|candidate| {
+            candidate
+                .activity_stage
+                .to_lowercase()
+                .contains(&term.to_lowercase())
+        })
+    });
+    let forbidden_kinds_absent = expect.forbidden_activity_kinds.iter().all(|kind| {
+        candidates
+            .iter()
+            .all(|candidate| activity_kind_label(&candidate.activity_kind) != kind)
+    });
+    let distractors_match = !expect.requires_distractors
+        || candidates
+            .iter()
+            .any(|candidate| !candidate.distractors.is_empty());
+
+    intent_label_matches
+        && required_kinds_match
+        && required_stages_match
+        && forbidden_kinds_absent
+        && distractors_match
+}
+
+#[cfg(test)]
+fn shape_signature(candidates: &[DraftCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}:{}:{}",
+                activity_kind_label(&candidate.activity_kind),
+                candidate.activity_stage,
+                if candidate.distractors.is_empty() {
+                    "short"
+                } else {
+                    "choice"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn activity_kind_label(kind: &GeneratedLearningActivityKind) -> &'static str {
+    match kind {
+        GeneratedLearningActivityKind::Quiz => "quiz",
+        GeneratedLearningActivityKind::Exercise => "exercise",
     }
 }
 
@@ -490,24 +587,24 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
     let _ = writeln!(receipt);
     let _ = writeln!(
         receipt,
-        "| source | category | drafts | schema | provenance | answerable | dup | count-ok | terms | tokens in/out | cost | latency |"
+        "| source | category | drafts | schema | provenance | answerable | dup | count-ok | terms | shape | tokens in/out | cost | latency |"
     );
     let _ = writeln!(
         receipt,
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     for score in scores {
         if let Some(error) = &score.provider_error {
             let _ = writeln!(
                 receipt,
-                "| {} | {} | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
+                "| {} | {} | — | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
                 score.source_id, score.category
             );
             continue;
         }
         let _ = writeln!(
             receipt,
-            "| {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {}/{} | {} | {}ms |",
+            "| {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {}/{} | {} | {}ms |",
             score.source_id,
             score.category,
             score.drafts,
@@ -517,6 +614,7 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
             score.duplicate_rate * 100.0,
             if score.count_in_range { "yes" } else { "NO" },
             score.key_term_coverage * 100.0,
+            if score.intent_shape_match { "yes" } else { "NO" },
             score.input_tokens,
             score.output_tokens,
             format_cost(score.cost_usd_micros),
@@ -552,6 +650,15 @@ fn render_receipt(label: &str, scores: &[SourceScore]) -> String {
         mean(&judged, |score| score.key_term_coverage) * 100.0,
         judged.iter().filter(|score| score.count_in_range).count(),
         judged.len(),
+    );
+    let shaped = judged
+        .iter()
+        .filter(|score| score.intent_shape_match)
+        .count();
+    let _ = writeln!(
+        receipt,
+        "- Intent shape matches: {shaped}/{} sources",
+        judged.len()
     );
     let _ = writeln!(
         receipt,
@@ -626,6 +733,11 @@ mod tests {
             min_drafts: 1,
             max_drafts: 3,
             key_terms: vec!["Alfa".to_owned(), "Bravo".to_owned()],
+            intent: None,
+            required_activity_kinds: Vec::new(),
+            required_activity_stage_terms: Vec::new(),
+            forbidden_activity_kinds: Vec::new(),
+            requires_distractors: false,
         }
     }
 
@@ -638,7 +750,7 @@ mod tests {
             candidate("What is B?", "Bravo", "B is Bravo."),
         ];
 
-        let score = deterministic_judges(BODY, &expectations(), &candidates);
+        let score = deterministic_judges(BODY, &expectations(), None, &candidates);
 
         assert!((score.provenance - 1.0).abs() < f64::EPSILON);
         assert!((score.answerability - 1.0).abs() < f64::EPSILON);
@@ -655,7 +767,7 @@ mod tests {
             candidate("What is D?", "Delta", "D is Delta."),
         ];
 
-        let score = deterministic_judges(BODY, &expectations(), &candidates);
+        let score = deterministic_judges(BODY, &expectations(), None, &candidates);
 
         assert!((score.provenance - 2.0 / 3.0).abs() < 0.01);
         assert!((score.duplicate_rate - 1.0 / 3.0).abs() < 0.01);
@@ -666,7 +778,7 @@ mod tests {
     fn provenance_matching_tolerates_case_and_punctuation() {
         let candidates = vec![candidate("What is C?", "Charlie", "c IS charlie")];
 
-        let score = deterministic_judges(BODY, &expectations(), &candidates);
+        let score = deterministic_judges(BODY, &expectations(), None, &candidates);
 
         assert!((score.provenance - 1.0).abs() < f64::EPSILON);
     }
@@ -679,14 +791,14 @@ mod tests {
             "B is Bravo",
         )];
 
-        let score = deterministic_judges(BODY, &expectations(), &candidates);
+        let score = deterministic_judges(BODY, &expectations(), None, &candidates);
 
         assert!(score.answerability.abs() < f64::EPSILON);
     }
 
     #[test]
     fn count_in_range_respects_annotations() {
-        let none = deterministic_judges(BODY, &expectations(), &[]);
+        let none = deterministic_judges(BODY, &expectations(), None, &[]);
         assert!(!none.count_in_range);
         assert!(none.provenance.abs() < f64::EPSILON);
     }
@@ -713,5 +825,62 @@ mod tests {
                 score.provenance
             );
         }
+    }
+
+    #[test]
+    fn intent_eval_fixtures_assert_different_item_shapes() {
+        let corpus = load_corpus().expect("corpus");
+        let intent_sources = corpus
+            .iter()
+            .filter(|source| source.expect.intent.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            intent_sources.len() >= 4,
+            "051 requires one eval fixture per capture intent"
+        );
+        let intent_labels = intent_sources
+            .iter()
+            .filter_map(|source| source.expect.intent.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            intent_labels,
+            [
+                "concept_understanding",
+                "fact_recall",
+                "procedure_process",
+                "verbatim_memorization",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        let mut signatures = std::collections::BTreeSet::new();
+        for source in intent_sources {
+            let document = SourceDocument {
+                id: source.id.clone(),
+                kind: SourceDocumentKind::Text,
+                title: source.title.clone(),
+                body: Some(source.body.clone()),
+                uri: None,
+                permission: SourcePermission::ModelEligible,
+                freshness: Some(NOW),
+                created_at: NOW,
+                archived_at: None,
+            };
+            let drafts = FakeModelProvider
+                .generate_drafts(&document)
+                .expect("fake provider");
+            assert!(
+                intent_shape_matches(&source.expect, drafts.learning_intent, &drafts.candidates),
+                "{} should satisfy its intent shape expectation",
+                source.id
+            );
+            signatures.insert(shape_signature(&drafts.candidates));
+        }
+
+        assert!(
+            signatures.len() >= 4,
+            "intent fixtures should not collapse into one generic item shape: {signatures:?}"
+        );
     }
 }

@@ -893,8 +893,11 @@ mod tests {
         let body = response_text(response).await;
         assert!(body.contains(r#"<form action="/app/start" method="post">"#));
         assert!(body.contains("Add something you want to learn"));
-        assert!(body.contains("Create review"));
+        assert!(body.contains("Save capture"));
         assert!(body.contains(r#"placeholder="Paste anything worth remembering.""#));
+        assert!(body.contains(r#"name="capture""#));
+        assert!(!body.contains(r#"name="title""#));
+        assert!(!body.contains(r#"name="body""#));
         assert!(body.contains(r#"<form action="/app/account" method="post">"#));
         assert!(!body.contains("NATO practice notes"));
         assert!(!body.contains("Concept: NATO letter A"));
@@ -933,17 +936,33 @@ mod tests {
             .oneshot(form_request(
                 "POST",
                 "/app/start",
-                &[("title", "NATO practice notes"), ("body", &source_body())],
+                &[("capture", &source_body())],
             ))
             .await
             .expect("start");
         assert_eq!(started.status(), StatusCode::OK);
         let cookie = session_cookie(&started);
         let started = response_text(started).await;
-        assert_keep_flow_html(&started);
-
         let csrf_token = html_value(&started, "csrfToken");
-        let draft_id = html_value(&started, "draftId");
+        let source_id = html_value(&started, "sourceId");
+        assert!(started.contains("Capture saved"));
+        assert!(started.contains("Saved material"));
+        assert!(!started.contains("Choose what to keep"));
+
+        let generated = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("generate");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_text(generated).await;
+        assert_keep_flow_html(&generated);
+        let draft_id = html_value(&generated, "draftId");
 
         let approved = app
             .clone()
@@ -1040,7 +1059,20 @@ mod tests {
         assert!(started.contains(r#"name="csrfToken""#));
 
         let csrf_token = html_value(&started, "csrfToken");
-        let draft_id = html_value(&started, "draftId");
+        let source_id = html_value(&started, "sourceId");
+        let generated = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("generate");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_text(generated).await;
+        let draft_id = html_value(&generated, "draftId");
         let rejected = app
             .clone()
             .oneshot(form_request_with_cookie(
@@ -1086,7 +1118,6 @@ mod tests {
         let started = response_text(started).await;
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
-        let draft_id = html_value(&started, "draftId");
 
         assert_forbidden_form(
             &app,
@@ -1119,7 +1150,7 @@ mod tests {
             &app,
             &cookie,
             "/app/approve",
-            &[("draftId", &draft_id)],
+            &[("draftId", "draft-withheld")],
             "approve without csrf",
         )
         .await;
@@ -1132,6 +1163,9 @@ mod tests {
         )
         .await;
         assert_forbidden_form(&app, &cookie, "/app/logout", &[], "logout without csrf").await;
+
+        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+        let draft_id = html_value(&generated, "draftId");
 
         let approved = app
             .clone()
@@ -1169,6 +1203,26 @@ mod tests {
             "submit without csrf",
         )
         .await;
+    }
+
+    async fn generate_source_html(
+        app: &axum::Router,
+        cookie: &str,
+        csrf_token: &str,
+        source_id: &str,
+    ) -> String {
+        let generated = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                cookie,
+                &[("csrfToken", csrf_token), ("sourceId", source_id)],
+            ))
+            .await
+            .expect("generate with csrf");
+        assert_eq!(generated.status(), StatusCode::OK);
+        response_text(generated).await
     }
 
     async fn assert_forbidden_form(
@@ -1617,7 +1671,8 @@ mod tests {
         let saved_cookie = session_cookie(&saved);
         let saved = response_text(saved).await;
         assert!(saved.contains("NATO practice notes"));
-        assert!(saved.contains("Keep this"));
+        assert!(saved.contains("Saved material"));
+        assert!(!saved.contains("Keep this"));
         assert!(!saved.contains("acct_fc9e1ff15d47bd67"));
         assert!(!saved.contains("Save account email"));
         let saved_csrf_token = html_value(&saved, "csrfToken");
@@ -2256,11 +2311,25 @@ mod tests {
         let started = response_text(started).await;
         assert!(!started.contains(r#"name="sessionToken""#));
         let csrf_token = html_value(&started, "csrfToken");
-        let draft_id = html_value(&started, "draftId");
+        let source_id = html_value(&started, "sourceId");
 
         let restarted_app = router(ApiState::new(AccountRegistry::with_postgres_url(
             database.scoped_url.clone(),
         )));
+        let generated = restarted_app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("generate after restart");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_text(generated).await;
+        let draft_id = html_value(&generated, "draftId");
+
         let approved = restarted_app
             .oneshot(form_request_with_cookie(
                 "POST",

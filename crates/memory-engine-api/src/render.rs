@@ -166,9 +166,8 @@ fn render_start_form(account: Option<&AppAccount>) -> String {
   <h2>Add something you want to learn</h2>
   <form action="{action}" method="post">
     {csrf}
-    <label>Title <input name="title" required placeholder="Short title"></label>
-    <label>Text <textarea name="body" rows="7" required placeholder="Paste anything worth remembering."></textarea></label>
-    <button type="submit">Create review</button>
+    <label>Capture <textarea name="capture" rows="7" required placeholder="Paste anything worth remembering."></textarea></label>
+    <button type="submit">Save capture</button>
   </form>
 </section>"#
     )

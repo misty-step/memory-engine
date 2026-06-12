@@ -6,6 +6,10 @@
   "expect": {
     "min_drafts": 3,
     "max_drafts": 8,
-    "key_terms": ["Alfa", "Foxtrot", "Hotel"]
+    "key_terms": ["Alfa", "Foxtrot", "Hotel"],
+    "intent": "fact_recall",
+    "required_activity_kinds": ["quiz"],
+    "required_activity_stage_terms": ["recognition"],
+    "requires_distractors": true
   }
 }

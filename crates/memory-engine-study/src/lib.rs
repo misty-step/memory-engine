@@ -67,6 +67,18 @@ pub struct BetaStudySourceInput {
     pub body: String,
 }
 
+impl BetaStudySourceInput {
+    #[must_use]
+    pub fn from_capture(id: impl Into<String>, body: impl Into<String>) -> Self {
+        let body = body.into();
+        Self {
+            id: id.into(),
+            title: infer_capture_title(&body),
+            body,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BetaStudyView {
@@ -435,12 +447,14 @@ where
         &mut self,
         input: BetaStudySourceInput,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let body = input.body.trim().to_owned();
+        let title = normalize_capture_title(&input.title, &body);
         self.store
             .save_source_document(SourceDocument {
                 id: input.id,
                 kind: SourceDocumentKind::Text,
-                title: input.title,
-                body: Some(input.body),
+                title,
+                body: Some(body),
                 uri: None,
                 permission: SourcePermission::ModelEligible,
                 freshness: Some((self.now)()),
@@ -970,6 +984,58 @@ fn source_row(source: &SourceDocument) -> BetaStudySourceRow {
         kind: source.kind.clone(),
         created_at: source.created_at,
     }
+}
+
+#[must_use]
+pub fn infer_capture_title(body: &str) -> String {
+    let candidate = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Untitled source");
+    let candidate = candidate
+        .trim_start_matches(|character: char| {
+            character == '#' || character == '-' || character == '*' || character.is_whitespace()
+        })
+        .trim();
+    let sentence_end = candidate
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '.' | '?' | '!').then_some(index))
+        .unwrap_or(candidate.len());
+    let candidate = candidate[..sentence_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let candidate = truncate_title(&candidate, 72);
+    if candidate.trim().is_empty() {
+        "Untitled source".to_owned()
+    } else {
+        candidate
+    }
+}
+
+fn normalize_capture_title(title: &str, body: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        infer_capture_title(body)
+    } else {
+        truncate_title(&title, 72)
+    }
+}
+
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    if title.chars().count() <= max_chars {
+        return title.to_owned();
+    }
+    let mut truncated = title
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    while truncated.chars().last().is_some_and(char::is_whitespace) {
+        truncated.pop();
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 fn has_active_sources(snapshot: &BetaStoreSnapshot) -> bool {

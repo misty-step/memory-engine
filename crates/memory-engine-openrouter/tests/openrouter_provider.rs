@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use memory_engine_generation::DraftProvider;
+use memory_engine_generation::{DraftProvider, LearningIntent};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
 
@@ -18,20 +18,27 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
         "choices": [{
             "message": {
                 "content": serde_json::json!({
+                    "learning_intent": "concept_understanding",
                     "drafts": [
                         {
                             "concept": "Mitochondria ATP production",
                             "question": "What do mitochondria generate most of?",
                             "answer": "The cell's supply of adenosine triphosphate",
                             "evidence_quote": "generate most of the cell's supply of adenosine triphosphate",
-                            "distractors": ["Ribosomal RNA", "Chlorophyll"]
+                            "distractors": ["Ribosomal RNA", "Chlorophyll"],
+                            "activity_kind": "quiz",
+                            "activity_stage": "free-recall",
+                            "worked_solution": ""
                         },
                         {
                             "concept": "",
                             "question": "Malformed draft",
                             "answer": "",
                             "evidence_quote": "",
-                            "distractors": []
+                            "distractors": [],
+                            "activity_kind": "quiz",
+                            "activity_stage": "recognition",
+                            "worked_solution": ""
                         }
                     ]
                 }).to_string()
@@ -57,6 +64,10 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
         .generate_drafts(&prose_source())
         .expect("provider output");
 
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ConceptUnderstanding)
+    );
     assert_eq!(drafts.candidates.len(), 1);
     let candidate = &drafts.candidates[0];
     assert_eq!(candidate.index, 1);
@@ -92,6 +103,9 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
         prompt.contains("Mitochondria are organelles"),
         "prompt must carry the source text"
     );
+    assert!(prompt.contains("learning_intent"));
+    assert!(prompt.contains("verbatim_memorization"));
+    assert!(prompt.contains("recitation-ladder exercise drafts only"));
 }
 
 #[test]

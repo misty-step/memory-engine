@@ -6,6 +6,10 @@
   "expect": {
     "min_drafts": 1,
     "max_drafts": 6,
-    "key_terms": ["feathers", "soul", "Gale"]
+    "key_terms": ["feathers", "soul", "Gale"],
+    "intent": "verbatim_memorization",
+    "required_activity_kinds": ["exercise"],
+    "required_activity_stage_terms": ["cued", "free"],
+    "forbidden_activity_kinds": ["quiz"]
   }
 }
