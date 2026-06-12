@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use memory_engine_core::{
-    ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId, ScheduleStatus,
-    Verdict,
+    ExactPrompt, ExactPromptKind, GradeResult, GraderKind, ProgressionMetadata, Prompt, Rating,
+    ReviewUnitId, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
@@ -15,6 +15,7 @@ use memory_engine_persistence::{
     GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument, SourceDocumentKind,
     SourcePermission,
 };
+use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::{
     infer_capture_title, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
     DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_SKIP_DEFER_MS,
@@ -220,6 +221,176 @@ fn duplicate_submit_after_grading_is_view_only() {
 }
 
 #[test]
+fn post_answer_feedback_summarizes_item_and_concept_history() {
+    let directory = TempDirectory::new("post-answer-feedback");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve");
+    assert_eq!(approved.concept_progress, Vec::new());
+
+    let reviewed = study.submit_answer("BRAVO", 1_800).expect("submit");
+    let current = reviewed.current.expect("current");
+    let feedback = current.feedback.expect("feedback");
+
+    assert_eq!(feedback.verdict, "Try again");
+    assert_eq!(feedback.expected_answer, "ALFA");
+    assert_eq!(feedback.item_history.attempts, 1);
+    assert_eq!(feedback.item_history.correct, 0);
+    assert_eq!(feedback.item_history.success_rate, "0 of 1 correct (0.0%)");
+    assert_eq!(feedback.item_history.last_seen, Some(NOW));
+    assert_eq!(
+        feedback.item_history.last_seen_summary,
+        "last seen just now"
+    );
+    assert!(feedback.item_history.stage.contains("Learning"));
+    assert!(
+        feedback.item_history.next_review.contains("again"),
+        "next review should be written in human language: {:?}",
+        feedback.item_history.next_review
+    );
+    let concept = feedback.concept_progress.expect("concept feedback");
+    assert_eq!(concept.concept_key, "nato-letter-a");
+    assert_eq!(concept.concept_label, "nato letter a");
+    assert_eq!(concept.attempts, 1);
+    assert_eq!(concept.correct, 0);
+    assert_eq!(concept.success_rate, "0 of 1 correct (0.0%)");
+    assert_eq!(concept.trend, "not enough data");
+    assert_eq!(concept.health, "struggling");
+    assert!(
+        concept.summary.contains("struggling"),
+        "failing concept copy must be honest: {}",
+        concept.summary
+    );
+    assert_eq!(reviewed.concept_progress, vec![concept]);
+}
+
+#[test]
+fn concept_progress_lists_weakest_concepts_first() {
+    let directory = TempDirectory::new("concept-progress");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz");
+
+    study
+        .submit_answer("CHARLIE ALFA TANGO", 4_200)
+        .expect("submit strong concept");
+    study.advance().expect("next");
+    let reviewed = study
+        .submit_answer("BRAVO", 1_800)
+        .expect("submit weak concept");
+
+    let concepts = reviewed.concept_progress;
+    assert_eq!(
+        concepts
+            .iter()
+            .map(|concept| concept.concept_key.as_str())
+            .collect::<Vec<_>>(),
+        ["nato-letter-a", "nato-cat-composition"]
+    );
+    assert_eq!(concepts[0].health, "struggling");
+    assert_eq!(concepts[0].success_rate, "0 of 1 correct (0.0%)");
+    assert_eq!(concepts[1].health, "solid");
+    assert_eq!(concepts[1].success_rate, "1 of 1 correct (100.0%)");
+}
+
+#[test]
+fn concept_progress_rolls_up_items_with_the_same_concept_key() {
+    let directory = TempDirectory::new("shared-concept-progress");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(shared_concept_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-shared-1-nato-letter-a")
+        .expect("approve first");
+    study
+        .approve_draft("study-run-1-draft-src-shared-2-nato-letter-a")
+        .expect("approve second");
+
+    study.submit_answer("ALFA", 1_800).expect("first submit");
+    study.advance().expect("next");
+    let reviewed = study.submit_answer("BRAVO", 1_800).expect("second submit");
+
+    assert_eq!(reviewed.concept_progress.len(), 1);
+    let concept = &reviewed.concept_progress[0];
+    assert_eq!(concept.concept_key, "nato-letter-a");
+    assert_eq!(concept.concept_label, "nato letter a");
+    assert_eq!(concept.attempts, 2);
+    assert_eq!(concept.correct, 1);
+    assert_eq!(concept.success_rate, "1 of 2 correct (50.0%)");
+    assert_eq!(concept.trend, "declining");
+    assert_ne!(
+        concept.concept_key,
+        "generated-quiz-src-shared-1-nato-letter-a"
+    );
+}
+
+#[test]
+fn concept_progress_tiebreaks_equal_rates_by_more_evidence() {
+    let directory = TempDirectory::new("concept-progress-tiebreak");
+    let path = directory.path().join("study.json");
+    {
+        let mut study =
+            BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+        study.add_source(source_input()).expect("source");
+        study.generate(None).expect("generate");
+        study
+            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("approve quiz");
+        study
+            .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+            .expect("approve exercise");
+    }
+    record_graded_attempt(
+        &path,
+        "study-run-1-draft-src-nato-1-nato-letter-a",
+        false,
+        1,
+    );
+    record_graded_attempt(
+        &path,
+        "study-run-1-draft-src-nato-2-nato-cat-composition",
+        false,
+        2,
+    );
+    record_graded_attempt(
+        &path,
+        "study-run-1-draft-src-nato-2-nato-cat-composition",
+        false,
+        3,
+    );
+
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("resume");
+    let view = resumed.start().expect("start");
+
+    assert_eq!(
+        view.concept_progress
+            .iter()
+            .map(|concept| (concept.concept_key.as_str(), concept.success_rate.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("nato-cat-composition", "0 of 2 correct (0.0%)"),
+            ("nato-letter-a", "0 of 1 correct (0.0%)")
+        ]
+    );
+}
+
+#[test]
 fn inspects_and_edits_active_review_item_without_revealing_answer() {
     let directory = TempDirectory::new("inspect-edit");
     let path = directory.path().join("study.json");
@@ -321,6 +492,14 @@ fn snoozes_and_deletes_active_review_items_without_touching_schedule_history() {
     assert_eq!(deleted.status, BetaStudyStatus::Drafting);
     assert_eq!(deleted.summary.approved_review_unit_count, 1);
     assert_eq!(deleted.summary.attempt_count, 1);
+    assert!(
+        deleted
+            .drafts
+            .iter()
+            .find(|draft| draft.id == "study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("archived approved draft")
+            .approved
+    );
     assert!(deleted.queue.iter().all(|row| {
         row.review_unit_id.as_str() != "study-run-1-draft-src-nato-1-nato-letter-a"
     }));
@@ -658,6 +837,87 @@ fn source_body() -> String {
         "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
     ]
     .join("\n")
+}
+
+fn shared_concept_input() -> BetaStudySourceInput {
+    BetaStudySourceInput {
+        id: "src-shared".to_owned(),
+        title: "Shared concept practice".to_owned(),
+        body: shared_concept_body(),
+    }
+}
+
+fn shared_concept_body() -> String {
+    [
+        "Concept: NATO letter A",
+        "Activity: quiz",
+        "Stage: recognition-3",
+        "Question: What is the NATO phonetic alphabet word for A?",
+        "Answer: ALFA",
+        "Distractors: BRAVO, CHARLIE",
+        "Reference: The NATO phonetic alphabet word for A is ALFA.",
+        "",
+        "Concept: NATO letter A",
+        "Activity: quiz",
+        "Stage: cued-recall",
+        "Question: Type the code word used for the letter A.",
+        "Answer: ALFA",
+        "Distractors: BRAVO, CHARLIE",
+        "Reference: A is represented by ALFA in the NATO phonetic alphabet.",
+    ]
+    .join("\n")
+}
+
+fn record_graded_attempt(path: &std::path::Path, draft_id: &str, is_correct: bool, offset: i64) {
+    let mut store = BetaPersistenceStore::open(path).expect("store");
+    let snapshot = store.snapshot();
+    let review_unit_id = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.id == draft_id)
+        .map(|draft| draft.review_unit_id.clone())
+        .or_else(|| {
+            snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.generated_prompt_draft_id.as_deref() == Some(draft_id))
+                .map(|unit| unit.review_unit_id.clone())
+        })
+        .expect("review unit id for draft");
+    store
+        .record_attempt(ServiceAttemptRecord {
+            review_unit_id: review_unit_id.clone(),
+            prompt_id: None,
+            submitted_answer: if is_correct { "ALFA" } else { "BRAVO" }.to_owned(),
+            response_time_ms: 1_800,
+            occurred_at: NOW + offset,
+            idempotency_key: Some(format!("{}-{offset}", review_unit_id.as_str())),
+            grade: Some(grade_result(is_correct)),
+        })
+        .expect("record attempt");
+}
+
+fn grade_result(is_correct: bool) -> GradeResult {
+    GradeResult {
+        verdict: if is_correct {
+            Verdict::Correct
+        } else {
+            Verdict::Wrong
+        },
+        rating: if is_correct {
+            Rating::Good
+        } else {
+            Rating::Again
+        },
+        is_correct,
+        submitted_answer: if is_correct { "ALFA" } else { "BRAVO" }.to_owned(),
+        expected_answer: "ALFA".to_owned(),
+        grader_kind: GraderKind::Deterministic,
+        grader_model: None,
+        grader_confidence: None,
+        feedback: String::new(),
+        criterion_results: Vec::new(),
+    }
 }
 
 fn seed_spanless_review(path: &std::path::Path) {

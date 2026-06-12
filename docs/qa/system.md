@@ -3,6 +3,7 @@
 Refs-backlog: 25
 Refs-backlog: 051
 Refs-backlog: 052
+Refs-backlog: 053
 
 ## Purpose
 
@@ -58,7 +59,7 @@ receipt after each lane:
 | `service.prototype` | `memory-engine-service` command boundary | prove command flow, injected persistence, and failure semantics |
 | `persistence.beta-store` | `memory-engine-persistence` durable beta store | prove persisted snapshots, restart, conflict, and validation semantics |
 | `generation.beta` | `memory-engine-generation` deterministic generation probe | prove source parsing, provenance, draft validation, and promotion behavior |
-| `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, skip/snooze, reference, bridge, queue, and resume flow |
+| `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, post-answer feedback, concept health, skip/snooze, reference, bridge, queue, and resume flow |
 | `app.beta-http` | `memory-engine-beta-app` local HTTP routes | prove mobile routes and validation run through the Rust study session |
 | `api.v1-contract` | versioned public JSON contract and consumer proof binary | run the Scry-facing client against a local HTTP API and prove contract fixtures stay executable |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
@@ -98,6 +99,7 @@ cargo test -p memory-engine-core
 cargo test -p memory-engine
 cargo test -p memory-engine-study
 cargo test -p memory-engine-api review_escape_hatches
+cargo test -p memory-engine-api post_answer_feedback
 cargo test -p memory-engine-openrouter
 cargo run -p memory-engine-bench -- generation
 ```

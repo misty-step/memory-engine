@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
-use memory_engine_study::{BetaStudyCurrent, BetaStudyDraftRow};
+use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow};
 
 use crate::{ApiFailure, ApiState, AppAccount, SourceRecord, StudyViewResponse};
 
@@ -93,6 +93,7 @@ fn render_workspace(
     if let Some(view) = view {
         html.push_str(&render_due_status(view.due_count));
         html.push_str(&render_generation_notices(&view.generation_notices));
+        html.push_str(&render_concept_progress(&view.concept_progress));
         html.push_str(&render_keep_flow(account, &view.drafts));
     }
     html.push_str(&render_source_form(account));
@@ -251,6 +252,7 @@ fn render_keep_flow(account: &AppAccount, drafts: &[BetaStudyDraftRow]) -> Strin
     let accepted = drafts
         .iter()
         .filter(|draft| draft.validation_status == GeneratedPromptValidationStatus::Accepted)
+        .filter(|draft| !draft.approved)
         .collect::<Vec<_>>();
     if accepted.is_empty() {
         return String::new();
@@ -284,9 +286,11 @@ fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> Stri
     let reference = render_reference(current);
     let answer = render_answer(current);
     let result = render_grade(account, current);
+    let feedback = render_feedback(current);
     let reveal = render_reveal_form(account, current);
     let submit = render_submit_form(account, current);
     let escape_hatches = render_escape_hatches(account, current);
+    let concepts = render_concept_progress(&view.concept_progress);
 
     format!(
         r#"{}
@@ -295,10 +299,12 @@ fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> Stri
   {reference}
   {answer}
   {result}
+  {feedback}
   {reveal}
   {submit}
   {escape_hatches}
-</section>"#,
+</section>
+{concepts}"#,
         render_due_status(view.due_count),
         escape_html(&current.prompt)
     )
@@ -340,6 +346,70 @@ fn render_grade(account: &AppAccount, current: &BetaStudyCurrent) -> String {
             hidden_csrf_input(account)
         )
     })
+}
+
+fn render_feedback(current: &BetaStudyCurrent) -> String {
+    let Some(feedback) = current.feedback.as_ref() else {
+        return String::new();
+    };
+    let item = &feedback.item_history;
+    let concept = feedback
+        .concept_progress
+        .as_ref()
+        .map_or_else(String::new, |concept| {
+            format!(
+                r"<p><strong>{}</strong>: {}</p>",
+                escape_html(&concept.concept_label),
+                escape_html(&concept.summary)
+            )
+        });
+
+    format!(
+        r#"<section class="secondary feedback" aria-label="Answer feedback">
+  <h2>Answer feedback</h2>
+  <p>This item: {} {}, {}; {}; {}; {}.</p>
+  <p>Expected answer: <strong>{}</strong></p>
+  {concept}
+</section>"#,
+        item.attempts,
+        plural(item.attempts, "attempt", "attempts"),
+        escape_html(&item.success_rate),
+        escape_html(&item.last_seen_summary),
+        escape_html(&item.stage),
+        escape_html(&item.next_review),
+        escape_html(&feedback.expected_answer)
+    )
+}
+
+fn render_concept_progress(concepts: &[BetaStudyConceptProgress]) -> String {
+    if concepts.is_empty() {
+        return String::new();
+    }
+
+    let mut rows = String::new();
+    for concept in concepts {
+        write!(
+            rows,
+            r"<li><strong>{}</strong> <span>{}: {}; trend is {}.</span></li>",
+            escape_html(&concept.concept_label),
+            escape_html(&concept.health),
+            escape_html(&concept.success_rate),
+            escape_html(&concept.trend)
+        )
+        .expect("write concept progress html");
+    }
+
+    format!(
+        r#"<section class="secondary concepts"><h2>Concept health</h2><ol>{rows}</ol></section>"#
+    )
+}
+
+fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
 }
 
 fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> String {

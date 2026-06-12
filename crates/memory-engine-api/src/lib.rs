@@ -24,8 +24,8 @@ use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::BetaPersistenceStore;
 use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
 use memory_engine_study::{
-    BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions, BetaStudySession, BetaStudySummary,
-    BetaStudyView,
+    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions,
+    BetaStudySession, BetaStudySummary, BetaStudyView,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -264,6 +264,7 @@ pub struct SubmitReviewRequest {
 pub struct StudyViewResponse {
     pub drafts: Vec<BetaStudyDraftRow>,
     pub current: Option<BetaStudyCurrent>,
+    pub concept_progress: Vec<BetaStudyConceptProgress>,
     pub summary: BetaStudySummary,
     pub due_count: usize,
     #[serde(default)]
@@ -275,6 +276,7 @@ impl StudyViewResponse {
         Self {
             drafts: view.drafts,
             current: view.current,
+            concept_progress: view.concept_progress,
             summary: view.summary,
             due_count: view.due_count,
             generation_notices: view.generation_notices,
@@ -1079,6 +1081,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mobile_submit_review_shows_human_result_and_item_history() {
+        let app = router(ApiState::default());
+        let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+        let draft_id = html_value(&generated, "draftId");
+        let approved = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("approve");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_text(approved).await;
+        let review_unit_id = html_value(&approved, "reviewUnitId");
+
+        let submitted = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "BRAVO"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "mobile-feedback-nato-a"),
+                ],
+            ))
+            .await
+            .expect("submit");
+        assert_eq!(submitted.status(), StatusCode::OK);
+        let submitted = response_text(submitted).await;
+
+        assert!(submitted.contains("Try again"));
+        assert!(submitted.contains("Expected answer"));
+        assert!(submitted.contains("ALFA"));
+        assert!(submitted.contains("This item: 1 attempt"));
+        assert!(submitted.contains("0 of 1 correct (0.0%)"));
+        assert!(submitted.contains("last seen just now"));
+        assert!(submitted.contains("nato letter a"));
+        assert_not_contains_any(
+            &submitted,
+            &[
+                "Wrong(",
+                "reviewState",
+                "scheduleChange",
+                "Generated material",
+                "validation",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_submit_review_shows_concept_rollup_for_shared_concept() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &shared_concept_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+        let draft_ids = html_values(&generated, "draftId");
+        assert_eq!(draft_ids.len(), 2);
+
+        for draft_id in &draft_ids {
+            let approved = app
+                .clone()
+                .oneshot(form_request_with_cookie(
+                    "POST",
+                    "/app/approve",
+                    &cookie,
+                    &[("csrfToken", &csrf_token), ("draftId", draft_id)],
+                ))
+                .await
+                .expect("approve");
+            assert_eq!(approved.status(), StatusCode::OK);
+        }
+        let current = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("current");
+        assert_eq!(current.status(), StatusCode::OK);
+        let current = response_text(current).await;
+        let first_id = html_value(&current, "reviewUnitId");
+
+        let first = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &first_id),
+                    ("answer", "ALFA"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "shared-concept-first"),
+                ],
+            ))
+            .await
+            .expect("first submit");
+        assert_eq!(first.status(), StatusCode::OK);
+        let next = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("next");
+        assert_eq!(next.status(), StatusCode::OK);
+        let next = response_text(next).await;
+        let second_id = html_value(&next, "reviewUnitId");
+
+        let submitted = app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &second_id),
+                    ("answer", "BRAVO"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "shared-concept-second"),
+                ],
+            ))
+            .await
+            .expect("second submit");
+        assert_eq!(submitted.status(), StatusCode::OK);
+        let submitted = response_text(submitted).await;
+
+        assert!(submitted.contains("nato letter a"));
+        assert!(submitted.contains("1 of 2 correct (50.0%)"));
+        assert!(submitted.contains("trend is declining"));
+    }
+
+    #[tokio::test]
+    async fn management_surface_lists_concepts_worst_first() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
+        let draft_ids = html_values(&generated, "draftId");
+        assert_eq!(draft_ids.len(), 2);
+
+        approve_drafts_html(&app, &cookie, &csrf_token, &draft_ids).await;
+        let current = next_review_html(&app, &cookie, &csrf_token, "current").await;
+        submit_review_from_html(&app, &cookie, &csrf_token, &current, "management-first").await;
+        let next = next_review_html(&app, &cookie, &csrf_token, "next").await;
+        submit_review_from_html(&app, &cookie, &csrf_token, &next, "management-second").await;
+        let workspace = next_review_html(&app, &cookie, &csrf_token, "workspace").await;
+
+        assert!(workspace.contains("Concept health"));
+        let weak = workspace
+            .find("<strong>nato letter a</strong>")
+            .expect("weak concept");
+        let strong = workspace
+            .find("<strong>nato cat composition</strong>")
+            .expect("strong concept");
+        assert!(weak < strong, "{workspace}");
+        assert!(workspace.contains("struggling"));
+        assert!(!workspace.contains("Choose what to keep"));
+        assert_not_contains_any(&workspace, &["chart", "streak", "badge"]);
+    }
+
+    #[tokio::test]
     async fn auth_rendered_forms_do_not_expose_session_credentials() {
         let app = router(ApiState::default());
         let started = app
@@ -1435,6 +1637,75 @@ mod tests {
             .expect("generate with csrf");
         assert_eq!(generated.status(), StatusCode::OK);
         response_text(generated).await
+    }
+
+    async fn approve_drafts_html(
+        app: &axum::Router,
+        cookie: &str,
+        csrf_token: &str,
+        draft_ids: &[String],
+    ) {
+        for draft_id in draft_ids {
+            let approved = app
+                .clone()
+                .oneshot(form_request_with_cookie(
+                    "POST",
+                    "/app/approve",
+                    cookie,
+                    &[("csrfToken", csrf_token), ("draftId", draft_id)],
+                ))
+                .await
+                .expect("approve");
+            assert_eq!(approved.status(), StatusCode::OK);
+        }
+    }
+
+    async fn next_review_html(
+        app: &axum::Router,
+        cookie: &str,
+        csrf_token: &str,
+        context: &str,
+    ) -> String {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                cookie,
+                &[("csrfToken", csrf_token)],
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(response.status(), StatusCode::OK, "{context}");
+        response_text(response).await
+    }
+
+    async fn submit_review_from_html(
+        app: &axum::Router,
+        cookie: &str,
+        csrf_token: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) {
+        let review_unit_id = html_value(body, "reviewUnitId");
+        let answer = management_answer_for_prompt(body);
+        let submitted = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                cookie,
+                &[
+                    ("csrfToken", csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", answer),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", idempotency_key),
+                ],
+            ))
+            .await
+            .expect("submit review");
+        assert_eq!(submitted.status(), StatusCode::OK);
     }
 
     async fn assert_forbidden_form(
@@ -2802,6 +3073,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_json_api_returns_post_answer_feedback_and_concept_progress() {
+        let app = router(ApiState::default());
+        let account = create_account_v1(&app, "feedback@example.com").await;
+        let source_id = create_source_v1(
+            &app,
+            &account,
+            "NATO practice notes",
+            &shared_concept_body(),
+        )
+        .await;
+        let generated = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate source");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_json(generated).await;
+        let draft_ids = generated["drafts"]
+            .as_array()
+            .expect("drafts")
+            .iter()
+            .map(|draft| draft["id"].as_str().expect("draft id").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(draft_ids.len(), 2);
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, &account, draft_id).await;
+        }
+
+        let first_id = next_review_v1(&app, &account).await;
+        let _ =
+            submit_review_v1_body(&app, &account, &first_id, "ALFA", "api-feedback-first").await;
+        let second_id = next_review_v1(&app, &account).await;
+        let submitted =
+            submit_review_v1_body(&app, &account, &second_id, "BRAVO", "api-feedback-second").await;
+
+        assert_eq!(
+            submitted["current"]["feedback"]["verdict"],
+            json!("Try again")
+        );
+        assert_eq!(
+            submitted["current"]["feedback"]["expectedAnswer"],
+            json!("ALFA")
+        );
+        assert_eq!(
+            submitted["current"]["feedback"]["itemHistory"]["successRate"],
+            json!("0 of 1 correct (0.0%)")
+        );
+        assert_eq!(
+            submitted["current"]["feedback"]["itemHistory"]["lastSeenSummary"],
+            json!("last seen just now")
+        );
+        assert!(submitted["current"]["feedback"]["itemHistory"]["lastSeen"]
+            .as_i64()
+            .is_some());
+        assert_eq!(
+            submitted["conceptProgress"]
+                .as_array()
+                .expect("concepts")
+                .len(),
+            1
+        );
+        assert_eq!(
+            submitted["conceptProgress"][0]["conceptKey"],
+            json!("nato-letter-a")
+        );
+        assert_eq!(
+            submitted["conceptProgress"][0]["successRate"],
+            json!("1 of 2 correct (50.0%)")
+        );
+    }
+
+    #[tokio::test]
     async fn v1_json_api_exposes_review_escape_hatches() {
         let app = router(ApiState::default());
         let account = create_account_v1(&app, "bridge@example.com").await;
@@ -3341,6 +3691,34 @@ mod tests {
         )
     }
 
+    async fn submit_review_v1_body(
+        app: &axum::Router,
+        account: &TestAccount,
+        review_unit_id: &str,
+        answer: &str,
+        idempotency_key: &str,
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(v1_json_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{review_unit_id}/submit",
+                    account.account_id
+                ),
+                &account.session_token,
+                &json!({
+                    "answer": answer,
+                    "responseTimeMs": 1800,
+                    "idempotencyKey": idempotency_key
+                }),
+            ))
+            .await
+            .expect("submit");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
     async fn archive_source_v1(app: &axum::Router, account: &TestAccount, source_id: &str) {
         let response = app
             .clone()
@@ -3548,8 +3926,31 @@ mod tests {
 
     fn assert_submitted_review_html(body: &str) {
         assert!(body.contains("Correct"));
+        assert!(body.contains("Answer feedback"));
+        assert!(body.contains("Expected answer"));
+        assert!(body.contains("This item: 1 attempt"));
+        assert!(body.contains("1 of 1 correct (100.0%)"));
+        assert!(body.contains("last seen just now"));
+        assert!(body.contains("Concept health"));
         assert!(body.contains("Next"));
-        assert_not_contains_any(body, &["Last result", "attempts", "Progress", "Correct("]);
+        assert_not_contains_any(
+            body,
+            &[
+                "Last result",
+                "Progress",
+                "Correct(",
+                "reviewState",
+                "scheduleChange",
+            ],
+        );
+    }
+
+    fn management_answer_for_prompt(body: &str) -> &'static str {
+        if body.contains("Spell CAT over the phone") {
+            "CHARLIE ALFA TANGO"
+        } else {
+            "BRAVO"
+        }
     }
 
     fn assert_not_contains_any(body: &str, needles: &[&str]) {
@@ -3697,6 +4098,27 @@ mod tests {
             "Answer: CHARLIE ALFA TANGO",
             "Worked Solution: C is CHARLIE, A is ALFA, and T is TANGO.",
             "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
+        ]
+        .join("\n")
+    }
+
+    fn shared_concept_body() -> String {
+        [
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for A?",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+            "",
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: cued-recall",
+            "Question: Type the code word used for the letter A.",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: A is represented by ALFA in the NATO phonetic alphabet.",
         ]
         .join("\n")
     }
