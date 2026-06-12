@@ -55,6 +55,7 @@ receipt after each lane:
 | `generation.beta` | `memory-engine-generation` deterministic generation probe | prove source parsing, provenance, draft validation, and promotion behavior |
 | `study.beta-session` | `memory-engine-study` session/API boundary | prove source, generation, approval, reveal, answer, queue, and resume flow |
 | `app.beta-http` | `memory-engine-beta-app` local HTTP routes | prove mobile routes and validation run through the Rust study session |
+| `api.v1-contract` | versioned public JSON contract and consumer proof binary | run the Scry-facing client against a local HTTP API and prove contract fixtures stay executable |
 | `dogfood.rust-receipts` | Rust CLI, import probe, web shell | exercise migrated dogfood clients through the Rust facade and service crates |
 | `docs.rustdoc` | all public Rust crates | prove public API documentation compiles |
 | `performance.benchmarks` | Rust facade, scheduler, queue, service | expose migrated-runtime performance drift without brittle thresholds |

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Form, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -15,11 +15,137 @@ use crate::{
     SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V1ContractOperation {
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V1Route {
+    OpenApi,
+    Accounts,
+    Sources,
+    Source,
+    Generate,
+    Approve,
+    Next,
+    Reveal,
+    Submit,
+}
+
+const V1_OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.v1.json");
+const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
+const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
+const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
+const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
+const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/generate";
+const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
+const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
+const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
+const V1_SUBMIT_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/submit";
+
+const V1_ROUTES: &[V1Route] = &[
+    V1Route::OpenApi,
+    V1Route::Accounts,
+    V1Route::Sources,
+    V1Route::Source,
+    V1Route::Generate,
+    V1Route::Approve,
+    V1Route::Next,
+    V1Route::Reveal,
+    V1Route::Submit,
+];
+
+impl V1Route {
+    fn mount(self, router: Router<ApiState>) -> Router<ApiState> {
+        match self {
+            Self::OpenApi => router.route(V1_OPENAPI_PATH, get(v1_openapi)),
+            Self::Accounts => router.route(V1_ACCOUNTS_PATH, post(create_account)),
+            Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
+            Self::Source => router.route(V1_SOURCE_PATH, delete(archive_source)),
+            Self::Generate => router.route(V1_GENERATE_PATH, post(generate_source)),
+            Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
+            Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
+            Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
+            Self::Submit => router.route(V1_SUBMIT_PATH, post(submit_review)),
+        }
+    }
+
+    #[cfg(test)]
+    fn operations(self) -> &'static [V1ContractOperation] {
+        match self {
+            Self::OpenApi => &[V1ContractOperation {
+                method: "GET",
+                path: V1_OPENAPI_PATH,
+            }],
+            Self::Accounts => &[V1ContractOperation {
+                method: "POST",
+                path: V1_ACCOUNTS_PATH,
+            }],
+            Self::Sources => &[
+                V1ContractOperation {
+                    method: "GET",
+                    path: V1_SOURCES_PATH,
+                },
+                V1ContractOperation {
+                    method: "POST",
+                    path: V1_SOURCES_PATH,
+                },
+            ],
+            Self::Source => &[V1ContractOperation {
+                method: "DELETE",
+                path: V1_SOURCE_PATH,
+            }],
+            Self::Generate => &[V1ContractOperation {
+                method: "POST",
+                path: V1_GENERATE_PATH,
+            }],
+            Self::Approve => &[V1ContractOperation {
+                method: "POST",
+                path: V1_APPROVE_PATH,
+            }],
+            Self::Next => &[V1ContractOperation {
+                method: "POST",
+                path: V1_NEXT_PATH,
+            }],
+            Self::Reveal => &[V1ContractOperation {
+                method: "POST",
+                path: V1_REVEAL_PATH,
+            }],
+            Self::Submit => &[V1ContractOperation {
+                method: "POST",
+                path: V1_SUBMIT_PATH,
+            }],
+        }
+    }
+}
+
+fn mount_v1_routes(router: Router<ApiState>) -> Router<ApiState> {
+    V1_ROUTES
+        .iter()
+        .copied()
+        .fold(router, |router, route| route.mount(router))
+}
+
+#[cfg(test)]
+pub(crate) fn v1_contract_operations() -> Vec<V1ContractOperation> {
+    V1_ROUTES
+        .iter()
+        .copied()
+        .flat_map(V1Route::operations)
+        .copied()
+        .collect()
+}
+
 pub fn router(state: ApiState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(app_home))
-        .route("/accounts", post(create_account))
+        .route("/accounts", post(create_account));
+
+    mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/account", post(create_app_account))
         .route("/app/login/verify", get(verify_app_login))
@@ -65,6 +191,10 @@ async fn healthz() -> Json<HealthResponse> {
         status: "ok",
         service: "memory-engine-api",
     })
+}
+
+async fn v1_openapi() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "application/json")], V1_OPENAPI_JSON)
 }
 
 async fn app_home() -> Html<String> {
