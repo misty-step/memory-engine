@@ -166,6 +166,14 @@ which creates a second `ApiState` before source creation and later resubmits
 the same review idempotency key after API state recreation with the original
 session token.
 
+Ticket 045 extends that local route contract with
+`postgres_backend_source_routes_are_account_scoped`,
+`app_session_mutations_require_csrf`, and
+`concurrent_duplicate_review_submit_counts_one_attempt`. The canonical Dagger
+gate now binds a Postgres service before `cargo test --workspace`, so the
+Postgres route tests run in CI instead of relying on an operator-provided local
+database.
+
 Restart/resume proof:
 
 ```sh

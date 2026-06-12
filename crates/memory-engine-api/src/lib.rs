@@ -6,32 +6,42 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    fs, io,
+    fs,
     path::{Path as FsPath, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use axum::{
-    extract::{Form, Path, Query, State},
     http::{
         header::{COOKIE, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    Json,
 };
 use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::BetaPersistenceStore;
 use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
 use memory_engine_study::{
-    BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions, BetaStudySession, BetaStudySourceInput,
-    BetaStudySummary, BetaStudyView,
+    BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions, BetaStudySession, BetaStudySummary,
+    BetaStudyView,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod registry;
+mod render;
+mod routes;
+mod storage;
+
+#[cfg(test)]
+use render::render_generation_notices;
+use render::{
+    render_account_page, render_action_result_html, render_app_shell, render_login_requested,
+};
+pub use routes::router;
+use storage::{StudyStorage, StudyStorageConfig};
 
 #[derive(Clone, Debug, Default)]
 pub struct ApiState {
@@ -110,9 +120,7 @@ impl AccountRegistry {
     pub fn with_store_root(store_root: impl Into<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
-                storage: StudyStorageBackend::File {
-                    store_root: store_root.into(),
-                },
+                storage: StudyStorageConfig::file(store_root),
                 ..AccountRegistryData::default()
             })),
         }
@@ -122,9 +130,7 @@ impl AccountRegistry {
     pub fn with_postgres_url(database_url: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AccountRegistryData {
-                storage: StudyStorageBackend::Postgres {
-                    database_url: database_url.into(),
-                },
+                storage: StudyStorageConfig::postgres(database_url),
                 ..AccountRegistryData::default()
             })),
         }
@@ -132,12 +138,9 @@ impl AccountRegistry {
 
     /// Apply browser-auth configuration to this registry.
     ///
-    /// # Panics
-    ///
-    /// Panics if the account registry mutex is poisoned.
     #[must_use]
     pub fn with_auth_config(self, auth_config: AuthConfig) -> Self {
-        let mut data = self.inner.lock().expect("account registry lock");
+        let mut data = self.lock_data();
         data.auth_config = auth_config;
         drop(data);
         self
@@ -149,23 +152,26 @@ impl AccountRegistry {
     /// schedule, auth-challenge, and session-expiry decision flows through
     /// this clock.
     ///
-    /// # Panics
-    ///
-    /// Panics if the account registry mutex is poisoned.
     #[must_use]
     pub fn with_clock(self, now_fn: fn() -> i64) -> Self {
-        let mut data = self.inner.lock().expect("account registry lock");
+        let mut data = self.lock_data();
         data.now_fn = now_fn;
         drop(data);
         self
     }
 
     fn clock(&self) -> fn() -> i64 {
-        self.inner.lock().expect("account registry lock").now_fn
+        self.lock_data().now_fn
     }
 
     fn now(&self) -> i64 {
         (self.clock())()
+    }
+
+    fn lock_data(&self) -> MutexGuard<'_, AccountRegistryData> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -174,7 +180,7 @@ struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
-    storage: StudyStorageBackend,
+    storage: StudyStorageConfig,
     now_fn: fn() -> i64,
 }
 
@@ -184,7 +190,7 @@ impl Default for AccountRegistryData {
             accounts: BTreeMap::new(),
             browser_sessions: BTreeMap::new(),
             auth_config: AuthConfig::default(),
-            storage: StudyStorageBackend::default(),
+            storage: StudyStorageConfig::default(),
             now_fn: wall_clock_ms,
         }
     }
@@ -206,1129 +212,9 @@ struct BrowserSessionRecord {
     expires_at_ms: i64,
 }
 
-#[derive(Clone, Debug)]
-enum StudyStorageBackend {
-    File { store_root: PathBuf },
-    Postgres { database_url: String },
-}
-
-/// Storage backend paired with the registry's time source, so every
-/// time-dependent persistence and scheduling decision shares one clock.
-#[derive(Clone, Debug)]
-struct StudyStorage {
-    backend: StudyStorageBackend,
-    now: fn() -> i64,
-}
-
-impl Default for StudyStorageBackend {
-    fn default() -> Self {
-        Self::File {
-            store_root: std::env::temp_dir().join(format!(
-                "memory-engine-api-{}-{}",
-                std::process::id(),
-                rand::random::<u128>()
-            )),
-        }
-    }
-}
-
-impl AccountRegistry {
-    /// Create a local account record for the production shell.
-    ///
-    /// The first slice keeps this registry in-memory while the Postgres adapter
-    /// is shaped behind the same account-scoped route contract.
-    fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
-        // Found live during ticket-42 QA: this route issued a session token to
-        // any email, bypassing the allowlist the magic-link flow enforces.
-        let allowed = {
-            let data = self.inner.lock().expect("account registry lock");
-            data.auth_config.email_allowed(email)
-        };
-        if !allowed {
-            return Err(ApiFailure::forbidden(
-                "This email is not allowed to register.",
-            ));
-        }
-        let account_id = account_id_for(email);
-        if self.account_exists(&account_id)? {
-            return Err(ApiFailure::conflict("Account already exists."));
-        }
-        let account = AccountCreated {
-            account_id: account_id.clone(),
-            session_token: new_session_token(),
-        };
-        let storage = self.storage();
-        storage.save_account_session(&account_id, &account.session_token)?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        let record = data
-            .accounts
-            .entry(account.account_id.clone())
-            .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
-                store_path: storage.account_store_path(&account_id),
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            });
-        record.session_token.clone_from(&account.session_token);
-        drop(data);
-
-        Ok(account)
-    }
-
-    fn save_account(
-        &self,
-        source_account_id: &str,
-        source_session_token: &str,
-        email: &str,
-    ) -> Result<AccountCreated, ApiFailure> {
-        let allowed = {
-            let data = self.inner.lock().expect("account registry lock");
-            data.auth_config.email_allowed(email)
-        };
-        if !allowed {
-            return Err(ApiFailure::forbidden(
-                "This email is not allowed to register.",
-            ));
-        }
-        let target_account_id = account_id_for(email);
-        let target = AccountCreated {
-            account_id: target_account_id.clone(),
-            session_token: new_session_token(),
-        };
-        let source = self.require_account(source_account_id, source_session_token)?;
-        let storage = self.storage();
-        if target_account_id != source_account_id && self.account_exists(&target_account_id)? {
-            return Err(ApiFailure::conflict("Account already exists."));
-        }
-        storage.save_account_session(&target_account_id, &target.session_token)?;
-        let target_store_path = storage.account_store_path(&target_account_id);
-        storage.copy_account(source_account_id, &target_account_id, &source.store_path)?;
-
-        let mut data = self.inner.lock().expect("account registry lock");
-        let record = data
-            .accounts
-            .entry(target.account_id.clone())
-            .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
-                store_path: target_store_path,
-                sources: source.sources.clone(),
-                submitted_reviews: BTreeMap::new(),
-            });
-        record.session_token.clone_from(&target.session_token);
-
-        Ok(target)
-    }
-
-    fn request_magic_link(
-        &self,
-        email: &str,
-        client_rate_limit_key: &str,
-    ) -> Result<MagicLinkRequest, ApiFailure> {
-        let Some(email) = normalize_email(email) else {
-            self.record_app_account_request(None, client_rate_limit_key)?;
-            return Err(ApiFailure::bad_request(
-                "Account email must contain one @ and a domain.",
-            ));
-        };
-        self.record_app_account_request(Some(&email), client_rate_limit_key)?;
-        let auth_config = {
-            let data = self.inner.lock().expect("account registry lock");
-            data.auth_config.clone()
-        };
-        if !auth_config.email_allowed(&email) {
-            return Ok(MagicLinkRequest { debug_link: None });
-        }
-
-        let token = new_magic_link_token();
-        let token_hash = secret_hash(&token);
-        self.storage().save_auth_challenge(
-            &token_hash,
-            &email,
-            self.now().saturating_add(AUTH_CHALLENGE_TTL_MS),
-        )?;
-        let link = format!("/app/login/verify?token={token}");
-        auth_config.deliver_magic_link(&email, &link)?;
-
-        Ok(MagicLinkRequest {
-            debug_link: auth_config.expose_debug_links.then_some(link),
-        })
-    }
-
-    fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
-        let token_hash = secret_hash(token.trim());
-        let email = self
-            .storage()
-            .consume_auth_challenge(&token_hash, self.now())?
-            .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
-        let account = self.login_account(&email)?;
-
-        self.create_browser_session(&account)
-    }
-
-    fn record_app_account_request(
-        &self,
-        email: Option<&str>,
-        client_rate_limit_key: &str,
-    ) -> Result<(), ApiFailure> {
-        let storage = self.storage();
-        let now_ms = self.now();
-        let mut keys = Vec::with_capacity(2);
-        if let Some(email) = email {
-            keys.push(format!("app-account-email:{email}"));
-        }
-        keys.push(format!("app-account-ip:{client_rate_limit_key}"));
-
-        if !storage.record_rate_limit_attempts(
-            &keys,
-            now_ms,
-            APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
-            APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
-        )? {
-            return Err(ApiFailure::too_many_requests(
-                "Too many sign-in attempts. Try again later.",
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn login_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
-        let account_id = account_id_for(email);
-        let account = AccountCreated {
-            account_id: account_id.clone(),
-            session_token: new_session_token(),
-        };
-        let storage = self.storage();
-        storage.save_account_session(&account_id, &account.session_token)?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        let record = data
-            .accounts
-            .entry(account.account_id.clone())
-            .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
-                store_path: storage.account_store_path(&account_id),
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            });
-        record.session_token.clone_from(&account.session_token);
-
-        Ok(account)
-    }
-
-    fn save_source(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        request: &CreateSourceRequest,
-    ) -> Result<SourceRecord, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        let title = normalize_required_text(&request.title, "Source title")?;
-        let body = normalize_required_text(&request.body, "Source body")?;
-        let source = SourceRecord {
-            source_id: source_id_for(account_id, &title, &body),
-            title,
-            body,
-        };
-
-        let storage = self.storage();
-        storage.save_source(account_id, &account.store_path, &source)?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        let record = data
-            .accounts
-            .entry(account_id.to_owned())
-            .or_insert_with(|| account.clone());
-        record
-            .sources
-            .entry(source.source_id.clone())
-            .or_insert_with(|| source.clone());
-
-        Ok(source)
-    }
-
-    fn list_sources(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        let storage = self.storage();
-
-        storage.list_sources(account_id, &account.store_path)
-    }
-
-    fn generate_source(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage()
-            .generate_source(account_id, &account.store_path, source_id)
-    }
-
-    fn approve_draft(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        draft_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage()
-            .approve_draft(account_id, &account.store_path, draft_id)
-    }
-
-    fn next_review(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage().next_review(account_id, &account.store_path)
-    }
-
-    fn study_view(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage().study_view(account_id, &account.store_path)
-    }
-
-    fn reveal_review(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        review_unit_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage()
-            .reveal_review(account_id, &account.store_path, review_unit_id)
-    }
-
-    fn submit_review(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        review_unit_id: &str,
-        request: &SubmitReviewRequest,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
-        if let Some(response) = account.submitted_reviews.get(&idempotency_key) {
-            return Ok(response.clone());
-        }
-        let answer = normalize_required_text(&request.answer, "Review answer")?;
-        if request.response_time_ms == 0 {
-            return Err(ApiFailure::bad_request(
-                "Review response time must be a positive integer.",
-            ));
-        }
-        let response = self.storage().submit_review(
-            account_id,
-            &account.store_path,
-            review_unit_id,
-            answer,
-            request.response_time_ms,
-            idempotency_key.clone(),
-        )?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        let record = data
-            .accounts
-            .entry(account_id.to_owned())
-            .or_insert_with(|| account.clone());
-        require_account_session(record, session_token)?;
-        record
-            .submitted_reviews
-            .insert(idempotency_key, response.clone());
-
-        Ok(response)
-    }
-
-    fn create_browser_session(&self, account: &AccountCreated) -> Result<AppAccount, ApiFailure> {
-        let browser_session_id = new_browser_session_id();
-        let csrf_token = new_csrf_token();
-        let session = BrowserSessionRecord {
-            account_id: account.account_id.clone(),
-            session_token: account.session_token.clone(),
-            csrf_token_hash: secret_hash(&csrf_token),
-            expires_at_ms: self.now().saturating_add(app_session_max_age_ms()),
-        };
-        self.storage()
-            .save_browser_session(&browser_session_id, &session)?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        data.browser_sessions
-            .insert(browser_session_id.clone(), session);
-
-        Ok(AppAccount {
-            browser_session_id,
-            account_id: account.account_id.clone(),
-            session_token: account.session_token.clone(),
-            csrf_token,
-        })
-    }
-
-    fn require_browser_session(
-        &self,
-        headers: &HeaderMap,
-        csrf_token: &str,
-    ) -> Result<AppAccount, ApiFailure> {
-        let session_id = read_browser_session_id(headers)?;
-        let mut session = {
-            let data = self.inner.lock().expect("account registry lock");
-            data.browser_sessions.get(session_id).cloned()
-        };
-        if session.is_none() {
-            session = self.storage().load_browser_session(session_id)?;
-            if let Some(session) = &session {
-                let mut data = self.inner.lock().expect("account registry lock");
-                data.browser_sessions
-                    .insert(session_id.to_owned(), session.clone());
-            }
-        }
-        let session = session.ok_or_else(ApiFailure::missing_session)?;
-        if session.expires_at_ms <= self.now() {
-            let mut data = self.inner.lock().expect("account registry lock");
-            data.browser_sessions.remove(session_id);
-            drop(data);
-            return Err(ApiFailure::missing_session());
-        }
-        if session.csrf_token_hash != secret_hash(csrf_token) {
-            return Err(ApiFailure::forbidden("CSRF token does not match session."));
-        }
-        self.require_account(&session.account_id, &session.session_token)?;
-
-        Ok(AppAccount {
-            browser_session_id: session_id.to_owned(),
-            account_id: session.account_id,
-            session_token: session.session_token,
-            csrf_token: csrf_token.to_owned(),
-        })
-    }
-
-    fn revoke_browser_session(
-        &self,
-        headers: &HeaderMap,
-        csrf_token: &str,
-    ) -> Result<(), ApiFailure> {
-        let account = self.require_browser_session(headers, csrf_token)?;
-        self.storage()
-            .revoke_browser_session(&account.browser_session_id, self.now())?;
-        let mut data = self.inner.lock().expect("account registry lock");
-        data.browser_sessions.remove(&account.browser_session_id);
-
-        Ok(())
-    }
-
-    fn storage(&self) -> StudyStorage {
-        let data = self.inner.lock().expect("account registry lock");
-        StudyStorage {
-            backend: data.storage.clone(),
-            now: data.now_fn,
-        }
-    }
-
-    fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
-        let storage = self.storage();
-        {
-            let data = self.inner.lock().expect("account registry lock");
-            if data.accounts.contains_key(account_id) {
-                return Ok(true);
-            }
-        }
-
-        storage.account_exists(account_id)
-    }
-
-    fn require_account(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<AccountRecord, ApiFailure> {
-        let storage = self.storage();
-        {
-            let data = self.inner.lock().expect("account registry lock");
-            if let Some(account) = data.accounts.get(account_id) {
-                require_account_session(account, session_token)?;
-
-                return Ok(account.clone());
-            }
-        }
-
-        if storage.account_session_matches(account_id, session_token)? {
-            return Ok(AccountRecord {
-                session_token: session_token.to_owned(),
-                store_path: storage.account_store_path(account_id),
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            });
-        }
-
-        Err(ApiFailure::unknown_account())
-    }
-}
-
-impl AuthConfig {
-    fn deliver_magic_link(&self, email: &str, link: &str) -> Result<(), ApiFailure> {
-        match &self.link_delivery {
-            AuthLinkDelivery::None => Ok(()),
-            AuthLinkDelivery::OutboxFile(path) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                }
-                let existing = fs::read_to_string(path).unwrap_or_default();
-                fs::write(path, format!("{existing}{email}\t{link}\n"))
-                    .map_err(|error| ApiFailure::internal(error.to_string()))
-            }
-            AuthLinkDelivery::Command(command) => {
-                let status = Command::new(command)
-                    .env("MEMORY_ENGINE_AUTH_EMAIL", email)
-                    .env("MEMORY_ENGINE_AUTH_LINK", link)
-                    .status()
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(ApiFailure::internal(format!(
-                        "auth mailer command exited with {status}"
-                    )))
-                }
-            }
-        }
-    }
-}
-
-impl StudyStorage {
-    fn now_ms(&self) -> i64 {
-        (self.now)()
-    }
-
-    fn account_store_path(&self, account_id: &str) -> PathBuf {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => account_store_path(store_root, account_id),
-            StudyStorageBackend::Postgres { .. } => PathBuf::new(),
-        }
-    }
-
-    fn save_account_session(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = account_session_path(store_root, account_id);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                }
-                fs::write(path, session_token)
-                    .map_err(|error| ApiFailure::internal(error.to_string()))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, self.now_ms(), |mut account| {
-                    account
-                        .save_api_session(session_token, self.now_ms())
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn account_session_matches(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<bool, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = account_session_path(store_root, account_id);
-                let Ok(saved) = fs::read_to_string(path) else {
-                    return Ok(false);
-                };
-
-                Ok(saved.trim() == session_token)
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .api_session_matches(account_id, session_token)
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn save_browser_session(
-        &self,
-        session_id: &str,
-        session: &BrowserSessionRecord,
-    ) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = browser_session_path(store_root, session_id);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                }
-                fs::write(
-                    path,
-                    format!(
-                        "{}\n{}\n{}\n{}\n",
-                        session.account_id,
-                        session.session_token,
-                        session.csrf_token_hash,
-                        session.expires_at_ms
-                    ),
-                )
-                .map_err(|error| ApiFailure::internal(error.to_string()))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .save_browser_session(
-                            &secret_hash(session_id),
-                            &session.account_id,
-                            &session.session_token,
-                            &session.csrf_token_hash,
-                            self.now_ms(),
-                            session.expires_at_ms,
-                        )
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn load_browser_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = browser_session_path(store_root, session_id);
-                let Ok(saved) = fs::read_to_string(path) else {
-                    return Ok(None);
-                };
-                let mut lines = saved.lines();
-                let Some(account_id) = lines.next() else {
-                    return Ok(None);
-                };
-                let Some(session_token) = lines.next() else {
-                    return Ok(None);
-                };
-                let Some(csrf_token_hash) = lines.next() else {
-                    return Ok(None);
-                };
-                let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok())
-                else {
-                    return Ok(None);
-                };
-                if expires_at_ms <= self.now_ms() {
-                    return Ok(None);
-                }
-
-                Ok(Some(BrowserSessionRecord {
-                    account_id: account_id.to_owned(),
-                    session_token: session_token.to_owned(),
-                    csrf_token_hash: csrf_token_hash.to_owned(),
-                    expires_at_ms,
-                }))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .browser_session(&secret_hash(session_id), self.now_ms())
-                        .map(|session| {
-                            session.map(|session| BrowserSessionRecord {
-                                account_id: session.account_id,
-                                session_token: session.session_token,
-                                csrf_token_hash: session.csrf_token_hash,
-                                expires_at_ms: session.expires_at_ms,
-                            })
-                        })
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = browser_session_path(store_root, session_id);
-                match fs::remove_file(path) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(ApiFailure::internal(error.to_string())),
-                }
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .revoke_browser_session(&secret_hash(session_id), now_ms)
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn save_auth_challenge(
-        &self,
-        challenge_hash: &str,
-        email: &str,
-        expires_at_ms: i64,
-    ) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = auth_challenge_path(store_root, challenge_hash);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                }
-                fs::write(path, format!("{email}\n{expires_at_ms}\n\n"))
-                    .map_err(|error| ApiFailure::internal(error.to_string()))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .save_auth_challenge(challenge_hash, email, expires_at_ms)
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn consume_auth_challenge(
-        &self,
-        challenge_hash: &str,
-        now_ms: i64,
-    ) -> Result<Option<String>, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let path = auth_challenge_path(store_root, challenge_hash);
-                let consumed_path = auth_challenge_consumed_path(store_root, challenge_hash);
-                match fs::rename(&path, &consumed_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(ApiFailure::internal(error.to_string())),
-                }
-                let saved = fs::read_to_string(&consumed_path)
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                let mut lines = saved.lines();
-                let Some(email) = lines.next() else {
-                    return Ok(None);
-                };
-                let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok())
-                else {
-                    return Ok(None);
-                };
-                let consumed_at_ms = lines
-                    .next()
-                    .filter(|value| !value.trim().is_empty())
-                    .and_then(|value| value.parse::<i64>().ok());
-                if consumed_at_ms.is_some() || expires_at_ms <= now_ms {
-                    return Ok(None);
-                }
-                fs::write(
-                    consumed_path,
-                    format!("{email}\n{expires_at_ms}\n{now_ms}\n"),
-                )
-                .map_err(|error| ApiFailure::internal(error.to_string()))?;
-
-                Ok(Some(email.to_owned()))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .consume_auth_challenge(challenge_hash, now_ms)
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn record_rate_limit_attempts(
-        &self,
-        keys: &[String],
-        now_ms: i64,
-        window_ms: i64,
-        max_attempts: u32,
-    ) -> Result<bool, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let mut attempts_by_key = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let path = rate_limit_path(store_root, key);
-                    let (window_start_ms, attempts) = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|saved| {
-                            let mut lines = saved.lines();
-                            let window_start_ms = lines.next()?.parse::<i64>().ok()?;
-                            let attempts = lines.next()?.parse::<u32>().ok()?;
-                            Some((window_start_ms, attempts))
-                        })
-                        .filter(|(window_start_ms, _)| {
-                            now_ms.saturating_sub(*window_start_ms) < window_ms
-                        })
-                        .unwrap_or((now_ms, 0));
-                    if attempts >= max_attempts {
-                        return Ok(false);
-                    }
-                    attempts_by_key.push((path, window_start_ms, attempts.saturating_add(1)));
-                }
-                for (path, window_start_ms, attempts) in attempts_by_key {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)
-                            .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                    }
-                    write_atomic(&path, &format!("{window_start_ms}\n{attempts}\n"))?;
-                }
-
-                Ok(true)
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store
-                        .record_rate_limit_attempts(
-                            keys,
-                            now_ms,
-                            window_ms,
-                            i32::try_from(max_attempts).expect("rate limit fits i32"),
-                        )
-                        .map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                Ok(account_session_path(store_root, account_id).exists()
-                    || account_store_path(store_root, account_id).exists())
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_store(database_url, |store| {
-                    store.account_exists(account_id).map_err(postgres_failure)
-                })
-            }
-        }
-    }
-
-    fn copy_account(
-        &self,
-        source_account_id: &str,
-        target_account_id: &str,
-        source_store_path: &FsPath,
-    ) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { store_root } => {
-                let target_store_path = account_store_path(store_root, target_account_id);
-                if source_store_path != target_store_path
-                    && source_store_path.exists()
-                    && !target_store_path.exists()
-                {
-                    if let Some(parent) = target_store_path.parent() {
-                        fs::create_dir_all(parent)
-                            .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                    }
-                    fs::copy(source_store_path, target_store_path)
-                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                }
-                Ok(())
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                let snapshot = with_postgres_account(
-                    database_url,
-                    source_account_id,
-                    self.now_ms(),
-                    |account| account.snapshot().map_err(postgres_failure),
-                )?;
-                with_postgres_account(
-                    database_url,
-                    target_account_id,
-                    self.now_ms(),
-                    |mut account| {
-                        for document in snapshot.source_documents {
-                            account
-                                .save_source_document(&document)
-                                .map_err(postgres_failure)?;
-                        }
-                        for reference in snapshot.reference_spans {
-                            account
-                                .save_reference_span(&reference)
-                                .map_err(postgres_failure)?;
-                        }
-                        for run in snapshot.generation_runs {
-                            account
-                                .save_generation_run(&run)
-                                .map_err(postgres_failure)?;
-                        }
-                        for draft in snapshot.generated_prompt_drafts {
-                            account
-                                .save_generated_prompt_draft(&draft)
-                                .map_err(postgres_failure)?;
-                        }
-                        for review_unit in snapshot.review_units {
-                            account
-                                .save_review_unit(&review_unit)
-                                .map_err(postgres_failure)?;
-                        }
-                        for schedule in snapshot.schedules {
-                            account
-                                .set_schedule_state(
-                                    &schedule.review_unit_id,
-                                    Some(&schedule.state),
-                                    self.now_ms(),
-                                )
-                                .map_err(postgres_failure)?;
-                        }
-                        Ok(())
-                    },
-                )
-            }
-        }
-    }
-
-    fn save_source(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        source: &SourceRecord,
-    ) -> Result<(), ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let mut study = open_study_session(store_path, self.now)?;
-                study
-                    .add_source(BetaStudySourceInput {
-                        id: source.source_id.clone(),
-                        title: source.title.clone(),
-                        body: source.body.clone(),
-                    })
-                    .map_err(study_failure)?;
-                Ok(())
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, self.now, |study| {
-                    study
-                        .add_source(BetaStudySourceInput {
-                            id: source.source_id.clone(),
-                            title: source.title.clone(),
-                            body: source.body.clone(),
-                        })
-                        .map(drop)
-                        .map_err(study_failure)
-                })
-            }
-        }
-    }
-
-    fn list_sources(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => persisted_sources(store_path),
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
-                    Ok(account
-                        .snapshot()
-                        .map_err(postgres_failure)?
-                        .source_documents
-                        .into_iter()
-                        .map(|source| SourceRecord {
-                            source_id: source.id,
-                            title: source.title,
-                            body: source.body.unwrap_or_default(),
-                        })
-                        .collect())
-                })
-            }
-        }
-    }
-
-    fn generate_source(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                if !persisted_source_exists(store_path, source_id)? {
-                    return Err(ApiFailure::not_found("Source not found."));
-                }
-                let mut study = open_study_session(store_path, self.now)?;
-                let view = run_source_generation(&mut study, source_id)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
-                    if !account
-                        .snapshot()
-                        .map_err(postgres_failure)?
-                        .source_documents
-                        .iter()
-                        .any(|source| source.id == source_id)
-                    {
-                        return Err(ApiFailure::not_found("Source not found."));
-                    }
-                    let mut study = BetaStudySession::from_store(account, self.now);
-                    let view = run_source_generation(&mut study, source_id)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
-
-    fn approve_draft(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        draft_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let mut study = open_study_session(store_path, self.now)?;
-                let view = study.approve_draft(draft_id).map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, self.now, |study| {
-                    let view = study.approve_draft(draft_id).map_err(study_failure)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
-
-    fn next_review(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let mut study = open_study_session(store_path, self.now)?;
-                let view = study.start().map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, self.now, |study| {
-                    let view = study.start().map_err(study_failure)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
-
-    fn study_view(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let study = open_study_session(store_path, self.now)?;
-                let view = study.view().map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, self.now, |study| {
-                    let view = study.view().map_err(study_failure)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
-
-    fn reveal_review(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let mut study = open_study_session(store_path, self.now)?;
-                require_current_review(&mut study, review_unit_id)?;
-                let view = study.reveal().map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_study(database_url, account_id, self.now, |study| {
-                    require_current_review_postgres(study, review_unit_id)?;
-                    let view = study.reveal().map_err(study_failure)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
-
-    fn submit_review(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-        answer: String,
-        response_time_ms: u32,
-        idempotency_key: String,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        match &self.backend {
-            StudyStorageBackend::File { .. } => {
-                let mut study = open_study_session(store_path, self.now)?;
-                require_current_review(&mut study, review_unit_id)?;
-                let view = study
-                    .submit_answer_with_idempotency_key(
-                        answer,
-                        response_time_ms,
-                        Some(idempotency_key),
-                    )
-                    .map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
-            }
-            StudyStorageBackend::Postgres { database_url } => {
-                with_postgres_account(database_url, account_id, self.now_ms(), |account| {
-                    if account
-                        .applied_review_idempotency_key_exists(&idempotency_key)
-                        .map_err(postgres_failure)?
-                    {
-                        let study = BetaStudySession::from_store(account, self.now);
-                        let view = study.view().map_err(study_failure)?;
-
-                        return Ok(StudyViewResponse::from_view(view));
-                    }
-
-                    let mut study = BetaStudySession::from_store(account, self.now);
-                    require_current_review_postgres(&mut study, review_unit_id)?;
-                    let view = study
-                        .submit_answer_with_idempotency_key(
-                            answer,
-                            response_time_ms,
-                            Some(idempotency_key),
-                        )
-                        .map_err(study_failure)?;
-
-                    Ok(StudyViewResponse::from_view(view))
-                })
-            }
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MagicLinkRequest {
+    debug_link: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1407,524 +293,6 @@ pub struct ApiError {
     pub error: String,
 }
 
-pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/", get(app_home))
-        .route("/accounts", post(create_account))
-        .route("/app/start", post(start_app_study))
-        .route("/app/account", post(create_app_account))
-        .route("/app/login/verify", get(verify_app_login))
-        .route("/app/logout", post(logout_app_session))
-        .route("/app/save-account", post(save_app_account))
-        .route("/app/source", post(create_app_source))
-        .route("/app/generate", post(generate_app_source))
-        .route("/app/approve", post(approve_app_draft))
-        .route("/app/next", post(next_app_review))
-        .route("/app/reveal", post(reveal_app_review))
-        .route("/app/submit", post(submit_app_review))
-        .route(
-            "/accounts/{account_id}/sources",
-            get(list_sources).post(create_source),
-        )
-        .route(
-            "/accounts/{account_id}/sources/{source_id}/generate",
-            post(generate_source),
-        )
-        .route(
-            "/accounts/{account_id}/drafts/{draft_id}/approve",
-            post(approve_draft),
-        )
-        .route("/accounts/{account_id}/review/next", get(next_review))
-        .route(
-            "/accounts/{account_id}/review/{review_unit_id}/reveal",
-            post(reveal_review),
-        )
-        .route(
-            "/accounts/{account_id}/review/{review_unit_id}/submit",
-            post(submit_review),
-        )
-        .with_state(state)
-}
-
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "memory-engine-api",
-    })
-}
-
-async fn app_home() -> Html<String> {
-    Html(render_app_shell(None, &[], None, None))
-}
-
-async fn create_account(
-    State(state): State<ApiState>,
-    Json(request): Json<CreateAccountRequest>,
-) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
-    let email = normalize_email(&request.email)
-        .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))?;
-    let account = state.accounts.create_account(&email)?;
-
-    Ok((StatusCode::CREATED, Json(account)))
-}
-
-async fn create_source(
-    State(state): State<ApiState>,
-    Path(account_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<CreateSourceRequest>,
-) -> Result<(StatusCode, Json<SourceRecord>), ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-    let source = state
-        .accounts
-        .save_source(&account_id, session_token, &request)?;
-
-    Ok((StatusCode::CREATED, Json(source)))
-}
-
-async fn list_sources(
-    State(state): State<ApiState>,
-    Path(account_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<SourceList>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(SourceList {
-        sources: state.accounts.list_sources(&account_id, session_token)?,
-    }))
-}
-
-async fn generate_source(
-    State(state): State<ApiState>,
-    Path((account_id, source_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<StudyViewResponse>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(state.accounts.generate_source(
-        &account_id,
-        session_token,
-        &source_id,
-    )?))
-}
-
-async fn approve_draft(
-    State(state): State<ApiState>,
-    Path((account_id, draft_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<StudyViewResponse>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(state.accounts.approve_draft(
-        &account_id,
-        session_token,
-        &draft_id,
-    )?))
-}
-
-async fn next_review(
-    State(state): State<ApiState>,
-    Path(account_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<StudyViewResponse>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(
-        state.accounts.next_review(&account_id, session_token)?,
-    ))
-}
-
-async fn reveal_review(
-    State(state): State<ApiState>,
-    Path((account_id, review_unit_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<StudyViewResponse>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(state.accounts.reveal_review(
-        &account_id,
-        session_token,
-        &review_unit_id,
-    )?))
-}
-
-async fn submit_review(
-    State(state): State<ApiState>,
-    Path((account_id, review_unit_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    Json(request): Json<SubmitReviewRequest>,
-) -> Result<Json<StudyViewResponse>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-
-    Ok(Json(state.accounts.submit_review(
-        &account_id,
-        session_token,
-        &review_unit_id,
-        &request,
-    )?))
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppAccountForm {
-    email: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppLoginVerifyQuery {
-    token: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MagicLinkRequest {
-    debug_link: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppStartForm {
-    title: String,
-    body: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppSourceForm {
-    csrf_token: Option<String>,
-    title: String,
-    body: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppSaveAccountForm {
-    csrf_token: Option<String>,
-    email: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppAccountActionForm {
-    csrf_token: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppSourceActionForm {
-    csrf_token: Option<String>,
-    source_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppDraftActionForm {
-    csrf_token: Option<String>,
-    draft_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppReviewActionForm {
-    csrf_token: Option<String>,
-    review_unit_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AppReviewSubmitForm {
-    csrf_token: Option<String>,
-    review_unit_id: String,
-    answer: String,
-    response_time_ms: u32,
-    idempotency_key: String,
-}
-
-async fn create_app_account(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppAccountForm>,
-) -> Response {
-    let result = state
-        .accounts
-        .request_magic_link(&form.email, &client_rate_limit_key(&headers));
-
-    match result {
-        Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn verify_app_login(
-    State(state): State<ApiState>,
-    Query(query): Query<AppLoginVerifyQuery>,
-) -> Response {
-    match state.accounts.verify_magic_link(&query.token) {
-        Ok(account) => {
-            let view = state
-                .accounts
-                .study_view(&account.account_id, &account.session_token)
-                .ok();
-            html_with_browser_session(
-                &account,
-                render_account_page(&state, &account, view.as_ref(), None),
-            )
-        }
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn logout_app_session(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppAccountActionForm>,
-) -> Response {
-    match state
-        .accounts
-        .revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, None)),
-        Err(error) => error.into_response(),
-    }
-}
-
-async fn save_app_account(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppSaveAccountForm>,
-) -> Response {
-    let source_account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let source_view = state
-        .accounts
-        .study_view(&source_account.account_id, &source_account.session_token)
-        .ok();
-    let result = normalize_email(&form.email)
-        .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))
-        .and_then(|email| {
-            state.accounts.save_account(
-                &source_account.account_id,
-                &source_account.session_token,
-                &email,
-            )
-        });
-
-    match result {
-        Ok(account) => {
-            let account = match state.accounts.create_browser_session(&account) {
-                Ok(account) => account,
-                Err(error) => return error.into_response(),
-            };
-            let view = state
-                .accounts
-                .study_view(&account.account_id, &account.session_token)
-                .ok()
-                .or(source_view);
-            html_with_browser_session(
-                &account,
-                render_account_page(&state, &account, view.as_ref(), None),
-            )
-        }
-        Err(error) => Html(render_account_page(
-            &state,
-            &source_account,
-            source_view.as_ref(),
-            Some(&error.message),
-        ))
-        .into_response(),
-    }
-}
-
-async fn start_app_study(
-    State(state): State<ApiState>,
-    Form(form): Form<AppStartForm>,
-) -> Response {
-    let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
-    let account = match state.accounts.create_account(&email) {
-        Ok(account) => account,
-        Err(error) => {
-            return Html(render_app_shell(None, &[], None, Some(&error.message))).into_response();
-        }
-    };
-    let account = match state.accounts.create_browser_session(&account) {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let source = state.accounts.save_source(
-        &account.account_id,
-        &account.session_token,
-        &CreateSourceRequest {
-            title: form.title,
-            body: form.body,
-        },
-    );
-    let result = source.and_then(|source| {
-        state.accounts.generate_source(
-            &account.account_id,
-            &account.session_token,
-            &source.source_id,
-        )
-    });
-
-    html_with_browser_session(
-        &account,
-        render_action_result_html(&state, &account, result),
-    )
-}
-
-async fn create_app_source(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppSourceForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state
-        .accounts
-        .save_source(
-            &account.account_id,
-            &account.session_token,
-            &CreateSourceRequest {
-                title: form.title,
-                body: form.body,
-            },
-        )
-        .and_then(|_| {
-            state
-                .accounts
-                .list_sources(&account.account_id, &account.session_token)
-        });
-
-    match result {
-        Ok(sources) => Html(render_app_shell(Some(&account), &sources, None, None)).into_response(),
-        Err(error) => Html(render_account_page(
-            &state,
-            &account,
-            None,
-            Some(&error.message),
-        ))
-        .into_response(),
-    }
-}
-
-async fn generate_app_source(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppSourceActionForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.generate_source(
-        &account.account_id,
-        &account.session_token,
-        &form.source_id,
-    );
-
-    Html(render_action_result_html(&state, &account, result)).into_response()
-}
-
-async fn approve_app_draft(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppDraftActionForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result =
-        state
-            .accounts
-            .approve_draft(&account.account_id, &account.session_token, &form.draft_id);
-
-    Html(render_action_result_html(&state, &account, result)).into_response()
-}
-
-async fn next_app_review(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppAccountActionForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state
-        .accounts
-        .next_review(&account.account_id, &account.session_token);
-
-    Html(render_action_result_html(&state, &account, result)).into_response()
-}
-
-async fn reveal_app_review(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppReviewActionForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.reveal_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
-
-    Html(render_action_result_html(&state, &account, result)).into_response()
-}
-
-async fn submit_app_review(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppReviewSubmitForm>,
-) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.submit_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-        &SubmitReviewRequest {
-            answer: form.answer,
-            response_time_ms: form.response_time_ms,
-            idempotency_key: form.idempotency_key,
-        },
-    );
-
-    Html(render_action_result_html(&state, &account, result)).into_response()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AppAccount {
     browser_session_id: String,
@@ -1932,464 +300,6 @@ struct AppAccount {
     session_token: String,
     csrf_token: String,
 }
-
-fn render_action_result_html(
-    state: &ApiState,
-    account: &AppAccount,
-    result: Result<StudyViewResponse, ApiFailure>,
-) -> String {
-    match result {
-        Ok(view) => render_account_page(state, account, Some(&view), None),
-        Err(error) => render_account_page(state, account, None, Some(&error.message)),
-    }
-}
-
-fn render_account_page(
-    state: &ApiState,
-    account: &AppAccount,
-    view: Option<&StudyViewResponse>,
-    error: Option<&str>,
-) -> String {
-    let sources = state
-        .accounts
-        .list_sources(&account.account_id, &account.session_token)
-        .unwrap_or_default();
-    render_app_shell(Some(account), &sources, view, error)
-}
-
-fn render_app_shell(
-    account: Option<&AppAccount>,
-    sources: &[SourceRecord],
-    view: Option<&StudyViewResponse>,
-    error: Option<&str>,
-) -> String {
-    let account_panel = account.map_or_else(render_account_form, |account| {
-        [
-            render_account_status(account),
-            render_source_form(account),
-            render_sources(account, sources),
-        ]
-        .join("")
-    });
-    let study_panel = account.map_or_else(String::new, |account| {
-        view.map_or_else(String::new, |view| render_study(account, view))
-    });
-    let error_panel = error.map_or_else(String::new, |message| {
-        format!(
-            r#"<section class="notice" role="alert">{}</section>"#,
-            escape_html(message)
-        )
-    });
-
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Memory Engine Study</title>
-  <style>{APP_CSS}</style>
-</head>
-<body>
-  <main>
-    <header>
-      <p class="eyebrow">Memory Engine</p>
-      <h1>Study from source material</h1>
-    </header>
-    {error_panel}
-    {account_panel}
-    {study_panel}
-  </main>
-</body>
-</html>"#
-    )
-}
-
-fn render_account_form() -> String {
-    format!(
-        r#"{}<section>
-  <h2>Sign in</h2>
-  <form action="/app/account" method="post">
-    <label>Email <input name="email" type="email" autocomplete="email" required></label>
-    <button type="submit">Send sign-in link</button>
-  </form>
-</section>"#,
-        render_start_form()
-    )
-}
-
-fn render_login_requested(debug_link: Option<&str>) -> String {
-    let debug_link = debug_link.map_or_else(String::new, |link| {
-        format!(
-            r#"<p class="muted"><a href="{}">Debug sign-in link</a></p>"#,
-            escape_html(link)
-        )
-    });
-
-    format!(
-        r#"{}<section class="compact">
-  <h2>Check your email</h2>
-  <p class="muted">If that address can sign in, a link is on the way.</p>
-  {}
-</section>"#,
-        render_start_form(),
-        debug_link
-    )
-}
-
-fn render_start_form() -> String {
-    format!(
-        r#"<section>
-  <h2>Add source</h2>
-  <form action="/app/start" method="post">
-    <label>Title <input name="title" required value="NATO practice notes"></label>
-    <label>Source text <textarea name="body" rows="11" required>{}</textarea></label>
-    <button type="submit">Generate study material</button>
-  </form>
-</section>"#,
-        escape_html(DEFAULT_SOURCE_BODY)
-    )
-}
-
-fn render_account_status(account: &AppAccount) -> String {
-    format!(
-        r#"<section class="compact">
-  <h2>Account</h2>
-  <p class="muted">Session ready for <code>{}</code>.</p>
-  <form action="/app/logout" method="post">
-    {}
-    <button type="submit">Sign out</button>
-  </form>
-  <form action="/app/save-account" method="post">
-    {}
-    <label>Email <input name="email" type="email" autocomplete="email" required></label>
-    <button type="submit">Save account email</button>
-  </form>
-</section>"#,
-        escape_html(&account.account_id),
-        hidden_csrf_input(account),
-        hidden_csrf_input(account)
-    )
-}
-
-fn render_source_form(account: &AppAccount) -> String {
-    format!(
-        r#"<section>
-  <h2>Add source</h2>
-  <form action="/app/source" method="post">
-    {}
-    <label>Title <input name="title" required value="NATO practice notes"></label>
-    <label>Source text <textarea name="body" rows="11" required>{}</textarea></label>
-    <button type="submit">Save source</button>
-  </form>
-</section>"#,
-        hidden_csrf_input(account),
-        escape_html(DEFAULT_SOURCE_BODY)
-    )
-}
-
-fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
-    if sources.is_empty() {
-        return r#"<section class="compact"><h2>Sources</h2><p class="muted">No sources yet.</p></section>"#
-            .to_owned();
-    }
-
-    let mut rows = String::new();
-    for source in sources {
-        write!(
-            rows,
-            r#"<article class="item">
-  <h3>{}</h3>
-  <p>{}</p>
-  <form action="/app/generate" method="post">
-    {}
-    <input type="hidden" name="sourceId" value="{}">
-    <button type="submit">Generate study material</button>
-  </form>
-</article>"#,
-            escape_html(&source.title),
-            escape_html(&source.body),
-            hidden_csrf_input(account),
-            escape_html(&source.source_id)
-        )
-        .expect("write source html");
-    }
-
-    format!(r"<section><h2>Sources</h2>{rows}</section>")
-}
-
-fn render_study(account: &AppAccount, view: &StudyViewResponse) -> String {
-    [
-        render_summary(&view.summary),
-        render_generation_notices(&view.generation_notices),
-        render_drafts(account, &view.drafts),
-        render_current_review(account, view.current.as_ref()),
-    ]
-    .join("")
-}
-
-fn render_generation_notices(notices: &[String]) -> String {
-    if notices.is_empty() {
-        return String::new();
-    }
-    let mut items = String::new();
-    for notice in notices {
-        write!(items, "<li>{}</li>", escape_html(notice)).expect("write notice html");
-    }
-
-    format!(
-        r#"<section class="compact notices"><h2>Generation notes</h2><ul>{items}</ul></section>"#
-    )
-}
-
-fn render_summary(summary: &BetaStudySummary) -> String {
-    format!(
-        r#"<section class="compact">
-  <h2>Progress</h2>
-  <div class="metrics">
-    <span><strong>{}</strong> sources</span>
-    <span><strong>{}</strong> drafts</span>
-    <span><strong>{}</strong> reviews</span>
-    <span><strong>{}</strong> attempts</span>
-  </div>
-</section>"#,
-        summary.source_count,
-        summary.accepted_draft_count,
-        summary.approved_review_unit_count,
-        summary.attempt_count
-    )
-}
-
-fn render_drafts(account: &AppAccount, drafts: &[BetaStudyDraftRow]) -> String {
-    if drafts.is_empty() {
-        return String::new();
-    }
-
-    let mut rows = String::new();
-    for draft in drafts {
-        let action = if draft.validation_status
-            == memory_engine_persistence::GeneratedPromptValidationStatus::Accepted
-        {
-            format!(
-                r#"<form action="/app/approve" method="post">
-  {}
-  <input type="hidden" name="draftId" value="{}">
-  <button type="submit">Keep for review</button>
-</form>"#,
-                hidden_csrf_input(account),
-                escape_html(&draft.id)
-            )
-        } else {
-            String::new()
-        };
-        write!(
-            rows,
-            r#"<article class="item">
-  <h3>{}</h3>
-  <p>{}</p>
-  <p class="muted">{}</p>
-  {}
-</article>"#,
-            escape_html(&draft.activity_stage),
-            escape_html(&draft.prompt),
-            escape_html(&draft.validation_reasons.join(", ")),
-            action
-        )
-        .expect("write draft html");
-    }
-
-    format!(r"<section><h2>Generated material</h2>{rows}</section>")
-}
-
-fn render_current_review(account: &AppAccount, current: Option<&BetaStudyCurrent>) -> String {
-    let Some(current) = current else {
-        return String::new();
-    };
-    let expected = current
-        .expected_answer
-        .as_ref()
-        .map_or_else(String::new, |answer| {
-            format!(
-                r#"<div class="answer"><span>Answer</span><strong>{}</strong></div>"#,
-                escape_html(answer)
-            )
-        });
-    let grade = current.grade.as_ref().map_or_else(String::new, |grade| {
-        format!(
-            r#"<p class="muted">Last result: {:?}</p>
-    <form action="/app/next" method="post">
-      {}
-      <button type="submit">Next review</button>
-    </form>"#,
-            grade.verdict,
-            hidden_csrf_input(account)
-        )
-    });
-
-    format!(
-        r#"<section>
-  <h2>Review</h2>
-  <article class="item focus">
-    <h3>{}</h3>
-    <p>{}</p>
-    {}
-    {}
-    <form action="/app/reveal" method="post">
-      {}
-      <input type="hidden" name="reviewUnitId" value="{}">
-      <button type="submit">Reveal answer</button>
-    </form>
-    <form action="/app/submit" method="post">
-      {}
-      <input type="hidden" name="reviewUnitId" value="{}">
-      <input type="hidden" name="responseTimeMs" value="1800">
-      <input type="hidden" name="idempotencyKey" value="review-{}">
-      <label>Your answer <input name="answer" required autocomplete="off"></label>
-      <button type="submit">Submit review</button>
-    </form>
-  </article>
-</section>"#,
-        escape_html(&current.activity_stage),
-        escape_html(&current.prompt),
-        expected,
-        grade,
-        hidden_csrf_input(account),
-        escape_html(&current.review_unit_id.to_string()),
-        hidden_csrf_input(account),
-        escape_html(&current.review_unit_id.to_string()),
-        escape_html(&current.review_unit_id.to_string())
-    )
-}
-
-fn hidden_csrf_input(account: &AppAccount) -> String {
-    format!(
-        r#"<input type="hidden" name="csrfToken" value="{}">"#,
-        escape_html(&account.csrf_token)
-    )
-}
-
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-const DEFAULT_SOURCE_BODY: &str = "\
-Concept: NATO letter A
-Activity: quiz
-Stage: recognition-3
-Question: What is the NATO phonetic alphabet word for A?
-Answer: ALFA
-Distractors: BRAVO, CHARLIE
-Reference: The NATO phonetic alphabet word for A is ALFA.
-
-Concept: NATO CAT composition
-Activity: exercise
-Stage: composition
-Question: Spell CAT over the phone using the NATO phonetic alphabet.
-Answer: CHARLIE ALFA TANGO
-Worked Solution: C is CHARLIE, A is ALFA, and T is TANGO.
-Reference: C is CHARLIE. A is ALFA. T is TANGO.";
-
-const APP_CSS: &str = r"
-:root {
-  color-scheme: light;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: #f6f7f8;
-  color: #172026;
-}
-* { box-sizing: border-box; }
-body { margin: 0; }
-main {
-  width: min(100%, 720px);
-  margin: 0 auto;
-  padding: 20px 14px 40px;
-}
-header { padding: 8px 0 14px; }
-.eyebrow {
-  margin: 0 0 6px;
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  color: #56616a;
-}
-h1, h2, h3, p { overflow-wrap: anywhere; }
-h1 { margin: 0; font-size: 1.85rem; line-height: 1.08; }
-h2 { margin: 0 0 12px; font-size: 1.08rem; }
-h3 { margin: 0 0 8px; font-size: 1rem; }
-section {
-  margin: 12px 0;
-  padding: 14px;
-  background: #ffffff;
-  border: 1px solid #d8dde2;
-  border-radius: 8px;
-}
-.compact { padding: 12px 14px; }
-.notice {
-  border-color: #ad3f32;
-  background: #fff1ef;
-  color: #7f241a;
-}
-.item {
-  margin: 10px 0;
-  padding: 12px;
-  border: 1px solid #d8dde2;
-  border-radius: 8px;
-  background: #fbfcfc;
-}
-.focus { border-color: #2f6f73; }
-.muted { color: #56616a; font-size: 0.92rem; }
-.metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-.metrics span {
-  padding: 8px;
-  background: #edf2f2;
-  border-radius: 6px;
-}
-form { display: grid; gap: 10px; margin: 10px 0 0; }
-label { display: grid; gap: 6px; font-weight: 650; }
-input, textarea {
-  width: 100%;
-  min-width: 0;
-  padding: 11px 12px;
-  border: 1px solid #bac3c9;
-  border-radius: 6px;
-  font: inherit;
-  background: #ffffff;
-}
-textarea { resize: vertical; }
-button {
-  width: 100%;
-  min-height: 44px;
-  border: 0;
-  border-radius: 6px;
-  background: #275d61;
-  color: #ffffff;
-  font: inherit;
-  font-weight: 750;
-}
-code {
-  font-size: 0.82rem;
-  white-space: normal;
-}
-.answer {
-  display: grid;
-  gap: 4px;
-  margin: 10px 0;
-  padding: 10px;
-  border-radius: 6px;
-  background: #e9f3ec;
-}
-.answer span {
-  color: #46614d;
-  font-size: 0.78rem;
-  text-transform: uppercase;
-}
-";
 
 #[derive(Debug)]
 struct ApiFailure {
@@ -3138,6 +1048,115 @@ mod tests {
         let approved = response_text(approved).await;
         assert!(!approved.contains(r#"name="sessionToken""#));
         assert!(approved.contains("Reveal answer"));
+    }
+
+    #[tokio::test]
+    async fn app_session_mutations_require_csrf() {
+        let app = router(ApiState::default());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        assert_eq!(started.status(), StatusCode::OK);
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let draft_id = html_value(&started, "draftId");
+
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/source",
+            &[
+                ("title", "Latin notes"),
+                ("body", "Poena means punishment."),
+            ],
+            "source without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/generate",
+            &[("sourceId", &source_id)],
+            "generate without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/approve",
+            &[("draftId", &draft_id)],
+            "approve without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/save-account",
+            &[("email", "learner@example.com")],
+            "save without csrf",
+        )
+        .await;
+        assert_forbidden_form(&app, &cookie, "/app/logout", &[], "logout without csrf").await;
+
+        let approved = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/approve",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("approve with csrf");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_text(approved).await;
+        let review_unit_id = html_value(&approved, "reviewUnitId");
+
+        assert_forbidden_form(&app, &cookie, "/app/next", &[], "next without csrf").await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/reveal",
+            &[("reviewUnitId", &review_unit_id)],
+            "reveal without csrf",
+        )
+        .await;
+        assert_forbidden_form(
+            &app,
+            &cookie,
+            "/app/submit",
+            &[
+                ("reviewUnitId", &review_unit_id),
+                ("answer", "ALFA"),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", "csrf-matrix-submit"),
+            ],
+            "submit without csrf",
+        )
+        .await;
+    }
+
+    async fn assert_forbidden_form(
+        app: &axum::Router,
+        cookie: &str,
+        uri: &str,
+        fields: &[(&str, &str)],
+        context: &str,
+    ) {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_cookie("POST", uri, cookie, fields))
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{context}");
     }
 
     #[tokio::test]
@@ -4079,6 +2098,92 @@ mod tests {
         assert!(approved.contains("Reveal answer"));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_backend_source_routes_are_account_scoped() {
+        let Some(database) = PostgresTestDatabase::new("source_scope") else {
+            return;
+        };
+        let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+            database.scoped_url.clone(),
+        )));
+        let first = create_account(&app, "first@example.com").await;
+        let second = create_account(&app, "second@example.com").await;
+
+        let first_source =
+            save_source(&app, &first, "NATO notes", "ALFA is the code word for A.").await;
+        let second_source =
+            save_source(&app, &second, "Latin notes", "Poena means punishment.").await;
+
+        let first_sources = app
+            .clone()
+            .oneshot(empty_request(
+                "GET",
+                &format!("/accounts/{}/sources", first.account_id),
+                &first.session_token,
+            ))
+            .await
+            .expect("first sources");
+        assert_eq!(first_sources.status(), StatusCode::OK);
+        let first_sources = response_json(first_sources).await;
+        assert_eq!(
+            first_sources["sources"].as_array().expect("sources").len(),
+            1
+        );
+        assert_eq!(
+            first_sources["sources"][0]["sourceId"],
+            first_source["sourceId"]
+        );
+        assert_ne!(
+            first_sources["sources"][0]["sourceId"],
+            second_source["sourceId"]
+        );
+
+        let second_sources = app
+            .clone()
+            .oneshot(empty_request(
+                "GET",
+                &format!("/accounts/{}/sources", second.account_id),
+                &second.session_token,
+            ))
+            .await
+            .expect("second sources");
+        assert_eq!(second_sources.status(), StatusCode::OK);
+        let second_sources = response_json(second_sources).await;
+        assert_eq!(
+            second_sources["sources"].as_array().expect("sources").len(),
+            1
+        );
+        assert_eq!(
+            second_sources["sources"][0]["sourceId"],
+            second_source["sourceId"]
+        );
+
+        let cross_read = app
+            .clone()
+            .oneshot(empty_request(
+                "GET",
+                &format!("/accounts/{}/sources", second.account_id),
+                &first.session_token,
+            ))
+            .await
+            .expect("cross read");
+        assert_eq!(cross_read.status(), StatusCode::FORBIDDEN);
+
+        let cross_write = app
+            .oneshot(json_request(
+                "POST",
+                &format!("/accounts/{}/sources", second.account_id),
+                &first.session_token,
+                &json!({
+                    "title": "Wrong account",
+                    "body": "This write must be rejected."
+                }),
+            ))
+            .await
+            .expect("cross write");
+        assert_eq!(cross_write.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn source_routes_reject_blank_source_material() {
         let app = router(ApiState::default());
@@ -4290,6 +2395,58 @@ mod tests {
             duplicate["current"]["reviewState"],
             first["current"]["reviewState"]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_duplicate_review_submit_counts_one_attempt() {
+        let app = router(ApiState::default());
+        let account = create_account(&app, "learner@example.com").await;
+        let review_unit_id = prepare_review_unit(&app, &account).await;
+        let submit_uri = format!(
+            "/accounts/{}/review/{review_unit_id}/submit",
+            account.account_id
+        );
+        let barrier = Arc::new(Barrier::new(16));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            let barrier = Arc::clone(&barrier);
+            let submit_uri = submit_uri.clone();
+            let session_token = account.session_token.clone();
+            workers.push(thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                barrier.wait();
+                runtime.block_on(async move {
+                    let response = app
+                        .oneshot(json_request(
+                            "POST",
+                            &submit_uri,
+                            &session_token,
+                            &json!({
+                                "answer": "ALFA",
+                                "responseTimeMs": 1800,
+                                "idempotencyKey": "concurrent-submit-nato-a"
+                            }),
+                        ))
+                        .await
+                        .expect("submit");
+                    let status = response.status();
+                    let body = response_json(response).await;
+
+                    (status, body)
+                })
+            }));
+        }
+
+        for result in workers {
+            let (status, body) = result.join().expect("worker");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["summary"]["attemptCount"], json!(1), "{body}");
+            assert_eq!(body["summary"]["lastOutcome"], json!("correct"), "{body}");
+        }
     }
 
     #[tokio::test]
@@ -4522,6 +2679,42 @@ mod tests {
         response_json(response).await
     }
 
+    async fn prepare_review_unit(app: &axum::Router, account: &TestAccount) -> String {
+        let source = save_source(app, account, "NATO practice notes", &source_body()).await;
+        let source_id = source["sourceId"].as_str().expect("source id");
+        let generated = app
+            .clone()
+            .oneshot(empty_request(
+                "POST",
+                &format!(
+                    "/accounts/{}/sources/{source_id}/generate",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("generate");
+        assert_eq!(generated.status(), StatusCode::OK);
+        let generated = response_json(generated).await;
+        let draft_id = generated["drafts"][0]["id"].as_str().expect("draft id");
+        let approved = app
+            .clone()
+            .oneshot(empty_request(
+                "POST",
+                &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
+                &account.session_token,
+            ))
+            .await
+            .expect("approve");
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved = response_json(approved).await;
+
+        approved["current"]["reviewUnitId"]
+            .as_str()
+            .expect("review unit id")
+            .to_owned()
+    }
+
     async fn assert_postgres_restart_resume_and_duplicate_submit(
         database_url: &str,
         original: &TestAccount,
@@ -4702,12 +2895,7 @@ mod tests {
     #[test]
     fn file_store_magic_link_consumption_is_atomic() {
         let store_root = temp_store_root("magic-link-atomic");
-        let storage = super::StudyStorage {
-            backend: super::StudyStorageBackend::File {
-                store_root: store_root.clone(),
-            },
-            now: expiry_clock,
-        };
+        let storage = super::StudyStorage::file(store_root.clone(), expiry_clock);
         storage
             .save_auth_challenge(
                 "atomic-challenge",
