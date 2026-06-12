@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use memory_engine_generation::{
-    DraftCandidate, DraftProvider, ProviderDrafts, ProviderFailure, ProviderUsage,
+    DraftCandidate, DraftProvider, LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
 };
 use memory_engine_persistence::{
     GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
@@ -200,6 +200,12 @@ impl DraftProvider for OpenRouterProvider {
         let parsed: DraftsPayload = serde_json::from_str(&response.content).map_err(|_| {
             ProviderFailure::new("The model's drafts could not be read; please try again.")
         })?;
+        let learning_intent =
+            LearningIntent::from_label(&parsed.learning_intent).ok_or_else(|| {
+                ProviderFailure::new(
+                    "The model's learning intent could not be read; please try again.",
+                )
+            })?;
 
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
@@ -219,6 +225,7 @@ impl DraftProvider for OpenRouterProvider {
 
         Ok(ProviderDrafts {
             model: self.model(),
+            learning_intent: Some(learning_intent),
             candidates,
             failures,
             usage: response.usage,
@@ -272,19 +279,33 @@ Principles:
     };
 
     format!(
-        "You generate spaced-repetition quiz drafts from a source document.
+        "You classify a source document's learning intent, then generate spaced-repetition drafts.
 
 SOURCE TITLE: {title}
 SOURCE TEXT:
 {body}
 
-{principles}Generate up to {max_drafts} quiz drafts testing the most valuable facts in the source.
+{principles}First classify the source as exactly one learning_intent:
+- verbatim_memorization: poems, quotes, speeches, prayers, scripts, or lists the learner likely wants to reproduce exactly.
+- concept_understanding: mechanisms, explanations, causes, theories, or ideas the learner should understand and apply.
+- fact_recall: discrete facts, names, dates, definitions, or mappings.
+- procedure_process: ordered steps, workflows, recipes, commands, or conditional processes.
+
+Then generate up to {max_drafts} drafts that match the intent:
+- verbatim_memorization: emit recitation-ladder exercise drafts only; do not ask multiple-choice trivia about the text.
+- concept_understanding: emit explanation/application prompts with activity_stage free-recall.
+- fact_recall: emit recognition or short-answer quiz prompts.
+- procedure_process: emit ordered-step prompts with activity_stage procedure-composition.
+
 Each draft has:
 - concept: short title naming the tested atom
 - question: a standalone question answerable from the source alone
 - answer: the correct answer
 - evidence_quote: a quote copied verbatim from the source text that proves the answer
 - distractors: 2-3 plausible wrong answers, or [] for a short-answer draft
+- activity_kind: quiz or exercise
+- activity_stage: recognition, cued-recall, free-recall, or procedure-composition
+- worked_solution: required for exercises, otherwise \"\"
 
 Return JSON only.",
         title = source.title,
@@ -296,6 +317,11 @@ fn drafts_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
+            "learning_intent": {
+                "type": "string",
+                "enum": ["verbatim_memorization", "concept_understanding", "fact_recall", "procedure_process"],
+                "description": "The classified learning goal for this source."
+            },
             "drafts": {
                 "type": "array",
                 "items": {
@@ -309,14 +335,27 @@ fn drafts_schema() -> serde_json::Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "2-3 semantically adjacent wrong answers, or empty for short-answer drafts."
+                        },
+                        "activity_kind": {
+                            "type": "string",
+                            "enum": ["quiz", "exercise"],
+                            "description": "quiz for recognition/recall checks; exercise for recitation-ladder items."
+                        },
+                        "activity_stage": {
+                            "type": "string",
+                            "description": "recognition, cued-recall, free-recall, or procedure-composition."
+                        },
+                        "worked_solution": {
+                            "type": "string",
+                            "description": "Required human-readable solution for exercises; empty string for quizzes."
                         }
                     },
-                    "required": ["concept", "question", "answer", "evidence_quote", "distractors"],
+                    "required": ["concept", "question", "answer", "evidence_quote", "distractors", "activity_kind", "activity_stage", "worked_solution"],
                     "additionalProperties": false
                 }
             }
         },
-        "required": ["drafts"],
+        "required": ["learning_intent", "drafts"],
         "additionalProperties": false
     })
 }
@@ -351,6 +390,8 @@ struct Usage {
 #[derive(Deserialize)]
 struct DraftsPayload {
     #[serde(default)]
+    learning_intent: String,
+    #[serde(default)]
     drafts: Vec<ModelDraft>,
 }
 
@@ -366,6 +407,12 @@ struct ModelDraft {
     evidence_quote: String,
     #[serde(default)]
     distractors: Vec<String>,
+    #[serde(default)]
+    activity_kind: String,
+    #[serde(default)]
+    activity_stage: String,
+    #[serde(default)]
+    worked_solution: String,
 }
 
 impl ModelDraft {
@@ -375,11 +422,14 @@ impl ModelDraft {
             ("question", &self.question),
             ("answer", &self.answer),
             ("evidence_quote", &self.evidence_quote),
+            ("activity_kind", &self.activity_kind),
+            ("activity_stage", &self.activity_stage),
         ] {
             if value.trim().is_empty() {
                 return Err(format!("the model omitted the {field}"));
             }
         }
+        let activity_kind = parse_activity_kind(&self.activity_kind)?;
 
         Ok(DraftCandidate {
             index,
@@ -392,11 +442,28 @@ impl ModelDraft {
                 .into_iter()
                 .filter(|distractor| !distractor.trim().is_empty())
                 .collect(),
-            worked_solution: None,
-            activity_kind: GeneratedLearningActivityKind::Quiz,
-            activity_stage: "recognition".to_owned(),
+            worked_solution: non_empty(&self.worked_solution),
+            activity_kind,
+            activity_stage: self.activity_stage,
             unsupported: false,
         })
+    }
+}
+
+fn parse_activity_kind(value: &str) -> Result<GeneratedLearningActivityKind, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "quiz" => Ok(GeneratedLearningActivityKind::Quiz),
+        "exercise" => Ok(GeneratedLearningActivityKind::Exercise),
+        other => Err(format!("unknown activity_kind {other}")),
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 

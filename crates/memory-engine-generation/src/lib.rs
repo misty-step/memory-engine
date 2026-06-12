@@ -16,8 +16,9 @@ mod provider;
 use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
-    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, ProviderDrafts,
-    ProviderFailure, ProviderUsage, StructuredBlockProvider,
+    classify_learning_intent, DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider,
+    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
+    StructuredBlockProvider,
 };
 
 use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
@@ -425,8 +426,8 @@ fn source_contains_quote(source: &SourceDocument, quote: &str) -> bool {
 ///
 /// A single-word quote like "the" substring-matches almost any prose, so it
 /// proves nothing about a fabricated answer; requiring a short phrase closes
-/// that hole without rejecting legitimately terse citations such as
-/// "100 degrees Celsius".
+/// that hole. Terse captures are the exception: when the entire source is one
+/// or two words, the source can support itself exactly.
 const MIN_EVIDENCE_WORDS: usize = 3;
 
 /// Whether an evidence quote is substantive and appears in the source text
@@ -434,18 +435,24 @@ const MIN_EVIDENCE_WORDS: usize = 3;
 ///
 /// Cheap models paraphrase formatting even when quoting faithfully, so exact
 /// matching would reject grounded drafts — hence the normalization. A quote
-/// shorter than the minimum evidence-word threshold is rejected outright: it would
-/// substring-match trivially and cannot support an answer. This is the same
-/// predicate the generation trust gate applies, exported so eval judges score
-/// exactly what production enforces.
+/// shorter than the minimum evidence-word threshold is accepted only when it
+/// equals the complete normalized source text, which lets a one-word capture be
+/// studied without treating tiny substrings as proof. This is the same predicate
+/// the generation trust gate applies, exported so eval judges score exactly what
+/// production enforces.
 #[must_use]
 pub fn evidence_quote_matches(source_text: &str, quote: &str) -> bool {
     let quote = normalize_for_match(quote);
-    if quote.split(' ').filter(|word| !word.is_empty()).count() < MIN_EVIDENCE_WORDS {
+    if quote.is_empty() {
         return false;
     }
 
-    normalize_for_match(source_text).contains(&quote)
+    let source = normalize_for_match(source_text);
+    if quote.split(' ').filter(|word| !word.is_empty()).count() < MIN_EVIDENCE_WORDS {
+        return quote == source;
+    }
+
+    source.contains(&quote)
 }
 
 fn normalize_for_match(text: &str) -> String {
@@ -751,6 +758,16 @@ mod tests {
         // The fabrication B1 closes: a real source word that proves nothing.
         assert!(!evidence_quote_matches(SOURCE, "the"));
         assert!(!evidence_quote_matches(SOURCE, "in the"));
+    }
+
+    #[test]
+    fn terse_quote_matches_only_when_it_is_the_complete_source() {
+        assert!(evidence_quote_matches("Mitochondria", "mitochondria"));
+        assert!(evidence_quote_matches("NATO alphabet", "NATO alphabet"));
+        assert!(!evidence_quote_matches(
+            "Mitochondria generate ATP.",
+            "mitochondria"
+        ));
     }
 
     #[test]

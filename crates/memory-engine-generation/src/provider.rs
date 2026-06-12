@@ -49,6 +49,7 @@ pub struct ProviderUsage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderDrafts {
     pub model: GeneratedPromptModel,
+    pub learning_intent: Option<LearningIntent>,
     pub candidates: Vec<DraftCandidate>,
     /// Human-readable, per-candidate problems the provider already detected
     /// (for example malformed blocks). Surfaced to the learner alongside
@@ -99,6 +100,86 @@ pub trait DraftProvider {
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LearningIntent {
+    VerbatimMemorization,
+    ConceptUnderstanding,
+    FactRecall,
+    ProcedureProcess,
+}
+
+impl LearningIntent {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VerbatimMemorization => "verbatim_memorization",
+            Self::ConceptUnderstanding => "concept_understanding",
+            Self::FactRecall => "fact_recall",
+            Self::ProcedureProcess => "procedure_process",
+        }
+    }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "verbatim_memorization" => Some(Self::VerbatimMemorization),
+            "concept_understanding" => Some(Self::ConceptUnderstanding),
+            "fact_recall" => Some(Self::FactRecall),
+            "procedure_process" => Some(Self::ProcedureProcess),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for LearningIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearningIntentClassification {
+    pub intent: LearningIntent,
+    pub rationale: String,
+}
+
+#[must_use]
+pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassification {
+    let body = source.body.as_deref().unwrap_or_default();
+    let normalized = body.to_lowercase();
+    let lines = non_empty_lines(body);
+    let list_facts = count_fact_sentences(body);
+    if looks_verbatim(&normalized, &lines) {
+        return LearningIntentClassification {
+            intent: LearningIntent::VerbatimMemorization,
+            rationale: "source reads like a quoted passage or line-broken text".to_owned(),
+        };
+    }
+    if looks_process(&normalized) {
+        return LearningIntentClassification {
+            intent: LearningIntent::ProcedureProcess,
+            rationale: "source describes ordered actions or conditional steps".to_owned(),
+        };
+    }
+    if looks_concept(&normalized) {
+        return LearningIntentClassification {
+            intent: LearningIntent::ConceptUnderstanding,
+            rationale: "source emphasizes causes, mechanisms, or explanatory ideas".to_owned(),
+        };
+    }
+    if list_facts >= 2 || looks_like_tiny_fact(&normalized) {
+        return LearningIntentClassification {
+            intent: LearningIntent::FactRecall,
+            rationale: "source is dominated by discrete facts".to_owned(),
+        };
+    }
+
+    LearningIntentClassification {
+        intent: LearningIntent::ConceptUnderstanding,
+        rationale: "source asks for explanation or conceptual retention".to_owned(),
+    }
+}
+
 /// Deterministic provider that parses `Concept:/Question:/Answer:` blocks.
 ///
 /// This is the original beta generation behavior, now one provider among
@@ -121,6 +202,7 @@ impl DraftProvider for StructuredBlockProvider {
 
         Ok(ProviderDrafts {
             model: self.model(),
+            learning_intent: Some(classify_learning_intent(source).intent),
             candidates,
             failures,
             usage: None,
@@ -183,40 +265,297 @@ impl DraftProvider for FakeModelProvider {
 
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
         let body = source.body.clone().unwrap_or_default();
-        let candidates = body
-            .split('.')
-            .map(str::trim)
-            .filter(|sentence| sentence.split_whitespace().count() >= 4)
-            .take(3)
-            .enumerate()
-            .map(|(position, sentence)| {
-                let lead = sentence
-                    .split_whitespace()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                DraftCandidate {
-                    index: position + 1,
-                    concept: format!("{} {}", source.title, position + 1),
-                    question: format!("According to \"{}\", complete: {lead} …", source.title),
-                    answer: sentence.to_owned(),
-                    evidence: Some(sentence.to_owned()),
-                    distractors: Vec::new(),
-                    worked_solution: None,
-                    activity_kind: GeneratedLearningActivityKind::Quiz,
-                    activity_stage: "recognition".to_owned(),
-                    unsupported: false,
-                }
-            })
-            .collect();
+        let classification = classify_learning_intent(source);
+        let candidates = match classification.intent {
+            LearningIntent::VerbatimMemorization => verbatim_candidates(source, &body),
+            LearningIntent::ConceptUnderstanding => concept_candidates(source, &body),
+            LearningIntent::FactRecall => fact_candidates(source, &body),
+            LearningIntent::ProcedureProcess => procedure_candidates(source, &body),
+        };
 
         Ok(ProviderDrafts {
             model: self.model(),
+            learning_intent: Some(classification.intent),
             candidates,
             failures: Vec::new(),
             usage: None,
         })
     }
+}
+
+fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
+    normalized.contains("recite")
+        || normalized.contains("memorize")
+        || normalized.contains("verbatim")
+        || normalized.contains("poem")
+        || (lines.len() >= 3
+            && lines
+                .iter()
+                .filter(|line| line.chars().count() <= 96)
+                .count()
+                >= 3)
+}
+
+fn looks_process(normalized: &str) -> bool {
+    [
+        "to maintain",
+        "first",
+        "then",
+        "finally",
+        "step",
+        "process",
+        "procedure",
+        "always ",
+        " once every ",
+        "if it ",
+        "before ",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn looks_concept(normalized: &str) -> bool {
+    [
+        " because ",
+        " theory",
+        " effect",
+        " why ",
+        "mechanism",
+        "regulate",
+        "descend",
+        "principle",
+        "algorithm",
+        "system design",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn looks_like_tiny_fact(normalized: &str) -> bool {
+    normalized.split_whitespace().count() <= 28
+        || normalized.contains(" is ")
+        || normalized.contains(" are ")
+        || normalized.contains(" means ")
+}
+
+fn count_fact_sentences(body: &str) -> usize {
+    split_sentences(body)
+        .iter()
+        .filter(|sentence| {
+            let normalized = sentence.to_lowercase();
+            normalized.contains(" is ")
+                || normalized.contains(" are ")
+                || normalized.contains(" means ")
+                || normalized.contains(" assigns ")
+        })
+        .count()
+}
+
+fn verbatim_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let lines = non_empty_lines(body);
+    if lines.len() >= 2 {
+        let cued_answer = lines[1].clone();
+        let cued_evidence = lines.iter().take(2).cloned().collect::<Vec<_>>().join("\n");
+        let free_answer = lines.iter().take(4).cloned().collect::<Vec<_>>().join("\n");
+        return vec![
+            DraftCandidate {
+                index: 1,
+                concept: format!("{} cued recitation", source.title),
+                question: format!("Recite the next line after: {}", lines[0]),
+                answer: cued_answer.clone(),
+                evidence: Some(cued_evidence),
+                distractors: Vec::new(),
+                worked_solution: Some(format!("The source line is: {cued_answer}")),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "cued-recall".to_owned(),
+                unsupported: false,
+            },
+            DraftCandidate {
+                index: 2,
+                concept: format!("{} free recitation", source.title),
+                question: format!("Recite the opening passage of {}.", source.title),
+                answer: free_answer.clone(),
+                evidence: Some(free_answer.clone()),
+                distractors: Vec::new(),
+                worked_solution: Some(format!("Compare your recitation against:\n{free_answer}")),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "free-recall".to_owned(),
+                unsupported: false,
+            },
+        ];
+    }
+
+    let sentence = split_sentences(body).into_iter().next().unwrap_or_default();
+    vec![DraftCandidate {
+        index: 1,
+        concept: format!("{} recitation", source.title),
+        question: format!("Recite {} exactly.", source.title),
+        answer: sentence.clone(),
+        evidence: Some(sentence.clone()),
+        distractors: Vec::new(),
+        worked_solution: Some(format!("Compare your answer against: {sentence}")),
+        activity_kind: GeneratedLearningActivityKind::Exercise,
+        activity_stage: "free-recall".to_owned(),
+        unsupported: false,
+    }]
+}
+
+fn concept_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    split_sentences(body)
+        .into_iter()
+        .filter(|sentence| sentence.split_whitespace().count() >= 6)
+        .take(3)
+        .enumerate()
+        .map(|(position, sentence)| DraftCandidate {
+            index: position + 1,
+            concept: format!("{} concept {}", source.title, position + 1),
+            question: format!(
+                "Explain the idea from \"{}\" in your own words: {}",
+                source.title,
+                lead_words(&sentence, 8)
+            ),
+            answer: sentence.clone(),
+            evidence: Some(sentence),
+            distractors: Vec::new(),
+            worked_solution: None,
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "free-recall".to_owned(),
+            unsupported: false,
+        })
+        .collect()
+}
+
+fn fact_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let facts = split_sentences(body)
+        .into_iter()
+        .filter(|sentence| {
+            let normalized = sentence.to_lowercase();
+            normalized.contains(" is ")
+                || normalized.contains(" are ")
+                || normalized.contains(" means ")
+                || normalized.contains(" assigns ")
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+    let facts = if facts.is_empty() {
+        let sentences = split_sentences(body)
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+        if sentences.is_empty() && !body.trim().is_empty() {
+            vec![body.trim().to_owned()]
+        } else {
+            sentences
+        }
+    } else {
+        facts
+    };
+
+    facts
+        .into_iter()
+        .enumerate()
+        .map(|(position, sentence)| {
+            let (question, answer) = fact_question_answer(source, &sentence);
+            DraftCandidate {
+                index: position + 1,
+                concept: format!("{} fact {}", source.title, position + 1),
+                question,
+                answer,
+                evidence: Some(sentence),
+                distractors: vec![
+                    "A nearby but different source detail".to_owned(),
+                    "A plausible unrelated detail".to_owned(),
+                ],
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "recognition".to_owned(),
+                unsupported: false,
+            }
+        })
+        .collect()
+}
+
+fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let sentences = split_sentences(body);
+    let evidence = sentences
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(". ");
+    let evidence = if evidence.is_empty() {
+        body.trim().to_owned()
+    } else {
+        evidence
+    };
+    let mut candidates = vec![DraftCandidate {
+        index: 1,
+        concept: format!("{} procedure", source.title),
+        question: format!("Describe the process in \"{}\" in order.", source.title),
+        answer: evidence.clone(),
+        evidence: Some(evidence),
+        distractors: Vec::new(),
+        worked_solution: None,
+        activity_kind: GeneratedLearningActivityKind::Quiz,
+        activity_stage: "procedure-composition".to_owned(),
+        unsupported: false,
+    }];
+    if let Some(check_sentence) = sentences.get(2).or_else(|| sentences.get(1)) {
+        candidates.push(DraftCandidate {
+            index: 2,
+            concept: format!("{} procedure check", source.title),
+            question: format!("What condition or check matters in \"{}\"?", source.title),
+            answer: check_sentence.clone(),
+            evidence: Some(check_sentence.clone()),
+            distractors: Vec::new(),
+            worked_solution: None,
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "procedure-check".to_owned(),
+            unsupported: false,
+        });
+    }
+    candidates
+}
+
+fn fact_question_answer(source: &SourceDocument, sentence: &str) -> (String, String) {
+    for separator in [" is ", " are ", " means "] {
+        if let Some((left, right)) = sentence.split_once(separator) {
+            let subject = left.trim();
+            let answer = right.trim().to_owned();
+            return (
+                format!("According to \"{}\", what is {subject}?", source.title),
+                answer,
+            );
+        }
+    }
+    (
+        format!("What fact should you recall from \"{}\"?", source.title),
+        sentence.to_owned(),
+    )
+}
+
+fn split_sentences(body: &str) -> Vec<String> {
+    body.split(['.', '?', '!'])
+        .map(str::trim)
+        .filter(|sentence| sentence.split_whitespace().count() >= 3)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn non_empty_lines(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn lead_words(sentence: &str, count: usize) -> String {
+    sentence
+        .split_whitespace()
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_source_document(

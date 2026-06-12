@@ -6,6 +6,9 @@
   "expect": {
     "min_drafts": 2,
     "max_drafts": 8,
-    "key_terms": ["adenosine triphosphate", "endosymbiotic", "apoptosis"]
+    "key_terms": ["adenosine triphosphate", "endosymbiotic", "apoptosis"],
+    "intent": "concept_understanding",
+    "required_activity_kinds": ["quiz"],
+    "required_activity_stage_terms": ["free"]
   }
 }

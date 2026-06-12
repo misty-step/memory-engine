@@ -1,9 +1,10 @@
 use std::{fs, path::PathBuf};
 
+use memory_engine_core::{ExactPromptKind, Prompt};
 use memory_engine_generation::{
-    run_beta_generation_with_provider, BetaGenerationRequest, DraftCandidate, DraftProvider,
-    FakeModelProvider, FallbackProvider, ProviderDrafts, ProviderFailure, ProviderUsage,
-    StructuredBlockProvider,
+    classify_learning_intent, run_beta_generation_with_provider, BetaGenerationRequest,
+    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, LearningIntent,
+    ProviderDrafts, ProviderFailure, ProviderUsage, StructuredBlockProvider,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, GeneratedLearningActivityKind, GeneratedPromptModel,
@@ -43,6 +44,178 @@ fn fake_model_provider_generates_grounded_drafts_from_arbitrary_prose() {
         reference.text
     );
     assert_eq!(snapshot.generation_runs[0].model, "fake-model");
+}
+
+#[test]
+fn one_word_capture_generates_an_accepted_grounded_draft() {
+    let directory = TempDirectory::new("one-word-capture");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(source_document("src-term", "Mitochondria", "Mitochondria"))
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        request("run-term", "src-term"),
+    )
+    .expect("generation");
+
+    assert!(
+        !result.accepted_draft_ids.is_empty(),
+        "one-word captures should not be rejected as under-evidenced: {:?}",
+        result.validation_failures
+    );
+    assert!(result.rejected_draft_ids.is_empty());
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.reference_spans[0].text, "Mitochondria");
+    assert_eq!(
+        snapshot.generated_prompt_drafts[0].validation.status,
+        GeneratedPromptValidationStatus::Accepted
+    );
+}
+
+#[test]
+fn fake_model_provider_branches_draft_shapes_by_learning_intent() {
+    let model = FakeModelProvider;
+    let verbatim = source_document(
+        "src-poem",
+        "Hope is the thing with feathers",
+        "\"Hope\" is the thing with feathers -\nThat perches in the soul -\nAnd sings the tune without the words -\nAnd never stops - at all -",
+    );
+    let concept = source_document(
+        "src-concept",
+        "Mitochondria",
+        "Mitochondria are organelles that generate most of the cell's supply of adenosine triphosphate because cells use ATP as chemical energy.",
+    );
+    let fact = source_document(
+        "src-fact",
+        "NATO letters",
+        "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+    );
+    let process = source_document(
+        "src-process",
+        "Sourdough starter",
+        "To maintain a sourdough starter, discard all but 50 grams and feed the remainder with equal weights of flour and water. Always let it double before baking.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&verbatim).intent,
+        LearningIntent::VerbatimMemorization
+    );
+    assert_eq!(
+        classify_learning_intent(&concept).intent,
+        LearningIntent::ConceptUnderstanding
+    );
+    assert_eq!(
+        classify_learning_intent(&fact).intent,
+        LearningIntent::FactRecall
+    );
+    assert_eq!(
+        classify_learning_intent(&process).intent,
+        LearningIntent::ProcedureProcess
+    );
+
+    let verbatim_drafts = model.generate_drafts(&verbatim).expect("verbatim");
+    assert_eq!(
+        verbatim_drafts.learning_intent,
+        Some(LearningIntent::VerbatimMemorization)
+    );
+    assert!(
+        verbatim_drafts
+            .candidates
+            .iter()
+            .all(|candidate| candidate.activity_kind == GeneratedLearningActivityKind::Exercise),
+        "verbatim captures should produce recitation exercises, not quizzes: {:?}",
+        verbatim_drafts.candidates
+    );
+    assert!(verbatim_drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage.contains("cued")));
+    assert!(verbatim_drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage.contains("free")));
+
+    let concept_drafts = model.generate_drafts(&concept).expect("concept");
+    assert_eq!(
+        concept_drafts.learning_intent,
+        Some(LearningIntent::ConceptUnderstanding)
+    );
+    assert!(concept_drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage.contains("free")));
+
+    let fact_drafts = model.generate_drafts(&fact).expect("fact");
+    assert_eq!(
+        fact_drafts.learning_intent,
+        Some(LearningIntent::FactRecall)
+    );
+    assert!(fact_drafts
+        .candidates
+        .iter()
+        .any(|candidate| !candidate.distractors.is_empty()));
+
+    let process_drafts = model.generate_drafts(&process).expect("process");
+    assert_eq!(
+        process_drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(process_drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage.contains("composition")));
+}
+
+#[test]
+fn verbatim_intent_persists_recitation_prompt_ladder() {
+    let directory = TempDirectory::new("verbatim-recitation");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(source_document(
+            "src-poem",
+            "Hope is the thing with feathers",
+            "\"Hope\" is the thing with feathers -\nThat perches in the soul -\nAnd sings the tune without the words -\nAnd never stops - at all -",
+        ))
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        request("run-poem", "src-poem"),
+    )
+    .expect("generation");
+
+    assert_eq!(result.rejected_draft_ids, Vec::<String>::new());
+    let snapshot = store.snapshot();
+    let stages = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .map(|draft| draft.activity_stage.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        stages.contains("cued-recall"),
+        "missing cued stage: {stages:?}"
+    );
+    assert!(
+        stages.contains("free-recall"),
+        "missing free stage: {stages:?}"
+    );
+    assert!(
+        snapshot.generated_prompt_drafts.iter().all(|draft| {
+            draft.activity_kind == GeneratedLearningActivityKind::Exercise
+                && matches!(
+                    &draft.prompt,
+                    Prompt::Exact(exact) if exact.kind == ExactPromptKind::Recitation
+                )
+        }),
+        "verbatim sources must not become MC trivia: {:?}",
+        snapshot.generated_prompt_drafts
+    );
 }
 
 #[test]
@@ -100,6 +273,7 @@ fn evidence_quote_not_found_in_source_is_rejected() {
         ) -> Result<ProviderDrafts, ProviderFailure> {
             Ok(ProviderDrafts {
                 model: self.model(),
+                learning_intent: Some(LearningIntent::FactRecall),
                 candidates: vec![DraftCandidate {
                     index: 1,
                     concept: "Mitochondrial DNA".to_owned(),
@@ -158,6 +332,7 @@ fn provider_usage_is_aggregated_onto_the_generation_run() {
             let sentence = body.split('.').next().unwrap_or_default().trim().to_owned();
             Ok(ProviderDrafts {
                 model: self.model(),
+                learning_intent: Some(LearningIntent::FactRecall),
                 candidates: vec![DraftCandidate {
                     index: 1,
                     concept: "Mitochondria energy".to_owned(),
@@ -301,6 +476,20 @@ fn open_store_with_prose(directory: &TempDirectory) -> BetaPersistenceStore {
         .expect("source");
 
     store
+}
+
+fn source_document(id: &str, title: &str, body: &str) -> SourceDocument {
+    SourceDocument {
+        id: id.to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: title.to_owned(),
+        body: Some(body.to_owned()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        created_at: NOW,
+        archived_at: None,
+    }
 }
 
 struct TempDirectory {

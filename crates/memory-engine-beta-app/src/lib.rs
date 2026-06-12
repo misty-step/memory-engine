@@ -11,19 +11,12 @@ use std::{
     net::{TcpListener, TcpStream},
 };
 
+use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
 use memory_engine_study::{
-    BetaStudyCurrent, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyView,
+    infer_capture_title, BetaStudyCurrent, BetaStudyOptions, BetaStudySession,
+    BetaStudySourceInput, BetaStudyView,
 };
 use serde::{Deserialize, Serialize};
-
-const DEFAULT_SOURCE_BODY: &str = "\
-Concept: NATO letter A
-Activity: quiz
-Stage: recognition-3
-Question: What is the NATO phonetic alphabet word for A?
-Answer: ALFA
-Distractors: BRAVO, CHARLIE
-Reference: The NATO phonetic alphabet word for A is ALFA.";
 
 #[derive(Clone, Debug)]
 pub struct BetaAppConfig {
@@ -105,7 +98,7 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
             Ok(source) => response_for(request, session.add_source(source)),
             Err(error) => HttpResponse::bad_request(&error),
         },
-        ("POST", "/generate") => response_for(request, session.generate(None)),
+        ("POST", "/generate") => response_for(request, generate_all_sources(session)),
         ("POST", "/approve") => match read_required_string(&request.body, "draftId") {
             Ok(draft_id) => response_for(request, session.approve_draft(&draft_id)),
             Err(error) => HttpResponse::bad_request(&error),
@@ -136,6 +129,15 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
         ("POST", "/next") => response_for(request, session.advance()),
         _ => HttpResponse::plain(404, "Not found"),
     }
+}
+
+fn generate_all_sources(
+    session: &mut BetaStudySession,
+) -> Result<BetaStudyView, memory_engine_study::BetaStudyError> {
+    let structured = StructuredBlockProvider;
+    let model = FakeModelProvider;
+    let provider = FallbackProvider::new(&structured, &model);
+    session.generate_with_provider(None, &provider)
 }
 
 fn response_for(
@@ -313,9 +315,10 @@ impl HttpResponse {
 
 #[derive(Deserialize)]
 struct SourcePayload {
-    id: String,
-    title: String,
-    body: String,
+    id: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    capture: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -333,29 +336,39 @@ struct RevisionPayload {
 fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
     if !looks_like_json(body) {
         let fields = parse_form(body)?;
-        let title = form_required(&fields, "title")?;
-        let body = form_required(&fields, "body")?;
+        let body = form_optional(&fields, "capture")
+            .or_else(|| form_optional(&fields, "body"))
+            .ok_or_else(|| "capture must be a non-empty string".to_owned())?;
+        let title = form_optional(&fields, "title").unwrap_or_default();
         let id = fields
             .iter()
             .find_map(|(key, value)| {
                 (key == "id" && !value.trim().is_empty()).then(|| value.clone())
             })
-            .unwrap_or_else(|| format!("source-{}", slug_fragment(&title)));
+            .unwrap_or_else(|| {
+                format!("source-{}", slug_fragment(&source_slug_text(&title, &body)))
+            });
 
         return Ok(BetaStudySourceInput { id, title, body });
     }
 
     let payload: SourcePayload = serde_json::from_slice(body)
         .map_err(|error| format!("Request body must be a source object: {error}"))?;
-    require_non_blank(&payload.id, "id")?;
-    require_non_blank(&payload.title, "title")?;
-    require_non_blank(&payload.body, "body")?;
+    let body = payload
+        .capture
+        .or(payload.body)
+        .ok_or_else(|| "capture must be a non-empty string".to_owned())?;
+    require_non_blank(&body, "capture")?;
+    let title = payload.title.unwrap_or_default();
+    let id = match payload.id {
+        Some(id) => {
+            require_non_blank(&id, "id")?;
+            id
+        }
+        None => format!("source-{}", slug_fragment(&source_slug_text(&title, &body))),
+    };
 
-    Ok(BetaStudySourceInput {
-        id: payload.id,
-        title: payload.title,
-        body: payload.body,
-    })
+    Ok(BetaStudySourceInput { id, title, body })
 }
 
 fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
@@ -447,12 +460,24 @@ fn parse_form(body: &[u8]) -> Result<Vec<(String, String)>, String> {
 }
 
 fn form_required(fields: &[(String, String)], key: &str) -> Result<String, String> {
-    let value = fields
+    let value =
+        form_optional(fields, key).ok_or_else(|| format!("{key} must be a non-empty string"))?;
+    Ok(value)
+}
+
+fn form_optional(fields: &[(String, String)], key: &str) -> Option<String> {
+    fields
         .iter()
         .find_map(|(field_key, value)| (field_key == key).then(|| value.clone()))
-        .ok_or_else(|| format!("{key} must be a non-empty string"))?;
-    require_non_blank(&value, key)?;
-    Ok(value)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn source_slug_text(title: &str, body: &str) -> String {
+    if title.trim().is_empty() {
+        infer_capture_title(body)
+    } else {
+        title.to_owned()
+    }
 }
 
 fn percent_decode(value: &str) -> Result<String, String> {
@@ -519,6 +544,7 @@ fn render_page(view: &BetaStudyView, error: Option<&str>) -> String {
     render_current(&mut html, view.current.as_ref(), error);
     html.push_str("</section><aside>");
     render_summary(&mut html, view);
+    render_generation_notices(&mut html, view);
     render_source_form(&mut html);
     render_drafts(&mut html, view);
     render_queue(&mut html, view);
@@ -603,9 +629,20 @@ fn render_summary(html: &mut String, view: &BetaStudyView) {
 }
 
 fn render_source_form(html: &mut String) {
-    html.push_str("<section class=\"panel\"><h2>Source</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-title\">Source title</label><input id=\"source-title\" name=\"title\" value=\"NATO practice notes\"><label for=\"source-body\">Source blocks</label><textarea id=\"source-body\" name=\"body\">");
-    html.push_str(&escape_html(DEFAULT_SOURCE_BODY));
-    html.push_str("</textarea><button type=\"submit\">Save source</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate</button></form></section>");
+    html.push_str("<section class=\"panel\"><h2>Add</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-capture\">Paste anything</label><textarea id=\"source-capture\" name=\"capture\" placeholder=\"Word, phrase, notes, or article\"></textarea><button type=\"submit\">Save capture</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate review items</button></form></section>");
+}
+
+fn render_generation_notices(html: &mut String, view: &BetaStudyView) {
+    if view.generation_notices.is_empty() {
+        return;
+    }
+    html.push_str("<section class=\"panel\"><h2>Generation notes</h2><ul>");
+    for notice in &view.generation_notices {
+        html.push_str("<li>");
+        html.push_str(&escape_html(notice));
+        html.push_str("</li>");
+    }
+    html.push_str("</ul></section>");
 }
 
 fn snooze_until() -> i64 {
@@ -708,7 +745,9 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use super::{looks_like_json, route, BetaStudyOptions, BetaStudySession, HttpRequest};
+    use super::{
+        looks_like_json, render_page, route, BetaStudyOptions, BetaStudySession, HttpRequest,
+    };
 
     const NOW: i64 = 1_779_984_000_000;
 
@@ -869,22 +908,113 @@ mod tests {
             &mut session,
             &form_request(
                 "/source",
-                &format!(
-                    "title=NATO+practice+notes&body={}",
-                    url_escape(&source_body())
-                ),
+                &format!("capture={}", url_escape(&source_body())),
             ),
         );
         assert_eq!(saved.status, 200);
         assert_eq!(saved.content_type, "text/html; charset=utf-8");
         let saved_html = String::from_utf8(saved.body).expect("saved html");
         assert!(saved_html.contains("Beta Study"));
+        assert!(saved_html.contains(r#"name="capture""#));
+        assert!(!saved_html.contains(r#"name="title""#));
+        assert!(!saved_html.contains(r#"name="body""#));
+        assert!(!saved_html.contains("Source title"));
+        assert!(!saved_html.contains("Source blocks"));
         assert!(!saved_html.contains("<script"));
 
         let generated = route(&mut session, &form_request("/generate", ""));
         let generated_html = String::from_utf8(generated.body).expect("generated html");
         assert!(generated_html.contains("What is the NATO phonetic alphabet word for A?"));
         assert!(!generated_html.contains("<script"));
+    }
+
+    #[test]
+    fn renders_generation_notices_as_human_sentences() {
+        let directory = TempDirectory::new("notice-flow");
+        let session = session(directory.path().join("study.json"));
+        let mut view = session.view().expect("view");
+        view.generation_notices = vec!["No review items could be generated.".to_owned()];
+
+        let generated_html = render_page(&view, None);
+
+        assert!(generated_html.contains("Generation notes"));
+        assert!(generated_html.contains("No review items could be generated"));
+    }
+
+    #[test]
+    fn generates_review_items_for_arbitrary_capture_text() {
+        let directory = TempDirectory::new("arbitrary-capture");
+        let mut session = session(directory.path().join("study.json"));
+
+        let saved = route(
+            &mut session,
+            &form_request(
+                "/source",
+                "capture=Mitochondria+are+organelles+because+cells+use+ATP+as+chemical+energy.",
+            ),
+        );
+        assert_eq!(saved.status, 200);
+
+        let generated = route(&mut session, &form_request("/generate", ""));
+        let generated_html = String::from_utf8(generated.body).expect("generated html");
+
+        assert!(generated_html.contains("Drafts"));
+        assert!(generated_html.contains("Explain the idea"));
+        assert!(!generated_html.contains("No review items could be generated"));
+    }
+
+    #[test]
+    fn renders_provider_failures_as_generation_notices() {
+        let directory = TempDirectory::new("provider-failure-notice");
+        let session = session(directory.path().join("study.json"));
+        let mut view = session.view().expect("view");
+        view.generation_notices =
+            vec!["src-prose: The model provider could not be reached.".to_owned()];
+
+        let html = render_page(&view, None);
+
+        assert!(html.contains("Generation notes"));
+        assert!(html.contains("src-prose: The model provider could not be reached."));
+        assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn accepts_legacy_and_json_capture_payload_shapes() {
+        let directory = TempDirectory::new("source-payload-shapes");
+        let mut legacy_session = session(directory.path().join("legacy-study.json"));
+
+        let legacy = route(
+            &mut legacy_session,
+            &form_request(
+                "/source",
+                &format!(
+                    "title=NATO+practice+notes&body={}",
+                    url_escape(&source_body())
+                ),
+            ),
+        );
+
+        assert_eq!(legacy.status, 200);
+        assert_eq!(
+            legacy_session.view().expect("view").sources[0].title,
+            "NATO practice notes"
+        );
+
+        let mut capture_session = session(directory.path().join("capture-study.json"));
+        let capture = route(
+            &mut capture_session,
+            &request(
+                "POST",
+                "/source",
+                &json!({ "capture": source_body() }).to_string(),
+            ),
+        );
+
+        assert_eq!(capture.status, 200);
+        assert_eq!(
+            capture_session.view().expect("view").sources[0].title,
+            "Concept: NATO letter A"
+        );
     }
 
     #[test]

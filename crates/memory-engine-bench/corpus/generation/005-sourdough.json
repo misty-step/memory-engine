@@ -6,6 +6,9 @@
   "expect": {
     "min_drafts": 2,
     "max_drafts": 8,
-    "key_terms": ["50 grams", "doubles", "acetone"]
+    "key_terms": ["50 grams", "doubles", "acetone"],
+    "intent": "procedure_process",
+    "required_activity_kinds": ["quiz"],
+    "required_activity_stage_terms": ["composition"]
   }
 }

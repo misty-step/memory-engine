@@ -2,6 +2,7 @@
 
 Refs-backlog: 20
 Refs-backlog: 050
+Refs-backlog: 051
 
 `memory-engine` uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI
@@ -81,8 +82,14 @@ cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
 
 Judges score schema validity, provenance (evidence quote actually in source —
 the same predicate the production trust gate enforces), answerability,
-duplicate rate, count-in-range, and key-term coverage, alongside tokens,
-dollars, and latency p50/p95. CI never calls live models; field runs are
-explicit and local, and their dated receipts live in `docs/evals/`. The
-2026-06-11 field run that picked the default model is
-`docs/evals/generation-field-2026-06-11.md`.
+duplicate rate, count-in-range, key-term coverage, and intent shape match.
+Intent shape match is the 051 capture-anything oracle: fixtures annotate
+verbatim memorization, concept understanding, fact recall, and
+procedure/process sources, and the provider must emit different activity
+kinds, stages, and distractor shapes rather than collapsing them into generic
+recognition quizzes. The receipt also reports tokens, dollars, and latency
+p50/p95.
+
+CI never calls live models; field runs are explicit and local, and their dated
+receipts live in `docs/evals/`. The 2026-06-11 field run that picked the
+default model is `docs/evals/generation-field-2026-06-11.md`.

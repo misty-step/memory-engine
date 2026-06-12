@@ -1,6 +1,7 @@
 # Memory Engine QA System
 
 Refs-backlog: 25
+Refs-backlog: 051
 
 ## Purpose
 
@@ -66,6 +67,17 @@ receipt after each lane:
 
 All lanes are gating except `performance.benchmarks`, which is receipt-only
 until the project has enough historical data to define stable budgets.
+
+The capture-anything path adds a focused generation receipt:
+
+```sh
+cargo run -p memory-engine-bench -- generation
+```
+
+That receipt is still local and deterministic, but it is not a raw performance
+benchmark: its `shape` column must stay green for the intent fixtures that
+cover verbatim memorization, concept understanding, fact recall, and
+procedure/process capture.
 
 ## Operating Procedure
 

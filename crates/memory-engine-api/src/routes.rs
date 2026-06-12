@@ -7,12 +7,14 @@ use axum::{
 };
 use serde::Deserialize;
 
+use memory_engine_study::infer_capture_title;
+
 use crate::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token, render_account_page,
     render_action_result_html, render_app_shell, render_login_requested, AccountCreated,
-    ApiFailure, ApiState, CreateAccountRequest, CreateSourceRequest, HealthResponse, SourceList,
-    SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateSourceRequest, HealthResponse,
+    SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -336,16 +338,18 @@ struct AppLoginVerifyQuery {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppStartForm {
-    title: String,
-    body: String,
+    title: Option<String>,
+    body: Option<String>,
+    capture: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppSourceForm {
     csrf_token: Option<String>,
-    title: String,
-    body: String,
+    title: Option<String>,
+    body: Option<String>,
+    capture: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -507,25 +511,15 @@ async fn start_app_study(
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let source = state.accounts.save_source(
+    let result = state.accounts.save_source(
         &account.account_id,
         &account.session_token,
-        &CreateSourceRequest {
-            title: form.title,
-            body: form.body,
-        },
+        &capture_request(form.title, form.body, form.capture),
     );
-    let result = source.and_then(|source| {
-        state.accounts.generate_source(
-            &account.account_id,
-            &account.session_token,
-            &source.source_id,
-        )
-    });
 
     html_with_browser_session(
         &account,
-        render_action_result_html(&state, &account, result),
+        render_save_result_html(&state, &account, result.map(|_| ())),
     )
 }
 
@@ -541,25 +535,47 @@ async fn create_app_source(
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let result = state
-        .accounts
-        .save_source(
-            &account.account_id,
-            &account.session_token,
-            &CreateSourceRequest {
-                title: form.title,
-                body: form.body,
-            },
-        )
-        .and_then(|source| {
-            state.accounts.generate_source(
-                &account.account_id,
-                &account.session_token,
-                &source.source_id,
-            )
-        });
+    let result = state.accounts.save_source(
+        &account.account_id,
+        &account.session_token,
+        &capture_request(form.title, form.body, form.capture),
+    );
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    Html(render_save_result_html(
+        &state,
+        &account,
+        result.map(|_| ()),
+    ))
+    .into_response()
+}
+
+fn render_save_result_html(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<(), ApiFailure>,
+) -> String {
+    match result {
+        Ok(()) => render_account_page(
+            state,
+            account,
+            None,
+            Some("Capture saved. Create review when you are ready."),
+        ),
+        Err(error) => render_account_page(state, account, None, Some(&error.message)),
+    }
+}
+
+fn capture_request(
+    title: Option<String>,
+    body: Option<String>,
+    capture: Option<String>,
+) -> CreateSourceRequest {
+    let body = capture.or(body).unwrap_or_default();
+    let title = title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| infer_capture_title(&body));
+
+    CreateSourceRequest { title, body }
 }
 
 async fn generate_app_source(
