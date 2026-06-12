@@ -25,6 +25,8 @@ account session. The token is secret; receipts and demos must never print it.
   localhost, runs the external consumer runner over HTTP, fetches the served
   OpenAPI contract, completes the full loop, archives its source, and proves
   receipts redact credentials.
+- `docs/qa/scry-v1-production-contract.md` records the production Fly contract
+  receipt against a pre-provisioned account session.
 
 ## Consumer Demo
 
