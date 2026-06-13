@@ -1,8 +1,10 @@
 //! Generation eval: deterministic judges over the prose→quiz corpus.
 //!
 //! `cargo run -p memory-engine-bench -- generation --model <id>` runs every
-//! corpus source through a draft provider and scores the output with judges
-//! that keep models out of the loop (a `--judge <model-id>` lane adds rubric quality scoring): schema validity, provenance
+//! corpus source through the production beta generation runner, then scores
+//! accepted output after trust-gate validation, duplicate suppression, and
+//! repair. Deterministic judges keep models out of the loop (a `--judge
+//! <model-id>` lane adds rubric quality scoring): schema validity, provenance
 //! (evidence-quote-actually-in-source, the same predicate the production
 //! trust gate enforces), answerability, duplicates, expected draft counts,
 //! and key-term coverage — alongside tokens, dollars, and latency.
@@ -10,16 +12,20 @@
 //! Receipts land in `docs/evals/`; CI never calls live models (the fake
 //! provider is the default when no `--model` is given).
 
-use std::{fmt::Write as _, fs, path::PathBuf};
+use std::{cell::RefCell, fmt::Write as _, fs, path::PathBuf};
 
-use memory_engine::types::ReviewUnitId;
+use memory_engine::types::{Prompt, ReviewUnitId};
 use memory_engine_generation::{
-    candidates_duplicateish, evidence_quote_matches, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
+    candidates_duplicateish, classify_learning_intent, evidence_quote_matches,
+    run_beta_generation_with_provider, BetaGenerationRequest, BetaGenerationStore,
+    BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
+    FakeModelProvider, LearningIntent, ReviewPerformanceContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
-    GeneratedLearningActivityKind, SourceDocument, SourceDocumentKind, SourcePermission,
+    BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    GeneratedPromptModel, GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan,
+    SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use serde::Deserialize;
 
@@ -263,14 +269,11 @@ fn load_corpus() -> Result<Vec<CorpusSource>, String> {
         .collect()
 }
 
-fn score_source<P>(
-    provider: &P,
+fn score_source(
+    provider: &dyn DraftProvider,
     model_judge: Option<&OpenRouterProvider>,
     source: &CorpusSource,
-) -> SourceScore
-where
-    P: DraftProvider + ?Sized,
-{
+) -> SourceScore {
     let document = SourceDocument {
         id: source.id.clone(),
         kind: SourceDocumentKind::Text,
@@ -283,35 +286,50 @@ where
         archived_at: None,
     };
 
-    match provider.generate_drafts(&document) {
-        Ok(drafts) => {
-            let mut score = deterministic_judges(
-                &source.body,
-                &source.expect,
-                drafts.learning_intent,
-                &drafts.candidates,
-            );
+    let request = BetaGenerationRequest {
+        run_id: format!("generation-bench-{}", source.id),
+        source_document_ids: vec![source.id.clone()],
+        parent_review_unit_id: None,
+        started_at: NOW,
+        completed_at: Some(NOW),
+        default_due: NOW,
+        model: None,
+    };
+    let fallback_learning_intent = Some(classify_learning_intent(&document).intent);
+    let mut bench_store = BenchGenerationStore::new(document);
+    let recording_provider = RecordingDraftProvider::new(provider);
+
+    match run_beta_generation_with_provider(&mut bench_store, &recording_provider, request) {
+        Ok(result) => {
+            let candidates = bench_store.accepted_candidates(&result.accepted_draft_ids);
+            let run = bench_store.completed_run(&result.run_id);
+            let usage = run.and_then(|run| run.usage.clone());
+            let learning_intent = recording_provider
+                .learning_intent()
+                .or(fallback_learning_intent);
+            let emitted = result.accepted_draft_ids.len()
+                + result.rejected_draft_ids.len()
+                + result.validation_failures.len();
+            let mut score =
+                deterministic_judges(&source.body, &source.expect, learning_intent, &candidates);
             score.source_id.clone_from(&source.id);
             score.category.clone_from(&source.category);
-            let emitted = drafts.candidates.len() + drafts.failures.len();
             score.schema_validity = if emitted == 0 {
                 1.0
             } else {
-                fraction(drafts.candidates.len(), emitted)
+                fraction(
+                    result.accepted_draft_ids.len() + result.rejected_draft_ids.len(),
+                    emitted,
+                )
             };
-            if let Some(usage) = drafts.usage {
+            if let Some(usage) = usage {
                 score.input_tokens = usage.input_tokens;
                 score.output_tokens = usage.output_tokens;
                 score.cost_usd_micros = usage.cost_usd_micros;
                 score.latency_ms = usage.latency_ms;
             }
             if let Some(judge) = model_judge {
-                match crate::judge::judge_source(
-                    judge,
-                    &source.title,
-                    &source.body,
-                    &drafts.candidates,
-                ) {
+                match crate::judge::judge_source(judge, &source.title, &source.body, &candidates) {
                     Ok(aggregate) => score.judge = aggregate,
                     Err(failure) => score.judge_error = Some(failure.to_string()),
                 }
@@ -338,6 +356,221 @@ where
             judge: None,
             judge_error: None,
         },
+    }
+}
+
+struct RecordingDraftProvider<'a> {
+    inner: &'a dyn DraftProvider,
+    learning_intent: RefCell<Option<LearningIntent>>,
+}
+
+impl<'a> RecordingDraftProvider<'a> {
+    fn new(inner: &'a dyn DraftProvider) -> Self {
+        Self {
+            inner,
+            learning_intent: RefCell::new(None),
+        }
+    }
+
+    fn learning_intent(&self) -> Option<LearningIntent> {
+        *self.learning_intent.borrow()
+    }
+
+    fn record_learning_intent(&self, drafts: &memory_engine_generation::ProviderDrafts) {
+        if let Some(intent) = drafts.learning_intent {
+            *self.learning_intent.borrow_mut() = Some(intent);
+        }
+    }
+}
+
+impl DraftProvider for RecordingDraftProvider<'_> {
+    fn model(&self) -> GeneratedPromptModel {
+        self.inner.model()
+    }
+
+    fn generate_drafts(
+        &self,
+        source: &SourceDocument,
+    ) -> Result<memory_engine_generation::ProviderDrafts, memory_engine_generation::ProviderFailure>
+    {
+        let drafts = self.inner.generate_drafts(source)?;
+        self.record_learning_intent(&drafts);
+        Ok(drafts)
+    }
+
+    fn repair_drafts(
+        &self,
+        source: &SourceDocument,
+        rejections: &[memory_engine_generation::DraftRejection],
+    ) -> Result<
+        Option<memory_engine_generation::ProviderDrafts>,
+        memory_engine_generation::ProviderFailure,
+    > {
+        let repaired = self.inner.repair_drafts(source, rejections)?;
+        if let Some(drafts) = &repaired {
+            self.record_learning_intent(drafts);
+        }
+        Ok(repaired)
+    }
+}
+
+struct BenchGenerationStore {
+    snapshot: BetaStoreSnapshot,
+}
+
+impl BenchGenerationStore {
+    fn new(source: SourceDocument) -> Self {
+        Self {
+            snapshot: BetaStoreSnapshot {
+                source_documents: vec![source],
+                ..BetaStoreSnapshot::default()
+            },
+        }
+    }
+
+    fn completed_run(&self, run_id: &str) -> Option<&GenerationRun> {
+        self.snapshot
+            .generation_runs
+            .iter()
+            .find(|run| run.id == run_id && run.completed_at.is_some())
+    }
+
+    fn accepted_candidates(&self, accepted_draft_ids: &[String]) -> Vec<DraftCandidate> {
+        accepted_draft_ids
+            .iter()
+            .filter_map(|id| {
+                self.snapshot
+                    .generated_prompt_drafts
+                    .iter()
+                    .find(|draft| {
+                        draft.id == *id
+                            && draft.validation.status == GeneratedPromptValidationStatus::Accepted
+                    })
+                    .map(|draft| self.draft_to_candidate(draft))
+            })
+            .collect()
+    }
+
+    fn draft_to_candidate(&self, draft: &GeneratedPromptDraft) -> DraftCandidate {
+        let (question, answer, distractors) = match &draft.prompt {
+            Prompt::Mcq {
+                prompt,
+                choices,
+                correct_choice,
+                ..
+            } => (
+                prompt.clone(),
+                correct_choice.clone(),
+                choices
+                    .iter()
+                    .filter(|choice| *choice != correct_choice)
+                    .cloned()
+                    .collect(),
+            ),
+            Prompt::Boolean {
+                prompt,
+                correct_answer,
+                ..
+            } => (prompt.clone(), correct_answer.to_string(), Vec::new()),
+            Prompt::Exact(exact) => (
+                exact.prompt.clone(),
+                exact.accepted_answers.first().cloned().unwrap_or_default(),
+                Vec::new(),
+            ),
+        };
+        let evidence = draft
+            .reference_span_ids
+            .first()
+            .and_then(|reference_id| {
+                self.snapshot
+                    .reference_spans
+                    .iter()
+                    .find(|reference| reference.id == *reference_id)
+            })
+            .map(|reference| reference.text.clone());
+        let concept = draft
+            .queue
+            .concept_key
+            .clone()
+            .unwrap_or_else(|| draft.review_unit_id.as_str().to_owned());
+
+        DraftCandidate {
+            index: 1,
+            concept,
+            question,
+            answer,
+            evidence,
+            distractors,
+            worked_solution: draft.worked_solution.clone(),
+            activity_kind: draft.activity_kind.clone(),
+            activity_stage: draft.activity_stage.clone(),
+            unsupported: false,
+        }
+    }
+
+    fn upsert_reference_span(&mut self, reference: ReferenceSpan) {
+        self.snapshot
+            .reference_spans
+            .retain(|existing| existing.id != reference.id);
+        self.snapshot.reference_spans.push(reference);
+    }
+
+    fn upsert_generation_run(&mut self, run: GenerationRun) {
+        self.snapshot
+            .generation_runs
+            .retain(|existing| existing.id != run.id);
+        self.snapshot.generation_runs.push(run);
+    }
+
+    fn upsert_concept_note(&mut self, note: ConceptReferenceNote) {
+        self.snapshot
+            .concept_reference_notes
+            .retain(|existing| existing.concept_key != note.concept_key);
+        self.snapshot.concept_reference_notes.push(note);
+    }
+
+    fn upsert_generated_prompt_draft(&mut self, draft: GeneratedPromptDraft) {
+        self.snapshot
+            .generated_prompt_drafts
+            .retain(|existing| existing.id != draft.id);
+        self.snapshot.generated_prompt_drafts.push(draft);
+    }
+}
+
+impl BetaGenerationStore for BenchGenerationStore {
+    type Error = String;
+
+    fn snapshot(&self) -> Result<BetaStoreSnapshot, Self::Error> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn save_generation_run(&mut self, run: GenerationRun) -> Result<GenerationRun, Self::Error> {
+        self.upsert_generation_run(run.clone());
+        Ok(run)
+    }
+
+    fn save_reference_span(
+        &mut self,
+        reference: ReferenceSpan,
+    ) -> Result<ReferenceSpan, Self::Error> {
+        self.upsert_reference_span(reference.clone());
+        Ok(reference)
+    }
+
+    fn save_concept_reference_note(
+        &mut self,
+        note: ConceptReferenceNote,
+    ) -> Result<ConceptReferenceNote, Self::Error> {
+        self.upsert_concept_note(note.clone());
+        Ok(note)
+    }
+
+    fn save_generated_prompt_draft(
+        &mut self,
+        draft: GeneratedPromptDraft,
+    ) -> Result<GeneratedPromptDraft, Self::Error> {
+        self.upsert_generated_prompt_draft(draft.clone());
+        Ok(draft)
     }
 }
 
@@ -983,9 +1216,11 @@ fn format_cost(micros: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use memory_engine_generation::{
-        BridgeMaterial, ProviderFailure, ReferenceNoteDraft, ReferenceNoteProvider,
-        ReferenceNoteRequest,
+        BridgeMaterial, DraftRejection, ProviderDrafts, ProviderFailure, ProviderUsage,
+        ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
     };
     use memory_engine_persistence::{GeneratedLearningActivityKind, GeneratedPromptModel};
 
@@ -1021,6 +1256,16 @@ mod tests {
     }
 
     const BODY: &str = "A is Alfa. B is Bravo. C is Charlie.";
+
+    fn corpus_source() -> CorpusSource {
+        CorpusSource {
+            id: "letters".to_owned(),
+            title: "Letters".to_owned(),
+            category: "fixture".to_owned(),
+            body: BODY.to_owned(),
+            expect: expectations(),
+        }
+    }
 
     #[test]
     fn parse_args_accepts_max_drafts() {
@@ -1075,6 +1320,31 @@ mod tests {
         assert!((score.provenance - 2.0 / 3.0).abs() < 0.01);
         assert!((score.duplicate_rate - 1.0 / 3.0).abs() < 0.01);
         assert!(score.count_in_range, "3 drafts sits inside [1, 3]");
+    }
+
+    #[test]
+    fn score_source_uses_production_gate_to_filter_duplicates_before_scoring() {
+        let score = score_source(&DuplicateDraftProvider, None, &corpus_source());
+
+        assert_eq!(score.drafts, 1);
+        assert!(score.duplicate_rate.abs() < f64::EPSILON);
+        assert!((score.schema_validity - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn score_source_includes_repaired_accepted_drafts_and_usage() {
+        let provider = RepairingDraftProvider {
+            repair_calls: Cell::new(0),
+        };
+
+        let score = score_source(&provider, None, &corpus_source());
+
+        assert_eq!(score.drafts, 1);
+        assert_eq!(provider.repair_calls.get(), 1);
+        assert_eq!(score.input_tokens, 14);
+        assert_eq!(score.output_tokens, 18);
+        assert_eq!(score.cost_usd_micros, Some(24));
+        assert_eq!(score.latency_ms, 30);
     }
 
     #[test]
@@ -1313,6 +1583,93 @@ mod tests {
     }
 
     struct DuplicateBridgeProvider;
+
+    struct DuplicateDraftProvider;
+
+    impl DraftProvider for DuplicateDraftProvider {
+        fn model(&self) -> GeneratedPromptModel {
+            model("duplicate-drafts")
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            Ok(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![
+                    candidate("What is A?", "Alfa", "A is Alfa."),
+                    candidate("What is A?", "Alfa", "A is Alfa."),
+                ],
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct RepairingDraftProvider {
+        repair_calls: Cell<u32>,
+    }
+
+    impl DraftProvider for RepairingDraftProvider {
+        fn model(&self) -> GeneratedPromptModel {
+            model("repairing-drafts")
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            let mut rejected = candidate("What is A?", "Alfa", "A is Alfa.");
+            rejected.unsupported = true;
+
+            Ok(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![rejected],
+                failures: Vec::new(),
+                usage: Some(ProviderUsage {
+                    input_tokens: 3,
+                    output_tokens: 5,
+                    cost_usd_micros: Some(7),
+                    latency_ms: 10,
+                }),
+            })
+        }
+
+        fn repair_drafts(
+            &self,
+            _source: &SourceDocument,
+            rejections: &[DraftRejection],
+        ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+            assert_eq!(rejections.len(), 1);
+            self.repair_calls.set(self.repair_calls.get() + 1);
+            let mut repaired = candidate("What is B?", "Bravo", "B is Bravo.");
+            repaired.index = 2;
+
+            Ok(Some(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![repaired],
+                failures: Vec::new(),
+                usage: Some(ProviderUsage {
+                    input_tokens: 11,
+                    output_tokens: 13,
+                    cost_usd_micros: Some(17),
+                    latency_ms: 20,
+                }),
+            }))
+        }
+    }
+
+    fn model(name: &str) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: name.to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
 
     impl ReferenceNoteProvider for DuplicateBridgeProvider {
         fn model(&self) -> GeneratedPromptModel {

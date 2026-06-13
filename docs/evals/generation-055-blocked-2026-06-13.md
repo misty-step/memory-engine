@@ -25,15 +25,23 @@ Field attempts run on 2026-06-13 did not clear both judged metrics:
 | `google/gemini-3.5-flash` + `openai/gpt-5.4` editor | cross-model distractor-only experiment | 3.5 | 78% | Keep improved, distractors and deterministic shape regressed. |
 | `google/gemini-3.5-flash` + `openai/gpt-5.4` editor | cross-model full-editor experiment | 3.3 | 78% | Keep improved, distractors and deterministic shape regressed. |
 | `google/gemini-3.5-flash` | retained code path after reverting polish/editor experiments | 3.4 | 78% | Keep improved, distractors and deterministic shape regressed. |
+| `google/gemini-3.5-flash` | production-gated bench, OpenAI judge | 3.0 | 54% | Proved the old bench bypassed production filtering/repair, but judged quality regressed. Artifact: `docs/evals/generation-gemini-3.5-flash-production-gated-judged-2026-06-13.md`. |
+| `google/gemini-3.5-flash` | production-gated, max 5, atomic prompt, Anthropic judge | 3.3 | 76% | Keep improved, distractors still below baseline. Artifact: `docs/evals/generation-gemini-3.5-flash-judged-2026-06-13.md`. |
+| `anthropic/claude-sonnet-4.6` | production-gated, max 5, atomic prompt, OpenAI judge | 3.3 | 70% | Model swap did not improve judged quality enough and had a 6.0s p95 outlier. Artifact: `docs/evals/generation-claude-sonnet-4.6-judged-2026-06-13.md`. |
 
-The prompt-strengthened experiments were reverted because they did not satisfy
-the judged distractor oracle. The polish/editor experiments were also reverted
-because they repeatedly lowered distractor quality and caused deterministic
-intent-shape regressions. The retained implementation work is limited to:
+The polish/editor experiments were reverted because they repeatedly lowered
+distractor quality and caused deterministic intent-shape regressions. The
+retained implementation work is limited to:
 
+- production-gated generation bench scoring: deterministic and model judges now
+  score accepted runtime drafts after duplicate filtering and repair instead of
+  raw provider output;
 - accepted-material near-duplicate filtering in source generation;
 - one bounded repair request after a source produces zero accepted first-pass
   drafts, with usage merged into the run;
+- a lower default model draft budget of 5, plus atomic-card and distractor
+  guardrails in the principled prompt; this is a 055 follow-up to the June 11
+  field note that identified `max_drafts` as the main cost/latency dial;
 - an explicit `--max-drafts` bench flag for future field sweeps.
 
 Production latency attempt:

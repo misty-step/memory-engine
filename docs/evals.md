@@ -66,7 +66,10 @@ to avoid brittle thresholds.
 
 The prose→quiz generation pipeline is scored by deterministic judges (no model
 in the judge loop) over a fixed corpus in
-`crates/memory-engine-bench/corpus/generation/`.
+`crates/memory-engine-bench/corpus/generation/`. The bench runs the selected
+provider through the same beta generation runner used at runtime, so receipts
+score accepted drafts after the production trust gate, duplicate suppression,
+and bounded repair pass rather than raw provider output.
 
 Run against the deterministic fake provider (the CI-safe default — no network):
 
@@ -86,9 +89,10 @@ the same predicate the production trust gate enforces), answerability,
 duplicate rate, count-in-range, key-term coverage, intent shape match, and
 variant quality. Duplicate rate uses the same cheap concept + answer + question
 surface similarity predicate as the production generation gate, so near-copy
-questions that would be rejected at runtime also score as duplicates in the
-receipt. Variant quality checks same-concept same-stage groups for meaningfully
-different question surfaces and rejects questions that leak the answer text.
+questions that would be rejected at runtime are filtered before the receipt
+judges accepted output. Variant quality checks same-concept same-stage groups
+for meaningfully different question surfaces and rejects questions that leak
+the answer text.
 Intent shape match is the 051 capture-anything oracle: fixtures annotate
 verbatim memorization, concept understanding, fact recall, and
 procedure/process sources, and the provider must emit different activity
