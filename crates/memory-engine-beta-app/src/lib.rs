@@ -583,6 +583,7 @@ fn render_current(html: &mut String, current: Option<&BetaStudyCurrent>, error: 
         html.push_str("</p>");
     }
     if let Some(current) = current {
+        render_choices(html, current);
         html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer or worked solution</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/current/learn-more\"><button type=\"submit\" class=\"secondary\">Learn more</button></form><form method=\"post\" action=\"/current/snooze\"><input type=\"hidden\" name=\"snoozedUntil\" value=\"");
         html.push_str(&snooze_until().to_string());
         html.push_str("\"><button type=\"submit\" class=\"secondary\">Snooze</button></form><form method=\"post\" action=\"/current/delete\"><button type=\"submit\" class=\"secondary danger\">Delete</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
@@ -614,6 +615,39 @@ fn render_current(html: &mut String, current: Option<&BetaStudyCurrent>, error: 
             )));
             html.push_str("</div>");
         }
+        render_feedback(html, current);
+    }
+    html.push_str("</div>");
+}
+
+fn render_choices(html: &mut String, current: &BetaStudyCurrent) {
+    if current.choices.is_empty() {
+        return;
+    }
+    html.push_str("<ol class=\"choices\">");
+    for choice in &current.choices {
+        html.push_str("<li>");
+        html.push_str(&escape_html(choice));
+        html.push_str("</li>");
+    }
+    html.push_str("</ol>");
+}
+
+fn render_feedback(html: &mut String, current: &BetaStudyCurrent) {
+    let Some(feedback) = &current.feedback else {
+        return;
+    };
+    let item = &feedback.item_history;
+    html.push_str("<div class=\"feedback\"><strong>Answer feedback</strong><p>");
+    html.push_str(&escape_html(&format!(
+        "{}; {}; {}; response time {}",
+        item.success_rate, item.trend, item.last_seen_summary, item.response_time_trend
+    )));
+    html.push_str("</p>");
+    if let Some(concept) = &feedback.concept_progress {
+        html.push_str("<p>");
+        html.push_str(&escape_html(&concept.summary));
+        html.push_str("</p>");
     }
     html.push_str("</div>");
 }
@@ -706,6 +740,9 @@ button{min-height:40px;border:1px solid #24533d;border-radius:6px;padding:0 14px
 button.secondary{background:#fff;color:#24533d}
 button.danger{border-color:#7a2e2a;color:#7a2e2a}
 .edit{display:grid;gap:10px;margin-top:14px}
+.choices{margin:0 0 16px;padding-left:22px;color:#20241f;font-weight:650}
+.feedback{margin-top:12px;border-left:3px solid #d9ded5;padding-left:12px;color:#455048;font-size:15px}
+.feedback p{margin:6px 0 0}
 .answer,.grade,.solution,.reference{margin-top:12px;min-height:24px;overflow-wrap:anywhere;font-size:15px;font-weight:650}.answer{color:#24533d}.grade{color:#7a4322}.solution,.reference{color:#455048;font-weight:500}.reference{border-left:3px solid #b9c4b5;padding-left:12px;white-space:pre-wrap}
 aside{min-width:0;border-left:1px solid #d9ded5;background:#fff}
 section.panel{border-bottom:1px solid #d9ded5;padding:20px}

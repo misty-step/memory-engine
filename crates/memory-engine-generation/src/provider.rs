@@ -611,7 +611,8 @@ fn fact_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
         facts
     };
 
-    facts
+    let fact_count = facts.len();
+    let mut candidates = facts
         .into_iter()
         .enumerate()
         .map(|(position, sentence)| {
@@ -632,7 +633,34 @@ fn fact_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
                 unsupported: false,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if (1..=2).contains(&fact_count) {
+        if let Some(first) = candidates.first() {
+            let concept = first.concept.clone();
+            let answer = first.answer.clone();
+            let evidence = first.evidence.clone();
+            let distractors = first.distractors.clone();
+            let activity_stage = first.activity_stage.clone();
+            candidates.push(DraftCandidate {
+                index: fact_count + 1,
+                concept,
+                question: format!(
+                    "Which source fact answers a second wording about \"{}\"?",
+                    source.title
+                ),
+                answer,
+                evidence,
+                distractors,
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage,
+                unsupported: false,
+            });
+        }
+    }
+
+    candidates
 }
 
 fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {

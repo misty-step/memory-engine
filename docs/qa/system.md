@@ -4,6 +4,7 @@ Refs-backlog: 25
 Refs-backlog: 051
 Refs-backlog: 052
 Refs-backlog: 053
+Refs-backlog: 054
 
 ## Purpose
 
@@ -79,8 +80,9 @@ cargo run -p memory-engine-bench -- generation
 That receipt is still local and deterministic, but it is not a raw performance
 benchmark: its `shape` column must stay green for the intent fixtures that
 cover verbatim memorization, concept understanding, fact recall, and
-procedure/process capture, and its bridge fixture must stay green for
-lower-stage, same-concept, non-duplicate bridge material.
+procedure/process capture, its `variants` column scores same-concept same-stage
+phrasing variety without answer leakage, and its bridge fixture must stay green
+for lower-stage, same-concept, non-duplicate bridge material.
 
 ## Operating Procedure
 

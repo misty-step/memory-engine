@@ -83,7 +83,10 @@ cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
 
 Judges score schema validity, provenance (evidence quote actually in source —
 the same predicate the production trust gate enforces), answerability,
-duplicate rate, count-in-range, key-term coverage, and intent shape match.
+duplicate rate, count-in-range, key-term coverage, intent shape match, and
+variant quality. Variant quality checks same-concept same-stage groups for
+meaningfully different question surfaces and rejects questions that leak the
+answer text.
 Intent shape match is the 051 capture-anything oracle: fixtures annotate
 verbatim memorization, concept understanding, fact recall, and
 procedure/process sources, and the provider must emit different activity

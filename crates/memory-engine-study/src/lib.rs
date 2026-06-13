@@ -6,6 +6,7 @@
 //! crates without moving filesystem, HTTP, or UI concerns into the pure core.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
@@ -13,7 +14,8 @@ use std::{
 };
 
 use memory_engine_core::{
-    GradeResult, Prompt, QueueCandidate, ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
+    reviewable_queue_candidates, GradeResult, Prompt, QueueCandidate, QueueSelectionOptions,
+    ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
@@ -149,6 +151,7 @@ pub struct BetaStudyCurrent {
     pub activity_kind: GeneratedLearningActivityKind,
     pub activity_stage: String,
     pub prompt: String,
+    pub choices: Vec<String>,
     pub revision_expected_answer: String,
     pub expected_answer: Option<String>,
     pub reference_text: Option<String>,
@@ -198,8 +201,12 @@ pub struct BetaStudyItemHistory {
     pub attempts: usize,
     pub correct: usize,
     pub success_rate: String,
+    pub trend: String,
     pub last_seen: Option<i64>,
     pub last_seen_summary: String,
+    pub last_response_time_ms: Option<u32>,
+    pub average_response_time_ms: Option<u32>,
+    pub response_time_trend: String,
     pub stage: String,
     pub next_review: String,
 }
@@ -213,6 +220,8 @@ pub struct BetaStudyConceptProgress {
     pub correct: usize,
     pub success_rate: String,
     pub trend: String,
+    pub average_response_time_ms: Option<u32>,
+    pub response_time_trend: String,
     pub health: String,
     pub summary: String,
 }
@@ -1103,15 +1112,16 @@ where
                                 now,
                             )
                         });
-                        current_view(
+                        current_view(CurrentViewParts {
+                            snapshot,
                             draft,
-                            schedule.as_ref(),
-                            self.expected_answer.clone(),
-                            self.reference_text.clone(),
-                            self.grade.clone(),
-                            self.schedule_change.clone(),
+                            schedule: schedule.as_ref(),
+                            expected_answer: self.expected_answer.clone(),
+                            reference_text: self.reference_text.clone(),
+                            grade: self.grade.clone(),
+                            schedule_change: self.schedule_change.clone(),
                             feedback,
-                        )
+                        })
                     })
             })
             .transpose()
@@ -1129,11 +1139,23 @@ where
         let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
         let active_source_ids = active_source_ids(&snapshot);
         let now = (self.now)();
-        self.current = selected
-            .candidate
-            .as_ref()
-            .filter(|candidate| candidate.due <= now)
-            .and_then(|candidate| find_approved_draft(&snapshot, candidate));
+        self.current = select_due_variant(
+            &snapshot,
+            &self
+                .store
+                .list_queue_candidates()
+                .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?,
+            &active_source_ids,
+            now,
+            selected.candidate.as_ref(),
+        );
+        if self.current.is_none() {
+            self.current = selected
+                .candidate
+                .as_ref()
+                .filter(|candidate| candidate.due <= now)
+                .and_then(|candidate| find_approved_draft(&snapshot, candidate));
+        }
         if self
             .current
             .as_ref()
@@ -1356,21 +1378,36 @@ fn queue_row(drafts: &[GeneratedPromptDraft], candidate: &QueueCandidate) -> Bet
     }
 }
 
-fn current_view(
-    draft: &GeneratedPromptDraft,
-    schedule: Option<&ScheduleState>,
+struct CurrentViewParts<'a> {
+    snapshot: &'a BetaStoreSnapshot,
+    draft: &'a GeneratedPromptDraft,
+    schedule: Option<&'a ScheduleState>,
     expected_answer: Option<String>,
     reference_text: Option<String>,
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
     feedback: Option<BetaStudyFeedback>,
-) -> BetaStudyCurrent {
+}
+
+fn current_view(parts: CurrentViewParts<'_>) -> BetaStudyCurrent {
+    let CurrentViewParts {
+        snapshot,
+        draft,
+        schedule,
+        expected_answer,
+        reference_text,
+        grade,
+        schedule_change,
+        feedback,
+    } = parts;
+
     BetaStudyCurrent {
         review_unit_id: draft.review_unit_id.clone(),
         prompt_id: draft.prompt_id.clone(),
         activity_kind: draft.activity_kind.clone(),
         activity_stage: draft.activity_stage.clone(),
         prompt: prompt_text(&draft.prompt).to_owned(),
+        choices: projected_choices(snapshot, draft, grade.is_some()),
         revision_expected_answer: prompt_expected_answer(&draft.prompt),
         worked_solution: expected_answer
             .as_ref()
@@ -1413,27 +1450,40 @@ fn item_history(
     schedule: Option<&ScheduleState>,
     now: i64,
 ) -> BetaStudyItemHistory {
-    let attempts = snapshot
+    let mut attempts = snapshot
         .attempts
         .iter()
         .filter(|attempt| attempt.review_unit_id == *review_unit_id)
         .collect::<Vec<_>>();
+    attempts.sort_by_key(|attempt| attempt.occurred_at);
     let correct = attempts
         .iter()
         .filter(|attempt| attempt.grade.as_ref().is_some_and(|grade| grade.is_correct))
         .count();
 
     let last_seen = attempts.iter().map(|attempt| attempt.occurred_at).max();
+    let outcomes = attempts
+        .iter()
+        .filter_map(|attempt| attempt.grade.as_ref().map(|grade| grade.is_correct))
+        .collect::<Vec<_>>();
+    let response_times = attempts
+        .iter()
+        .map(|attempt| attempt.response_time_ms)
+        .collect::<Vec<_>>();
 
     BetaStudyItemHistory {
         attempts: attempts.len(),
         correct,
         success_rate: success_rate(correct, attempts.len()),
+        trend: trend(&outcomes),
         last_seen,
         last_seen_summary: last_seen.map_or_else(
             || "not seen before".to_owned(),
             |last_seen| last_seen_phrase(last_seen, now),
         ),
+        last_response_time_ms: response_times.last().copied(),
+        average_response_time_ms: average_response_time_ms(&response_times),
+        response_time_trend: response_time_trend(&response_times),
         stage: schedule.map_or_else(|| "New".to_owned(), schedule_stage),
         next_review: schedule.map_or_else(
             || "no review is scheduled yet".to_owned(),
@@ -1444,11 +1494,13 @@ fn item_history(
 
 fn concept_progress(snapshot: &BetaStoreSnapshot) -> Vec<BetaStudyConceptProgress> {
     let mut rows: BTreeMap<String, ConceptAccumulator> = BTreeMap::new();
-    for attempt in snapshot
+    let mut attempts = snapshot
         .attempts
         .iter()
         .filter(|attempt| attempt.grade.is_some())
-    {
+        .collect::<Vec<_>>();
+    attempts.sort_by_key(|attempt| attempt.occurred_at);
+    for attempt in attempts {
         let (concept_key, concept_label) =
             concept_identity_for_review_unit(snapshot, &attempt.review_unit_id);
         let row = rows
@@ -1477,6 +1529,7 @@ struct ConceptAccumulator {
     attempts: usize,
     correct: usize,
     outcomes: Vec<bool>,
+    response_times: Vec<u32>,
 }
 
 impl ConceptAccumulator {
@@ -1487,6 +1540,7 @@ impl ConceptAccumulator {
             attempts: 0,
             correct: 0,
             outcomes: Vec::new(),
+            response_times: Vec::new(),
         }
     }
 
@@ -1497,13 +1551,21 @@ impl ConceptAccumulator {
             self.correct += 1;
         }
         self.outcomes.push(is_correct);
+        self.response_times.push(attempt.response_time_ms);
     }
 
     fn into_progress(self) -> BetaStudyConceptProgress {
         let success_rate = success_rate(self.correct, self.attempts);
         let trend = trend(&self.outcomes);
+        let response_time_trend = response_time_trend(&self.response_times);
         let health = health(self.correct, self.attempts).to_owned();
-        let summary = concept_summary(&self.concept_label, &health, &success_rate, &trend);
+        let summary = concept_summary(
+            &self.concept_label,
+            &health,
+            &success_rate,
+            &trend,
+            &response_time_trend,
+        );
 
         BetaStudyConceptProgress {
             concept_key: self.concept_key,
@@ -1512,6 +1574,8 @@ impl ConceptAccumulator {
             correct: self.correct,
             success_rate,
             trend,
+            average_response_time_ms: average_response_time_ms(&self.response_times),
+            response_time_trend,
             health,
             summary,
         }
@@ -1591,6 +1655,30 @@ fn trend(outcomes: &[bool]) -> String {
     }
 }
 
+fn average_response_time_ms(response_times: &[u32]) -> Option<u32> {
+    if response_times.is_empty() {
+        return None;
+    }
+    let total: u64 = response_times.iter().map(|value| u64::from(*value)).sum();
+    let count = u64::try_from(response_times.len()).unwrap_or(1);
+    u32::try_from(total / count).ok()
+}
+
+fn response_time_trend(response_times: &[u32]) -> String {
+    match response_times {
+        [] | [_] => "not enough data".to_owned(),
+        values => {
+            let previous = values[values.len() - 2];
+            let latest = values[values.len() - 1];
+            match latest.cmp(&previous) {
+                Ordering::Less => "faster".to_owned(),
+                Ordering::Greater => "slower".to_owned(),
+                Ordering::Equal => "steady".to_owned(),
+            }
+        }
+    }
+}
+
 fn health(correct: usize, attempts: usize) -> &'static str {
     if attempts == 0 {
         return "untried";
@@ -1604,8 +1692,16 @@ fn health(correct: usize, attempts: usize) -> &'static str {
     }
 }
 
-fn concept_summary(label: &str, health: &str, success_rate: &str, trend: &str) -> String {
-    format!("{label} is {health}: {success_rate}; trend is {trend}.")
+fn concept_summary(
+    label: &str,
+    health: &str,
+    success_rate: &str,
+    trend: &str,
+    response_time_trend: &str,
+) -> String {
+    format!(
+        "{label} is {health}: {success_rate}; trend is {trend}; response time is {response_time_trend}."
+    )
 }
 
 fn verdict_label(verdict: Verdict) -> &'static str {
@@ -1675,6 +1771,79 @@ fn last_seen_phrase(last_seen: i64, now: i64) -> String {
     "last seen just now".to_owned()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VariantGroup {
+    concept_key: String,
+    stage_order: u32,
+    activity_stage: String,
+}
+
+fn select_due_variant(
+    snapshot: &BetaStoreSnapshot,
+    candidates: &[QueueCandidate],
+    active_source_ids: &BTreeSet<String>,
+    now: i64,
+    selected: Option<&QueueCandidate>,
+) -> Option<GeneratedPromptDraft> {
+    let selected = selected.filter(|candidate| candidate.due <= now)?;
+    let selected_draft = find_approved_draft(snapshot, selected)?;
+    if !draft_has_active_source(&selected_draft, active_source_ids) {
+        return None;
+    }
+    let group = variant_group(&selected_draft)?;
+    let options = QueueSelectionOptions {
+        now,
+        ..QueueSelectionOptions::default()
+    };
+    let variants = reviewable_queue_candidates(candidates, mastered_after_three_reviews, &options)
+        .iter()
+        .filter_map(|candidate| find_approved_draft(snapshot, candidate))
+        .filter(|draft| draft_has_active_source(draft, active_source_ids))
+        .filter(|draft| variant_group(draft).as_ref() == Some(&group))
+        .collect::<Vec<_>>();
+    if variants.len() <= 1 {
+        return Some(selected_draft);
+    }
+
+    let mut variants = variants
+        .into_iter()
+        .map(|draft| (variant_attempt_key(snapshot, &draft), draft))
+        .collect::<Vec<_>>();
+    variants.sort_by(|(left_key, left_draft), (right_key, right_draft)| {
+        left_key
+            .cmp(right_key)
+            .then_with(|| left_draft.review_unit_id.cmp(&right_draft.review_unit_id))
+    });
+    variants.into_iter().next().map(|(_, draft)| draft)
+}
+
+fn variant_group(draft: &GeneratedPromptDraft) -> Option<VariantGroup> {
+    let progression = draft.queue.progression.as_ref()?;
+    let concept_key = draft
+        .queue
+        .concept_key
+        .clone()
+        .or_else(|| progression.progression_group.clone())?;
+    Some(VariantGroup {
+        concept_key,
+        stage_order: progression.stage_order,
+        activity_stage: draft.activity_stage.clone(),
+    })
+}
+
+fn variant_attempt_key(
+    snapshot: &BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+) -> (usize, Option<i64>) {
+    snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.review_unit_id == draft.review_unit_id)
+        .fold((0, None), |(count, latest), attempt| {
+            (count + 1, latest.max(Some(attempt.occurred_at)))
+        })
+}
+
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
 
@@ -1720,6 +1889,40 @@ fn prompt_text(prompt: &Prompt) -> &str {
         Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt,
         Prompt::Exact(prompt) => &prompt.prompt,
     }
+}
+
+fn projected_choices(
+    snapshot: &BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+    hold_latest_attempt: bool,
+) -> Vec<String> {
+    let Prompt::Mcq { choices, .. } = &draft.prompt else {
+        return Vec::new();
+    };
+    if choices.len() <= 1 {
+        return choices.clone();
+    }
+    let attempts = snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.review_unit_id == draft.review_unit_id)
+        .count();
+    let display_attempts = if hold_latest_attempt {
+        attempts.saturating_sub(1)
+    } else {
+        attempts
+    };
+    let mut projected = choices.clone();
+    let offset = (stable_seed(draft.review_unit_id.as_str()).saturating_add(display_attempts))
+        % projected.len();
+    projected.rotate_left(offset);
+    projected
+}
+
+fn stable_seed(value: &str) -> usize {
+    value.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(16_777_619) ^ usize::from(byte)
+    })
 }
 
 fn prompt_expected_answer(prompt: &Prompt) -> String {

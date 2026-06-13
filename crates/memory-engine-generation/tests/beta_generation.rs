@@ -164,6 +164,101 @@ fn browser_form_line_endings_preserve_multiple_structured_blocks() {
 }
 
 #[test]
+fn structured_generation_preserves_same_stage_variants_for_one_concept() {
+    let directory = TempDirectory::new("variants");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-variants".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "NATO variants".to_owned(),
+            body: Some(
+                [
+                    "Concept: NATO letter A",
+                    "Activity: quiz",
+                    "Stage: recognition-3",
+                    "Question: What is the NATO phonetic alphabet word for A?",
+                    "Answer: ALFA",
+                    "Distractors: BRAVO, CHARLIE",
+                    "Reference: The NATO phonetic alphabet word for A is ALFA.",
+                    "",
+                    "Concept: NATO letter A",
+                    "Activity: quiz",
+                    "Stage: recognition-3",
+                    "Question: Choose the code word used for the letter A.",
+                    "Answer: ALFA",
+                    "Distractors: BRAVO, CHARLIE",
+                    "Reference: The NATO phonetic alphabet word for A is ALFA.",
+                    "",
+                    "Concept: NATO letter A",
+                    "Activity: quiz",
+                    "Stage: recognition-3",
+                    "Question: In radio spelling, which word represents A?",
+                    "Answer: ALFA",
+                    "Distractors: BRAVO, CHARLIE",
+                    "Reference: The NATO phonetic alphabet word for A is ALFA.",
+                ]
+                .join("\n"),
+            ),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "run-variants".to_owned(),
+            source_document_ids: vec!["src-variants".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 3);
+    let snapshot = store.snapshot();
+    let variants = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| draft.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .collect::<Vec<_>>();
+    assert_eq!(variants.len(), 3);
+    assert!(variants
+        .iter()
+        .all(|draft| draft.activity_stage == "recognition-3"));
+    assert!(variants.iter().all(|draft| {
+        draft
+            .queue
+            .progression
+            .as_ref()
+            .and_then(|progression| progression.progression_group.as_deref())
+            == Some("nato-letter-a")
+    }));
+    assert_eq!(
+        variants
+            .iter()
+            .map(|draft| match &draft.prompt {
+                Prompt::Mcq { prompt, .. } => prompt.as_str(),
+                other => panic!("variant should be MCQ: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [
+            "What is the NATO phonetic alphabet word for A?",
+            "Choose the code word used for the letter A.",
+            "In radio spelling, which word represents A?"
+        ]
+    );
+}
+
+#[test]
 fn persists_rejected_unsupported_and_duplicate_drafts() {
     let directory = TempDirectory::new("rejected");
     let path = directory.path().join("store.json");

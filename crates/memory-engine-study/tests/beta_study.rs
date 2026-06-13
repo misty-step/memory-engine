@@ -242,11 +242,15 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
     assert_eq!(feedback.item_history.attempts, 1);
     assert_eq!(feedback.item_history.correct, 0);
     assert_eq!(feedback.item_history.success_rate, "0 of 1 correct (0.0%)");
+    assert_eq!(feedback.item_history.trend, "not enough data");
     assert_eq!(feedback.item_history.last_seen, Some(NOW));
     assert_eq!(
         feedback.item_history.last_seen_summary,
         "last seen just now"
     );
+    assert_eq!(feedback.item_history.last_response_time_ms, Some(1_800));
+    assert_eq!(feedback.item_history.average_response_time_ms, Some(1_800));
+    assert_eq!(feedback.item_history.response_time_trend, "not enough data");
     assert!(feedback.item_history.stage.contains("Learning"));
     assert!(
         feedback.item_history.next_review.contains("again"),
@@ -260,6 +264,8 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
     assert_eq!(concept.correct, 0);
     assert_eq!(concept.success_rate, "0 of 1 correct (0.0%)");
     assert_eq!(concept.trend, "not enough data");
+    assert_eq!(concept.average_response_time_ms, Some(1_800));
+    assert_eq!(concept.response_time_trend, "not enough data");
     assert_eq!(concept.health, "struggling");
     assert!(
         concept.summary.contains("struggling"),
@@ -267,6 +273,182 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
         concept.summary
     );
     assert_eq!(reviewed.concept_progress, vec![concept]);
+}
+
+#[test]
+fn multiple_choice_choices_rotate_between_reviews_without_changing_answer() {
+    let directory = TempDirectory::new("mcq-choice-rotation");
+    let path = directory.path().join("study.json");
+    {
+        let mut study =
+            BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+        study.add_source(source_input()).expect("source");
+        study.generate(None).expect("generate");
+        study
+            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("approve");
+    }
+
+    let mut first_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("resume");
+    let first = first_session
+        .start()
+        .expect("start")
+        .current
+        .expect("current");
+    assert_eq!(first.revision_expected_answer, "ALFA");
+    assert_eq!(
+        sorted(first.choices.clone()),
+        ["ALFA".to_owned(), "BRAVO".to_owned(), "CHARLIE".to_owned()]
+    );
+
+    record_graded_attempt_with_response_time(
+        &path,
+        "study-run-1-draft-src-nato-1-nato-letter-a",
+        false,
+        1,
+        2_400,
+    );
+    let mut second_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    let second = second_session
+        .start()
+        .expect("start")
+        .current
+        .expect("current");
+
+    assert_eq!(second.review_unit_id, first.review_unit_id);
+    assert_eq!(second.revision_expected_answer, "ALFA");
+    assert!(second.choices.iter().any(|choice| choice == "ALFA"));
+    assert_ne!(second.choices, first.choices);
+
+    record_graded_attempt_with_response_time(
+        &path,
+        "study-run-1-draft-src-nato-1-nato-letter-a",
+        true,
+        2,
+        1_900,
+    );
+    let mut third_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    let third = third_session
+        .start()
+        .expect("start")
+        .current
+        .expect("current");
+
+    assert_eq!(third.review_unit_id, first.review_unit_id);
+    assert_ne!(third.choices, second.choices);
+}
+
+#[test]
+fn queue_rotates_due_variants_with_the_same_concept_and_stage() {
+    let directory = TempDirectory::new("variant-rotation");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(variant_concept_input()).expect("source");
+    let generated = study.generate(None).expect("generate");
+    assert_eq!(generated.drafts.len(), 3);
+    assert!(generated.drafts.iter().all(|draft| {
+        draft.validation_status == GeneratedPromptValidationStatus::Accepted
+            && draft.activity_stage == "recognition-3"
+    }));
+    for draft_id in generated
+        .drafts
+        .iter()
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>()
+    {
+        study.approve_draft(&draft_id).expect("approve variant");
+    }
+
+    let first = study
+        .start()
+        .expect("first")
+        .current
+        .expect("first current");
+    study
+        .submit_answer("ALFA", 2_100)
+        .expect("first submit through study boundary");
+    let second = study
+        .advance()
+        .expect("second")
+        .current
+        .expect("second current");
+
+    assert_eq!(second.activity_stage, "recognition-3");
+    assert_ne!(second.review_unit_id, first.review_unit_id);
+    assert_ne!(second.prompt, first.prompt);
+
+    study
+        .submit_answer("BRAVO", 2_800)
+        .expect("second submit through study boundary");
+    let third = study
+        .advance()
+        .expect("third")
+        .current
+        .expect("third current");
+
+    assert_ne!(third.review_unit_id, first.review_unit_id);
+    assert_ne!(third.review_unit_id, second.review_unit_id);
+    assert_ne!(third.prompt, first.prompt);
+    assert_ne!(third.prompt, second.prompt);
+}
+
+#[test]
+fn post_answer_feedback_exposes_item_response_time_and_success_trends() {
+    let directory = TempDirectory::new("response-time-trend");
+    let path = directory.path().join("study.json");
+    {
+        let mut study =
+            BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+        study.add_source(source_input()).expect("source");
+        study.generate(None).expect("generate");
+        study
+            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("approve");
+    }
+    record_graded_attempt_with_response_time(
+        &path,
+        "study-run-1-draft-src-nato-1-nato-letter-a",
+        false,
+        1,
+        3_200,
+    );
+    record_graded_attempt_with_response_time(
+        &path,
+        "study-run-1-draft-src-nato-1-nato-letter-a",
+        true,
+        2,
+        2_100,
+    );
+
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+    let pre_submit_choices = resumed
+        .start()
+        .expect("start")
+        .current
+        .expect("current")
+        .choices;
+    let reviewed = resumed
+        .submit_answer("BRAVO", 2_900)
+        .expect("submit latest");
+    let current = reviewed.current.expect("current");
+    assert_eq!(current.choices, pre_submit_choices);
+    let feedback = current.feedback.expect("feedback");
+
+    assert_eq!(feedback.item_history.attempts, 3);
+    assert_eq!(feedback.item_history.correct, 1);
+    assert_eq!(feedback.item_history.trend, "declining");
+    assert_eq!(feedback.item_history.last_response_time_ms, Some(2_900));
+    assert_eq!(feedback.item_history.average_response_time_ms, Some(2_733));
+    assert_eq!(feedback.item_history.response_time_trend, "slower");
+    let concept = feedback.concept_progress.expect("concept");
+    assert_eq!(concept.trend, "declining");
+    assert_eq!(concept.average_response_time_ms, Some(2_733));
+    assert_eq!(concept.response_time_trend, "slower");
 }
 
 #[test]
@@ -868,8 +1050,51 @@ fn shared_concept_body() -> String {
     .join("\n")
 }
 
+fn variant_concept_input() -> BetaStudySourceInput {
+    BetaStudySourceInput {
+        id: "src-variants".to_owned(),
+        title: "NATO letter A variants".to_owned(),
+        body: [
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for A?",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+            "",
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: Choose the code word used for the letter A.",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+            "",
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: In radio spelling, which word represents A?",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+        ]
+        .join("\n"),
+    }
+}
+
 fn record_graded_attempt(path: &std::path::Path, draft_id: &str, is_correct: bool, offset: i64) {
-    let mut store = BetaPersistenceStore::open(path).expect("store");
+    record_graded_attempt_with_response_time(path, draft_id, is_correct, offset, 1_800);
+}
+
+fn record_graded_attempt_with_response_time(
+    path: &std::path::Path,
+    draft_id: &str,
+    is_correct: bool,
+    offset: i64,
+    response_time_ms: u32,
+) {
+    let store = BetaPersistenceStore::open(path).expect("store");
     let snapshot = store.snapshot();
     let review_unit_id = snapshot
         .generated_prompt_drafts
@@ -884,17 +1109,39 @@ fn record_graded_attempt(path: &std::path::Path, draft_id: &str, is_correct: boo
                 .map(|unit| unit.review_unit_id.clone())
         })
         .expect("review unit id for draft");
+    record_graded_attempt_for_review_unit(
+        path,
+        &review_unit_id,
+        is_correct,
+        offset,
+        response_time_ms,
+    );
+}
+
+fn record_graded_attempt_for_review_unit(
+    path: &std::path::Path,
+    review_unit_id: &ReviewUnitId,
+    is_correct: bool,
+    offset: i64,
+    response_time_ms: u32,
+) {
+    let mut store = BetaPersistenceStore::open(path).expect("store");
     store
         .record_attempt(ServiceAttemptRecord {
             review_unit_id: review_unit_id.clone(),
             prompt_id: None,
             submitted_answer: if is_correct { "ALFA" } else { "BRAVO" }.to_owned(),
-            response_time_ms: 1_800,
+            response_time_ms,
             occurred_at: NOW + offset,
             idempotency_key: Some(format!("{}-{offset}", review_unit_id.as_str())),
             grade: Some(grade_result(is_correct)),
         })
         .expect("record attempt");
+}
+
+fn sorted(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
 }
 
 fn grade_result(is_correct: bool) -> GradeResult {

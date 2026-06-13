@@ -284,6 +284,7 @@ fn render_keep_flow(account: &AppAccount, drafts: &[BetaStudyDraftRow]) -> Strin
 fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> String {
     let current = view.current.as_ref().expect("review view has current item");
     let reference = render_reference(current);
+    let choices = render_choices(current);
     let answer = render_answer(current);
     let result = render_grade(account, current);
     let feedback = render_feedback(current);
@@ -296,6 +297,7 @@ fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> Stri
         r#"{}
 <section class="review">
   <p class="prompt">{}</p>
+  {choices}
   {reference}
   {answer}
   {result}
@@ -308,6 +310,19 @@ fn render_current_review(account: &AppAccount, view: &StudyViewResponse) -> Stri
         render_due_status(view.due_count),
         escape_html(&current.prompt)
     )
+}
+
+fn render_choices(current: &BetaStudyCurrent) -> String {
+    if current.choices.is_empty() {
+        return String::new();
+    }
+
+    let mut rows = String::new();
+    for choice in &current.choices {
+        write!(rows, r"<li>{}</li>", escape_html(choice)).expect("write choice html");
+    }
+
+    format!(r#"<ol class="choices">{rows}</ol>"#)
 }
 
 fn render_answer(current: &BetaStudyCurrent) -> String {
@@ -367,7 +382,7 @@ fn render_feedback(current: &BetaStudyCurrent) -> String {
     format!(
         r#"<section class="secondary feedback" aria-label="Answer feedback">
   <h2>Answer feedback</h2>
-  <p>This item: {} {}, {}; {}; {}; {}.</p>
+  <p>This item: {} {}, {}; {}; {}; {}; response time {}.</p>
   <p>Expected answer: <strong>{}</strong></p>
   {concept}
 </section>"#,
@@ -377,6 +392,7 @@ fn render_feedback(current: &BetaStudyCurrent) -> String {
         escape_html(&item.last_seen_summary),
         escape_html(&item.stage),
         escape_html(&item.next_review),
+        escape_html(&item.response_time_trend),
         escape_html(&feedback.expected_answer)
     )
 }

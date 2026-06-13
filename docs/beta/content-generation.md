@@ -119,6 +119,12 @@ cached note instead of pretending to have source spans. Provider-generated
 source drafts that have source ids but no reference spans are rejected before
 promotion.
 
+Multiple accepted drafts may share the same `Concept` and `Stage`. The study
+boundary treats those as item variants over one concept: each variant keeps its
+own `reviewUnitId`, attempt trail, and schedule state, while due queue
+selection rotates among same-concept same-stage siblings before showing the
+same phrasing again.
+
 Rejected drafts remain useful evidence. They preserve source ids, reference
 span ids or concept reference note keys, critique notes, and rejection reasons
 so later model-backed generation can be evaluated rather than hand-waved.

@@ -3128,8 +3128,27 @@ mod tests {
             json!("0 of 1 correct (0.0%)")
         );
         assert_eq!(
+            submitted["current"]["feedback"]["itemHistory"]["lastResponseTimeMs"],
+            json!(1800)
+        );
+        assert_eq!(
+            submitted["current"]["feedback"]["itemHistory"]["averageResponseTimeMs"],
+            json!(1800)
+        );
+        assert_eq!(
+            submitted["current"]["feedback"]["itemHistory"]["responseTimeTrend"],
+            json!("not enough data")
+        );
+        assert_eq!(
             submitted["current"]["feedback"]["itemHistory"]["lastSeenSummary"],
             json!("last seen just now")
+        );
+        assert_eq!(
+            submitted["current"]["choices"]
+                .as_array()
+                .expect("choices")
+                .len(),
+            3
         );
         assert!(submitted["current"]["feedback"]["itemHistory"]["lastSeen"]
             .as_i64()
@@ -3148,6 +3167,10 @@ mod tests {
         assert_eq!(
             submitted["conceptProgress"][0]["successRate"],
             json!("1 of 2 correct (50.0%)")
+        );
+        assert_eq!(
+            submitted["conceptProgress"][0]["averageResponseTimeMs"],
+            json!(1800)
         );
     }
 
@@ -3290,6 +3313,22 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(actual, expected);
+        assert_schema_requires(&contract, "StudyCurrent", &["choices"]);
+        assert_schema_requires(
+            &contract,
+            "StudyItemHistory",
+            &[
+                "trend",
+                "lastResponseTimeMs",
+                "averageResponseTimeMs",
+                "responseTimeTrend",
+            ],
+        );
+        assert_schema_requires(
+            &contract,
+            "ConceptProgress",
+            &["averageResponseTimeMs", "responseTimeTrend"],
+        );
     }
 
     #[tokio::test]
@@ -4180,6 +4219,22 @@ mod tests {
             } else {
                 drop_schema();
             }
+        }
+    }
+
+    fn assert_schema_requires(contract: &Value, schema_name: &str, fields: &[&str]) {
+        let required = contract["components"]["schemas"][schema_name]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{schema_name} required fields"));
+        let required = required
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        for field in fields {
+            assert!(
+                required.contains(field),
+                "{schema_name} schema should require {field}; required fields were {required:?}"
+            );
         }
     }
 

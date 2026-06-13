@@ -624,6 +624,7 @@
           "activityKind",
           "activityStage",
           "prompt",
+          "choices",
           "revisionExpectedAnswer",
           "expectedAnswer",
           "referenceText",
@@ -648,6 +649,12 @@
           },
           "prompt": {
             "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "revisionExpectedAnswer": {
             "type": "string"
@@ -760,8 +767,12 @@
           "attempts",
           "correct",
           "successRate",
+          "trend",
           "lastSeen",
           "lastSeenSummary",
+          "lastResponseTimeMs",
+          "averageResponseTimeMs",
+          "responseTimeTrend",
           "stage",
           "nextReview"
         ],
@@ -777,6 +788,9 @@
           "successRate": {
             "type": "string"
           },
+          "trend": {
+            "type": "string"
+          },
           "lastSeen": {
             "anyOf": [
               {
@@ -788,6 +802,31 @@
             ]
           },
           "lastSeenSummary": {
+            "type": "string"
+          },
+          "lastResponseTimeMs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "averageResponseTimeMs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "responseTimeTrend": {
             "type": "string"
           },
           "stage": {
@@ -807,6 +846,8 @@
           "correct",
           "successRate",
           "trend",
+          "averageResponseTimeMs",
+          "responseTimeTrend",
           "health",
           "summary"
         ],
@@ -829,6 +870,20 @@
             "type": "string"
           },
           "trend": {
+            "type": "string"
+          },
+          "averageResponseTimeMs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "responseTimeTrend": {
             "type": "string"
           },
           "health": {

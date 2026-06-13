@@ -57,13 +57,15 @@ source absent from the active list.
 
 Scry should treat `ReviewUnitId` as opaque. It should not infer concept,
 phrasing, or scheduling meaning from IDs. The client can keep its own view
-state, but the current due item, revealed answer, grade, attempt count,
-post-answer feedback, item history, concept health rollup, and schedule result
-come from the engine response.
+state, but the current due item, projected multiple-choice choices, revealed
+answer, grade, attempt count, post-answer feedback, item history, concept
+health rollup, and schedule result come from the engine response.
 
 After a submit, `current.feedback` carries human-language result text, the
 expected answer, this item's attempt history (`lastSeen` plus
-`lastSeenSummary`), and the matching concept rollup.
+`lastSeenSummary`, success trend, and response-time trend), and the matching
+concept rollup. `current.choices` is already projected in the engine response;
+clients should not pin answer position across reviews.
 `conceptProgress` is the management-surface list of attempted concepts sorted
 weakest first. It is derived from the existing attempt log and review-unit
 concept metadata; clients should not build a separate analytics store for v1.

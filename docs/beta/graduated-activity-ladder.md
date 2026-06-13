@@ -23,9 +23,10 @@ variant's schedule state; the harder unit starts with its own fresh schedule
 history and preserves its own attempt provenance.
 
 Multiple-choice variants can change answer-choice count while keeping the same
-concept key. The beta generator shuffles choices deterministically so the
-correct answer is not positionally fixed, while still preserving the same
-`correctChoice` and concept identity.
+concept key. The beta study projection rotates choices deterministically from
+the review-unit id and attempt count so the correct answer is not positionally
+fixed across reviews, while still preserving the same `correctChoice` and
+concept identity.
 
 Exercise fixtures can carry a worked solution and a scoring rubric. The NATO
 composition fixture records both so QA can distinguish a harder application
