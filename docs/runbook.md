@@ -38,6 +38,48 @@ status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
 ```
 
+## Production generation latency
+
+Use this when a ticket needs model-backed production latency evidence. It
+uses an existing allowlisted v1 account/session, saves one article-sized
+source, times the end-to-end `generate` request, records the response, and
+archives the source. Production account creation is allowlist-protected, so do
+not use a throwaway email here; export a pre-provisioned account id and session
+token first.
+
+```sh
+base="https://memory-engine-api.fly.dev"
+receipt_dir="docs/qa"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
+session_token="${MEMORY_ENGINE_SESSION_TOKEN:?set MEMORY_ENGINE_SESSION_TOKEN}"
+body='Spaced practice improves long-term retention because each retrieval attempt forces the learner to reconstruct the memory rather than reread it passively. Feedback closes the loop by showing whether the reconstruction was accurate. When practice is delayed, the extra effort strengthens later access, but if the delay is too long the learner may fail without a useful cue. A good study system therefore mixes short recognition checks, cued recall, free recall, and applied composition so the learner moves from identifying an answer toward using the idea in context.'
+
+source_json="$(jq -n --arg title "Latency receipt $stamp" --arg body "$body" \
+  '{title:$title, body:$body}')"
+source_response="$(curl -fsS --max-time 20 \
+  -H 'content-type: application/json' \
+  -H "authorization: Bearer $session_token" \
+  -d "$source_json" \
+  "$base/v1/accounts/$account_id/sources")"
+source_id="$(printf '%s' "$source_response" | jq -r '.sourceId')"
+
+generate_status="$(curl -fsS --max-time 90 \
+  -H "authorization: Bearer $session_token" \
+  -o "$receipt_dir/production-generation-$stamp.json" \
+  -w "status=%{http_code} time_total=%{time_total}\n" \
+  -X POST \
+  "$base/v1/accounts/$account_id/sources/$source_id/generate")"
+printf '%s\n' "$generate_status" \
+  | tee "$receipt_dir/production-generation-$stamp.latency.txt"
+
+curl -fsS --max-time 20 \
+  -H "authorization: Bearer $session_token" \
+  -X DELETE \
+  "$base/v1/accounts/$account_id/sources/$source_id" \
+  >/dev/null
+```
+
 ## Deploy and rollback
 
 Deploys are automatic and gated: pushing `master` runs the `ci` workflow;

@@ -8,7 +8,7 @@ use std::{
 
 use memory_engine_core::ReviewUnitId;
 use memory_engine_generation::{
-    BridgeMaterialProvider, BridgeMaterialRequest, DraftProvider, LearningIntent,
+    BridgeMaterialProvider, BridgeMaterialRequest, DraftProvider, DraftRejection, LearningIntent,
     ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
@@ -110,6 +110,81 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
     assert!(prompt.contains("learning_intent"));
     assert!(prompt.contains("verbatim_memorization"));
     assert!(prompt.contains("recitation-ladder exercise drafts only"));
+    assert!(prompt.contains("semantically adjacent confusions"));
+    assert!(prompt.contains("never format variants"));
+}
+
+#[test]
+fn sends_repair_feedback_and_parses_repaired_drafts_with_usage() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "learning_intent": "concept_understanding",
+                    "drafts": [{
+                        "concept": "Mitochondria ATP production",
+                        "question": "Why are mitochondria associated with ATP supply?",
+                        "answer": "They generate most of the cell's supply of adenosine triphosphate.",
+                        "evidence_quote": "generate most of the cell's supply of adenosine triphosphate",
+                        "distractors": ["They package ribosomal RNA", "They absorb chlorophyll"],
+                        "activity_kind": "quiz",
+                        "activity_stage": "recognition",
+                        "worked_solution": ""
+                    }]
+                }).to_string()
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 900,
+            "completion_tokens": 180,
+            "cost": 0.000_31
+        }
+    });
+    let (base_url, request) = serve_once(200, &body.to_string());
+
+    let provider = OpenRouterProvider::new(OpenRouterConfig {
+        api_key: "test-key".to_owned(),
+        model: "deepseek/deepseek-v4-flash".to_owned(),
+        base_url,
+        timeout: Duration::from_secs(5),
+        prompt: PromptVariant::Principled,
+        max_drafts: 8,
+    });
+    let repair = provider
+        .repair_drafts(
+            &prose_source(),
+            &[DraftRejection {
+                index: 1,
+                concept: "Mitochondria ATP production".to_owned(),
+                question: "What do mitochondria generate?".to_owned(),
+                answer: "ATP".to_owned(),
+                reasons: vec![
+                    "Duplicate-ish generated draft".to_owned(),
+                    "Evidence quote not found in cited source".to_owned(),
+                ],
+            }],
+        )
+        .expect("repair request")
+        .expect("repair drafts");
+
+    assert_eq!(repair.candidates.len(), 1);
+    assert_eq!(repair.usage.expect("usage").cost_usd_micros, Some(310));
+
+    let request = request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request");
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        payload["response_format"]["json_schema"]["name"],
+        "quiz_draft_repair"
+    );
+    let prompt = payload["messages"][0]["content"].as_str().expect("prompt");
+    assert!(prompt.contains("Repair pass:"));
+    assert!(prompt.contains("Generate fresh replacements only"));
+    assert!(prompt.contains("Duplicate-ish generated draft"));
+    assert!(prompt.contains("Evidence quote not found in cited source"));
+    assert!(prompt.contains("semantically adjacent confusions"));
 }
 
 #[test]

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
-    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft,
-    ReferenceNoteProvider, ReferenceNoteRequest,
+    DraftRejection, LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
+    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
@@ -199,40 +199,74 @@ impl DraftProvider for OpenRouterProvider {
             "quiz_drafts",
             &drafts_schema(),
         )?;
-        let parsed: DraftsPayload = serde_json::from_str(&response.content).map_err(|_| {
-            ProviderFailure::new("The model's drafts could not be read; please try again.")
-        })?;
-        let learning_intent =
-            LearningIntent::from_label(&parsed.learning_intent).ok_or_else(|| {
-                ProviderFailure::new(
-                    "The model's learning intent could not be read; please try again.",
-                )
-            })?;
+        parse_drafts_response(
+            response,
+            source,
+            DraftProvider::model(self),
+            self.config.max_drafts,
+        )
+    }
 
-        let mut candidates = Vec::new();
-        let mut failures = Vec::new();
-        for (position, draft) in parsed
-            .drafts
-            .into_iter()
-            .take(self.config.max_drafts)
-            .enumerate()
-        {
-            match draft.into_candidate(position + 1) {
-                Ok(candidate) => candidates.push(candidate),
-                Err(reason) => {
-                    failures.push(format!("{} draft {}: {reason}", source.id, position + 1));
-                }
-            }
+    fn repair_drafts(
+        &self,
+        source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        if rejections.is_empty() {
+            return Ok(None);
         }
 
-        Ok(ProviderDrafts {
-            model: DraftProvider::model(self),
-            learning_intent: Some(learning_intent),
-            candidates,
-            failures,
-            usage: response.usage,
-        })
+        let response = self.complete_structured(
+            &build_repair_prompt(
+                self.config.prompt,
+                self.config.max_drafts,
+                source,
+                rejections,
+            ),
+            "quiz_draft_repair",
+            &drafts_schema(),
+        )?;
+        parse_drafts_response(
+            response,
+            source,
+            DraftProvider::model(self),
+            self.config.max_drafts,
+        )
+        .map(Some)
     }
+}
+
+fn parse_drafts_response(
+    response: StructuredResponse,
+    source: &SourceDocument,
+    model: GeneratedPromptModel,
+    max_drafts: usize,
+) -> Result<ProviderDrafts, ProviderFailure> {
+    let parsed: DraftsPayload = serde_json::from_str(&response.content).map_err(|_| {
+        ProviderFailure::new("The model's drafts could not be read; please try again.")
+    })?;
+    let learning_intent = LearningIntent::from_label(&parsed.learning_intent).ok_or_else(|| {
+        ProviderFailure::new("The model's learning intent could not be read; please try again.")
+    })?;
+
+    let mut candidates = Vec::new();
+    let mut failures = Vec::new();
+    for (position, draft) in parsed.drafts.into_iter().take(max_drafts).enumerate() {
+        match draft.into_candidate(position + 1) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(reason) => {
+                failures.push(format!("{} draft {}: {reason}", source.id, position + 1));
+            }
+        }
+    }
+
+    Ok(ProviderDrafts {
+        model,
+        learning_intent: Some(learning_intent),
+        candidates,
+        failures,
+        usage: response.usage,
+    })
 }
 
 impl ReferenceNoteProvider for OpenRouterProvider {
@@ -356,6 +390,43 @@ Each draft has:
 Return JSON only.",
         title = source.title,
         body = source.body.as_deref().unwrap_or_default(),
+    )
+}
+
+fn build_repair_prompt(
+    variant: PromptVariant,
+    max_drafts: usize,
+    source: &SourceDocument,
+    rejections: &[DraftRejection],
+) -> String {
+    let rejected = rejections
+        .iter()
+        .map(|rejection| {
+            format!(
+                "- draft {} concept {:?}: question {:?}; answer {:?}; rejected because {}",
+                rejection.index,
+                rejection.concept,
+                rejection.question,
+                rejection.answer,
+                rejection.reasons.join("; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "{base}
+
+Repair pass:
+- The drafts below were rejected by the trust gate. Generate fresh replacements only.
+- Do not repeat rejected question wording or duplicate an accepted concept/question/answer surface.
+- Fix every listed rejection reason; if you cannot fix one with source-grounded evidence, omit it.
+- Return at most {repair_limit} repaired drafts.
+
+REJECTED DRAFTS:
+{rejected}",
+        base = build_prompt(variant, max_drafts, source),
+        repair_limit = rejections.len().min(max_drafts),
     )
 }
 

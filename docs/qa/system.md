@@ -5,6 +5,7 @@ Refs-backlog: 051
 Refs-backlog: 052
 Refs-backlog: 053
 Refs-backlog: 054
+Refs-backlog: 055
 
 ## Purpose
 
@@ -81,8 +82,18 @@ That receipt is still local and deterministic, but it is not a raw performance
 benchmark: its `shape` column must stay green for the intent fixtures that
 cover verbatim memorization, concept understanding, fact recall, and
 procedure/process capture, its `variants` column scores same-concept same-stage
-phrasing variety without answer leakage, and its bridge fixture must stay green
-for lower-stage, same-concept, non-duplicate bridge material.
+phrasing variety without answer leakage, its `dup` column uses the same
+near-duplicate predicate as source generation, and its bridge fixture must stay
+green for lower-stage, same-concept, non-duplicate bridge material. Live model
+quality comparisons stay explicit and write dated receipts under `docs/evals/`:
+
+```sh
+cargo run -p memory-engine-bench -- generation \
+  --model google/gemini-3.5-flash \
+  --prompt principled \
+  --judge anthropic/claude-sonnet-4.6 \
+  --out docs/evals/generation-gemini-3.5-flash-judged-$(date +%F).md
+```
 
 ## Operating Procedure
 

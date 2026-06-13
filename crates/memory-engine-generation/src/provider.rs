@@ -59,6 +59,15 @@ pub struct ProviderDrafts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DraftRejection {
+    pub index: usize,
+    pub concept: String,
+    pub question: String,
+    pub answer: String,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReviewPerformanceContext {
     pub review_unit_id: String,
     pub submitted_answer: String,
@@ -140,6 +149,25 @@ pub trait DraftProvider {
     /// output for the source (transport failure, malformed response). The
     /// message is surfaced to the learner.
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure>;
+
+    /// Regenerate draft candidates once after the shared trust gate rejected
+    /// every candidate for a source.
+    ///
+    /// Providers that cannot use rejection feedback return `Ok(None)`. The
+    /// generation runner still owns validation and persistence for repaired
+    /// candidates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderFailure`] when a provider-specific repair request
+    /// fails after it has chosen to attempt repair.
+    fn repair_drafts(
+        &self,
+        _source: &SourceDocument,
+        _rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        Ok(None)
+    }
 }
 
 /// Produces a short concept-level explanation when no source span exists.
@@ -312,6 +340,17 @@ impl DraftProvider for FallbackProvider<'_> {
             self.fallback.generate_drafts(source)
         } else {
             Ok(primary)
+        }
+    }
+
+    fn repair_drafts(
+        &self,
+        source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        match self.primary.repair_drafts(source, rejections)? {
+            Some(drafts) => Ok(Some(drafts)),
+            None => self.fallback.repair_drafts(source, rejections),
         }
     }
 }
@@ -611,22 +650,26 @@ fn fact_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
         facts
     };
 
-    let fact_count = facts.len();
-    let mut candidates = facts
+    let fact_rows = facts
         .into_iter()
-        .enumerate()
-        .map(|(position, sentence)| {
+        .map(|sentence| {
             let (question, answer) = fact_question_answer(source, &sentence);
+            (question, answer, sentence)
+        })
+        .collect::<Vec<_>>();
+    let fact_count = fact_rows.len();
+    let mut candidates = fact_rows
+        .iter()
+        .enumerate()
+        .map(|(position, (question, answer, sentence))| {
+            let distractors = grounded_fact_distractors(&fact_rows, answer);
             DraftCandidate {
                 index: position + 1,
                 concept: format!("{} fact {}", source.title, position + 1),
-                question,
-                answer,
-                evidence: Some(sentence),
-                distractors: vec![
-                    "A nearby but different source detail".to_owned(),
-                    "A plausible unrelated detail".to_owned(),
-                ],
+                question: question.clone(),
+                answer: answer.clone(),
+                evidence: Some(sentence.clone()),
+                distractors,
                 worked_solution: None,
                 activity_kind: GeneratedLearningActivityKind::Quiz,
                 activity_stage: "recognition".to_owned(),
@@ -661,6 +704,21 @@ fn fact_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
     }
 
     candidates
+}
+
+fn grounded_fact_distractors(facts: &[(String, String, String)], answer: &str) -> Vec<String> {
+    let distractors = facts
+        .iter()
+        .map(|(_, fact_answer, _)| fact_answer.trim())
+        .filter(|fact_answer| !fact_answer.is_empty() && *fact_answer != answer.trim())
+        .take(2)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if distractors.len() >= 2 {
+        distractors
+    } else {
+        Vec::new()
+    }
 }
 
 fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {

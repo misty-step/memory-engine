@@ -125,9 +125,18 @@ own `reviewUnitId`, attempt trail, and schedule state, while due queue
 selection rotates among same-concept same-stage siblings before showing the
 same phrasing again.
 
+Source generation rejects duplicate-ish accepted material by concept, answer,
+and cheap normalized question-token similarity. That catches exact copies and
+near-copy wording without blocking legitimate same-concept same-stage variants
+that ask meaningfully different questions.
+
 Rejected drafts remain useful evidence. They preserve source ids, reference
 span ids or concept reference note keys, critique notes, and rejection reasons
 so later model-backed generation can be evaluated rather than hand-waved.
+When every first-pass draft for a source is rejected and the provider supports
+repair, the runner makes one bounded repair request with the rejection reasons,
+persists the repaired candidates through the same trust gate, and aggregates
+the repair pass into the run-level usage totals.
 
 ## Kernel Boundary
 

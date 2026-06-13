@@ -14,8 +14,8 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use memory_engine::types::ReviewUnitId;
 use memory_engine_generation::{
-    evidence_quote_matches, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
-    DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
+    candidates_duplicateish, evidence_quote_matches, BridgeMaterialProvider, BridgeMaterialRequest,
+    DraftCandidate, DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
@@ -96,10 +96,12 @@ pub struct BridgeQualityScore {
     pub passes: bool,
 }
 
+#[derive(Debug)]
 pub struct GenerationBenchArgs {
     pub model: Option<String>,
     pub prompt: PromptVariant,
     pub judge: Option<String>,
+    pub max_drafts: Option<usize>,
     pub out: Option<PathBuf>,
 }
 
@@ -117,6 +119,7 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
         model: None,
         prompt: PromptVariant::Principled,
         judge: None,
+        max_drafts: None,
         out: None,
     };
     let mut iterator = arguments.iter();
@@ -149,6 +152,18 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
                         .clone(),
                 );
             }
+            "--max-drafts" => {
+                let value = iterator
+                    .next()
+                    .ok_or("--max-drafts requires a positive integer")?;
+                let max_drafts = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-drafts value: {value}"))?;
+                if max_drafts == 0 {
+                    return Err("--max-drafts must be greater than zero".to_owned());
+                }
+                parsed.max_drafts = Some(max_drafts);
+            }
             "--out" => {
                 parsed.out = Some(PathBuf::from(
                     iterator.next().ok_or("--out requires a file path")?,
@@ -156,7 +171,7 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--out <path>]"
+                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--max-drafts <n>] [--out <path>]"
                 ))
             }
         }
@@ -181,7 +196,13 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
             let mut config = OpenRouterConfig::from_env()?;
             config.model.clone_from(model);
             config.prompt = parsed.prompt;
-            let label = format!("openrouter/{model} ({})", parsed.prompt.label());
+            if let Some(max_drafts) = parsed.max_drafts {
+                config.max_drafts = max_drafts;
+            }
+            let mut label = format!("openrouter/{model} ({})", parsed.prompt.label());
+            if let Some(max_drafts) = parsed.max_drafts {
+                let _ = write!(label, " · max_drafts: {max_drafts}");
+            }
             (Box::new(OpenRouterProvider::new(config)), label)
         }
     };
@@ -349,15 +370,13 @@ fn deterministic_judges(
             .count(),
         drafts,
     );
-    let mut seen = std::collections::BTreeSet::new();
     let duplicates = candidates
         .iter()
-        .filter(|candidate| {
-            !seen.insert(format!(
-                "{}\0{}",
-                candidate.question.to_lowercase(),
-                candidate.answer.to_lowercase()
-            ))
+        .enumerate()
+        .filter(|(index, candidate)| {
+            candidates[..*index]
+                .iter()
+                .any(|seen| candidates_duplicateish(seen, candidate))
         })
         .count();
     let covered_terms = expect
@@ -1002,6 +1021,30 @@ mod tests {
     }
 
     const BODY: &str = "A is Alfa. B is Bravo. C is Charlie.";
+
+    #[test]
+    fn parse_args_accepts_max_drafts() {
+        let args = [
+            "--model".to_owned(),
+            "google/gemini-3.5-flash".to_owned(),
+            "--max-drafts".to_owned(),
+            "4".to_owned(),
+        ];
+
+        let parsed = parse_args(&args).expect("args");
+
+        assert_eq!(parsed.model.as_deref(), Some("google/gemini-3.5-flash"));
+        assert_eq!(parsed.max_drafts, Some(4));
+    }
+
+    #[test]
+    fn parse_args_rejects_zero_max_drafts() {
+        let args = ["--max-drafts".to_owned(), "0".to_owned()];
+
+        let error = parse_args(&args).expect_err("zero max drafts");
+
+        assert!(error.contains("greater than zero"));
+    }
 
     #[test]
     fn grounded_output_scores_perfect_provenance_and_coverage() {
