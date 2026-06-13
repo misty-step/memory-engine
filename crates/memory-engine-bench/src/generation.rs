@@ -49,6 +49,8 @@ struct Expectations {
     forbidden_activity_kinds: Vec<String>,
     #[serde(default)]
     requires_distractors: bool,
+    #[serde(default)]
+    requires_variants: bool,
 }
 
 /// Deterministic judge scores for one source's provider output.
@@ -71,6 +73,9 @@ pub struct SourceScore {
     pub key_term_coverage: f64,
     /// Whether intent-specific activity kind/stage expectations were met.
     pub intent_shape_match: bool,
+    /// Same-concept same-stage variant groups with distinct surface forms and
+    /// no answer leakage in the question text.
+    pub variant_quality: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: Option<i64>,
@@ -303,6 +308,7 @@ where
             count_in_range: false,
             key_term_coverage: 0.0,
             intent_shape_match: source.expect.intent.is_none(),
+            variant_quality: 0.0,
             input_tokens: 0,
             output_tokens: 0,
             cost_usd_micros: None,
@@ -382,6 +388,7 @@ fn deterministic_judges(
         count_in_range: drafts >= expect.min_drafts && drafts <= expect.max_drafts,
         key_term_coverage: fraction(covered_terms, expect.key_terms.len()),
         intent_shape_match: intent_shape_matches(expect, learning_intent, candidates),
+        variant_quality: variant_quality(candidates),
         input_tokens: 0,
         output_tokens: 0,
         cost_usd_micros: None,
@@ -402,6 +409,7 @@ fn intent_shape_matches(
         && expect.required_activity_stage_terms.is_empty()
         && expect.forbidden_activity_kinds.is_empty()
         && !expect.requires_distractors
+        && !expect.requires_variants
     {
         return true;
     }
@@ -432,12 +440,91 @@ fn intent_shape_matches(
         || candidates
             .iter()
             .any(|candidate| !candidate.distractors.is_empty());
+    let variants_match =
+        !expect.requires_variants || (variant_quality(candidates) - 1.0).abs() < f64::EPSILON;
 
     intent_label_matches
         && required_kinds_match
         && required_stages_match
         && forbidden_kinds_absent
         && distractors_match
+        && variants_match
+}
+
+fn variant_quality(candidates: &[DraftCandidate]) -> f64 {
+    let mut groups: std::collections::BTreeMap<String, Vec<&DraftCandidate>> =
+        std::collections::BTreeMap::new();
+    for candidate in candidates {
+        let key = [
+            normalize(&candidate.concept),
+            activity_kind_label(&candidate.activity_kind).to_owned(),
+            candidate.activity_stage.trim().to_lowercase(),
+        ]
+        .join("\0");
+        groups.entry(key).or_default().push(candidate);
+    }
+    let variant_groups = groups
+        .into_values()
+        .filter(|group| group.len() >= 2)
+        .collect::<Vec<_>>();
+    if variant_groups.is_empty() {
+        return 0.0;
+    }
+    let passing = variant_groups
+        .iter()
+        .filter(|group| variant_group_passes(group))
+        .count();
+    fraction(passing, variant_groups.len())
+}
+
+fn variant_group_passes(candidates: &[&DraftCandidate]) -> bool {
+    let mut surfaces = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        let question = normalize(&candidate.question);
+        let answer = normalize(&candidate.answer);
+        if !surfaces.insert(question.clone()) {
+            return false;
+        }
+        if question_leaks_answer(&question, &answer) {
+            return false;
+        }
+    }
+
+    for (index, left) in candidates.iter().enumerate() {
+        for right in &candidates[index + 1..] {
+            if surface_similarity(&left.question, &right.question) >= 0.85 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn question_leaks_answer(question: &str, answer: &str) -> bool {
+    let answer_tokens = answer.split_whitespace().collect::<Vec<_>>();
+    if answer_tokens.is_empty() {
+        return false;
+    }
+    let question_tokens = question.split_whitespace().collect::<Vec<_>>();
+    question_tokens
+        .windows(answer_tokens.len())
+        .any(|window| window == answer_tokens.as_slice())
+}
+
+fn surface_similarity(left: &str, right: &str) -> f64 {
+    let left_normalized = normalize(left);
+    let left = left_normalized
+        .split_whitespace()
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_normalized = normalize(right);
+    let right = right_normalized
+        .split_whitespace()
+        .collect::<std::collections::BTreeSet<_>>();
+    let union = left.union(&right).count();
+    if union == 0 {
+        return 1.0;
+    }
+    fraction(left.intersection(&right).count(), union)
 }
 
 #[cfg(test)]
@@ -610,11 +697,11 @@ fn render_receipt(
     let _ = writeln!(receipt);
     let _ = writeln!(
         receipt,
-        "| source | category | drafts | schema | provenance | answerable | dup | count-ok | terms | shape | tokens in/out | cost | latency |"
+        "| source | category | drafts | schema | provenance | answerable | dup | count-ok | terms | shape | variants | tokens in/out | cost | latency |"
     );
     let _ = writeln!(
         receipt,
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     render_score_rows(&mut receipt, scores);
     let _ = writeln!(receipt);
@@ -629,14 +716,14 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
         if let Some(error) = &score.provider_error {
             let _ = writeln!(
                 receipt,
-                "| {} | {} | — | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
+                "| {} | {} | — | — | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
                 score.source_id, score.category
             );
             continue;
         }
         let _ = writeln!(
             receipt,
-            "| {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {}/{} | {} | {}ms |",
+            "| {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {:.0}% | {}/{} | {} | {}ms |",
             score.source_id,
             score.category,
             score.drafts,
@@ -647,6 +734,7 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
             if score.count_in_range { "yes" } else { "NO" },
             score.key_term_coverage * 100.0,
             if score.intent_shape_match { "yes" } else { "NO" },
+            score.variant_quality * 100.0,
             score.input_tokens,
             score.output_tokens,
             format_cost(score.cost_usd_micros),
@@ -909,6 +997,7 @@ mod tests {
             required_activity_stage_terms: Vec::new(),
             forbidden_activity_kinds: Vec::new(),
             requires_distractors: false,
+            requires_variants: false,
         }
     }
 
@@ -981,6 +1070,83 @@ mod tests {
         assert!(!failed.passes);
         assert!((failed.duplicate_rate - 1.0).abs() < f64::EPSILON);
         assert!(failed.easier_than_parent.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn variant_quality_requires_distinct_same_concept_stage_phrasings_without_answer_leakage() {
+        let mut expect = expectations();
+        expect.requires_variants = true;
+        let variants = vec![
+            nato_letter_a_variant("What is the NATO phonetic alphabet word for A?"),
+            nato_letter_a_variant("Choose the code word used for the letter A."),
+        ];
+
+        let clean = deterministic_judges(BODY, &expect, None, &variants);
+
+        assert!((clean.variant_quality - 1.0).abs() < f64::EPSILON);
+        assert!(clean.intent_shape_match);
+
+        let short_answer_clean = vec![
+            alphabet_a_variant("What name marks the first NATO letter?"),
+            alphabet_a_variant("Choose the initial alphabet symbol."),
+        ];
+        let short_answer = deterministic_judges(BODY, &expect, None, &short_answer_clean);
+
+        assert!((short_answer.variant_quality - 1.0).abs() < f64::EPSILON);
+        assert!(short_answer.intent_shape_match);
+
+        assert_variant_quality_fails(
+            &expect,
+            &[
+                variants[0].clone(),
+                nato_letter_a_variant("Which option is ALFA for the letter A?"),
+            ],
+        );
+        assert_variant_quality_fails(
+            &expect,
+            &[
+                variants[0].clone(),
+                nato_letter_a_variant("What is the NATO phonetic alphabet word for A?"),
+            ],
+        );
+        assert_variant_quality_fails(
+            &expect,
+            &[
+                variants[0].clone(),
+                nato_letter_a_variant("What is the NATO phonetic alphabet word for the letter A?"),
+            ],
+        );
+    }
+
+    fn assert_variant_quality_fails(expect: &Expectations, variants: &[DraftCandidate]) {
+        let failed = deterministic_judges(BODY, expect, None, variants);
+        assert!(failed.variant_quality < 1.0);
+        assert!(!failed.intent_shape_match);
+    }
+
+    fn nato_letter_a_variant(question: &str) -> DraftCandidate {
+        DraftCandidate {
+            concept: "NATO letter A".to_owned(),
+            question: question.to_owned(),
+            answer: "ALFA".to_owned(),
+            distractors: vec!["BRAVO".to_owned(), "CHARLIE".to_owned()],
+            activity_stage: "recognition-3".to_owned(),
+            ..candidate(
+                question,
+                "ALFA",
+                "The NATO phonetic alphabet word for A is ALFA",
+            )
+        }
+    }
+
+    fn alphabet_a_variant(question: &str) -> DraftCandidate {
+        DraftCandidate {
+            concept: "Alphabet first letter".to_owned(),
+            question: question.to_owned(),
+            answer: "A".to_owned(),
+            activity_stage: "recognition-3".to_owned(),
+            ..candidate(question, "A", "A is the first letter of the alphabet")
+        }
     }
 
     #[test]
