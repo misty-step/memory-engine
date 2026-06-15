@@ -28,6 +28,11 @@ Field attempts run on 2026-06-13 did not clear both judged metrics:
 | `google/gemini-3.5-flash` | production-gated bench, OpenAI judge | 3.0 | 54% | Proved the old bench bypassed production filtering/repair, but judged quality regressed. Artifact: `docs/evals/generation-gemini-3.5-flash-production-gated-judged-2026-06-13.md`. |
 | `google/gemini-3.5-flash` | production-gated, max 5, atomic prompt, Anthropic judge | 3.3 | 76% | Keep improved, distractors still below baseline. Artifact: `docs/evals/generation-gemini-3.5-flash-judged-2026-06-13.md`. |
 | `anthropic/claude-sonnet-4.6` | production-gated, max 5, atomic prompt, OpenAI judge | 3.3 | 70% | Model swap did not improve judged quality enough and had a 6.0s p95 outlier. Artifact: `docs/evals/generation-claude-sonnet-4.6-judged-2026-06-13.md`. |
+| `google/gemini-3.5-flash` | one-pass expert item-writer prompt | 3.6 | 69% | Better distractors than the retained 3.3 path, but keep regressed and deterministic shape was 11/12. Artifact: `docs/evals/generation-gemini-3.5-flash-item-writer-judged-2026-06-15.md`. |
+| `google/gemini-3.5-flash` | one-pass item-writer + required audit fields | 3.5 | 61% | Structured rationale/self-check fields made output worse; experiment reverted. Artifact: `docs/evals/generation-gemini-3.5-flash-item-writer-audit-judged-2026-06-15.md`. |
+| `openai/gpt-5.4` | one-pass item-writer + required audit fields | 3.6 | 72% | Stronger model improved keep but still missed distractor baseline; audit schema reverted. Artifact: `docs/evals/generation-gpt-5.4-item-writer-audit-judged-2026-06-15.md`. |
+| `openai/gpt-5.4` | one-pass expert item-writer prompt | 3.5 | 64% | Removing audit fields did not improve distractors or keep. Artifact: `docs/evals/generation-gpt-5.4-item-writer-judged-2026-06-15.md`. |
+| `openai/gpt-5.4` | one-pass item-writer + partial repair for rejected candidates | 3.4 | 63% | Repair-on-any-rejection plus safe MCQ gates did not lift judged quality. Artifact: `docs/evals/generation-gpt-5.4-item-writer-partial-repair-judged-2026-06-15.md`. |
 
 The polish/editor experiments were reverted because they repeatedly lowered
 distractor quality and caused deterministic intent-shape regressions. The
@@ -37,12 +42,22 @@ retained implementation work is limited to:
   score accepted runtime drafts after duplicate filtering and repair instead of
   raw provider output;
 - accepted-material near-duplicate filtering in source generation;
-- one bounded repair request after a source produces zero accepted first-pass
-  drafts, with usage merged into the run;
+- one bounded repair request for rejected first-pass drafts, with usage merged
+  into the run, even when the same source also produced accepted drafts;
+- cheap MCQ trust-gate rejection for compound questions and distractors that
+  duplicate the correct answer;
 - a lower default model draft budget of 5, plus atomic-card and distractor
   guardrails in the principled prompt; this is a 055 follow-up to the June 11
   field note that identified `max_drafts` as the main cost/latency dial;
-- an explicit `--max-drafts` bench flag for future field sweeps.
+- explicit `--max-drafts` and `--prompt item-writer` bench flags for future
+  field sweeps. The item-writer prompt remains an experiment; production
+  default stays `prompt-principled` until a judged receipt clears the oracle.
+
+The 2026-06-15 one-pass experiments were run because the likely failure could
+have been prompt/context engineering rather than model capability. The retained
+result does not support shipping a prompt-only/model-swap fix: the best
+one-pass distractor score was 3.6, still below the 3.825 baseline, and the
+strongest keep-rate result still missed distractor quality.
 
 Production latency attempt:
 

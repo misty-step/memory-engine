@@ -133,10 +133,11 @@ that ask meaningfully different questions.
 Rejected drafts remain useful evidence. They preserve source ids, reference
 span ids or concept reference note keys, critique notes, and rejection reasons
 so later model-backed generation can be evaluated rather than hand-waved.
-When every first-pass draft for a source is rejected and the provider supports
+When any first-pass draft for a source is rejected and the provider supports
 repair, the runner makes one bounded repair request with the rejection reasons,
 persists the repaired candidates through the same trust gate, and aggregates
-the repair pass into the run-level usage totals.
+the repair pass into the run-level usage totals. The repair pass is still
+cost-capped: only the first bounded set of rejection reasons is sent.
 
 ## Kernel Boundary
 

@@ -464,6 +464,60 @@ fn repairs_zero_accepted_source_once_and_counts_repair_usage() {
 }
 
 #[test]
+fn repairs_rejected_candidates_even_when_source_has_accepted_drafts() {
+    let directory = TempDirectory::new("partial-repair");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-partial-repair".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Partial repair notes".to_owned(),
+            body: Some("Partial repair notes say feedback improves recall.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &PartialRepairProvider,
+        BetaGenerationRequest {
+            run_id: "run-partial-repair".to_owned(),
+            source_document_ids: vec!["src-partial-repair".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(
+        result.rejected_draft_ids,
+        ["run-partial-repair-draft-src-partial-repair-2-recall-feedback"]
+    );
+    assert_eq!(
+        result.accepted_draft_ids,
+        [
+            "run-partial-repair-draft-src-partial-repair-1-recall-feedback",
+            "run-partial-repair-draft-src-partial-repair-3-recall-feedback"
+        ]
+    );
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.generated_prompt_drafts.len(), 3);
+    assert_eq!(
+        snapshot.generated_prompt_drafts[1].validation.reasons,
+        ["MCQ distractor duplicates the correct answer"]
+    );
+}
+
+#[test]
 fn repair_feedback_is_capped_before_provider_retry() {
     let directory = TempDirectory::new("repair-cap");
     let path = directory.path().join("store.json");
@@ -947,6 +1001,83 @@ impl DraftProvider for RepairingProvider {
                 cost_usd_micros: Some(25),
                 latency_ms: 30,
             }),
+        }))
+    }
+}
+
+struct PartialRepairProvider;
+
+impl DraftProvider for PartialRepairProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "partial-repair-provider".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: "Recall feedback".to_owned(),
+                    question: "What improves recall?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["spacing".to_owned(), "sleep".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: "Recall feedback".to_owned(),
+                    question: "Which item from the notes improves later recall?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["feedback".to_owned(), "guessing".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+            ],
+            failures: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn repair_drafts(
+        &self,
+        _source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].reasons,
+            ["MCQ distractor duplicates the correct answer"]
+        );
+        Ok(Some(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 3,
+                concept: "Recall feedback".to_owned(),
+                question: "What improves recall after practice?".to_owned(),
+                answer: "feedback".to_owned(),
+                evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                distractors: vec!["guessing".to_owned(), "forgetting".to_owned()],
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "recognition".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: None,
         }))
     }
 }

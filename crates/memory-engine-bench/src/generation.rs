@@ -142,11 +142,12 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
             "--prompt" => {
                 parsed.prompt = match iterator
                     .next()
-                    .ok_or("--prompt requires `minimal` or `principled`")?
+                    .ok_or("--prompt requires `minimal`, `principled`, or `item-writer`")?
                     .as_str()
                 {
                     "minimal" => PromptVariant::Minimal,
                     "principled" => PromptVariant::Principled,
+                    "item-writer" => PromptVariant::ItemWriter,
                     other => return Err(format!("unknown prompt variant: {other}")),
                 };
             }
@@ -177,7 +178,7 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--max-drafts <n>] [--out <path>]"
+                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled|item-writer] [--judge <id>] [--max-drafts <n>] [--out <path>]"
                 ))
             }
         }
@@ -1280,6 +1281,15 @@ mod tests {
 
         assert_eq!(parsed.model.as_deref(), Some("google/gemini-3.5-flash"));
         assert_eq!(parsed.max_drafts, Some(4));
+    }
+
+    #[test]
+    fn parse_args_accepts_item_writer_prompt_variant() {
+        let args = ["--prompt".to_owned(), "item-writer".to_owned()];
+
+        let parsed = parse_args(&args).expect("args");
+
+        assert_eq!(parsed.prompt, PromptVariant::ItemWriter);
     }
 
     #[test]

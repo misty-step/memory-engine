@@ -46,6 +46,8 @@ pub enum PromptVariant {
     Minimal,
     /// Adds principle-based rules distilled from Scry's production prompts.
     Principled,
+    /// One-pass expert item-writing prompt with embedded distractor planning.
+    ItemWriter,
 }
 
 impl PromptVariant {
@@ -54,6 +56,7 @@ impl PromptVariant {
         match self {
             Self::Minimal => "prompt-minimal",
             Self::Principled => "prompt-principled",
+            Self::ItemWriter => "prompt-item-writer",
         }
     }
 }
@@ -343,6 +346,10 @@ fn transport_failure(error: &ureq::Error) -> ProviderFailure {
 }
 
 fn build_prompt(variant: PromptVariant, max_drafts: usize, source: &SourceDocument) -> String {
+    if variant == PromptVariant::ItemWriter {
+        return build_item_writer_prompt(max_drafts, source);
+    }
+
     let principles = match variant {
         PromptVariant::Minimal => String::new(),
         PromptVariant::Principled => "\
@@ -360,6 +367,7 @@ Principles:
 
 "
         .to_owned(),
+        PromptVariant::ItemWriter => unreachable!("handled before principle prompt construction"),
     };
 
     format!(
@@ -392,6 +400,74 @@ Each draft has:
 - worked_solution: required for exercises, otherwise \"\"
 
 Return JSON only.",
+        title = source.title,
+        body = source.body.as_deref().unwrap_or_default(),
+    )
+}
+
+fn build_item_writer_prompt(max_drafts: usize, source: &SourceDocument) -> String {
+    format!(
+        "You are an expert test-item writer creating spaced-repetition material from one source.
+
+<source>
+<title>{title}</title>
+<text>
+{body}
+</text>
+</source>
+
+<task>
+Classify the source as exactly one learning_intent:
+- verbatim_memorization: poems, quotes, speeches, prayers, scripts, or lists the learner likely wants to reproduce exactly.
+- concept_understanding: mechanisms, explanations, causes, theories, or ideas the learner should understand and apply.
+- fact_recall: discrete facts, names, dates, definitions, or mappings.
+- procedure_process: ordered steps, workflows, recipes, commands, or conditional processes.
+
+Generate 2-5 drafts, never exceeding {max_drafts}. For tiny sources, emit 1-3 drafts. Fewer strong drafts beat many shallow drafts.
+</task>
+
+<one_pass_workflow>
+For each draft, do this privately before writing the final JSON:
+1. Select one durable atom that is important to remember and has a verbatim supporting quote.
+2. Solve and anchor: determine the exact correct answer from the quote before writing the question.
+3. Choose the answer type and granularity: person, date, number, command, mechanism, definition, mapping, line, or step.
+4. If this can be a recognition quiz, create 2-3 distractors from likely learner misconceptions:
+   - same answer type and grammatical form as the correct answer;
+   - same category and level of specificity as the correct answer;
+   - wrong because of a common confusion, swapped relation, nearby concept, wrong scale, reversed condition, or plausible procedural error;
+   - not copied true statements from the source, not overlapping numeric ranges, not jokes, not anachronisms, not random names, not obviously impossible options.
+5. Self-audit every distractor. Replace any distractor that is true, too broad, too silly, category-mismatched, a clue by length/grammar, or merely a format variant of the answer.
+6. If you cannot write 2-3 strong distractors after the self-audit, make the draft short-answer with [] distractors.
+</one_pass_workflow>
+
+<item_quality_examples>
+Bad distractors for answer \"Cache-Control: no-store\": \"Banana\", \"HTTP/2\", \"a browser\". They do not share the command/directive category.
+Good distractors: \"Cache-Control: private\", \"Cache-Control: max-age=0\", \"Pragma: no-cache\". They are nearby cache directives a learner might confuse.
+
+Bad distractors for answer \"1903\": \"1904-1906\", \"the Rubicon\", \"yesterday\". They leak format or category clues.
+Good distractors: \"1901\", \"1905\", \"1911\" when those dates are plausible nearby historical confusions and not true source answers.
+</item_quality_examples>
+
+<output_rules>
+Each draft must contain:
+- concept: short title naming the tested atom, at most 12 words.
+- question: standalone, short, single-part, and answerable from the source alone.
+- answer: the exact correct answer.
+- evidence_quote: a verbatim source quote that proves the answer.
+- distractors: 2-3 plausible wrong answers, or [] only for short-answer drafts.
+- activity_kind: quiz or exercise.
+- activity_stage: recognition, cued-recall, free-recall, or procedure-composition.
+- worked_solution: required for exercises, otherwise \"\".
+
+Intent routing:
+- verbatim_memorization: emit recitation-ladder exercise drafts only; ask for exactly one line or short phrase; include both cued-recall and free-recall activity_stage values when there is enough text; never emit a quiz.
+- concept_understanding: set learning_intent to concept_understanding; emit quiz drafts; at least one draft must use activity_stage exactly free-recall and ask the learner to explain or apply a mechanism. Do not use recognition-only output for concept prose.
+- fact_recall: prefer recognition quizzes only when the distractors pass the self-audit; otherwise use cued-recall.
+- procedure_process: emit quiz drafts with activity_stage procedure-composition; ask the learner to choose, arrange, or identify the correct next step, condition, or process state.
+- for tiny factual sources with one or two numeric facts, create at least two variants under the same concept, activity_kind, and activity_stage: one direct recall question, one condition/exception question, and one application/comparison question. Vary the question surface meaningfully; do not repeat the same stem with minor wording changes.
+
+Return JSON only. Do not include your private workflow, rationale, self-audit, markdown, or prose outside the JSON object.
+</output_rules>",
         title = source.title,
         body = source.body.as_deref().unwrap_or_default(),
     )
@@ -839,7 +915,9 @@ fn non_empty(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_json_object, parse_bridge_stage};
+    use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
+
+    use super::{build_prompt, extract_json_object, parse_bridge_stage, PromptVariant};
 
     #[test]
     fn unwraps_markdown_fenced_json() {
@@ -875,5 +953,31 @@ mod tests {
         );
         assert!(parse_bridge_stage("0.3").is_err());
         assert!(parse_bridge_stage("composition").is_err());
+    }
+
+    #[test]
+    fn item_writer_prompt_embeds_one_pass_distractor_workflow() {
+        let source = SourceDocument {
+            id: "source-1".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "HTTP caching".to_owned(),
+            body: Some(
+                "Cache-Control: no-store prevents a cache from storing a response.".to_owned(),
+            ),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: None,
+            created_at: 1_700_000_000,
+            archived_at: None,
+        };
+
+        let prompt = build_prompt(PromptVariant::ItemWriter, 5, &source);
+
+        assert!(prompt.contains("expert test-item writer"));
+        assert!(prompt.contains("Solve and anchor"));
+        assert!(prompt.contains("misconception"));
+        assert!(prompt.contains("Self-audit"));
+        assert!(prompt.contains("same answer type"));
+        assert!(prompt.contains("Return JSON only"));
     }
 }

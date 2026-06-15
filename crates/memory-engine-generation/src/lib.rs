@@ -282,7 +282,6 @@ where
             producing_models.push(source_model.clone());
         }
 
-        let accepted_before_source = accepted_draft_ids.len();
         let mut source_rejections = Vec::new();
         persist_candidates(
             store,
@@ -300,24 +299,22 @@ where
             },
         )?;
 
-        if accepted_draft_ids.len() == accepted_before_source {
-            usage = merge_usage(
-                usage,
-                try_repair_source(
-                    store,
-                    provider,
-                    source,
-                    &request,
-                    &source_rejections,
-                    &mut seen_signatures,
-                    &mut validation_failures,
-                    &mut draft_ids,
-                    &mut accepted_draft_ids,
-                    &mut rejected_draft_ids,
-                    &mut producing_models,
-                )?,
-            );
-        }
+        usage = merge_usage(
+            usage,
+            try_repair_source(
+                store,
+                provider,
+                source,
+                &request,
+                &source_rejections,
+                &mut seen_signatures,
+                &mut validation_failures,
+                &mut draft_ids,
+                &mut accepted_draft_ids,
+                &mut rejected_draft_ids,
+                &mut producing_models,
+            )?,
+        );
     }
 
     let run_model = match producing_models.as_slice() {
@@ -1227,8 +1224,48 @@ fn validation_reasons(
     {
         reasons.push("Exercises require a worked solution".to_owned());
     }
+    reasons.extend(mcq_quality_reasons(candidate));
 
     reasons
+}
+
+fn mcq_quality_reasons(candidate: &DraftCandidate) -> Vec<String> {
+    if candidate.activity_kind != GeneratedLearningActivityKind::Quiz
+        || candidate.distractors.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let mut reasons = Vec::new();
+    if compound_question(&candidate.question) {
+        reasons.push("MCQ question tests multiple atoms".to_owned());
+    }
+
+    let answer = normalize_for_match(&candidate.answer);
+    for distractor in &candidate.distractors {
+        let normalized = normalize_for_match(distractor);
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized == answer {
+            reasons.push("MCQ distractor duplicates the correct answer".to_owned());
+        }
+    }
+
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn compound_question(question: &str) -> bool {
+    let normalized = normalize_for_match(question);
+    (normalized.contains(" and ")
+        || normalized.contains(" plus ")
+        || normalized.contains(" along with "))
+        && (normalized.contains("what ")
+            || normalized.contains("which ")
+            || normalized.contains("why ")
+            || normalized.contains("how "))
 }
 
 fn existing_accepted_candidate_signatures(
@@ -1479,10 +1516,30 @@ fn source_kind_key(kind: &SourceDocumentKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::evidence_quote_matches;
+    use memory_engine_persistence::GeneratedLearningActivityKind;
+
+    use super::{evidence_quote_matches, validation_reasons, DraftCandidate};
 
     const SOURCE: &str = "Photosynthesis occurs in the chloroplast and converts \
                           light into chemical energy stored as glucose.";
+
+    fn quiz(question: &str, answer: &str, distractors: &[&str]) -> DraftCandidate {
+        DraftCandidate {
+            index: 1,
+            concept: "Test concept".to_owned(),
+            question: question.to_owned(),
+            answer: answer.to_owned(),
+            evidence: Some("Photosynthesis occurs in the chloroplast".to_owned()),
+            distractors: distractors
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            worked_solution: None,
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "recognition".to_owned(),
+            unsupported: false,
+        }
+    }
 
     #[test]
     fn substantive_verbatim_quote_matches() {
@@ -1531,5 +1588,31 @@ mod tests {
             SOURCE,
             "stored as fructose molecules"
         ));
+    }
+
+    #[test]
+    fn mcq_quality_rejects_compound_questions() {
+        let candidate = quiz(
+            "What do mitochondria generate and what process do they regulate?",
+            "ATP and apoptosis",
+            &["Glucose and mitosis", "RNA and transcription"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true);
+
+        assert!(reasons.contains(&"MCQ question tests multiple atoms".to_owned()));
+    }
+
+    #[test]
+    fn mcq_quality_rejects_answer_duplicate_distractors() {
+        let candidate = quiz(
+            "Where does photosynthesis occur?",
+            "chloroplast",
+            &["chloroplast", "mitochondrion"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true);
+
+        assert!(reasons.contains(&"MCQ distractor duplicates the correct answer".to_owned()));
     }
 }

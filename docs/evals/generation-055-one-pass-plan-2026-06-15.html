@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plan Review: Generation 055 One-Pass Distractors</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f4ef;
+      --panel: #ffffff;
+      --ink: #171717;
+      --muted: #5f6460;
+      --line: #d9d5ca;
+      --accent: #126a5a;
+      --accent-soft: #dcece7;
+      --warn: #9b4d12;
+      --warn-soft: #f4e4d4;
+      --risk: #8f2432;
+      --risk-soft: #f0d7dc;
+      --code: #eeece4;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171816;
+        --panel: #22231f;
+        --ink: #f4f1e9;
+        --muted: #b9baaf;
+        --line: #3e4039;
+        --accent: #69c3ad;
+        --accent-soft: #1f3d37;
+        --warn: #e0a15f;
+        --warn-soft: #3c2c1d;
+        --risk: #ef8896;
+        --risk-soft: #3d2026;
+        --code: #303129;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.48 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 34px 22px 64px;
+    }
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(260px, .75fr);
+      gap: 22px;
+      align-items: end;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 24px;
+      margin-bottom: 24px;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      font-size: clamp(32px, 5vw, 58px);
+      line-height: 1;
+      margin-bottom: 12px;
+      letter-spacing: 0;
+    }
+    h2 { font-size: 19px; margin-bottom: 12px; }
+    h3 { font-size: 15px; margin-bottom: 6px; }
+    code { background: var(--code); border-radius: 4px; padding: 1px 4px; }
+    .eyebrow {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .lede {
+      color: var(--muted);
+      font-size: 18px;
+      max-width: 760px;
+      margin-bottom: 0;
+    }
+    .meta { display: grid; gap: 8px; justify-self: stretch; }
+    .chip {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      width: fit-content;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .span-4 { grid-column: span 4; }
+    .span-6 { grid-column: span 6; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+    .callout { border-left: 5px solid var(--accent); background: var(--accent-soft); }
+    .warn { border-left: 5px solid var(--warn); background: var(--warn-soft); }
+    .risk { border-left: 5px solid var(--risk); background: var(--risk-soft); }
+    .map { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .map > div {
+      min-height: 118px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: color-mix(in srgb, var(--panel) 80%, var(--bg));
+    }
+    .phase {
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr) minmax(210px, .8fr);
+      gap: 14px;
+      align-items: start;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+      margin-top: 14px;
+    }
+    .phase:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+    .phase strong { color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    ul { margin: 0; padding-left: 18px; }
+    li + li { margin-top: 6px; }
+    .review-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .review-strip div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel);
+    }
+    @media (max-width: 860px) {
+      header, .map, .phase, .review-strip { grid-template-columns: 1fr; }
+      .span-4, .span-6, .span-8, .span-12 { grid-column: span 12; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <section>
+      <p class="eyebrow">Plan review</p>
+      <h1>One-Pass Distractor Recovery</h1>
+      <p class="lede">Backlog 055 should first test whether modern LLMs can clear the quality gate in one pass when given better task framing, examples, and context. Only keep repair/ranking complexity if the receipts show one-pass generation cannot reach the judged baseline.</p>
+    </section>
+    <aside class="meta" aria-label="Plan metadata">
+      <span class="chip">Status: executing</span>
+      <span class="chip">Owner: lead agent</span>
+      <span class="chip">Updated: 2026-06-15</span>
+      <span class="chip">Branch: cx/055-generation-quality-latency</span>
+    </aside>
+  </header>
+
+  <section class="grid" aria-label="Executive summary">
+    <article class="panel callout span-4">
+      <h2>Recommendation</h2>
+      <p>Run focused prompt/context experiments before adding more orchestration. The likely implementation is a stronger one-pass schema prompt with explicit item-writing standards, negative examples, source-grounded context, and a self-check embedded inside the model call.</p>
+    </article>
+    <article class="panel span-4">
+      <h2>Definition Of Done</h2>
+      <ul>
+        <li>Fresh judged receipt beats 2026-06-11 distractor quality 3.825 and keep rate 70.5%.</li>
+        <li>Receipt is committed under <code>docs/evals/</code>.</li>
+        <li><code>bun run ci</code> passes and the tree is clean.</li>
+      </ul>
+    </article>
+    <article class="panel warn span-4">
+      <h2>Stop Conditions</h2>
+      <ul>
+        <li>No OpenRouter credentials for live model experiments.</li>
+        <li>One-pass experiments repeatedly improve keep rate but not distractors.</li>
+        <li>Production latency still lacks allowlisted credentials.</li>
+      </ul>
+    </article>
+  </section>
+
+  <section class="panel span-12" aria-label="Visual map" style="margin-top: 14px;">
+    <h2>Visual Map</h2>
+    <div class="map">
+      <div>
+        <h3>Current State</h3>
+        <p>The production-gated bench is wired correctly, but latest judged runs score distractors around 3.3, below the 3.825 baseline.</p>
+      </div>
+      <div>
+        <h3>Change Shape</h3>
+        <p>Shift prompt design from generic quiz generation to an expert item-writer task: identify misconception class, lock answer type, forbid source-truth distractors, and self-audit before JSON output.</p>
+      </div>
+      <div>
+        <h3>Proof Surface</h3>
+        <p><code>cargo run -p memory-engine-bench -- generation --model ... --prompt principled --judge ... --out docs/evals/...</code></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid" aria-label="Scope and anchors" style="margin-top: 14px;">
+    <article class="panel span-6">
+      <h2>Scope</h2>
+      <ul>
+        <li>Goal: improve MCQ distractor quality without hiding failures behind post hoc repair.</li>
+        <li>Non-goal: close production latency without allowlisted production session credentials.</li>
+        <li>Invariant: provider boundary stays thin; generation trust gate remains in <code>memory-engine-generation</code>.</li>
+      </ul>
+    </article>
+    <article class="panel span-6">
+      <h2>Repo Anchors</h2>
+      <ul>
+        <li><code>backlog.d/055-generation-quality-latency.md</code> - acceptance oracle.</li>
+        <li><code>crates/memory-engine-openrouter/src/lib.rs</code> - prompt and schema.</li>
+        <li><code>crates/memory-engine-bench/src/generation.rs</code> - judged bench receipt.</li>
+        <li><code>docs/evals/generation-055-blocked-2026-06-13.md</code> - failed experiment ledger.</li>
+      </ul>
+    </article>
+  </section>
+
+  <section class="panel" style="margin-top: 14px;">
+    <h2>Execution Plan</h2>
+    <div class="phase">
+      <strong>Phase 1</strong>
+      <div>
+        <h3>Research prompt/context patterns</h3>
+        <p>Use current retrieval and an independent repo-aware lane to identify how strong one-pass MCQ/distractor prompts are structured.</p>
+      </div>
+      <div>
+        <h3>Evidence</h3>
+        <p>Source matrix plus local file anchors.</p>
+      </div>
+    </div>
+    <div class="phase">
+      <strong>Phase 2</strong>
+      <div>
+        <h3>Run one-pass experiments</h3>
+        <p>Patch only the principled prompt/schema if needed, then run deterministic and judged benches with exact receipts.</p>
+      </div>
+      <div>
+        <h3>Evidence</h3>
+        <p>Committed <code>docs/evals/</code> receipt with judge means.</p>
+      </div>
+    </div>
+    <div class="phase">
+      <strong>Phase 3</strong>
+      <div>
+        <h3>Review and close out</h3>
+        <p>Fresh critic gets diff plus oracle only; then run CI, commit, push, and report blocker status honestly.</p>
+      </div>
+      <div>
+        <h3>Evidence</h3>
+        <p><code>bun run ci</code>, critic verdict, <code>git status</code>, remote sync.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid" aria-label="Decision tables" style="margin-top: 14px;">
+    <article class="panel span-8">
+      <h2>Alternatives</h2>
+      <table>
+        <thead><tr><th>Option</th><th>Why It Helps</th><th>Failure Mode</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td>One-pass expert item-writer prompt</td><td>Matches modern LLM capability, cheapest, simplest latency profile.</td><td>May still produce shallow distractors without examples.</td><td>Test first.</td></tr>
+          <tr><td>One-pass prompt with embedded self-check fields</td><td>Forces type, misconception, and plausibility reasoning before final answer.</td><td>Could bloat output and require parser/schema changes.</td><td>Use if schema-compatible.</td></tr>
+          <tr><td>Repair/ranker pipeline</td><td>Can catch weak items after generation.</td><td>Adds latency, cost, and moving parts.</td><td>Fallback only.</td></tr>
+        </tbody>
+      </table>
+    </article>
+    <article class="panel risk span-4">
+      <h2>Risks</h2>
+      <table>
+        <thead><tr><th>Risk</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td>Prompt overfits judge wording.</td><td>Use deterministic bench plus at least one held receipt.</td></tr>
+          <tr><td>Experiment receipt is unavailable.</td><td>Stop and report missing credential instead of claiming progress.</td></tr>
+          <tr><td>Latency gate remains blocked.</td><td>Keep quality and latency blockers separate in the receipt.</td></tr>
+        </tbody>
+      </table>
+    </article>
+  </section>
+
+  <section class="panel" style="margin-top: 14px;">
+    <h2>Review Focus</h2>
+    <div class="review-strip">
+      <div>
+        <h3>Operator Question</h3>
+        <p>Does the final prompt make the model behave like an expert test-item writer, or just a JSON generator?</p>
+      </div>
+      <div>
+        <h3>Agent Self-Check</h3>
+        <p>Compare the receipt against both judged means, not only keep rate.</p>
+      </div>
+      <div>
+        <h3>Fresh Critic Prompt</h3>
+        <p>Given only the diff and 055 oracle, identify any production-quality gap that remains before merge.</p>
+      </div>
+    </div>
+  </section>
+</main>
+</body>
+</html>
