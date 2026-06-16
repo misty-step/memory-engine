@@ -48,11 +48,24 @@ not use a throwaway email here; export a pre-provisioned account id and session
 token first.
 
 ```sh
+set -euo pipefail
+
 base="https://memory-engine-api.fly.dev"
 receipt_dir="docs/qa"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
 session_token="${MEMORY_ENGINE_SESSION_TOKEN:?set MEMORY_ENGINE_SESSION_TOKEN}"
+source_id=""
+cleanup_source() {
+  if [ -n "$source_id" ]; then
+    curl -fsS --max-time 20 \
+      -H "authorization: Bearer $session_token" \
+      -X DELETE \
+      "$base/v1/accounts/$account_id/sources/$source_id" \
+      >/dev/null || true
+  fi
+}
+trap cleanup_source EXIT
 body='Spaced practice improves long-term retention because each retrieval attempt forces the learner to reconstruct the memory rather than reread it passively. Feedback closes the loop by showing whether the reconstruction was accurate. When practice is delayed, the extra effort strengthens later access, but if the delay is too long the learner may fail without a useful cue. A good study system therefore mixes short recognition checks, cued recall, free recall, and applied composition so the learner moves from identifying an answer toward using the idea in context.'
 
 source_json="$(jq -n --arg title "Latency receipt $stamp" --arg body "$body" \
@@ -64,20 +77,18 @@ source_response="$(curl -fsS --max-time 20 \
   "$base/v1/accounts/$account_id/sources")"
 source_id="$(printf '%s' "$source_response" | jq -r '.sourceId')"
 
-generate_status="$(curl -fsS --max-time 90 \
+generate_status="$(curl -fsS --max-time 150 \
   -H "authorization: Bearer $session_token" \
   -o "$receipt_dir/production-generation-$stamp.json" \
   -w "status=%{http_code} time_total=%{time_total}\n" \
   -X POST \
   "$base/v1/accounts/$account_id/sources/$source_id/generate")"
+case "$generate_status" in
+  status=2??\ *) ;;
+  *) echo "generation failed: $generate_status"; exit 1 ;;
+esac
 printf '%s\n' "$generate_status" \
   | tee "$receipt_dir/production-generation-$stamp.latency.txt"
-
-curl -fsS --max-time 20 \
-  -H "authorization: Bearer $session_token" \
-  -X DELETE \
-  "$base/v1/accounts/$account_id/sources/$source_id" \
-  >/dev/null
 ```
 
 ## Deploy and rollback

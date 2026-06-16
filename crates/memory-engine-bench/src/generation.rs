@@ -4,7 +4,7 @@
 //! corpus source through the production beta generation runner, then scores
 //! accepted output after trust-gate validation, duplicate suppression, and
 //! repair. Deterministic judges keep models out of the loop (a `--judge
-//! <model-id>` lane adds rubric quality scoring): schema validity, provenance
+//! <model-id>` lane adds rubric quality scoring): runtime acceptance, provenance
 //! (evidence-quote-actually-in-source, the same predicate the production
 //! trust gate enforces), answerability, duplicates, expected draft counts,
 //! and key-term coverage — alongside tokens, dollars, and latency.
@@ -65,8 +65,11 @@ pub struct SourceScore {
     pub source_id: String,
     pub category: String,
     pub drafts: usize,
-    /// Candidates emitted vs candidates plus per-draft schema failures.
-    pub schema_validity: f64,
+    /// Persisted drafts accepted by the runtime gate vs persisted drafts plus
+    /// pre-persistence trust-gate failures.
+    pub runtime_acceptance: f64,
+    pub rejected_drafts: usize,
+    pub validation_failures: usize,
     /// Fraction of drafts whose evidence quote is found in the source.
     pub provenance: f64,
     /// Fraction of drafts whose answer content appears in the source.
@@ -142,12 +145,11 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
             "--prompt" => {
                 parsed.prompt = match iterator
                     .next()
-                    .ok_or("--prompt requires `minimal`, `principled`, or `item-writer`")?
+                    .ok_or("--prompt requires `minimal` or `principled`")?
                     .as_str()
                 {
                     "minimal" => PromptVariant::Minimal,
                     "principled" => PromptVariant::Principled,
-                    "item-writer" => PromptVariant::ItemWriter,
                     other => return Err(format!("unknown prompt variant: {other}")),
                 };
             }
@@ -178,7 +180,7 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled|item-writer] [--judge <id>] [--max-drafts <n>] [--out <path>]"
+                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--max-drafts <n>] [--out <path>]"
                 ))
             }
         }
@@ -315,13 +317,12 @@ fn score_source(
                 deterministic_judges(&source.body, &source.expect, learning_intent, &candidates);
             score.source_id.clone_from(&source.id);
             score.category.clone_from(&source.category);
-            score.schema_validity = if emitted == 0 {
+            score.rejected_drafts = result.rejected_draft_ids.len();
+            score.validation_failures = result.validation_failures.len();
+            score.runtime_acceptance = if emitted == 0 {
                 1.0
             } else {
-                fraction(
-                    result.accepted_draft_ids.len() + result.rejected_draft_ids.len(),
-                    emitted,
-                )
+                fraction(result.accepted_draft_ids.len(), emitted)
             };
             if let Some(usage) = usage {
                 score.input_tokens = usage.input_tokens;
@@ -341,7 +342,9 @@ fn score_source(
             source_id: source.id.clone(),
             category: source.category.clone(),
             drafts: 0,
-            schema_validity: 0.0,
+            runtime_acceptance: 0.0,
+            rejected_drafts: 0,
+            validation_failures: 1,
             provenance: 0.0,
             answerability: 0.0,
             duplicate_rate: 0.0,
@@ -634,7 +637,9 @@ fn deterministic_judges(
         source_id: String::new(),
         category: String::new(),
         drafts,
-        schema_validity: 1.0,
+        runtime_acceptance: 1.0,
+        rejected_drafts: 0,
+        validation_failures: 0,
         provenance,
         answerability,
         duplicate_rate: fraction(duplicates, drafts),
@@ -950,11 +955,11 @@ fn render_receipt(
     let _ = writeln!(receipt);
     let _ = writeln!(
         receipt,
-        "| source | category | drafts | schema | provenance | answerable | dup | count-ok | terms | shape | variants | tokens in/out | cost | latency |"
+        "| source | category | accepted | rejected | failures | runtime | provenance | answerable | dup | count-ok | terms | shape | variants | tokens in/out | cost | latency |"
     );
     let _ = writeln!(
         receipt,
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     render_score_rows(&mut receipt, scores);
     let _ = writeln!(receipt);
@@ -969,18 +974,20 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
         if let Some(error) = &score.provider_error {
             let _ = writeln!(
                 receipt,
-                "| {} | {} | — | — | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
+                "| {} | {} | — | — | 1 | 0% | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
                 score.source_id, score.category
             );
             continue;
         }
         let _ = writeln!(
             receipt,
-            "| {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {:.0}% | {}/{} | {} | {}ms |",
+            "| {} | {} | {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {:.0}% | {}/{} | {} | {}ms |",
             score.source_id,
             score.category,
             score.drafts,
-            score.schema_validity * 100.0,
+            score.rejected_drafts,
+            score.validation_failures,
+            score.runtime_acceptance * 100.0,
             score.provenance * 100.0,
             score.answerability * 100.0,
             score.duplicate_rate * 100.0,
@@ -1284,15 +1291,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_accepts_item_writer_prompt_variant() {
-        let args = ["--prompt".to_owned(), "item-writer".to_owned()];
-
-        let parsed = parse_args(&args).expect("args");
-
-        assert_eq!(parsed.prompt, PromptVariant::ItemWriter);
-    }
-
-    #[test]
     fn parse_args_rejects_zero_max_drafts() {
         let args = ["--max-drafts".to_owned(), "0".to_owned()];
 
@@ -1338,7 +1336,25 @@ mod tests {
 
         assert_eq!(score.drafts, 1);
         assert!(score.duplicate_rate.abs() < f64::EPSILON);
-        assert!((score.schema_validity - 0.5).abs() < f64::EPSILON);
+        assert_eq!(score.rejected_drafts, 0);
+        assert_eq!(score.validation_failures, 1);
+        assert!((score.runtime_acceptance - 0.5).abs() < f64::EPSILON);
+
+        let receipt = render_receipt(
+            "fixture",
+            &[score],
+            &Ok(BridgeQualityScore {
+                drafts: 0,
+                easier_than_parent: 1.0,
+                faithful_to_concept: 1.0,
+                duplicate_rate: 0.0,
+                passes: true,
+            }),
+        );
+        assert!(
+            receipt.contains("| source | category | accepted | rejected | failures | runtime |")
+        );
+        assert!(receipt.contains("| letters | fixture | 1 | 0 | 1 | 50% |"));
     }
 
     #[test]
@@ -1355,6 +1371,9 @@ mod tests {
         assert_eq!(score.output_tokens, 18);
         assert_eq!(score.cost_usd_micros, Some(24));
         assert_eq!(score.latency_ms, 30);
+        assert_eq!(score.rejected_drafts, 1);
+        assert_eq!(score.validation_failures, 0);
+        assert!((score.runtime_acceptance - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

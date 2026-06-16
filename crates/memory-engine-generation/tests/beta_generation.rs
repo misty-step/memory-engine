@@ -442,6 +442,7 @@ fn repairs_zero_accepted_source_once_and_counts_repair_usage() {
         result.accepted_draft_ids,
         ["run-repair-draft-src-repair-2-repair-feedback"]
     );
+    assert_ne!(result.rejected_draft_ids[0], result.accepted_draft_ids[0]);
 
     let snapshot = store.snapshot();
     assert_eq!(snapshot.generated_prompt_drafts.len(), 2);
@@ -508,6 +509,9 @@ fn repairs_rejected_candidates_even_when_source_has_accepted_drafts() {
             "run-partial-repair-draft-src-partial-repair-3-recall-feedback"
         ]
     );
+    assert!(!result
+        .accepted_draft_ids
+        .contains(&result.rejected_draft_ids[0]));
 
     let snapshot = store.snapshot();
     assert_eq!(snapshot.generated_prompt_drafts.len(), 3);
@@ -980,7 +984,7 @@ impl DraftProvider for RepairingProvider {
             model: DraftProvider::model(self),
             learning_intent: None,
             candidates: vec![DraftCandidate {
-                index: 2,
+                index: 1,
                 concept: "Repair feedback".to_owned(),
                 question: "Explain why spaced practice needs feedback.".to_owned(),
                 answer: "Spaced practice needs feedback.".to_owned(),
@@ -1064,18 +1068,35 @@ impl DraftProvider for PartialRepairProvider {
         Ok(Some(ProviderDrafts {
             model: DraftProvider::model(self),
             learning_intent: None,
-            candidates: vec![DraftCandidate {
-                index: 3,
-                concept: "Recall feedback".to_owned(),
-                question: "What improves recall after practice?".to_owned(),
-                answer: "feedback".to_owned(),
-                evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
-                distractors: vec!["guessing".to_owned(), "forgetting".to_owned()],
-                worked_solution: None,
-                activity_kind: GeneratedLearningActivityKind::Quiz,
-                activity_stage: "recognition".to_owned(),
-                unsupported: false,
-            }],
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: "Recall feedback".to_owned(),
+                    question: "What improves recall after practice?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["guessing".to_owned(), "forgetting".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 1,
+                    concept: "Excess repair".to_owned(),
+                    question: "Which extra repair should be ignored?".to_owned(),
+                    answer: "the over-budget repair".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec![
+                        "the accepted repair".to_owned(),
+                        "the rejected draft".to_owned(),
+                    ],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+            ],
             failures: Vec::new(),
             usage: None,
         }))
@@ -1126,7 +1147,7 @@ impl DraftProvider for RepairCapProvider {
             model: DraftProvider::model(self),
             learning_intent: None,
             candidates: vec![DraftCandidate {
-                index: 6,
+                index: 1,
                 concept: "Repair cap".to_owned(),
                 question: "Explain why repair feedback is capped.".to_owned(),
                 answer: "Repair feedback is capped to bound retry cost.".to_owned(),

@@ -28,11 +28,11 @@ Field attempts run on 2026-06-13 did not clear both judged metrics:
 | `google/gemini-3.5-flash` | production-gated bench, OpenAI judge | 3.0 | 54% | Proved the old bench bypassed production filtering/repair, but judged quality regressed. Artifact: `docs/evals/generation-gemini-3.5-flash-production-gated-judged-2026-06-13.md`. |
 | `google/gemini-3.5-flash` | production-gated, max 5, atomic prompt, Anthropic judge | 3.3 | 76% | Keep improved, distractors still below baseline. Artifact: `docs/evals/generation-gemini-3.5-flash-judged-2026-06-13.md`. |
 | `anthropic/claude-sonnet-4.6` | production-gated, max 5, atomic prompt, OpenAI judge | 3.3 | 70% | Model swap did not improve judged quality enough and had a 6.0s p95 outlier. Artifact: `docs/evals/generation-claude-sonnet-4.6-judged-2026-06-13.md`. |
-| `google/gemini-3.5-flash` | one-pass expert item-writer prompt | 3.6 | 69% | Better distractors than the retained 3.3 path, but keep regressed and deterministic shape was 11/12. Artifact: `docs/evals/generation-gemini-3.5-flash-item-writer-judged-2026-06-15.md`. |
-| `google/gemini-3.5-flash` | one-pass item-writer + required audit fields | 3.5 | 61% | Structured rationale/self-check fields made output worse; experiment reverted. Artifact: `docs/evals/generation-gemini-3.5-flash-item-writer-audit-judged-2026-06-15.md`. |
-| `openai/gpt-5.4` | one-pass item-writer + required audit fields | 3.6 | 72% | Stronger model improved keep but still missed distractor baseline; audit schema reverted. Artifact: `docs/evals/generation-gpt-5.4-item-writer-audit-judged-2026-06-15.md`. |
-| `openai/gpt-5.4` | one-pass expert item-writer prompt | 3.5 | 64% | Removing audit fields did not improve distractors or keep. Artifact: `docs/evals/generation-gpt-5.4-item-writer-judged-2026-06-15.md`. |
-| `openai/gpt-5.4` | one-pass item-writer + partial repair for rejected candidates | 3.4 | 63% | Repair-on-any-rejection plus safe MCQ gates did not lift judged quality. Artifact: `docs/evals/generation-gpt-5.4-item-writer-partial-repair-judged-2026-06-15.md`. |
+| `google/gemini-3.5-flash` | one-pass expert item-writer prompt | 3.6 | 69% | Better distractors than the retained 3.3 path, but keep regressed and deterministic shape was 11/12. Failed experiment removed after review. |
+| `google/gemini-3.5-flash` | one-pass item-writer + required audit fields | 3.5 | 61% | Structured rationale/self-check fields made output worse. Failed experiment removed after review. |
+| `openai/gpt-5.4` | one-pass item-writer + required audit fields | 3.6 | 72% | Stronger model improved keep but still missed distractor baseline. Failed experiment removed after review. |
+| `openai/gpt-5.4` | one-pass expert item-writer prompt | 3.5 | 64% | Removing audit fields did not improve distractors or keep. Failed experiment removed after review. |
+| `openai/gpt-5.4` | one-pass item-writer + partial repair for rejected candidates | 3.4 | 63% | Repair-on-any-rejection plus safe MCQ gates did not lift judged quality. Failed experiment removed after review. |
 
 The polish/editor experiments were reverted because they repeatedly lowered
 distractor quality and caused deterministic intent-shape regressions. The
@@ -49,9 +49,10 @@ retained implementation work is limited to:
 - a lower default model draft budget of 5, plus atomic-card and distractor
   guardrails in the principled prompt; this is a 055 follow-up to the June 11
   field note that identified `max_drafts` as the main cost/latency dial;
-- explicit `--max-drafts` and `--prompt item-writer` bench flags for future
-  field sweeps. The item-writer prompt remains an experiment; production
-  default stays `prompt-principled` until a judged receipt clears the oracle.
+- explicit `--max-drafts` bench support for future field sweeps. The failed
+  item-writer prompt experiment is summarized here as negative evidence; its
+  live bench flag, provider prompt surface, and non-reproducible receipt files
+  were removed after review because no judged receipt cleared the oracle.
 
 The 2026-06-15 one-pass experiments were run because the likely failure could
 have been prompt/context engineering rather than model capability. The retained
@@ -79,5 +80,6 @@ The runbook has been corrected to require `MEMORY_ENGINE_ACCOUNT_ID` and
 account. This shell did not have those credentials exported, so no production
 latency receipt was generated.
 
-Current status: blocked. Do not archive backlog 055 or merge this branch until
-both required evidence gates are satisfied.
+Current status: blocked. Infrastructure and evidence from this branch may land,
+but do not archive backlog 055 or claim the ticket is shipped until both
+required evidence gates are satisfied.

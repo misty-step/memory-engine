@@ -84,15 +84,14 @@ cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
   --prompt principled --out docs/evals/generation-<model>-<date>.md
 ```
 
-`--prompt item-writer` selects the one-pass expert item-writing experiment
-added during backlog 055. It keeps the same provider schema but frames the
-model as a test-item writer, includes positive/negative distractor examples,
-and asks the model to solve, generate misconception-shaped distractors, and
-self-audit inside one call. Use it for A/B receipts; the runtime default remains
-`prompt-principled` until a judged receipt clears the 055 oracle.
+`--max-drafts <n>` changes the model draft budget for field sweeps. Keep the
+runtime prompt on `prompt-principled` unless a shaped ticket adds and proves a
+new prompt variant with a judged receipt that clears its oracle.
 
-Judges score schema validity, provenance (evidence quote actually in source —
-the same predicate the production trust gate enforces), answerability,
+Judges score runtime acceptance (accepted persisted drafts divided by persisted
+drafts plus pre-persistence trust-gate failures), provenance (evidence quote
+actually in source — the same predicate the production trust gate enforces),
+answerability,
 duplicate rate, count-in-range, key-term coverage, intent shape match, and
 variant quality. Duplicate rate uses the same cheap concept + answer + question
 surface similarity predicate as the production generation gate, so near-copy

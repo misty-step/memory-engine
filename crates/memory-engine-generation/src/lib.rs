@@ -283,6 +283,7 @@ where
         }
 
         let mut source_rejections = Vec::new();
+        let mut max_candidate_index = 0;
         persist_candidates(
             store,
             source,
@@ -296,6 +297,7 @@ where
                 accepted_draft_ids: &mut accepted_draft_ids,
                 rejected_draft_ids: &mut rejected_draft_ids,
                 source_rejections: &mut source_rejections,
+                max_candidate_index: &mut max_candidate_index,
             },
         )?;
 
@@ -313,6 +315,7 @@ where
                 &mut accepted_draft_ids,
                 &mut rejected_draft_ids,
                 &mut producing_models,
+                &mut max_candidate_index,
             )?,
         );
     }
@@ -355,6 +358,7 @@ fn try_repair_source<S>(
     accepted_draft_ids: &mut Vec<String>,
     rejected_draft_ids: &mut Vec<String>,
     producing_models: &mut Vec<GeneratedPromptModel>,
+    max_candidate_index: &mut usize,
 ) -> Result<Option<ProviderUsage>, BetaGenerationError<S::Error>>
 where
     S: BetaGenerationStore,
@@ -379,11 +383,19 @@ where
     if !repair.candidates.is_empty() && !producing_models.contains(&repair_model) {
         producing_models.push(repair_model.clone());
     }
+    let mut repair_candidates = repair
+        .candidates
+        .into_iter()
+        .take(repair_rejections.len())
+        .collect::<Vec<_>>();
+    for (offset, candidate) in repair_candidates.iter_mut().enumerate() {
+        candidate.index = *max_candidate_index + offset + 1;
+    }
     let mut repair_rejections = Vec::new();
     persist_candidates(
         store,
         source,
-        repair.candidates,
+        repair_candidates,
         &mut PersistCandidatesContext {
             request,
             source_model: &repair_model,
@@ -393,6 +405,7 @@ where
             accepted_draft_ids,
             rejected_draft_ids,
             source_rejections: &mut repair_rejections,
+            max_candidate_index,
         },
     )?;
 
@@ -408,6 +421,7 @@ struct PersistCandidatesContext<'a> {
     accepted_draft_ids: &'a mut Vec<String>,
     rejected_draft_ids: &'a mut Vec<String>,
     source_rejections: &'a mut Vec<DraftRejection>,
+    max_candidate_index: &'a mut usize,
 }
 
 fn persist_candidates<S>(
@@ -420,6 +434,7 @@ where
     S: BetaGenerationStore,
 {
     for candidate in candidates {
+        *context.max_candidate_index = (*context.max_candidate_index).max(candidate.index);
         let Some(evidence) = candidate
             .evidence
             .as_deref()

@@ -151,7 +151,7 @@ pub trait DraftProvider {
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure>;
 
     /// Regenerate draft candidates once after the shared trust gate rejected
-    /// every candidate for a source.
+    /// one or more first-pass candidates for a source.
     ///
     /// Providers that cannot use rejection feedback return `Ok(None)`. The
     /// generation runner still owns validation and persistence for repaired
