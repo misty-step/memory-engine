@@ -2,10 +2,11 @@ use std::{fs, path::PathBuf};
 
 use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
 use memory_engine_generation::{
-    run_beta_generation, run_bridge_generation_with_provider, BetaGenerationError,
-    BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial, BridgeMaterialProvider,
-    BridgeMaterialRequest, DraftCandidate, ProviderFailure, ReferenceNoteDraft,
-    ReferenceNoteProvider, ReferenceNoteRequest,
+    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
+    BetaGenerationError, BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial,
+    BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection,
+    ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
@@ -323,19 +324,241 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
     );
     assert_eq!(
         result.rejected_draft_ids,
-        [
-            "run-options-draft-src-options-2-gamma-definition",
-            "run-options-draft-src-options-3-gamma-advice"
-        ]
+        ["run-options-draft-src-options-3-gamma-advice"]
+    );
+    assert_eq!(
+        result.validation_failures,
+        ["src-options block 2: Duplicate-ish generated draft"]
     );
     let drafts = store.snapshot().generated_prompt_drafts;
     assert_eq!(
         drafts[1].validation.reasons,
-        ["Duplicate-ish generated draft"]
+        ["Unsupported by cited source material"]
+    );
+}
+
+#[test]
+fn rejects_near_duplicate_questions_before_persistence_acceptance() {
+    let directory = TempDirectory::new("near-duplicate");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-gamma-near".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Gamma notes".to_owned(),
+            body: Some(
+                [
+                    "Concept: Gamma definition",
+                    "Activity: quiz",
+                    "Stage: free-recall",
+                    "Question: What does Gamma measure?",
+                    "Answer: The rate of change of Delta.",
+                    "Reference: Gamma measures the rate of change of Delta.",
+                    "",
+                    "Concept: Gamma definition",
+                    "Activity: quiz",
+                    "Stage: free-recall",
+                    "Question: What exactly does Gamma measure?",
+                    "Answer: The rate of change of Delta.",
+                    "Reference: Gamma measures the rate of change of Delta.",
+                ]
+                .join("\n"),
+            ),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "run-gamma-near".to_owned(),
+            source_document_ids: vec!["src-gamma-near".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(
+        result.accepted_draft_ids,
+        ["run-gamma-near-draft-src-gamma-near-1-gamma-definition"]
+    );
+    assert!(result.rejected_draft_ids.is_empty());
+    assert_eq!(
+        result.validation_failures,
+        ["src-gamma-near block 2: Duplicate-ish generated draft"]
+    );
+    let drafts = store.snapshot().generated_prompt_drafts;
+    assert_eq!(drafts.len(), 1);
+}
+
+#[test]
+fn repairs_zero_accepted_source_once_and_counts_repair_usage() {
+    let directory = TempDirectory::new("repair");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-repair".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Repairable notes".to_owned(),
+            body: Some("Repairable notes say spaced practice needs feedback.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &RepairingProvider,
+        BetaGenerationRequest {
+            run_id: "run-repair".to_owned(),
+            source_document_ids: vec!["src-repair".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(
+        result.rejected_draft_ids,
+        ["run-repair-draft-src-repair-1-repair-feedback"]
     );
     assert_eq!(
-        drafts[2].validation.reasons,
-        ["Unsupported by cited source material"]
+        result.accepted_draft_ids,
+        ["run-repair-draft-src-repair-2-repair-feedback"]
+    );
+    assert_ne!(result.rejected_draft_ids[0], result.accepted_draft_ids[0]);
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.generated_prompt_drafts.len(), 2);
+    assert_eq!(
+        snapshot.generated_prompt_drafts[0].validation.reasons,
+        ["Exercises require a worked solution"]
+    );
+    assert_eq!(
+        snapshot.generated_prompt_drafts[1].validation.status,
+        GeneratedPromptValidationStatus::Accepted
+    );
+    let usage = snapshot.generation_runs[0]
+        .usage
+        .as_ref()
+        .expect("run usage");
+    assert_eq!(usage.input_tokens, 13);
+    assert_eq!(usage.output_tokens, 24);
+    assert_eq!(usage.cost_usd_micros, Some(125));
+    assert_eq!(usage.latency_ms, 80);
+}
+
+#[test]
+fn repairs_rejected_candidates_even_when_source_has_accepted_drafts() {
+    let directory = TempDirectory::new("partial-repair");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-partial-repair".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Partial repair notes".to_owned(),
+            body: Some("Partial repair notes say feedback improves recall.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &PartialRepairProvider,
+        BetaGenerationRequest {
+            run_id: "run-partial-repair".to_owned(),
+            source_document_ids: vec!["src-partial-repair".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(
+        result.rejected_draft_ids,
+        ["run-partial-repair-draft-src-partial-repair-2-recall-feedback"]
+    );
+    assert_eq!(
+        result.accepted_draft_ids,
+        [
+            "run-partial-repair-draft-src-partial-repair-1-recall-feedback",
+            "run-partial-repair-draft-src-partial-repair-3-recall-feedback"
+        ]
+    );
+    assert!(!result
+        .accepted_draft_ids
+        .contains(&result.rejected_draft_ids[0]));
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.generated_prompt_drafts.len(), 3);
+    assert_eq!(
+        snapshot.generated_prompt_drafts[1].validation.reasons,
+        ["MCQ distractor duplicates the correct answer"]
+    );
+}
+
+#[test]
+fn repair_feedback_is_capped_before_provider_retry() {
+    let directory = TempDirectory::new("repair-cap");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-repair-cap".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Repair cap notes".to_owned(),
+            body: Some("Repair cap notes require worked solutions.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &RepairCapProvider,
+        BetaGenerationRequest {
+            run_id: "run-repair-cap".to_owned(),
+            source_document_ids: vec!["src-repair-cap".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.rejected_draft_ids.len(), 5);
+    assert_eq!(
+        result.accepted_draft_ids,
+        ["run-repair-cap-draft-src-repair-cap-6-repair-cap"]
     );
 }
 
@@ -707,6 +930,237 @@ impl BridgeMaterialProvider for DuplicateParentBridgeProvider {
             }],
             usage: None,
         })
+    }
+}
+
+struct RepairingProvider;
+
+impl DraftProvider for RepairingProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "repairing-provider".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: "Repair feedback".to_owned(),
+                question: "Explain why spaced practice needs feedback.".to_owned(),
+                answer: "Spaced practice needs feedback.".to_owned(),
+                evidence: Some("Repairable notes say spaced practice needs feedback.".to_owned()),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "free-recall".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: Some(ProviderUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cost_usd_micros: Some(100),
+                latency_ms: 50,
+            }),
+        })
+    }
+
+    fn repair_drafts(
+        &self,
+        _source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].reasons,
+            ["Exercises require a worked solution"]
+        );
+        Ok(Some(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: "Repair feedback".to_owned(),
+                question: "Explain why spaced practice needs feedback.".to_owned(),
+                answer: "Spaced practice needs feedback.".to_owned(),
+                evidence: Some("Repairable notes say spaced practice needs feedback.".to_owned()),
+                distractors: Vec::new(),
+                worked_solution: Some(
+                    "Feedback tells the learner whether the spaced retrieval was correct."
+                        .to_owned(),
+                ),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "free-recall".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: Some(ProviderUsage {
+                input_tokens: 3,
+                output_tokens: 4,
+                cost_usd_micros: Some(25),
+                latency_ms: 30,
+            }),
+        }))
+    }
+}
+
+struct PartialRepairProvider;
+
+impl DraftProvider for PartialRepairProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "partial-repair-provider".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: "Recall feedback".to_owned(),
+                    question: "What improves recall?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["spacing".to_owned(), "sleep".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: "Recall feedback".to_owned(),
+                    question: "Which item from the notes improves later recall?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["feedback".to_owned(), "guessing".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+            ],
+            failures: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn repair_drafts(
+        &self,
+        _source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].reasons,
+            ["MCQ distractor duplicates the correct answer"]
+        );
+        Ok(Some(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: "Recall feedback".to_owned(),
+                    question: "What improves recall after practice?".to_owned(),
+                    answer: "feedback".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec!["guessing".to_owned(), "forgetting".to_owned()],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 1,
+                    concept: "Excess repair".to_owned(),
+                    question: "Which extra repair should be ignored?".to_owned(),
+                    answer: "the over-budget repair".to_owned(),
+                    evidence: Some("Partial repair notes say feedback improves recall.".to_owned()),
+                    distractors: vec![
+                        "the accepted repair".to_owned(),
+                        "the rejected draft".to_owned(),
+                    ],
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                },
+            ],
+            failures: Vec::new(),
+            usage: None,
+        }))
+    }
+}
+
+struct RepairCapProvider;
+
+impl DraftProvider for RepairCapProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "repair-cap-provider".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: (1..=5)
+                .map(|index| DraftCandidate {
+                    index,
+                    concept: format!("Repair cap {index}"),
+                    question: format!("Explain repair cap item {index}."),
+                    answer: "Repair cap notes require worked solutions.".to_owned(),
+                    evidence: Some("Repair cap notes require worked solutions.".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "free-recall".to_owned(),
+                    unsupported: false,
+                })
+                .collect(),
+            failures: Vec::new(),
+            usage: None,
+        })
+    }
+
+    fn repair_drafts(
+        &self,
+        _source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        assert_eq!(rejections.len(), 4);
+        Ok(Some(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: "Repair cap".to_owned(),
+                question: "Explain why repair feedback is capped.".to_owned(),
+                answer: "Repair feedback is capped to bound retry cost.".to_owned(),
+                evidence: Some("Repair cap notes require worked solutions.".to_owned()),
+                distractors: Vec::new(),
+                worked_solution: Some("The retry receives a bounded rejection list.".to_owned()),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: "free-recall".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: None,
+        }))
     }
 }
 

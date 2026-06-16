@@ -66,7 +66,10 @@ to avoid brittle thresholds.
 
 The prose→quiz generation pipeline is scored by deterministic judges (no model
 in the judge loop) over a fixed corpus in
-`crates/memory-engine-bench/corpus/generation/`.
+`crates/memory-engine-bench/corpus/generation/`. The bench runs the selected
+provider through the same beta generation runner used at runtime, so receipts
+score accepted drafts after the production trust gate, duplicate suppression,
+and bounded repair pass rather than raw provider output.
 
 Run against the deterministic fake provider (the CI-safe default — no network):
 
@@ -81,12 +84,24 @@ cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
   --prompt principled --out docs/evals/generation-<model>-<date>.md
 ```
 
-Judges score schema validity, provenance (evidence quote actually in source —
-the same predicate the production trust gate enforces), answerability,
+`--max-drafts <n>` changes the model draft budget for field sweeps. Keep the
+runtime prompt on `prompt-principled` unless a shaped ticket adds and proves a
+new prompt variant with a judged receipt that clears its oracle.
+
+Judges score runtime acceptance (accepted persisted drafts divided by persisted
+drafts plus pre-persistence trust-gate failures), provenance (evidence quote
+actually in source — the same predicate the production trust gate enforces),
+answerability,
 duplicate rate, count-in-range, key-term coverage, intent shape match, and
-variant quality. Variant quality checks same-concept same-stage groups for
-meaningfully different question surfaces and rejects questions that leak the
-answer text.
+variant quality. Duplicate rate uses the same cheap concept + answer + question
+surface similarity predicate as the production generation gate, so near-copy
+questions that would be rejected at runtime are filtered before the receipt
+judges accepted output. The production trust gate also rejects compound MCQs
+that ask for multiple atoms and MCQ distractors that duplicate the correct
+answer; rejected candidates are now eligible for the same bounded one-repair
+pass even when the source already produced other accepted drafts. Variant
+quality checks same-concept same-stage groups for meaningfully different
+question surfaces and rejects questions that leak the answer text.
 Intent shape match is the 051 capture-anything oracle: fixtures annotate
 verbatim memorization, concept understanding, fact recall, and
 procedure/process sources, and the provider must emit different activity

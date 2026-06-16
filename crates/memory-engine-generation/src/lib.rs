@@ -8,7 +8,7 @@
 //!
 //! Every provider's output passes the same trust gate before persistence:
 //! drafts must carry evidence quoting the source (verified by normalized
-//! substring match), duplicates are rejected, and exercises require worked
+//! substring match), duplicates are filtered, and exercises require worked
 //! solutions.
 
 mod provider;
@@ -17,8 +17,8 @@ use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
     classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, LearningIntent,
-    LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
+    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
+    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
     ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
     StructuredBlockProvider,
 };
@@ -263,7 +263,8 @@ where
         .save_generation_run(run_receipt(&request, &model, RunProgress::Started))
         .map_err(BetaGenerationError::Store)?;
 
-    let mut seen_signatures = existing_draft_signatures(&snapshot.generated_prompt_drafts);
+    let mut seen_signatures =
+        existing_accepted_candidate_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
         let drafts = match provider.generate_drafts(source) {
             Ok(drafts) => drafts,
@@ -281,42 +282,42 @@ where
             producing_models.push(source_model.clone());
         }
 
-        for candidate in drafts.candidates {
-            let Some(evidence) = candidate
-                .evidence
-                .as_deref()
-                .filter(|quote| !normalize_for_match(quote).is_empty())
-            else {
-                validation_failures.push(format!(
-                    "{} block {}: generated drafts require source provenance",
-                    source.id, candidate.index
-                ));
-                continue;
-            };
-            let signature = candidate_signature(&candidate);
-            let duplicate = seen_signatures.contains(&signature);
-            seen_signatures.insert(signature);
+        let mut source_rejections = Vec::new();
+        let mut max_candidate_index = 0;
+        persist_candidates(
+            store,
+            source,
+            drafts.candidates,
+            &mut PersistCandidatesContext {
+                request: &request,
+                source_model: &source_model,
+                seen_signatures: &mut seen_signatures,
+                validation_failures: &mut validation_failures,
+                draft_ids: &mut draft_ids,
+                accepted_draft_ids: &mut accepted_draft_ids,
+                rejected_draft_ids: &mut rejected_draft_ids,
+                source_rejections: &mut source_rejections,
+                max_candidate_index: &mut max_candidate_index,
+            },
+        )?;
 
-            let draft = persist_candidate(
+        usage = merge_usage(
+            usage,
+            try_repair_source(
                 store,
+                provider,
                 source,
-                &candidate,
-                evidence,
-                &PersistParams {
-                    request: &request,
-                    model: &source_model,
-                    duplicate,
-                    quote_verified: source_contains_quote(source, evidence),
-                },
-            )?;
-
-            draft_ids.push(draft.id.clone());
-            if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
-                accepted_draft_ids.push(draft.id);
-            } else {
-                rejected_draft_ids.push(draft.id);
-            }
-        }
+                &request,
+                &source_rejections,
+                &mut seen_signatures,
+                &mut validation_failures,
+                &mut draft_ids,
+                &mut accepted_draft_ids,
+                &mut rejected_draft_ids,
+                &mut producing_models,
+                &mut max_candidate_index,
+            )?,
+        );
     }
 
     let run_model = match producing_models.as_slice() {
@@ -342,6 +343,165 @@ where
         rejected_draft_ids,
         validation_failures,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_repair_source<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    source: &SourceDocument,
+    request: &BetaGenerationRequest,
+    source_rejections: &[DraftRejection],
+    seen_signatures: &mut Vec<CandidateSignature>,
+    validation_failures: &mut Vec<String>,
+    draft_ids: &mut Vec<String>,
+    accepted_draft_ids: &mut Vec<String>,
+    rejected_draft_ids: &mut Vec<String>,
+    producing_models: &mut Vec<GeneratedPromptModel>,
+    max_candidate_index: &mut usize,
+) -> Result<Option<ProviderUsage>, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    if source_rejections.is_empty() {
+        return Ok(None);
+    }
+    let repair_rejections =
+        &source_rejections[..source_rejections.len().min(MAX_REPAIR_REJECTIONS)];
+
+    let repair = match provider.repair_drafts(source, repair_rejections) {
+        Ok(Some(repair)) => repair,
+        Ok(None) => return Ok(None),
+        Err(failure) => {
+            validation_failures.push(format!("{} repair: {failure}", source.id));
+            return Ok(None);
+        }
+    };
+    validation_failures.extend(repair.failures);
+    let usage = repair.usage;
+    let repair_model = request.model.clone().unwrap_or(repair.model);
+    if !repair.candidates.is_empty() && !producing_models.contains(&repair_model) {
+        producing_models.push(repair_model.clone());
+    }
+    let mut repair_candidates = repair
+        .candidates
+        .into_iter()
+        .take(repair_rejections.len())
+        .collect::<Vec<_>>();
+    for (offset, candidate) in repair_candidates.iter_mut().enumerate() {
+        candidate.index = *max_candidate_index + offset + 1;
+    }
+    let mut repair_rejections = Vec::new();
+    persist_candidates(
+        store,
+        source,
+        repair_candidates,
+        &mut PersistCandidatesContext {
+            request,
+            source_model: &repair_model,
+            seen_signatures,
+            validation_failures,
+            draft_ids,
+            accepted_draft_ids,
+            rejected_draft_ids,
+            source_rejections: &mut repair_rejections,
+            max_candidate_index,
+        },
+    )?;
+
+    Ok(usage)
+}
+
+struct PersistCandidatesContext<'a> {
+    request: &'a BetaGenerationRequest,
+    source_model: &'a GeneratedPromptModel,
+    seen_signatures: &'a mut Vec<CandidateSignature>,
+    validation_failures: &'a mut Vec<String>,
+    draft_ids: &'a mut Vec<String>,
+    accepted_draft_ids: &'a mut Vec<String>,
+    rejected_draft_ids: &'a mut Vec<String>,
+    source_rejections: &'a mut Vec<DraftRejection>,
+    max_candidate_index: &'a mut usize,
+}
+
+fn persist_candidates<S>(
+    store: &mut S,
+    source: &SourceDocument,
+    candidates: Vec<DraftCandidate>,
+    context: &mut PersistCandidatesContext<'_>,
+) -> Result<(), BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    for candidate in candidates {
+        *context.max_candidate_index = (*context.max_candidate_index).max(candidate.index);
+        let Some(evidence) = candidate
+            .evidence
+            .as_deref()
+            .filter(|quote| !normalize_for_match(quote).is_empty())
+        else {
+            let reason = "generated drafts require source provenance".to_owned();
+            context
+                .validation_failures
+                .push(format!("{} block {}: {reason}", source.id, candidate.index));
+            context
+                .source_rejections
+                .push(candidate_rejection(&candidate, vec![reason]));
+            continue;
+        };
+        let signature = CandidateSignature::from_candidate(&candidate);
+        let duplicate = context
+            .seen_signatures
+            .iter()
+            .any(|seen| seen.duplicates(&signature));
+        if duplicate {
+            let reason = "Duplicate-ish generated draft".to_owned();
+            context
+                .validation_failures
+                .push(format!("{} block {}: {reason}", source.id, candidate.index));
+            context
+                .source_rejections
+                .push(candidate_rejection(&candidate, vec![reason]));
+            continue;
+        }
+
+        let draft = persist_candidate(
+            store,
+            source,
+            &candidate,
+            evidence,
+            &PersistParams {
+                request: context.request,
+                model: context.source_model,
+                duplicate: false,
+                quote_verified: source_contains_quote(source, evidence),
+            },
+        )?;
+
+        context.draft_ids.push(draft.id.clone());
+        if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
+            context.seen_signatures.push(signature);
+            context.accepted_draft_ids.push(draft.id);
+        } else {
+            context.source_rejections.push(candidate_rejection(
+                &candidate,
+                draft.validation.reasons.clone(),
+            ));
+            context.rejected_draft_ids.push(draft.id);
+        }
+    }
+
+    Ok(())
+}
+
+fn candidate_rejection(candidate: &DraftCandidate, reasons: Vec<String>) -> DraftRejection {
+    DraftRejection {
+        index: candidate.index,
+        concept: candidate.concept.clone(),
+        question: candidate.question.clone(),
+        answer: candidate.answer.clone(),
+        reasons,
+    }
 }
 
 /// Generate bridge material for one approved parent review unit.
@@ -789,6 +949,7 @@ fn source_contains_quote(source: &SourceDocument, quote: &str) -> bool {
 /// that hole. Terse captures are the exception: when the entire source is one
 /// or two words, the source can support itself exactly.
 const MIN_EVIDENCE_WORDS: usize = 3;
+const MAX_REPAIR_REJECTIONS: usize = 4;
 
 /// Whether an evidence quote is substantive and appears in the source text
 /// after folding case, punctuation, and whitespace.
@@ -1078,8 +1239,58 @@ fn validation_reasons(
     {
         reasons.push("Exercises require a worked solution".to_owned());
     }
+    reasons.extend(mcq_quality_reasons(candidate));
 
     reasons
+}
+
+fn mcq_quality_reasons(candidate: &DraftCandidate) -> Vec<String> {
+    if candidate.activity_kind != GeneratedLearningActivityKind::Quiz
+        || candidate.distractors.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let mut reasons = Vec::new();
+    if compound_question(&candidate.question) {
+        reasons.push("MCQ question tests multiple atoms".to_owned());
+    }
+
+    let answer = normalize_for_match(&candidate.answer);
+    for distractor in &candidate.distractors {
+        let normalized = normalize_for_match(distractor);
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized == answer {
+            reasons.push("MCQ distractor duplicates the correct answer".to_owned());
+        }
+    }
+
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn compound_question(question: &str) -> bool {
+    let normalized = normalize_for_match(question);
+    (normalized.contains(" and ")
+        || normalized.contains(" plus ")
+        || normalized.contains(" along with "))
+        && (normalized.contains("what ")
+            || normalized.contains("which ")
+            || normalized.contains("why ")
+            || normalized.contains("how "))
+}
+
+fn existing_accepted_candidate_signatures(
+    drafts: &[GeneratedPromptDraft],
+) -> Vec<CandidateSignature> {
+    drafts
+        .iter()
+        .filter(|draft| draft.validation.status == GeneratedPromptValidationStatus::Accepted)
+        .map(CandidateSignature::from_draft)
+        .collect()
 }
 
 fn existing_draft_signatures(drafts: &[GeneratedPromptDraft]) -> BTreeSet<String> {
@@ -1117,6 +1328,57 @@ fn candidate_signature(candidate: &DraftCandidate) -> String {
         candidate.answer.to_lowercase(),
     ]
     .join("\0")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateSignature {
+    concept: String,
+    question: String,
+    answer: String,
+}
+
+impl CandidateSignature {
+    fn from_candidate(candidate: &DraftCandidate) -> Self {
+        Self {
+            concept: slug(&candidate.concept),
+            question: normalize_for_match(&candidate.question),
+            answer: normalize_for_match(&candidate.answer),
+        }
+    }
+
+    fn from_draft(draft: &GeneratedPromptDraft) -> Self {
+        Self {
+            concept: draft.queue.concept_key.clone().unwrap_or_default(),
+            question: normalize_for_match(&prompt_text(&draft.prompt)),
+            answer: normalize_for_match(&expected_answer(&draft.prompt)),
+        }
+    }
+
+    fn duplicates(&self, other: &Self) -> bool {
+        self.concept == other.concept
+            && self.answer == other.answer
+            && question_similarity(&self.question, &other.question) >= 0.8
+    }
+}
+
+/// Cheap production duplicate predicate shared with the deterministic eval
+/// harness so bench duplicate rates match runtime acceptance.
+#[must_use]
+pub fn candidates_duplicateish(left: &DraftCandidate, right: &DraftCandidate) -> bool {
+    CandidateSignature::from_candidate(left).duplicates(&CandidateSignature::from_candidate(right))
+}
+
+fn question_similarity(left: &str, right: &str) -> f64 {
+    let left = left.split_whitespace().collect::<BTreeSet<_>>();
+    let right = right.split_whitespace().collect::<BTreeSet<_>>();
+    let union = left.union(&right).count();
+    if union == 0 {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        left.intersection(&right).count() as f64 / union as f64
+    }
 }
 
 fn recent_performance_for_concept(
@@ -1269,10 +1531,30 @@ fn source_kind_key(kind: &SourceDocumentKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::evidence_quote_matches;
+    use memory_engine_persistence::GeneratedLearningActivityKind;
+
+    use super::{evidence_quote_matches, validation_reasons, DraftCandidate};
 
     const SOURCE: &str = "Photosynthesis occurs in the chloroplast and converts \
                           light into chemical energy stored as glucose.";
+
+    fn quiz(question: &str, answer: &str, distractors: &[&str]) -> DraftCandidate {
+        DraftCandidate {
+            index: 1,
+            concept: "Test concept".to_owned(),
+            question: question.to_owned(),
+            answer: answer.to_owned(),
+            evidence: Some("Photosynthesis occurs in the chloroplast".to_owned()),
+            distractors: distractors
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            worked_solution: None,
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "recognition".to_owned(),
+            unsupported: false,
+        }
+    }
 
     #[test]
     fn substantive_verbatim_quote_matches() {
@@ -1321,5 +1603,31 @@ mod tests {
             SOURCE,
             "stored as fructose molecules"
         ));
+    }
+
+    #[test]
+    fn mcq_quality_rejects_compound_questions() {
+        let candidate = quiz(
+            "What do mitochondria generate and what process do they regulate?",
+            "ATP and apoptosis",
+            &["Glucose and mitosis", "RNA and transcription"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true);
+
+        assert!(reasons.contains(&"MCQ question tests multiple atoms".to_owned()));
+    }
+
+    #[test]
+    fn mcq_quality_rejects_answer_duplicate_distractors() {
+        let candidate = quiz(
+            "Where does photosynthesis occur?",
+            "chloroplast",
+            &["chloroplast", "mitochondrion"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true);
+
+        assert!(reasons.contains(&"MCQ distractor duplicates the correct answer".to_owned()));
     }
 }

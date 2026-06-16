@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
-    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft,
-    ReferenceNoteProvider, ReferenceNoteRequest,
+    DraftRejection, LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
+    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
@@ -35,7 +35,7 @@ pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
 pub const DEFAULT_MODEL: &str = "google/gemini-3.5-flash";
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_MAX_DRAFTS: usize = 8;
+const DEFAULT_MAX_DRAFTS: usize = 5;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Prompt strategy under evaluation; see
@@ -199,40 +199,74 @@ impl DraftProvider for OpenRouterProvider {
             "quiz_drafts",
             &drafts_schema(),
         )?;
-        let parsed: DraftsPayload = serde_json::from_str(&response.content).map_err(|_| {
-            ProviderFailure::new("The model's drafts could not be read; please try again.")
-        })?;
-        let learning_intent =
-            LearningIntent::from_label(&parsed.learning_intent).ok_or_else(|| {
-                ProviderFailure::new(
-                    "The model's learning intent could not be read; please try again.",
-                )
-            })?;
+        parse_drafts_response(
+            response,
+            source,
+            DraftProvider::model(self),
+            self.config.max_drafts,
+        )
+    }
 
-        let mut candidates = Vec::new();
-        let mut failures = Vec::new();
-        for (position, draft) in parsed
-            .drafts
-            .into_iter()
-            .take(self.config.max_drafts)
-            .enumerate()
-        {
-            match draft.into_candidate(position + 1) {
-                Ok(candidate) => candidates.push(candidate),
-                Err(reason) => {
-                    failures.push(format!("{} draft {}: {reason}", source.id, position + 1));
-                }
-            }
+    fn repair_drafts(
+        &self,
+        source: &SourceDocument,
+        rejections: &[DraftRejection],
+    ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        if rejections.is_empty() {
+            return Ok(None);
         }
 
-        Ok(ProviderDrafts {
-            model: DraftProvider::model(self),
-            learning_intent: Some(learning_intent),
-            candidates,
-            failures,
-            usage: response.usage,
-        })
+        let response = self.complete_structured(
+            &build_repair_prompt(
+                self.config.prompt,
+                self.config.max_drafts,
+                source,
+                rejections,
+            ),
+            "quiz_draft_repair",
+            &drafts_schema(),
+        )?;
+        parse_drafts_response(
+            response,
+            source,
+            DraftProvider::model(self),
+            self.config.max_drafts,
+        )
+        .map(Some)
     }
+}
+
+fn parse_drafts_response(
+    response: StructuredResponse,
+    source: &SourceDocument,
+    model: GeneratedPromptModel,
+    max_drafts: usize,
+) -> Result<ProviderDrafts, ProviderFailure> {
+    let parsed: DraftsPayload = serde_json::from_str(&response.content).map_err(|_| {
+        ProviderFailure::new("The model's drafts could not be read; please try again.")
+    })?;
+    let learning_intent = LearningIntent::from_label(&parsed.learning_intent).ok_or_else(|| {
+        ProviderFailure::new("The model's learning intent could not be read; please try again.")
+    })?;
+
+    let mut candidates = Vec::new();
+    let mut failures = Vec::new();
+    for (position, draft) in parsed.drafts.into_iter().take(max_drafts).enumerate() {
+        match draft.into_candidate(position + 1) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(reason) => {
+                failures.push(format!("{} draft {}: {reason}", source.id, position + 1));
+            }
+        }
+    }
+
+    Ok(ProviderDrafts {
+        model,
+        learning_intent: Some(learning_intent),
+        candidates,
+        failures,
+        usage: response.usage,
+    })
 }
 
 impl ReferenceNoteProvider for OpenRouterProvider {
@@ -315,8 +349,12 @@ fn build_prompt(variant: PromptVariant, max_drafts: usize, source: &SourceDocume
 Principles:
 - One concept per draft; never merge topics. Concept titles have at most 12 words; no vague labels like \"overview\" or \"basics\".
 - Each question is standalone: it names its topic explicitly and never relies on surrounding context.
-- Test the ideas a learner should retain, not punctuation, formatting, or trivia.
+- Test one durable atom a learner should retain, not punctuation, formatting, or trivia.
+- Keep questions short and single-part. Never ask for two facts, two lines, a list, or a causal chain in one draft.
 - Distractors are semantically adjacent confusions a real learner would make, never format variants of the answer.
+- Distractors must match the answer's category and granularity: person for person, command for command, duration for duration, mechanism for mechanism.
+- Never use another true source statement, an overlapping numeric range, a joke, an anachronism, a grammar error, or an obviously impossible option as a distractor.
+- If you cannot write 2-3 strong distractors, make the draft short-answer with [] distractors.
 - If you cannot quote verbatim support for a draft from the source text, do not emit that draft.
 - Fewer, better drafts beat many shallow ones.
 
@@ -337,8 +375,8 @@ SOURCE TEXT:
 - fact_recall: discrete facts, names, dates, definitions, or mappings.
 - procedure_process: ordered steps, workflows, recipes, commands, or conditional processes.
 
-Then generate up to {max_drafts} drafts that match the intent:
-- verbatim_memorization: emit recitation-ladder exercise drafts only; do not ask multiple-choice trivia about the text.
+Then generate 2-5 drafts, never exceeding {max_drafts}, that match the intent. For tiny sources, emit 1-3 drafts. Stop early when the remaining material would produce weak or repetitive drafts:
+- verbatim_memorization: emit 1-3 recitation-ladder exercise drafts only; each asks for exactly one line or one short phrase. Do not ask multiple-choice trivia about the text.
 - concept_understanding: emit explanation/application prompts with activity_stage free-recall.
 - fact_recall: emit recognition or short-answer quiz prompts.
 - procedure_process: emit ordered-step prompts with activity_stage procedure-composition.
@@ -356,6 +394,43 @@ Each draft has:
 Return JSON only.",
         title = source.title,
         body = source.body.as_deref().unwrap_or_default(),
+    )
+}
+
+fn build_repair_prompt(
+    variant: PromptVariant,
+    max_drafts: usize,
+    source: &SourceDocument,
+    rejections: &[DraftRejection],
+) -> String {
+    let rejected = rejections
+        .iter()
+        .map(|rejection| {
+            format!(
+                "- draft {} concept {:?}: question {:?}; answer {:?}; rejected because {}",
+                rejection.index,
+                rejection.concept,
+                rejection.question,
+                rejection.answer,
+                rejection.reasons.join("; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "{base}
+
+Repair pass:
+- The drafts below were rejected by the trust gate. Generate fresh replacements only.
+- Do not repeat rejected question wording or duplicate an accepted concept/question/answer surface.
+- Fix every listed rejection reason; if you cannot fix one with source-grounded evidence, omit it.
+- Return at most {repair_limit} repaired drafts.
+
+REJECTED DRAFTS:
+{rejected}",
+        base = build_prompt(variant, max_drafts, source),
+        repair_limit = rejections.len().min(max_drafts),
     )
 }
 
@@ -453,7 +528,7 @@ fn drafts_schema() -> serde_json::Value {
                         "distractors": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "2-3 semantically adjacent wrong answers, or empty for short-answer drafts."
+                            "description": "2-3 same-category plausible wrong answers, or empty for short-answer drafts."
                         },
                         "activity_kind": {
                             "type": "string",
