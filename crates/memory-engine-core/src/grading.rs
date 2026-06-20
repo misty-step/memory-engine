@@ -48,7 +48,13 @@ impl Grader {
         correct_choice: &str,
         context: GradeContext,
     ) -> GradeResult {
-        let is_correct = submitted_answer == correct_choice;
+        // Normalize both sides like exact grading (case-fold, strip diacritics
+        // and punctuation, collapse whitespace). A clicked choice submits the
+        // verbatim option and matches trivially; this is what makes a *typed*
+        // answer ("charlie" vs the stored "Charlie") grade correctly instead of
+        // failing on case alone — the bug a learner hits when they type the right
+        // word and are told they're wrong.
+        let is_correct = normalize_exact(submitted_answer) == normalize_exact(correct_choice);
         let verdict = if is_correct {
             Verdict::Correct
         } else {
@@ -356,6 +362,36 @@ mod tests {
         assert_eq!(grade.verdict, Verdict::Correct);
         assert_eq!(grade.rating, Rating::Good);
         assert_eq!(grade.submitted_answer, "Alpha");
+    }
+
+    #[test]
+    fn mcq_grading_is_case_and_punctuation_insensitive() {
+        // Regression: a learner typed the right word and was marked wrong because
+        // MCQ grading compared raw strings. The stored choice is "Charlie"; the
+        // learner's "charlie" (and "charlie!") must grade correct.
+        let prompt = Prompt::Mcq {
+            review_unit_id: ReviewUnitId::new("mcq"),
+            prompt: "Which code word represents the letter C?".to_owned(),
+            choices: vec![
+                "Charlie".to_owned(),
+                "Delta".to_owned(),
+                "Bravo".to_owned(),
+                "Echo".to_owned(),
+            ],
+            correct_choice: "Charlie".to_owned(),
+        };
+
+        for submission in ["charlie", "Charlie", "  CHARLIE ", "charlie!"] {
+            let grade = Grader::new().grade(&prompt, submission, context(5_100, 0));
+            assert_eq!(
+                grade.verdict,
+                Verdict::Correct,
+                "submission {submission:?} should grade correct"
+            );
+        }
+
+        let wrong = Grader::new().grade(&prompt, "Delta", context(5_100, 0));
+        assert_eq!(wrong.verdict, Verdict::Wrong);
     }
 
     #[test]
