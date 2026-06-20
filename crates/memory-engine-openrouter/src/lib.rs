@@ -35,7 +35,11 @@ pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
 pub const DEFAULT_MODEL: &str = "google/gemini-3.5-flash";
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_MAX_DRAFTS: usize = 5;
+/// Per-generation card ceiling. High enough that a finite enumerable set (an
+/// alphabet, the 50 US states) is covered completely; the prompt restrains
+/// open-ended material to a few high-value cards, so this is a ceiling, not a
+/// target.
+const DEFAULT_MAX_DRAFTS: usize = 60;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Prompt strategy under evaluation; see
@@ -342,54 +346,58 @@ fn transport_failure(error: &ureq::Error) -> ProviderFailure {
     }
 }
 
+/// The unified generation prompt. The input may be a topic to expand from world
+/// knowledge, a passage to extract and quote from, or a mix; the model decides
+/// learning intent, coverage, and — per card — grounding (quote the source when
+/// the answer is in it, otherwise leave the quote empty). No deterministic
+/// pre-classifier picks a mode: the model judges it, and the trust gate verifies
+/// every quote a card claims.
 fn build_prompt(variant: PromptVariant, max_drafts: usize, source: &SourceDocument) -> String {
     let principles = match variant {
         PromptVariant::Minimal => String::new(),
         PromptVariant::Principled => "\
 Principles:
-- One concept per draft; never merge topics. Concept titles have at most 12 words; no vague labels like \"overview\" or \"basics\".
-- Each question is standalone: it names its topic explicitly and never relies on surrounding context.
-- Test one durable atom a learner should retain, not punctuation, formatting, or trivia.
-- Keep questions short and single-part. Never ask for two facts, two lines, a list, or a causal chain in one draft.
-- Distractors are semantically adjacent confusions a real learner would make, never format variants of the answer.
-- Distractors must match the answer's category and granularity: person for person, command for command, duration for duration, mechanism for mechanism.
-- Never use another true source statement, an overlapping numeric range, a joke, an anachronism, a grammar error, or an obviously impossible option as a distractor.
-- If you cannot write 2-3 strong distractors, make the draft short-answer with [] distractors.
-- If you cannot quote verbatim support for a draft from the source text, do not emit that draft.
-- Fewer, better drafts beat many shallow ones.
+- One concept per card; never merge topics. Concept titles have at most 12 words; no vague labels like \"overview\" or \"basics\".
+- Each question is standalone: it names its subject explicitly and never relies on the source, this prompt, or surrounding context.
+- Test one durable atom a learner should retain, not punctuation, formatting, or trivia. Single-part: never ask for two facts, a list, or a causal chain in one card.
+- Distractors are semantically adjacent confusions a real learner would make, matching the answer's category and granularity; never format variants of the answer, another true statement, an overlapping numeric range, a joke, an anachronism, or an impossible option.
+- Distractors must share whatever surface feature the question keys on, so the answer is never identifiable by that feature alone. If the question fixes the letter C (\"which code word for the letter C?\"), EVERY option must start with C — answer Charlie, distractors like Cobra, Caesar, Casino — never Delta or Echo, which a learner eliminates without knowing the answer. The plausible same-feature options may come from your own knowledge, not only the source set.
+- If you cannot write 2-3 distractors that share the answer's keyed feature, make the card short-answer with [] distractors rather than ship guessable options.
+- Never invent or paraphrase a source quote. Fewer, better cards beat many shallow ones.
 
 "
         .to_owned(),
     };
 
     format!(
-        "You classify a source document's learning intent, then generate spaced-repetition drafts.
+        "You turn a learner's study input into spaced-repetition quiz cards. The input may be a TOPIC to expand from your own knowledge (for example \"NATO phonetic alphabet\"), a PASSAGE to extract and quote from, or a mix of both.
 
 SOURCE TITLE: {title}
 SOURCE TEXT:
 {body}
 
-{principles}First classify the source as exactly one learning_intent:
-- verbatim_memorization: poems, quotes, speeches, prayers, scripts, or lists the learner likely wants to reproduce exactly.
-- concept_understanding: mechanisms, explanations, causes, theories, or ideas the learner should understand and apply.
+{principles}First classify the input's learning_intent as exactly one of:
+- verbatim_memorization: a specific text to reproduce exactly (a poem, an oath, a quote).
+- concept_understanding: a mechanism, theory, cause, or idea to understand and apply.
 - fact_recall: discrete facts, names, dates, definitions, or mappings.
-- procedure_process: ordered steps, workflows, recipes, commands, or conditional processes.
+- procedure_process: ordered steps, a workflow, a recipe, or commands.
 
-Then generate 2-5 drafts, never exceeding {max_drafts}, that match the intent. For tiny sources, emit 1-3 drafts. Stop early when the remaining material would produce weak or repetitive drafts:
-- verbatim_memorization: emit 1-3 recitation-ladder exercise drafts only; each asks for exactly one line or one short phrase. Do not ask multiple-choice trivia about the text.
-- concept_understanding: emit explanation/application prompts with activity_stage free-recall.
-- fact_recall: emit recognition or short-answer quiz prompts.
-- procedure_process: emit ordered-step prompts with activity_stage procedure-composition.
+Then generate cards, never exceeding {max_drafts}:
+- Coverage: if the input names a finite, enumerable set (an alphabet, the planets, the months, a fixed list), write ONE card for EVERY element, in order — cover the whole set, never collapse it into a single card. Otherwise write the highest-value cards a learner should master first, one atomic fact or idea each, and stop early rather than pad with weak cards.
 
-Each draft has:
-- concept: short title naming the tested atom
-- question: a standalone question answerable from the source alone
-- answer: the correct answer
-- evidence_quote: a quote copied verbatim from the source text that proves the answer
-- distractors: 2-3 plausible wrong answers, or [] for a short-answer draft
-- activity_kind: quiz or exercise
-- activity_stage: recognition, cued-recall, free-recall, or procedure-composition
-- worked_solution: required for exercises, otherwise \"\"
+Decide grounding for EACH card:
+- If the answer is contained in the SOURCE TEXT above, set evidence_quote to the exact verbatim span from it that proves the answer. Never invent or paraphrase a quote.
+- If the card comes from your own knowledge of the topic and the SOURCE TEXT does not state it, set evidence_quote to \"\".
+
+Each card has:
+- concept: short title naming the tested atom, at most 12 words (for example \"NATO alphabet: B\").
+- question: a standalone question. The learner sees only the question, so name the subject inside it. Write \"In the NATO phonetic alphabet, which word stands for the letter B?\" — never \"What is the second item?\" or \"the subject of the text\". Never mention \"the source\", \"the passage\", \"the list above\", or \"the text\".
+- answer: the exact correct answer, as short as it can correctly be.
+- evidence_quote: a verbatim span copied from the SOURCE TEXT, or \"\" for a world-knowledge card (see grounding above).
+- distractors: 2-3 plausible same-category wrong answers, or [] for a short-answer card.
+- activity_kind: quiz or exercise.
+- activity_stage: recognition, cued-recall, free-recall, or procedure-composition.
+- worked_solution: required for exercises, otherwise \"\".
 
 Return JSON only.",
         title = source.title,
@@ -787,11 +795,13 @@ fn parse_bridge_stage(stage: &str) -> Result<String, String> {
 
 impl ModelDraft {
     fn into_candidate(self, index: usize) -> Result<DraftCandidate, String> {
+        // evidence_quote is intentionally optional: a world-knowledge card
+        // leaves it empty, and the generation trust gate decides grounding per
+        // card from its presence (and verifies any quote that is present).
         for (field, value) in [
             ("concept", &self.concept),
             ("question", &self.question),
             ("answer", &self.answer),
-            ("evidence_quote", &self.evidence_quote),
             ("activity_kind", &self.activity_kind),
             ("activity_stage", &self.activity_stage),
         ] {
@@ -806,7 +816,7 @@ impl ModelDraft {
             concept: self.concept,
             question: self.question,
             answer: self.answer,
-            evidence: Some(self.evidence_quote),
+            evidence: non_empty(&self.evidence_quote),
             distractors: self
                 .distractors
                 .into_iter()

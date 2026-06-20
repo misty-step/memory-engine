@@ -32,6 +32,24 @@ use memory_engine_persistence::{
     SourceDocumentKind,
 };
 
+/// The text a world-knowledge card grounds in: the captured input itself. A
+/// card with no verbatim quote was expanded from the model's knowledge about
+/// the input (a topic), so the input is its reference seed.
+///
+/// `require_source` (run before any persistence) guarantees a non-blank body, so
+/// the body branch is always taken and the seed is never empty — the store's
+/// non-blank reference-span check therefore cannot trip on a knowledge card. The
+/// title fallback only matters if a future change lets an empty-body source
+/// reach persistence.
+fn knowledge_seed(source: &SourceDocument) -> &str {
+    source
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+        .unwrap_or_else(|| source.title.trim())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BetaGenerationRequest {
     pub run_id: String,
@@ -282,6 +300,10 @@ where
             producing_models.push(source_model.clone());
         }
 
+        // Grounding is decided per card, by the generator, not by a heuristic
+        // over the source: a card that cites a verbatim quote is source-grounded
+        // (the quote must verify); a card with no quote is a world-knowledge
+        // expansion grounded in the captured topic itself.
         let mut source_rejections = Vec::new();
         let mut max_candidate_index = 0;
         persist_candidates(
@@ -435,20 +457,19 @@ where
 {
     for candidate in candidates {
         *context.max_candidate_index = (*context.max_candidate_index).max(candidate.index);
-        let Some(evidence) = candidate
+        // The generator decides grounding per card. A cited quote means the
+        // card claims to come from the provided text, so the quote must verify
+        // against it (a fabricated citation is rejected downstream). No quote
+        // means a world-knowledge expansion of the input, which grounds in the
+        // captured input itself as its reference seed.
+        let cited = candidate
             .evidence
             .as_deref()
-            .filter(|quote| !normalize_for_match(quote).is_empty())
-        else {
-            let reason = "generated drafts require source provenance".to_owned();
-            context
-                .validation_failures
-                .push(format!("{} block {}: {reason}", source.id, candidate.index));
-            context
-                .source_rejections
-                .push(candidate_rejection(&candidate, vec![reason]));
-            continue;
-        };
+            .map(str::trim)
+            .filter(|quote| !normalize_for_match(quote).is_empty());
+        let grounded = cited.is_some();
+        let evidence: &str = cited.unwrap_or_else(|| knowledge_seed(source));
+
         let signature = CandidateSignature::from_candidate(&candidate);
         let duplicate = context
             .seen_signatures
@@ -474,7 +495,8 @@ where
                 request: context.request,
                 model: context.source_model,
                 duplicate: false,
-                quote_verified: source_contains_quote(source, evidence),
+                grounded,
+                quote_verified: !grounded || source_contains_quote(source, evidence),
             },
         )?;
 
@@ -810,6 +832,7 @@ struct PersistParams<'a> {
     request: &'a BetaGenerationRequest,
     model: &'a GeneratedPromptModel,
     duplicate: bool,
+    grounded: bool,
     quote_verified: bool,
 }
 
@@ -824,11 +847,19 @@ fn persist_candidate<S>(
 where
     S: BetaGenerationStore,
 {
+    // A source-grounded card cites the verbatim quote that proves its answer; a
+    // world-knowledge card cites the captured input it was expanded from. Either
+    // way the span is a real pointer into the source the store can resolve.
+    let label = if params.grounded {
+        format!("{} source evidence", candidate.concept)
+    } else {
+        format!("{} input", candidate.concept)
+    };
     let reference_span = store
         .save_reference_span(ReferenceSpan {
             id: generated_id(&params.request.run_id, "ref", &source.id, candidate),
             source_document_id: source.id.clone(),
-            label: format!("{} source evidence", candidate.concept),
+            label,
             text: evidence.to_owned(),
             locator: format!("block:{}", candidate.index),
             created_at: params.request.started_at,
@@ -846,6 +877,7 @@ where
                 due: params.request.default_due,
                 created_at: params.request.started_at,
                 duplicate: params.duplicate,
+                grounded: params.grounded,
                 quote_verified: params.quote_verified,
             },
         ))
@@ -901,6 +933,7 @@ struct DraftContext<'a> {
     due: i64,
     created_at: i64,
     duplicate: bool,
+    grounded: bool,
     quote_verified: bool,
 }
 
@@ -1028,14 +1061,23 @@ fn build_draft(
         &source.id,
         candidate,
     ));
-    let reasons = validation_reasons(candidate, context.duplicate, context.quote_verified);
+    let reasons = validation_reasons(
+        candidate,
+        context.duplicate,
+        context.grounded,
+        context.quote_verified,
+    );
     let status = if reasons.is_empty() {
         GeneratedPromptValidationStatus::Accepted
     } else {
         GeneratedPromptValidationStatus::Rejected
     };
     let critique_notes = if status == GeneratedPromptValidationStatus::Accepted {
-        vec![format!("Grounded in {}.", context.reference_span_id)]
+        if context.grounded {
+            vec![format!("Grounded in {}.", context.reference_span_id)]
+        } else {
+            vec![format!("Expanded from input \"{}\".", source.title)]
+        }
     } else {
         reasons
             .iter()
@@ -1222,17 +1264,30 @@ fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Pr
 fn validation_reasons(
     candidate: &DraftCandidate,
     duplicate: bool,
+    grounded: bool,
     quote_verified: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    // A generator-flagged "unsupported" card is rejected in BOTH lanes: the flag
+    // is a quality red flag, not a provenance claim, so it must bite even for a
+    // quote-free world-knowledge card (otherwise omitting the quote would launder
+    // an explicitly-flagged-bad answer into the queue).
     if candidate.unsupported {
         reasons.push("Unsupported by cited source material".to_owned());
     }
-    if !quote_verified {
+    // The quote check applies only to a card that CLAIMS a source quote: it must
+    // verify, or the card is rejected — a fabricated citation is the
+    // anti-hallucination failure this catches. A world-knowledge card has no
+    // quote to verify; its factual correctness rests on the model and the
+    // human keep-review the card still passes through before study.
+    if grounded && !quote_verified {
         reasons.push("Evidence quote not found in cited source".to_owned());
     }
     if duplicate {
         reasons.push("Duplicate-ish generated draft".to_owned());
+    }
+    if references_source_artifact(&candidate.question) {
+        reasons.push("Question references the source instead of standing alone".to_owned());
     }
     if candidate.activity_kind == GeneratedLearningActivityKind::Exercise
         && candidate.worked_solution.is_none()
@@ -1242,6 +1297,46 @@ fn validation_reasons(
     reasons.extend(mcq_quality_reasons(candidate));
 
     reasons
+}
+
+/// A card must stand alone — the learner sees only the question, never the
+/// material it was generated from. A question that points back at the study
+/// artifact ("the subject of the source text", "according to the passage") is
+/// unanswerable once the source is gone, and is exactly the meta-card the
+/// generation prompt is told to avoid. The model usually obeys; this gate
+/// rejects the ones that slip through so the repair pass regenerates a
+/// self-contained card. Phrases mirror the prompt's own forbidden list and are
+/// multi-word to keep a legitimate bare "text"/"source" from tripping it.
+///
+/// Exported so the generation bench eval scores self-reference with the exact
+/// same definition the runtime gate enforces. A private copy in the bench crate
+/// had silently drifted to a shorter phrase list, which let the eval pass cards
+/// (e.g. "the list above") that the runtime gate actually rejects.
+#[must_use]
+pub fn references_source_artifact(question: &str) -> bool {
+    const ARTIFACT_PHRASES: &[&str] = &[
+        "source text",
+        "the source material",
+        "subject of the source",
+        "subject of the text",
+        "the passage",
+        "the excerpt",
+        "the list above",
+        "the text above",
+        "the table above",
+        "the article above",
+        "the document above",
+        "the reading above",
+        "according to the source",
+        "according to the passage",
+        "according to the text",
+        "according to the article",
+        "in the passage",
+    ];
+    let normalized = normalize_for_match(question);
+    ARTIFACT_PHRASES
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
 }
 
 fn mcq_quality_reasons(candidate: &DraftCandidate) -> Vec<String> {
@@ -1613,7 +1708,7 @@ mod tests {
             &["Glucose and mitosis", "RNA and transcription"],
         );
 
-        let reasons = validation_reasons(&candidate, false, true);
+        let reasons = validation_reasons(&candidate, false, true, true);
 
         assert!(reasons.contains(&"MCQ question tests multiple atoms".to_owned()));
     }
@@ -1626,8 +1721,48 @@ mod tests {
             &["chloroplast", "mitochondrion"],
         );
 
-        let reasons = validation_reasons(&candidate, false, true);
+        let reasons = validation_reasons(&candidate, false, true, true);
 
         assert!(reasons.contains(&"MCQ distractor duplicates the correct answer".to_owned()));
+    }
+
+    #[test]
+    fn self_referential_meta_question_is_rejected() {
+        // The exact garbage meta-card observed in dogfood: it asks about the
+        // study artifact rather than the subject, so it is unanswerable once the
+        // source is gone. The gate must reject it (the repair pass then writes a
+        // standalone card) even though it carries a valid quote and no flags.
+        let candidate = quiz(
+            "What is the name of the phonetic alphabet presented as the subject of the source text?",
+            "NATO phonetic alphabet",
+            &["ICAO spelling alphabet", "ITU phonetic alphabet"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true, true);
+
+        assert!(
+            reasons
+                .contains(&"Question references the source instead of standing alone".to_owned()),
+            "self-referential meta-question must be rejected: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_question_naming_its_subject_is_accepted() {
+        // The well-formed sibling: names its subject, mentions no artifact. It
+        // must pass cleanly so the gate does not trip on a legitimate card that
+        // merely contains words like "text" or "source" in other contexts.
+        let candidate = quiz(
+            "In the NATO phonetic alphabet, what code word represents the letter A?",
+            "Alfa",
+            &["Apple", "Alpha-One"],
+        );
+
+        let reasons = validation_reasons(&candidate, false, true, true);
+
+        assert!(
+            reasons.is_empty(),
+            "a self-contained card must not be rejected: {reasons:?}"
+        );
     }
 }

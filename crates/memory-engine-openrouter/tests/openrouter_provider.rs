@@ -109,9 +109,78 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
     );
     assert!(prompt.contains("learning_intent"));
     assert!(prompt.contains("verbatim_memorization"));
-    assert!(prompt.contains("recitation-ladder exercise drafts only"));
+    // The unified prompt asks the model to decide grounding per card.
+    assert!(prompt.contains("Decide grounding for EACH card"));
     assert!(prompt.contains("semantically adjacent confusions"));
     assert!(prompt.contains("never format variants"));
+}
+
+#[test]
+fn expands_a_bare_topic_into_standalone_cards_without_requiring_quotes() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "learning_intent": "fact_recall",
+                    "drafts": [
+                        {
+                            "concept": "NATO alphabet: A",
+                            "question": "In the NATO phonetic alphabet, which word stands for the letter A?",
+                            "answer": "Alfa",
+                            "evidence_quote": "",
+                            "distractors": [],
+                            "activity_kind": "quiz",
+                            "activity_stage": "cued-recall",
+                            "worked_solution": ""
+                        },
+                        {
+                            "concept": "NATO alphabet: B",
+                            "question": "In the NATO phonetic alphabet, which word stands for the letter B?",
+                            "answer": "Bravo",
+                            "evidence_quote": "",
+                            "distractors": [],
+                            "activity_kind": "quiz",
+                            "activity_stage": "cued-recall",
+                            "worked_solution": ""
+                        }
+                    ]
+                }).to_string()
+            }
+        }]
+    });
+    let (base_url, request) = serve_once(200, &body.to_string());
+
+    let provider = OpenRouterProvider::new(OpenRouterConfig {
+        api_key: "test-key".to_owned(),
+        model: "google/gemini-3.5-flash".to_owned(),
+        base_url,
+        timeout: Duration::from_secs(5),
+        prompt: PromptVariant::Principled,
+        max_drafts: 5,
+    });
+    let drafts = provider
+        .generate_drafts(&topic_source())
+        .expect("provider output");
+
+    // Both cards persist even though they carry no evidence quote: a topic
+    // expands from world knowledge with nothing to cite.
+    assert_eq!(drafts.candidates.len(), 2);
+    assert!(drafts.failures.is_empty());
+    assert_eq!(drafts.candidates[0].evidence, None);
+    assert_eq!(drafts.candidates[1].answer, "Bravo");
+
+    let request = request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request");
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    let prompt = payload["messages"][0]["content"].as_str().expect("prompt");
+    // The unified prompt covers enumerable sets exhaustively, demands standalone
+    // questions, and lets a card leave its quote empty when it expands from
+    // world knowledge.
+    assert!(prompt.contains("ONE card for EVERY element"));
+    assert!(prompt.contains("In the NATO phonetic alphabet"));
+    assert!(prompt.contains("world-knowledge card"));
 }
 
 #[test]
@@ -405,16 +474,199 @@ fn test_config(base_url: String) -> OpenRouterConfig {
     }
 }
 
+/// Grounding the model is expected to use for a scenario's input.
+#[derive(Clone, Copy)]
+enum Grounding {
+    /// A bare topic: every card expands from world knowledge (no quote).
+    Knowledge,
+    /// A passage: at least some cards cite a verbatim quote from it.
+    Source,
+}
+
+/// Live generation eval (opt-in; hits `OpenRouter`, so `#[ignore]`d in CI). This
+/// is the acceptance oracle for the model-judged generation harness: across
+/// topic, passage, and large-enumerable inputs, every card must stand alone, and
+/// every card that CLAIMS a source quote must quote the input verbatim (no
+/// fabricated citations — the anti-hallucination guarantee). It prints a
+/// scorecard so the prompt can be iterated against live reality. Run it with:
+///
+/// ```text
+/// set -a; . ./.env; set +a
+/// cargo test -p memory-engine-openrouter --test openrouter_provider \
+///   -- --ignored --nocapture live_generation_eval
+/// ```
+#[test]
+#[ignore = "hits the live OpenRouter API; requires OPENROUTER_API_KEY"]
+#[allow(clippy::too_many_lines)]
+fn live_generation_eval() {
+    use memory_engine_generation::evidence_quote_matches;
+
+    let config = OpenRouterConfig::from_env().expect("OPENROUTER_API_KEY must be set");
+    let model = config.model.clone();
+    let provider = OpenRouterProvider::new(config);
+
+    let mitochondria = "Mitochondria are double-membraned organelles. The inner membrane folds \
+        into structures called cristae, which increase the surface area available for ATP \
+        synthesis. Mitochondria carry their own circular DNA and are inherited maternally in \
+        most animals. The endosymbiotic theory proposes that mitochondria descended from \
+        free-living alpha-proteobacteria engulfed by an ancestral eukaryotic cell.";
+
+    // (name, title, body, min_cards, expected grounding)
+    let scenarios: [(&str, &str, &str, usize, Grounding); 4] = [
+        (
+            "topic / NATO alphabet",
+            "NATO phonetic alphabet",
+            "nato phonetic alphabet",
+            24,
+            Grounding::Knowledge,
+        ),
+        (
+            "topic / planets",
+            "the eight planets in order from the sun",
+            "the eight planets in order from the sun",
+            8,
+            Grounding::Knowledge,
+        ),
+        (
+            "passage / mitochondria",
+            "Mitochondria",
+            mitochondria,
+            2,
+            Grounding::Source,
+        ),
+        (
+            "large enumerable / months",
+            "the twelve months of the year and how many days each has",
+            "the twelve months of the year and how many days each has",
+            12,
+            Grounding::Knowledge,
+        ),
+    ];
+
+    let banned = [
+        "source text",
+        "the passage",
+        "presented as",
+        "the text above",
+        "the list above",
+        "the subject of",
+    ];
+    let mut failures: Vec<String> = Vec::new();
+
+    for (name, title, body, min_cards, grounding) in scenarios {
+        let source = eval_source(title, body);
+        let drafts = match provider.generate_drafts(&source) {
+            Ok(drafts) => drafts,
+            Err(error) => {
+                failures.push(format!("{name}: provider error: {error}"));
+                continue;
+            }
+        };
+
+        let (mut source_cards, mut knowledge_cards, mut fabricated, mut meta) = (0, 0, 0, 0);
+        eprintln!("\n=== {name} — {} cards ===", drafts.candidates.len());
+        for candidate in &drafts.candidates {
+            let tag = if let Some(quote) = candidate.evidence.as_deref() {
+                source_cards += 1;
+                if !evidence_quote_matches(body, quote) {
+                    fabricated += 1;
+                }
+                "src "
+            } else {
+                knowledge_cards += 1;
+                "know"
+            };
+            let lowered = candidate.question.to_lowercase();
+            if banned.iter().any(|phrase| lowered.contains(phrase)) {
+                meta += 1;
+            }
+            eprintln!("  [{tag}] {} => {}", candidate.question, candidate.answer);
+        }
+        eprintln!(
+            "  source={source_cards} knowledge={knowledge_cards} fabricated_quotes={fabricated} meta={meta}"
+        );
+
+        if drafts.candidates.len() < min_cards {
+            failures.push(format!(
+                "{name}: {} cards < expected {min_cards}",
+                drafts.candidates.len()
+            ));
+        }
+        if meta > 0 {
+            failures.push(format!("{name}: {meta} non-standalone (meta) questions"));
+        }
+        // The anti-hallucination guarantee: a card that claims a source quote
+        // must quote the input verbatim.
+        if fabricated > 0 {
+            failures.push(format!(
+                "{name}: {fabricated} cards cite a quote that is not in the input"
+            ));
+        }
+        match grounding {
+            Grounding::Knowledge if source_cards > 0 => failures.push(format!(
+                "{name}: {source_cards} cards cited a quote for a bare topic with nothing to quote"
+            )),
+            Grounding::Source if source_cards == 0 => failures.push(format!(
+                "{name}: no card grounded in the passage (expected source extraction)"
+            )),
+            _ => {}
+        }
+    }
+
+    eprintln!(
+        "\n=== model {model}: {} scorecard failures ===",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "live generation eval failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+fn eval_source(title: &str, body: &str) -> SourceDocument {
+    SourceDocument {
+        id: "src-eval".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: title.to_owned(),
+        body: Some(body.to_owned()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        created_at: NOW,
+        archived_at: None,
+    }
+}
+
 fn prose_source() -> SourceDocument {
     SourceDocument {
         id: "src-prose".to_owned(),
         kind: SourceDocumentKind::Text,
         title: "Mitochondria notes".to_owned(),
+        // A short passage — one sentence — to pin that prose stays in
+        // passage-extraction mode even when brief: it ends with sentence
+        // punctuation, so the provenance gate stays on.
         body: Some(
             "Mitochondria are organelles that generate most of the cell's supply of \
-             adenosine triphosphate."
+             adenosine triphosphate through oxidative phosphorylation."
                 .to_owned(),
         ),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        created_at: NOW,
+        archived_at: None,
+    }
+}
+
+/// A bare topic — three words, no passage — the case that produced the
+/// "subject of the source text" meta-question under the passage prompt.
+fn topic_source() -> SourceDocument {
+    SourceDocument {
+        id: "src-topic".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "NATO phonetic alphabet".to_owned(),
+        body: Some("nato phonetic alphabet".to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),

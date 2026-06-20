@@ -606,21 +606,21 @@ fn bridge_generation_rejects_duplicate_of_manual_parent_review_unit() {
 }
 
 #[test]
-fn records_missing_provenance_failures_without_saving_malformed_drafts() {
-    let directory = TempDirectory::new("missing-provenance");
+fn authored_block_without_a_reference_is_a_world_knowledge_card() {
+    let directory = TempDirectory::new("no-reference");
     let path = directory.path().join("store.json");
     let mut store = BetaPersistenceStore::open(&path).expect("store");
     store
         .save_source_document(SourceDocument {
-            id: "src-missing-provenance".to_owned(),
+            id: "src-no-reference".to_owned(),
             kind: SourceDocumentKind::Text,
-            title: "Unsupported note".to_owned(),
+            title: "Authored note".to_owned(),
             body: Some(
                 [
-                    "Concept: unsupported",
+                    "Concept: nato letter a",
                     "Activity: quiz",
-                    "Question: What is unsupported?",
-                    "Answer: This has no cited source span.",
+                    "Question: What is A in the NATO phonetic alphabet?",
+                    "Answer: Alfa",
                 ]
                 .join("\n"),
             ),
@@ -635,8 +635,8 @@ fn records_missing_provenance_failures_without_saving_malformed_drafts() {
     let result = run_beta_generation(
         &mut store,
         BetaGenerationRequest {
-            run_id: "run-missing".to_owned(),
-            source_document_ids: vec!["src-missing-provenance".to_owned()],
+            run_id: "run-no-reference".to_owned(),
+            source_document_ids: vec!["src-no-reference".to_owned()],
             parent_review_unit_id: None,
             started_at: NOW,
             completed_at: None,
@@ -646,16 +646,262 @@ fn records_missing_provenance_failures_without_saving_malformed_drafts() {
     )
     .expect("generation");
 
-    assert!(result.draft_ids.is_empty());
+    // No cited reference, so the card is a world-knowledge expansion: grounding
+    // is decided per card by quote presence, and a quote-free card is accepted
+    // and grounded in the captured input rather than rejected.
+    assert_eq!(result.accepted_draft_ids.len(), 1);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+    let draft = &store.snapshot().generated_prompt_drafts[0];
     assert_eq!(
-        result.validation_failures,
-        ["src-missing-provenance block 1: generated drafts require source provenance"]
+        draft.validation.status,
+        GeneratedPromptValidationStatus::Accepted
     );
-    assert!(store.snapshot().generated_prompt_drafts.is_empty());
+    assert!(draft
+        .critique_notes
+        .iter()
+        .any(|note| note.contains("Expanded from input")));
+}
+
+/// A model-style provider that expands the input from world knowledge: its
+/// card carries no source quote, the way real topic expansion does.
+struct KnowledgeCardProvider;
+
+impl DraftProvider for KnowledgeCardProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fake-knowledge".to_owned(),
+            name: "knowledge-expander".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: "NATO alphabet: B".to_owned(),
+                question: "In the NATO phonetic alphabet, what word represents the letter B?"
+                    .to_owned(),
+                answer: "Bravo".to_owned(),
+                evidence: None,
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "recognition".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: None,
+        })
+    }
+}
+
+/// A provider whose card claims a source quote that is NOT in the source — the
+/// fabricated-citation failure the anti-hallucination gate must catch.
+struct FabricatedQuoteProvider;
+
+impl DraftProvider for FabricatedQuoteProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fake-fabricator".to_owned(),
+            name: "fabricator".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: vec![DraftCandidate {
+                index: 1,
+                concept: "Mitochondria invention".to_owned(),
+                question: "Who invented mitochondria in 1923?".to_owned(),
+                answer: "Dr. Smith".to_owned(),
+                evidence: Some("mitochondria were invented by Dr. Smith in 1923".to_owned()),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "recognition".to_owned(),
+                unsupported: false,
+            }],
+            failures: Vec::new(),
+            usage: None,
+        })
+    }
+}
+
+#[test]
+fn world_knowledge_card_without_a_quote_is_accepted_and_seeded() {
+    let directory = TempDirectory::new("knowledge-card");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-topic".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "NATO phonetic alphabet".to_owned(),
+            body: Some("nato phonetic alphabet".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &KnowledgeCardProvider,
+        BetaGenerationRequest {
+            run_id: "run-topic".to_owned(),
+            source_document_ids: vec!["src-topic".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 1);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+
+    let snapshot = store.snapshot();
+    // No per-fact quote, so the card grounds in the captured input itself as its
+    // reference span — a real pointer the store can resolve.
+    assert_eq!(snapshot.reference_spans.len(), 1);
+    assert_eq!(snapshot.reference_spans[0].text, "nato phonetic alphabet");
+    let draft = &snapshot.generated_prompt_drafts[0];
     assert_eq!(
-        store.snapshot().generation_runs[0].validation_failures,
-        result.validation_failures
+        draft.validation.status,
+        GeneratedPromptValidationStatus::Accepted
     );
+    assert_eq!(draft.source_document_ids, ["src-topic"]);
+    assert_eq!(draft.reference_span_ids.len(), 1);
+    assert_eq!(draft.queue.concept_key.as_deref(), Some("nato-alphabet-b"));
+    // Recorded as a world-knowledge expansion, not a source-grounded extraction.
+    assert!(draft
+        .critique_notes
+        .iter()
+        .any(|note| note.contains("Expanded from input")));
+}
+
+#[test]
+fn fabricated_source_quote_is_rejected() {
+    let directory = TempDirectory::new("fabricated-quote");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-passage".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Mitochondria".to_owned(),
+            body: Some(
+                "Mitochondria are membrane-bound organelles found in the cytoplasm of nearly \
+                 all eukaryotic cells, where they generate most of the cell's supply of \
+                 adenosine triphosphate through the process of oxidative phosphorylation."
+                    .to_owned(),
+            ),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FabricatedQuoteProvider,
+        BetaGenerationRequest {
+            run_id: "run-passage".to_owned(),
+            source_document_ids: vec!["src-passage".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    // A card that CLAIMS a source quote must have it verify. This quote is not
+    // in the source, so the card is rejected — the anti-hallucination guarantee.
+    assert!(result.accepted_draft_ids.is_empty());
+    let rejected = &store.snapshot().generated_prompt_drafts[0];
+    assert_eq!(
+        rejected.validation.status,
+        GeneratedPromptValidationStatus::Rejected
+    );
+    assert!(rejected
+        .validation
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("Evidence quote not found in cited source")));
+}
+
+#[test]
+fn flagged_unsupported_card_is_rejected_even_without_a_quote() {
+    // A card the generator flags as unsupported must be rejected whether or not
+    // it cites a quote: omitting the quote must not launder a flagged-bad answer
+    // into the queue through the world-knowledge lane.
+    let directory = TempDirectory::new("flagged-unsupported");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-flagged".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Flagged note".to_owned(),
+            body: Some(
+                [
+                    "Concept: dubious",
+                    "Activity: quiz",
+                    "Question: What is dubious?",
+                    "Answer: An answer the generator could not support.",
+                    "Unsupported: true",
+                ]
+                .join("\n"),
+            ),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "run-flagged".to_owned(),
+            source_document_ids: vec!["src-flagged".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: None,
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert!(result.accepted_draft_ids.is_empty());
+    let rejected = &store.snapshot().generated_prompt_drafts[0];
+    assert_eq!(
+        rejected.validation.status,
+        GeneratedPromptValidationStatus::Rejected
+    );
+    assert!(rejected
+        .validation
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("Unsupported by cited source material")));
 }
 
 #[test]
