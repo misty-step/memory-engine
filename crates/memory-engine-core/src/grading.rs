@@ -238,7 +238,7 @@ fn apply_equivalence_groups(value: &str, groups: &[Vec<String>]) -> String {
         .filter(|(alias, canonical)| !alias.is_empty() && alias != canonical)
         .collect::<Vec<_>>();
 
-    replacements.sort_by(|left, right| right.0.len().cmp(&left.0.len()));
+    replacements.sort_by_key(|(alias, _)| std::cmp::Reverse(alias.len()));
 
     replace_whole_tokens(value, &replacements)
 }

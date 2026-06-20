@@ -450,7 +450,7 @@ impl WebShellSession {
                 }
             })
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left.due.cmp(&right.due));
+        rows.sort_by_key(|row| row.due);
         rows
     }
 }
