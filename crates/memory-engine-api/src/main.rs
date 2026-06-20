@@ -50,6 +50,10 @@ async fn main() {
         process::exit(1);
     };
 
+    // Start the background generation worker before serving so captures run
+    // asynchronously instead of blocking the request thread.
+    state.start_worker();
+
     if let Err(error) = axum::serve(listener, router(state)).await {
         eprintln!("{error}");
         process::exit(1);
@@ -71,7 +75,12 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
         );
     }
 
-    let auth_config = AuthConfig::allow_emails(allowed_emails);
+    let mut auth_config = AuthConfig::allow_emails(allowed_emails);
+    // Local/dev only: surface the magic link on the "check your email" page so
+    // sign-in works without a real mailer. Never enable in production.
+    if env::var("MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS").as_deref() == Ok("true") {
+        auth_config = auth_config.with_debug_links(true);
+    }
     if let Ok(command) = env::var("MEMORY_ENGINE_AUTH_MAILER_COMMAND") {
         let command = command.trim();
         if !command.is_empty() {
