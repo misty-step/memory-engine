@@ -28,9 +28,10 @@
     }
   }
 
-  // Build a fresh row when a job arrives that isn't on the page yet (e.g. a
-  // capture made in another tab). Mirrors render_job_row's structure; CSS drives
-  // the status glyph and retry visibility off data-status.
+  // Build a minimal row when a job arrives that isn't on the page yet (e.g. a
+  // capture made in another tab). It carries status + meta only — the retry
+  // control needs a server-issued CSRF token, so a job that fails here gets its
+  // Retry button on the next full page load (the list is server-authoritative).
   function createRow(job) {
     var li = document.createElement("li");
     li.className = "me-job";

@@ -2702,6 +2702,66 @@ mod tests {
         assert_eq!(reran.attempts, 2, "retry must re-run the worker");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drains_an_enqueued_capture_and_broadcasts_success() {
+        // The deterministic run_pending_blocking shim covers job *logic*; this is
+        // the one test that exercises the real spawned worker (spawn_blocking +
+        // the semaphore) and the broadcast the SSE activity feed subscribes to.
+        let state = ApiState::default();
+        state.start_worker();
+        let mut updates = state.jobs.subscribe();
+        let app = router(state.clone());
+
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", "seed topic notes")],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let csrf_token = html_value(&response_text(started).await, "csrfToken");
+        app.clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/capture",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("capture", &source_body())],
+            ))
+            .await
+            .expect("capture");
+
+        // The spawned worker — not the test shim — must run the job and fan a
+        // succeeded snapshot out over the broadcast channel.
+        let account_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let update = match updates.recv().await {
+                    Ok(update) => update,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before a succeeded job")
+                    }
+                };
+                let job: serde_json::Value =
+                    serde_json::from_str(&update.payload).expect("job payload is json");
+                if job["status"] == "succeeded" {
+                    return update.account_id;
+                }
+            }
+        })
+        .await
+        .expect("the worker must broadcast a succeeded job within 5s");
+
+        // The broadcast carries the owning account — the field the SSE handler
+        // filters on so a learner only ever receives their own jobs.
+        assert!(
+            !account_id.is_empty(),
+            "a succeeded broadcast must be account-tagged"
+        );
+    }
+
     #[tokio::test]
     async fn create_account_returns_stable_account_id() {
         let request = Request::builder()

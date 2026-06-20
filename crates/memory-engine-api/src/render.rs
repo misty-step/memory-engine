@@ -824,8 +824,6 @@ textarea.ae-input:focus-visible { border-color: var(--ae-ink); outline: 2px soli
 .me-concept-note { font-size: 13px; margin: 0.5em 0 0; }
 .me-trend { display: inline-flex; align-items: center; gap: 0.3em; white-space: nowrap; }
 .me-notice { display: flex; gap: 0.6em; align-items: baseline; padding: 0.85em 1em; border: 1px solid var(--ae-line); margin: 0 0 1.9em; }
-.me-notes { list-style: none; margin: 0; padding: 0; }
-.me-notes li { display: flex; gap: 0.55em; align-items: baseline; font-size: 13px; padding: 0.3em 0; }
 .me-foot-form { margin: 0; }
 .me-submit { margin: 0; }
 "#;
