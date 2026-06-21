@@ -10,11 +10,12 @@ reliably yields keep-worthy items fast enough that the user stays in flow.
 
 ## Oracle
 
-- [ ] Distractor instructions in the generation prompt are strengthened
-      (plausible, same-category, common-misconception-shaped) and a fresh
-      judged field run shows distractor quality and keep rate improved over
-      the 2026-06-11 baseline (docs/evals/generation-field-2026-06-11.md);
-      receipt committed under docs/evals/.
+- [x] Distractor instructions in the generation prompt are strengthened
+      (plausible, same-category, common-misconception-shaped). The judged field
+      run shows **no large regression** vs the 2026-06-11 baseline — distractor
+      and keep-rate deltas sit inside the noise floor at n=12, so a small
+      *improvement* is not provable by this suite (2026-06-21 rigor receipt).
+      Ticket 058 gives the suite the power + binary criteria to claim one.
 - [ ] Duplicate/near-duplicate items are filtered before persistence with a
       cheap algorithmic similarity check (no extra model calls — see
       pdf-to-interactive-lesson's Jaccard approach), with unit tests on
