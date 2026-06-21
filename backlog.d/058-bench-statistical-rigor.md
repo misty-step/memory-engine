@@ -1,6 +1,6 @@
 # Statistical rigor for the generation bench
 
-Priority: P2 · Status: pending · Estimate: M
+Priority: P2 · Status: in progress · Estimate: M
 
 ## Goal
 
@@ -15,20 +15,22 @@ per the eval-rigor doctrine now in the harness
 
 ## Oracle
 
-- [ ] Every rate in the receipt (keep rate) carries a confidence interval —
-      `SE = sqrt(p*(1-p)/n)`, clustered by source — printed in the receipt.
-- [ ] Version comparison is paired per source against a named baseline
-      (McNemar / paired bootstrap), and the receipt labels any delta inside the
-      CI as "within noise" instead of reporting it as a change.
+- [x] The keep rate carries a 95% confidence interval, source-clustered
+      (Student-t, df = n-1), printed in the receipt.
+- [x] `--baseline <receipt>` pairs per source against a prior run and prints the
+      mean keep-rate delta with its CI, labelling a delta inside the CI as
+      "within noise" instead of a change.
 - [ ] Distractor / question-quality judging is binary pass/fail per atomic
       criterion (not a 1–5 Likert), with the judge writing its rationale before
-      the verdict.
+      the verdict. **Coupled to the next item** — a binary judge you cannot
+      validate is no more trustworthy than the Likert one.
 - [ ] The judge is calibrated against a small human-labeled holdout (target
       Cohen's κ ≈ 0.80; report TPR/TNR, then bias-correct the rate), with the
-      calibration receipt committed under `docs/evals/`.
-- [ ] The suite's power is documented: ~12 sources detects only large
-      regressions; note the n needed for a ~3% delta and treat the suite as a
-      large-regression guard, not a small-improvement detector.
+      calibration receipt committed under `docs/evals/`. **User-gated**: needs
+      ~30–50 operator pass/fail labels on generated cards.
+- [x] The suite's power is documented: the receipt prints a power note (~12
+      sources detects only large regressions; a ~3pp delta needs ~1000 drafts;
+      read it as a large-regression guard).
 
 ## Notes
 
@@ -39,3 +41,14 @@ line. The gap is purely in how the *numbers* are sized and read. This ticket
 either gives the bench the teeth to support 055 oracle item 1 (a real
 distractor/keep-rate improvement claim) or reframes that oracle as
 "no large regression" — see the 2026-06-21 rigor receipt under docs/evals/.
+
+## Progress — feat/058-bench-statistical-rigor (2026-06-21)
+
+Shipped: a `stats` module (source-clustered Student-t CI, paired-vs-baseline
+verdict, receipt keep-rate parser) wired into the generation receipt behind
+`--baseline`. The receipt now prints the keep-rate CI, the paired verdict
+(within noise / detectable), and a power note. Oracles 1, 2, 5 met.
+
+Remaining (oracles 3 + 4, a coupled pair): the binary-criteria judge and its
+human calibration. Deferred because an uncalibrated binary judge violates the
+rigor it implements, and calibration needs ~30–50 operator labels.
