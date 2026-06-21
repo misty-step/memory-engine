@@ -37,7 +37,7 @@
 
 - Judge means: faithfulness 4.9 · question quality 4.8 · distractors 3.9 · keep rate 69% · judge cost $0.1004
 - Keep rate (source-clustered, n=12): 69% (95% CI ±17pp)
-- Paired vs baseline (12 sources): keep Δ -1.4pp (95% CI ±19.5pp) — **within noise** (indistinguishable from a no-op at this n)
+- Paired vs baseline (12 sources): keep Δ -1.4pp (95% CI ±19.5pp) — **within noise** — CI includes 0 (not detected; not proof of no change)
 - Power: ~12 sources resolves only large regressions; a ~3pp change needs ~1000 drafts (Miller 2411.00640). Read this suite as a large-regression guard.
 
 Judge would not keep:

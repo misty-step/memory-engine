@@ -37,7 +37,9 @@ fn t_critical_95(df: usize) -> f64 {
 
 /// Mean of `values` with the half-width of its two-sided 95% CI, treating each
 /// value as one cluster (one source). Returns `None` for fewer than two values
-/// — spread cannot be estimated from a single cluster.
+/// — spread cannot be estimated from a single cluster. Sources are weighted
+/// equally regardless of draft count (the conservative cluster-robust default:
+/// a source with fewer drafts is noisier, so equal weighting widens the CI).
 #[must_use]
 pub fn mean_ci_95(values: &[f64]) -> Option<MeanCi> {
     let n = values.len();
@@ -65,8 +67,9 @@ pub struct PairedVerdict {
     pub mean_delta: f64,
     pub half_width: f64,
     pub paired: usize,
-    /// True when the 95% CI of the mean paired delta includes zero — the change
-    /// is indistinguishable from run-to-run noise.
+    /// True when the 95% CI of the mean paired delta includes zero: the change
+    /// is not resolved at this n (not detected, not proof of no effect — a true
+    /// effect up to the interval bound could still hide).
     pub within_noise: bool,
 }
 
@@ -94,6 +97,9 @@ pub fn paired_verdict(
         mean_delta: interval.mean,
         half_width: interval.half_width,
         paired: deltas.len(),
+        // CI includes 0. (Identical deltas give zero variance and a zero-width
+        // CI, reading any nonzero shift as detectable; real per-source rates
+        // always vary, so that degenerate case cannot fire here.)
         within_noise: interval.mean.abs() <= interval.half_width,
     })
 }
@@ -140,7 +146,13 @@ pub fn parse_keep_rates(receipt: &str) -> Vec<(String, f64)> {
         let (Some(source), Some(keep)) = (cells.get(source_index), cells.get(keep_index)) else {
             continue;
         };
-        if let Ok(percent) = keep.trim().trim_end_matches('%').parse::<f64>() {
+        // Require the trailing '%' so a stray bare number cannot be silently
+        // mis-scaled (e.g. "0.33" -> 0.0033).
+        if let Some(percent) = keep
+            .trim()
+            .strip_suffix('%')
+            .and_then(|n| n.parse::<f64>().ok())
+        {
             rates.push((source.trim().to_owned(), percent / 100.0));
         }
     }

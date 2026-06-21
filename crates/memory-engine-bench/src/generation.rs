@@ -1073,9 +1073,9 @@ fn render_keep_rate_rigor(
             verdict.mean_delta * 100.0,
             verdict.half_width * 100.0,
             if verdict.within_noise {
-                "**within noise** (indistinguishable from a no-op at this n)"
+                "**within noise** — CI includes 0 (not detected; not proof of no change)"
             } else {
-                "**detectable**"
+                "**detectable** — CI excludes 0"
             },
         );
     }
