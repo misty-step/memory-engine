@@ -1,11 +1,12 @@
 use std::{collections::BTreeMap, fs, process::Command};
 
 use axum::http::HeaderMap;
+use memory_engine_persistence::GeneratedPromptValidationStatus;
 
 use crate::{
-    account_id_for, app_session_max_age_ms, new_browser_session_id, new_csrf_token,
-    new_magic_link_token, new_session_token, normalize_email, normalize_required_text,
-    read_browser_session_id, require_account_session, secret_hash, source_id_for, AccountCreated,
+    account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
+    new_session_token, normalize_email, normalize_required_text, read_browser_session_id,
+    require_account_session, secret_hash, session_csrf_token, source_id_for, AccountCreated,
     AccountRecord, AccountRegistry, ApiFailure, AppAccount, AuthConfig, AuthLinkDelivery,
     BrowserSessionRecord, CreateSourceRequest, MagicLinkRequest, SourceRecord, StudyStorage,
     StudyViewResponse, SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
@@ -247,6 +248,38 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
+    /// Run a queued generation job end to end on a worker thread: generate from
+    /// the already-saved source, then optimistically approve (schedule) every
+    /// accepted card. Returns how many cards were scheduled.
+    ///
+    /// Session-free by design — enqueueing was already authorized in the request
+    /// that created the job, and the background worker is trusted, so it keys off
+    /// the account id alone rather than carrying a credential.
+    pub(crate) fn run_generation_job(
+        &self,
+        account_id: &str,
+        source_id: &str,
+    ) -> Result<usize, ApiFailure> {
+        let storage = self.storage();
+        let store_path = storage.account_store_path(account_id);
+        storage.generate_source(account_id, &store_path, source_id)?;
+        let view = storage.study_view(account_id, &store_path)?;
+        let pending = view
+            .drafts
+            .iter()
+            .filter(|draft| {
+                draft.validation_status == GeneratedPromptValidationStatus::Accepted
+                    && !draft.approved
+            })
+            .map(|draft| draft.id.clone())
+            .collect::<Vec<_>>();
+        let card_count = pending.len();
+        for draft_id in pending {
+            storage.approve_draft(account_id, &store_path, &draft_id)?;
+        }
+        Ok(card_count)
+    }
+
     pub(crate) fn archive_source(
         &self,
         account_id: &str,
@@ -320,6 +353,20 @@ impl AccountRegistry {
             .skip_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Permanently remove a review card from the learner's queue. Backed by
+    /// archival (`archived_at`), so the card never resurfaces in review while
+    /// the underlying record stays recoverable in storage.
+    pub(crate) fn delete_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .delete_review(account_id, &account.store_path, review_unit_id)
+    }
+
     pub(crate) fn snooze_review(
         &self,
         account_id: &str,
@@ -391,7 +438,7 @@ impl AccountRegistry {
         account: &AccountCreated,
     ) -> Result<AppAccount, ApiFailure> {
         let browser_session_id = new_browser_session_id();
-        let csrf_token = new_csrf_token();
+        let csrf_token = session_csrf_token(&account.session_token);
         let session = BrowserSessionRecord {
             account_id: account.account_id.clone(),
             session_token: account.session_token.clone(),
@@ -447,6 +494,47 @@ impl AccountRegistry {
             account_id: session.account_id,
             session_token: session.session_token,
             csrf_token: csrf_token.to_owned(),
+        })
+    }
+
+    /// Session-only auth for GET requests, which carry the session cookie but no
+    /// CSRF token in the request: the SSE job stream and the signed-in home
+    /// render. A GET submits nothing, so there is no token to validate; the
+    /// returned account still carries the session's derived CSRF token so a
+    /// rendered home can emit valid forms (the actual CSRF guard runs when those
+    /// forms POST back through [`AccountRegistry::require_browser_session`]).
+    pub(crate) fn require_browser_session_readonly(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AppAccount, ApiFailure> {
+        let session_id = read_browser_session_id(headers)?;
+        let mut session = {
+            let data = self.lock_data();
+            data.browser_sessions.get(session_id).cloned()
+        };
+        if session.is_none() {
+            session = self.storage().load_browser_session(session_id)?;
+            if let Some(session) = &session {
+                let mut data = self.lock_data();
+                data.browser_sessions
+                    .insert(session_id.to_owned(), session.clone());
+            }
+        }
+        let session = session.ok_or_else(ApiFailure::missing_session)?;
+        if session.expires_at_ms <= self.now() {
+            let mut data = self.lock_data();
+            data.browser_sessions.remove(session_id);
+            drop(data);
+            return Err(ApiFailure::missing_session());
+        }
+        self.require_account(&session.account_id, &session.session_token)?;
+
+        let csrf_token = session_csrf_token(&session.session_token);
+        Ok(AppAccount {
+            browser_session_id: session_id.to_owned(),
+            account_id: session.account_id,
+            session_token: session.session_token,
+            csrf_token,
         })
     }
 

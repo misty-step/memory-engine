@@ -45,3 +45,32 @@ existing PromptVariant machinery so A/B runs stay one flag away.
 2. Algorithmic dedup before persistence.
 3. Bounded repair/regeneration stage with cost cap.
 4. Production latency measurement + one structural improvement if needed.
+
+## Progress — feat/055-gen-quality-latency (2026-06-20)
+
+Landed on the branch (delivered, merge-ready):
+
+- Distractor prompt strengthened (same-category / same-keyed-feature /
+  misconception-shaped) with a deterministic `distractor_cohesion` bench judge; a
+  self-reference gate with a `self_referential_free` judge; per-card grounding (a
+  quote-free card becomes a world-knowledge expansion instead of a rejection).
+- Structural latency improvement shipped (oracle 4): generation is now
+  non-blocking — a capture enqueues a background job and returns immediately, with
+  status streamed to the UI over SSE. This cuts *perceived* latency; per-source
+  model compute is unchanged.
+- Dedup (oracle 2) and bounded repair (oracle 3) were already in HEAD before this
+  branch (6d400fa et al.) and were left untouched.
+- The bench now shares the runtime self-reference predicate, so eval and gate
+  cannot drift. MCQ grading normalizes case/punctuation.
+- Live QA receipt: docs/qa/055-async-generation-live-2026-06-20.md.
+
+Still open (operational receipts, not code):
+
+- Oracle 1: a fresh *judged field run* (scored batch) showing distractor quality
+  and keep rate beat the 2026-06-11 baseline, committed under docs/evals/. The
+  live walk showed one clean MCQ (Alfa/Amber/Atlas/Apollo), not a scored run.
+- Oracle 4: record a production p50; if it still exceeds ~10s, the deeper
+  candidate (parallel per-chunk model calls) is the next lever — deferred here.
+- Oracle 5: confirm the full 12-source bench (deterministic + model judge) as the
+  comparison artifact.
+- Durability/retention of the new job queue is tracked separately in 057.

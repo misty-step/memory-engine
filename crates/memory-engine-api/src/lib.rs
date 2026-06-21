@@ -30,28 +30,45 @@ use memory_engine_study::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+mod design_preview;
+mod jobs;
 mod registry;
 mod render;
 mod routes;
 mod storage;
 
-#[cfg(test)]
-use render::render_generation_notices;
+pub use jobs::{GenerationJob, JobBroadcast, JobQueue, JobStatus};
+
 use render::{
     render_account_page, render_action_result_html, render_app_shell, render_login_requested,
 };
 pub use routes::router;
 use storage::{StudyStorage, StudyStorageConfig};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct ApiState {
     accounts: AccountRegistry,
+    jobs: JobQueue,
 }
 
 impl ApiState {
     #[must_use]
     pub fn new(accounts: AccountRegistry) -> Self {
-        Self { accounts }
+        let jobs = JobQueue::new(accounts.clone());
+        Self { accounts, jobs }
+    }
+
+    /// Start the background generation worker. Call once, from inside the Tokio
+    /// runtime (e.g. in `main`), before serving requests.
+    pub fn start_worker(&self) {
+        self.jobs.spawn_worker();
+    }
+}
+
+impl Default for ApiState {
+    fn default() -> Self {
+        Self::new(AccountRegistry::default())
     }
 }
 
@@ -164,7 +181,7 @@ impl AccountRegistry {
         self.lock_data().now_fn
     }
 
-    fn now(&self) -> i64 {
+    pub(crate) fn now(&self) -> i64 {
         (self.clock())()
     }
 
@@ -574,8 +591,19 @@ fn new_browser_session_id() -> String {
     format!("browser_{:032x}", rand::random::<u128>())
 }
 
-fn new_csrf_token() -> String {
-    format!("csrf_{:032x}", rand::random::<u128>())
+/// Derive a session's CSRF token from its server-side session secret.
+///
+/// The token is a pure function of `session_token`, which never leaves the
+/// server — the browser cookie carries only the opaque session id. So any
+/// cookie-authenticated render, including a plain `GET /` of the home, can emit
+/// valid CSRF-protected forms without the token being stored or threaded
+/// through. An attacker mounting a cross-site request knows neither the session
+/// secret nor this one-way derivation of it, so they cannot forge the token; and
+/// because the digest is one-way, exposing a form's CSRF token never reveals the
+/// session secret. Validation stays hash-based: the session record holds
+/// `secret_hash(session_csrf_token(session_token))`, unchanged.
+fn session_csrf_token(session_token: &str) -> String {
+    format!("csrf_{}", secret_hash(&format!("csrf:{session_token}")))
 }
 
 fn new_magic_link_token() -> String {
@@ -902,10 +930,7 @@ mod tests {
 
     use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
-    use super::{
-        render_generation_notices, router, routes, AccountRegistry, ApiState, AuthConfig,
-        AUTH_CHALLENGE_TTL_MS,
-    };
+    use super::{router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS};
 
     #[tokio::test]
     async fn healthz_exposes_production_api_boundary() {
@@ -926,7 +951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_home_prioritizes_source_capture_before_account_creation() {
+    async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
         let response = router(ApiState::default())
             .oneshot(
                 Request::builder()
@@ -939,46 +964,365 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
-        assert!(body.contains(r#"<form action="/app/start" method="post">"#));
-        assert!(body.contains("Add something you want to learn"));
-        assert!(body.contains("Save capture"));
-        assert!(body.contains(r#"placeholder="Paste anything worth remembering.""#));
-        assert!(body.contains(r#"name="capture""#));
-        assert!(!body.contains(r#"name="title""#));
-        assert!(!body.contains(r#"name="body""#));
+        // Onboarding leads with the magic-link email form, not the guest path.
         assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+        assert!(body.contains(r#"name="email""#));
+        assert!(body.contains(r#"placeholder="you@example.com""#));
+        assert!(body.contains("Get started"));
+        assert!(body.contains("Spaced repetition, made effortless"));
+        assert!(body.contains("Remember it for good."));
+        // Regression: the anonymous home must NOT offer the guest capture form,
+        // which dead-ends on the account allowlist ("not allowed to register").
+        assert!(!body.contains(r#"action="/app/start""#));
+        assert!(!body.contains(r#"name="capture""#));
+        assert!(!body.contains("Start remembering"));
+        // No source/account internals leak onto the anonymous home.
         assert!(!body.contains("NATO practice notes"));
         assert!(!body.contains("Concept: NATO letter A"));
-        assert!(
-            body.find("/app/start").expect("start form")
-                < body.find("/app/account").expect("account form")
-        );
-    }
-
-    #[test]
-    fn generation_notices_render_as_a_visible_section() {
-        let html = render_generation_notices(&[
-            "No review items could be generated from this source yet.".to_owned(),
-        ]);
-        assert!(html.contains("Generation notes"));
-        assert!(html.contains("No review items could be generated"));
-
-        assert!(
-            render_generation_notices(&[]).is_empty(),
-            "a clean run renders nothing"
-        );
-    }
-
-    #[test]
-    fn generation_notices_escape_html() {
-        let html = render_generation_notices(&["<script>alert(1)</script>".to_owned()]);
-        assert!(!html.contains("<script>"));
-        assert!(html.contains("&lt;script&gt;"));
     }
 
     #[tokio::test]
-    async fn mobile_form_flow_generates_keeps_reveals_and_submits_review() {
-        let app = router(ApiState::default());
+    async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
+        let state = ApiState::default();
+        let app = router(state.clone());
+        // Bootstrap a session (the start route only seeds an empty source).
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", "seed topic notes")],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+
+        // One action: capture. Generation is enqueued and the handler returns
+        // immediately — no cards in the response yet, just the "generating" notice
+        // and a queued activity-log row. There is no manual keep gate anymore.
+        let captured = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/capture",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("capture", &source_body())],
+            ))
+            .await
+            .expect("capture");
+        assert_eq!(captured.status(), StatusCode::OK);
+        let captured = response_text(captured).await;
+        assert!(captured.contains("Generating your cards — they'll appear below as they're ready."));
+        assert!(captured.contains(r#"<ul id="me-jobs""#));
+        assert_not_contains_any(&captured, &["Add all to reviews", ">Keep</button>"]);
+
+        // Drain the background job: real generation + auto-approve every accepted
+        // card, scheduling it immediately due. The activity log now shows the
+        // finished job, both NATO concepts scheduled for review.
+        state.jobs.run_pending_blocking();
+        let workspace = workspace_html(&app, &cookie).await;
+        assert_activity_succeeded_html(&workspace, 2);
+
+        // The scheduled cards drive the review flow with no keep step in between.
+        let review = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &csrf_token)],
+            ))
+            .await
+            .expect("next");
+        assert_eq!(review.status(), StatusCode::OK);
+        let review = response_text(review).await;
+        assert!(review.contains("2 due"));
+        assert!(review.contains("Reveal answer"));
+        assert!(!review.contains("Add all to reviews"));
+    }
+
+    #[tokio::test]
+    async fn signed_in_home_surfaces_review_cta_after_generation() {
+        // Regression: a learner who generated cards could see "scheduled for
+        // review" in the activity log but had no way to start reviewing. Two gaps
+        // fed it. Workspace re-renders passed no study view, so the header read
+        // "0 due" and the "Start review" button — gated on due_count > 0 — never
+        // rendered. And GET / ignored the session entirely, always serving the
+        // signed-out cover. After draining a real generation job, the signed-in
+        // workspace must surface the due count and Start review CTA on both the
+        // POST refresh and a plain GET /.
+        let state = ApiState::default();
+        let app = router(state.clone());
+        let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+        // Generate from the seeded source and drain the queue: real generation,
+        // auto-approve, cards scheduled immediately due. The helper returns the
+        // refreshed workspace, which fetches the live study view — so the due
+        // callout and Start review CTA appear, not "0 due" and not the cover.
+        let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert!(
+            workspace.contains("Start review"),
+            "workspace must surface the Start review CTA: {workspace}"
+        );
+        assert!(workspace.contains("Due now"));
+        assert!(!workspace.contains("0 due"));
+
+        // A plain GET / carrying the session cookie renders the signed-in
+        // workspace, not the signed-out cover — the way into review survives a
+        // reload rather than depending on the last POST's response.
+        let home = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("home request"),
+            )
+            .await
+            .expect("home");
+        assert_eq!(home.status(), StatusCode::OK);
+        let home = response_text(home).await;
+        assert!(
+            home.contains("Start review"),
+            "signed-in GET / must surface the Start review CTA: {home}"
+        );
+        assert!(home.contains("Due now"));
+        assert_not_contains_any(&home, &["Get started"]);
+
+        // The CTA must actually work: the CSRF token embedded by the GET render
+        // has to validate when its form POSTs. A cookie-only GET carries no token
+        // in the request, so the home derives it from the session — submitting
+        // that derived token to /app/next must open the review, not bounce on
+        // "CSRF token does not match session."
+        let home_csrf = html_value(&home, "csrfToken");
+        let review = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/next",
+                &cookie,
+                &[("csrfToken", &home_csrf)],
+            ))
+            .await
+            .expect("start review from home CTA");
+        assert_eq!(review.status(), StatusCode::OK);
+        let review = response_text(review).await;
+        assert!(
+            review.contains("Reveal answer"),
+            "the home Start review CTA must open a review: {review}"
+        );
+        assert!(!review.contains("CSRF token does not match"));
+    }
+
+    #[tokio::test]
+    async fn mcq_review_is_click_to_answer_and_grades_case_insensitively() {
+        // The NATO letter-A card is multiple choice (answer ALFA, distractors
+        // BRAVO/CHARLIE). It must render as clickable options that submit the
+        // exact choice — not a static list plus a confusing "type the letter"
+        // box — and a typed answer in the wrong case must still grade correct
+        // (the bug where a learner typed the right word and was marked wrong).
+        let state = ApiState::default();
+        let app = router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
+
+        let mcq = advance_to_prompt(
+            &app,
+            &cookie,
+            &csrf_token,
+            "NATO phonetic alphabet word for A",
+        )
+        .await;
+        assert!(
+            mcq.contains(r#"class="me-choice""#),
+            "MCQ must render clickable choice buttons: {mcq}"
+        );
+        assert!(
+            mcq.contains(r#"name="answer" value="ALFA""#),
+            "each option submits its exact choice text: {mcq}"
+        );
+        assert!(!mcq.contains("Type the letter"));
+        let review_unit_id = html_value(&mcq, "reviewUnitId");
+
+        // Typed answer in the wrong case grades correct.
+        let graded = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "alfa"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "review-mcq-case"),
+                ],
+            ))
+            .await
+            .expect("submit lowercase answer");
+        assert_eq!(graded.status(), StatusCode::OK);
+        let graded = response_text(graded).await;
+        assert!(
+            graded.contains("me-verdict") && graded.contains(">Correct<"),
+            "lowercase 'alfa' must grade correct against stored 'ALFA': {graded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn free_response_review_shows_a_prominent_input_not_choice_buttons() {
+        // The CAT exercise is free-response: it must show the bounded answer box
+        // (not clickable options, and not a hairline underline that reads as a
+        // divider).
+        let state = ApiState::default();
+        let app = router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+        let free = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+        assert!(
+            free.contains(r#"class="ae-input me-answer-input""#),
+            "free-response must show the prominent answer box: {free}"
+        );
+        assert!(!free.contains(r#"class="me-choice""#));
+        let review_unit_id = html_value(&free, "reviewUnitId");
+
+        // Graded (D): a free-response card has no options to mark, so the answer
+        // is revealed on one line, with the verdict and the when-it-returns line.
+        // No metrics wall, no concept health on the card.
+        let graded = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "CHARLIE ALFA TANGO"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "free-graded"),
+                ],
+            ))
+            .await
+            .expect("submit free response");
+        assert_eq!(graded.status(), StatusCode::OK);
+        let graded = response_text(graded).await;
+        assert!(graded.contains(r#"<span class="me-verdict">Correct</span>"#));
+        assert!(
+            graded.contains(r#"<p class="me-answer"><span class="me-answer-label">Answer</span>"#),
+            "free-response graded must reveal the answer on one line: {graded}"
+        );
+        assert!(graded.contains("CHARLIE ALFA TANGO"));
+        assert!(graded.contains(r#"<p class="me-next-when"#));
+        // No choice rows in the markup (the .me-graded-choice CSS rule still ships
+        // in the inline stylesheet — assert on the element, not the class string).
+        assert!(!graded.contains(r#"<li class="me-graded-choice"#));
+        assert_not_contains_any(
+            &graded,
+            &["Answer feedback", "Concept health", "This item:"],
+        );
+    }
+
+    #[tokio::test]
+    async fn review_delete_removes_the_card_for_good() {
+        // A learner who hits a bad card must be able to delete it from review.
+        // Delete archives the current card and drops straight to the next: the
+        // due count falls by one, the deleted prompt is gone from the response,
+        // and it never resurfaces when the queue is driven again.
+        let state = ApiState::default();
+        let app = router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
+
+        // Land on a known card and delete it.
+        let target = "Spell CAT over the phone";
+        let on_card = advance_to_prompt(&app, &cookie, &csrf_token, target).await;
+        assert!(on_card.contains("2 due"));
+        assert!(on_card.contains(">Delete</button>"));
+        let review_unit_id = html_value(&on_card, "reviewUnitId");
+
+        let deleted = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/delete",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                ],
+            ))
+            .await
+            .expect("delete");
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted = response_text(deleted).await;
+        // One card remains, due count dropped, and the deleted prompt is gone.
+        assert!(
+            deleted.contains("1 due"),
+            "due count must drop after delete: {deleted}"
+        );
+        assert!(
+            !deleted.contains(target),
+            "deleted card must not remain on screen: {deleted}"
+        );
+
+        // Drive the queue: the deleted card must never resurface.
+        for _ in 0..4 {
+            let page = next_review_html(&app, &cookie, &csrf_token, "post-delete").await;
+            assert!(
+                !page.contains(target),
+                "deleted card must not return to the queue: {page}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mobile_form_flow_generates_reveals_and_submits_review() {
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -995,37 +1339,20 @@ mod tests {
         let source_id = html_value(&started, "sourceId");
         assert!(started.contains("Capture saved"));
         assert!(started.contains("Saved material"));
-        assert!(!started.contains("Choose what to keep"));
+        assert!(!started.contains("Add all to reviews"));
 
-        let generated = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/generate",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
-            ))
-            .await
-            .expect("generate");
-        assert_eq!(generated.status(), StatusCode::OK);
-        let generated = response_text(generated).await;
-        assert_keep_flow_html(&generated);
-        let draft_id = html_value(&generated, "draftId");
+        // Regenerate from the saved source: enqueue, drain, and reload. Both
+        // accepted cards are auto-approved and scheduled — no keep gate, no
+        // per-draft approve. The activity log shows the finished job.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
 
-        let approved = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
-            ))
-            .await
-            .expect("approve");
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        assert_due_review_html(&approved);
-        let review_unit_id = html_value(&approved, "reviewUnitId");
+        // Open the review queue: both scheduled cards are due. Take whichever
+        // card surfaces first (auto-approve fixes no order), reveal it — every
+        // expected answer here contains "ALFA" — and answer it correctly.
+        let opened = next_review_html(&app, &cookie, &csrf_token, "open queue").await;
+        assert_due_review_html(&opened, 2);
+        let review_unit_id = html_value(&opened, "reviewUnitId");
 
         let revealed = app
             .clone()
@@ -1053,9 +1380,9 @@ mod tests {
                 &[
                     ("csrfToken", &csrf_token),
                     ("reviewUnitId", &review_unit_id),
-                    ("answer", "ALFA"),
+                    ("answer", correct_answer_for_prompt(&revealed)),
                     ("responseTimeMs", "1800"),
-                    ("idempotencyKey", "mobile-nato-a"),
+                    ("idempotencyKey", "mobile-review-first"),
                 ],
             ))
             .await
@@ -1063,6 +1390,28 @@ mod tests {
         assert_eq!(submitted.status(), StatusCode::OK);
         let submitted = response_text(submitted).await;
         assert_submitted_review_html(&submitted);
+
+        // Both cards were scheduled; clear the remaining one so the queue drains
+        // to empty and the workspace returns to its blank state.
+        let remaining = next_review_html(&app, &cookie, &csrf_token, "remaining").await;
+        let remaining_id = html_value(&remaining, "reviewUnitId");
+        let cleared = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &remaining_id),
+                    ("answer", correct_answer_for_prompt(&remaining)),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", "mobile-review-second"),
+                ],
+            ))
+            .await
+            .expect("clear remaining");
+        assert_eq!(cleared.status(), StatusCode::OK);
 
         let next = app
             .oneshot(form_request_with_cookie(
@@ -1076,29 +1425,28 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK);
         let next = response_text(next).await;
         assert!(next.contains("0 due"));
-        assert!(next.contains("Add something you want to learn"));
+        assert!(next.contains("What do you want to remember?"));
         assert!(!next.contains("Progress"));
     }
 
     #[tokio::test]
-    async fn mobile_submit_review_shows_human_result_and_item_history() {
-        let app = router(ApiState::default());
+    async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
+        let state = ApiState::default();
+        let app = router(state.clone());
         let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
-        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
-        let draft_id = html_value(&generated, "draftId");
-        let approved = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
-            ))
-            .await
-            .expect("approve");
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        let review_unit_id = html_value(&approved, "reviewUnitId");
+        // Generation auto-approves and schedules every accepted card; no manual
+        // per-draft approve. Drive the queue to the NATO-A quiz card and answer
+        // it wrong to exercise the human result + item-history rollup.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
+        let current = advance_to_prompt(
+            &app,
+            &cookie,
+            &csrf_token,
+            "What is the NATO phonetic alphabet",
+        )
+        .await;
+        let review_unit_id = html_value(&current, "reviewUnitId");
 
         let submitted = app
             .oneshot(form_request_with_cookie(
@@ -1118,16 +1466,23 @@ mod tests {
         assert_eq!(submitted.status(), StatusCode::OK);
         let submitted = response_text(submitted).await;
 
-        assert!(submitted.contains("Try again"));
-        assert!(submitted.contains("Expected answer"));
+        // D graded screen, wrong answer: the verdict reads "Try again", the
+        // correct option is still revealed (marked) so the learner sees it, and a
+        // quiet line says when the card returns. No metrics wall, no concept note
+        // — those live on the workspace now.
+        assert!(submitted.contains(r#"<span class="me-verdict">Try again</span>"#));
         assert!(submitted.contains("ALFA"));
-        assert!(submitted.contains("This item: 1 attempt"));
-        assert!(submitted.contains("0 of 1 correct (0.0%)"));
-        assert!(submitted.contains("last seen just now"));
-        assert!(submitted.contains("nato letter a"));
+        assert!(submitted.contains(r#"<li class="me-graded-choice me-graded-choice-correct">"#));
+        assert!(submitted.contains("you'll see this again"));
         assert_not_contains_any(
             &submitted,
             &[
+                "Expected answer",
+                "This item:",
+                "last seen",
+                "nato letter a",
+                "Answer feedback",
+                "Concept health",
                 "Wrong(",
                 "reviewState",
                 "scheduleChange",
@@ -1139,7 +1494,8 @@ mod tests {
 
     #[tokio::test]
     async fn mobile_submit_review_shows_concept_rollup_for_shared_concept() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -1154,23 +1510,11 @@ mod tests {
         let started = response_text(started).await;
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
-        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
-        let draft_ids = html_values(&generated, "draftId");
-        assert_eq!(draft_ids.len(), 2);
+        // Generation auto-approves and schedules both cards (same concept). No
+        // manual per-draft approve — the activity log confirms two cards landed.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
 
-        for draft_id in &draft_ids {
-            let approved = app
-                .clone()
-                .oneshot(form_request_with_cookie(
-                    "POST",
-                    "/app/approve",
-                    &cookie,
-                    &[("csrfToken", &csrf_token), ("draftId", draft_id)],
-                ))
-                .await
-                .expect("approve");
-            assert_eq!(approved.status(), StatusCode::OK);
-        }
         let current = app
             .clone()
             .oneshot(form_request_with_cookie(
@@ -1217,6 +1561,7 @@ mod tests {
         let second_id = html_value(&next, "reviewUnitId");
 
         let submitted = app
+            .clone()
             .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/submit",
@@ -1234,14 +1579,24 @@ mod tests {
         assert_eq!(submitted.status(), StatusCode::OK);
         let submitted = response_text(submitted).await;
 
-        assert!(submitted.contains("nato letter a"));
-        assert!(submitted.contains("1 of 2 correct (50.0%)"));
-        assert!(submitted.contains("trend is declining"));
+        // D keeps the graded screen to the verdict — no concept note piled on.
+        assert!(submitted.contains(r#"<span class="me-verdict">Try again</span>"#));
+        assert_not_contains_any(&submitted, &["nato letter a", "Concept health"]);
+
+        // Concept health rolls up on the workspace, off the per-card loop: once
+        // the queue drains, Next lands there with both attempts on the shared
+        // concept folded into one row.
+        let workspace = next_review_html(&app, &cookie, &csrf_token, "workspace").await;
+        assert!(workspace.contains("Concept health"));
+        assert!(workspace.contains("nato letter a"));
+        assert!(workspace.contains("1 of 2 correct (50.0%)"));
+        assert!(workspace.contains("declining"));
     }
 
     #[tokio::test]
     async fn management_surface_lists_concepts_worst_first() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -1256,11 +1611,10 @@ mod tests {
         let started = response_text(started).await;
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
-        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
-        let draft_ids = html_values(&generated, "draftId");
-        assert_eq!(draft_ids.len(), 2);
+        // Generation auto-approves and schedules both cards — no manual approve.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
 
-        approve_drafts_html(&app, &cookie, &csrf_token, &draft_ids).await;
         let current = next_review_html(&app, &cookie, &csrf_token, "current").await;
         submit_review_from_html(&app, &cookie, &csrf_token, &current, "management-first").await;
         let next = next_review_html(&app, &cookie, &csrf_token, "next").await;
@@ -1276,13 +1630,14 @@ mod tests {
             .expect("strong concept");
         assert!(weak < strong, "{workspace}");
         assert!(workspace.contains("struggling"));
-        assert!(!workspace.contains("Choose what to keep"));
+        assert!(!workspace.contains("Add all to reviews"));
         assert_not_contains_any(&workspace, &["chart", "streak", "badge"]);
     }
 
     #[tokio::test]
     async fn auth_rendered_forms_do_not_expose_session_credentials() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -1308,50 +1663,24 @@ mod tests {
 
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
-        let generated = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/generate",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
-            ))
-            .await
-            .expect("generate");
-        assert_eq!(generated.status(), StatusCode::OK);
-        let generated = response_text(generated).await;
-        let draft_id = html_value(&generated, "draftId");
-        let rejected = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                &cookie,
-                &[("draftId", &draft_id)],
-            ))
-            .await
-            .expect("approve without csrf");
-        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        // The workspace with a finished activity-log row must not leak credentials.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
+        assert!(!generated.contains(r#"name="accountId""#));
+        assert!(!generated.contains(r#"name="sessionToken""#));
+        assert!(!generated.contains("acct_"));
 
-        let approved = app
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
-            ))
-            .await
-            .expect("approve with csrf");
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        assert!(!approved.contains(r#"name="sessionToken""#));
-        assert!(!approved.contains("acct_"));
-        assert!(approved.contains("Reveal answer"));
+        // The review screen the scheduled cards drive must not leak them either.
+        let review = next_review_html(&app, &cookie, &csrf_token, "review").await;
+        assert!(!review.contains(r#"name="sessionToken""#));
+        assert!(!review.contains("acct_"));
+        assert!(review.contains("Reveal answer"));
     }
 
     #[tokio::test]
     async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -1366,27 +1695,13 @@ mod tests {
         let started = response_text(started).await;
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
-        let generated = generate_source_html(&app, &cookie, &csrf_token, &source_id).await;
-        let draft_ids = html_values(&generated, "draftId");
-        let exercise_draft_id = draft_ids
-            .iter()
-            .find(|id| id.contains("nato-cat-composition"))
-            .expect("exercise draft");
-        let approved = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", exercise_draft_id)],
-            ))
-            .await
-            .expect("approve exercise");
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        assert!(approved.contains("1 due"));
+        // Generation auto-approves and schedules both cards. Drive the queue to
+        // the CAT *exercise* card — the one that carries the escape hatches.
+        let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+        assert_activity_succeeded_html(&generated, 2);
+        let approved =
+            advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
         assert!(approved.contains("Reveal answer"));
-        assert!(approved.contains("Spell CAT over the phone"));
         assert!(approved.contains("Reference"));
         assert!(approved.contains("Skip"));
         assert!(approved.contains("Snooze"));
@@ -1456,11 +1771,13 @@ mod tests {
 
     #[tokio::test]
     async fn app_session_mutations_require_csrf() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
 
         assert_source_session_mutations_require_csrf(&app, &cookie, &source_id).await;
-        let review_unit_id = approve_review_for_csrf(&app, &cookie, &csrf_token, &source_id).await;
+        let review_unit_id =
+            schedule_review_for_csrf(&app, &state, &cookie, &csrf_token, &source_id).await;
         assert_review_mutations_require_csrf(&app, &cookie, &review_unit_id).await;
     }
 
@@ -1515,12 +1832,14 @@ mod tests {
             "generate without csrf",
         )
         .await;
+        // The keep flow is gone; the new CSRF-protected session mutation is the
+        // job retry. It must reject a forged cross-site POST just like the rest.
         assert_forbidden_form(
             app,
             cookie,
-            "/app/approve",
-            &[("draftId", "draft-withheld")],
-            "approve without csrf",
+            "/app/jobs/retry",
+            &[("jobId", "job-withheld")],
+            "retry without csrf",
         )
         .await;
         assert_forbidden_form(
@@ -1534,28 +1853,19 @@ mod tests {
         assert_forbidden_form(app, cookie, "/app/logout", &[], "logout without csrf").await;
     }
 
-    async fn approve_review_for_csrf(
+    /// Generation auto-approves and schedules cards (no keep gate); open the
+    /// review queue and return the current review unit id so the review-mutation
+    /// CSRF matrix has a real target.
+    async fn schedule_review_for_csrf(
         app: &axum::Router,
+        state: &ApiState,
         cookie: &str,
         csrf_token: &str,
         source_id: &str,
     ) -> String {
-        let generated = generate_source_html(app, cookie, csrf_token, source_id).await;
-        let draft_id = html_value(&generated, "draftId");
-
-        let approved = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/approve",
-                cookie,
-                &[("csrfToken", csrf_token), ("draftId", &draft_id)],
-            ))
-            .await
-            .expect("approve with csrf");
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        html_value(&approved, "reviewUnitId")
+        generate_source_html(app, state, cookie, csrf_token, source_id).await;
+        let current = next_review_html(app, cookie, csrf_token, "csrf review").await;
+        html_value(&current, "reviewUnitId")
     }
 
     async fn assert_review_mutations_require_csrf(
@@ -1619,8 +1929,14 @@ mod tests {
         .await;
     }
 
+    /// Enqueue generation for a saved source, drain the job synchronously (real
+    /// structured-block generation + auto-approve/schedule), and return the
+    /// reloaded workspace — which now reflects the scheduled, due cards and a
+    /// succeeded activity-log row. This is the async-model replacement for the
+    /// old synchronous "generate → keep" dance.
     async fn generate_source_html(
         app: &axum::Router,
+        state: &ApiState,
         cookie: &str,
         csrf_token: &str,
         source_id: &str,
@@ -1636,28 +1952,67 @@ mod tests {
             .await
             .expect("generate with csrf");
         assert_eq!(generated.status(), StatusCode::OK);
-        response_text(generated).await
+        let generated = response_text(generated).await;
+        // The handler returns immediately with the queued job, before any card
+        // exists. Drain the queue so the deck is generated and scheduled, then
+        // re-render the workspace so the activity log shows the finished job.
+        assert!(generated.contains("Generating — watch the activity log."));
+        state.jobs.run_pending_blocking();
+        workspace_html(app, cookie).await
     }
 
-    async fn approve_drafts_html(
+    /// Drive `/app/next` until the current review item's prompt contains
+    /// `needle`, returning that page. Auto-approve schedules every accepted card
+    /// at once, so which card surfaces first is not fixed; this makes a flow that
+    /// targets a specific card order-independent. Skips non-matching items via
+    /// `/app/skip` so they rotate to the back of the queue.
+    async fn advance_to_prompt(
         app: &axum::Router,
         cookie: &str,
         csrf_token: &str,
-        draft_ids: &[String],
-    ) {
-        for draft_id in draft_ids {
-            let approved = app
+        needle: &str,
+    ) -> String {
+        for _ in 0..8 {
+            let page = next_review_html(app, cookie, csrf_token, "advance").await;
+            if page.contains(needle) {
+                return page;
+            }
+            let review_unit_id = html_value(&page, "reviewUnitId");
+            let skipped = app
                 .clone()
                 .oneshot(form_request_with_cookie(
                     "POST",
-                    "/app/approve",
+                    "/app/skip",
                     cookie,
-                    &[("csrfToken", csrf_token), ("draftId", draft_id)],
+                    &[("csrfToken", csrf_token), ("reviewUnitId", &review_unit_id)],
                 ))
                 .await
-                .expect("approve");
-            assert_eq!(approved.status(), StatusCode::OK);
+                .expect("skip while advancing");
+            assert_eq!(skipped.status(), StatusCode::OK);
         }
+        panic!("no review item matched prompt {needle:?}");
+    }
+
+    /// Re-render the signed-in workspace (the activity log + saved material) the
+    /// way a learner reloads it: a plain `GET /` carrying the session cookie. The
+    /// home reads the live job list and study view, so a job drained just before
+    /// this call shows its final `succeeded`/`failed` status and its scheduled
+    /// cards drive the due count and Start review CTA.
+    async fn workspace_html(app: &axum::Router, cookie: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .expect("workspace request"),
+            )
+            .await
+            .expect("workspace refresh");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_text(response).await
     }
 
     async fn next_review_html(
@@ -2155,15 +2510,14 @@ mod tests {
         let saved = response_text(saved).await;
         assert!(saved.contains("NATO practice notes"));
         assert!(saved.contains("Saved material"));
-        assert!(!saved.contains("Keep this"));
+        assert!(!saved.contains("Add all to reviews"));
         assert!(!saved.contains("acct_fc9e1ff15d47bd67"));
         assert!(!saved.contains("Save account email"));
         let saved_csrf_token = html_value(&saved, "csrfToken");
         let source_id = html_value(&saved, "sourceId");
 
-        let restarted_app = router(ApiState::new(super::AccountRegistry::with_store_root(
-            &store_root,
-        )));
+        let restarted_state = ApiState::new(super::AccountRegistry::with_store_root(&store_root));
+        let restarted_app = router(restarted_state.clone());
         let replay = restarted_app
             .clone()
             .oneshot(form_request(
@@ -2178,23 +2532,25 @@ mod tests {
         assert!(replay.contains("Check your email"));
         assert!(!replay.contains("Account already exists."));
 
-        let generated = restarted_app
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/generate",
-                &saved_cookie,
-                &[("csrfToken", &saved_csrf_token), ("sourceId", &source_id)],
-            ))
-            .await
-            .expect("generate after resume");
-        assert_eq!(generated.status(), StatusCode::OK);
-        let generated = response_text(generated).await;
-        assert!(generated.contains("Choose what to keep"));
+        // The resumed session can still regenerate the persisted source: enqueue,
+        // drain, and confirm the cards land. (The old synchronous "Add all to
+        // reviews" keep gate is gone — success now shows in the activity log and
+        // the cards are auto-scheduled.)
+        let generated = generate_source_html(
+            &restarted_app,
+            &restarted_state,
+            &saved_cookie,
+            &saved_csrf_token,
+            &source_id,
+        )
+        .await;
+        assert_activity_succeeded_html(&generated, 2);
     }
 
     #[tokio::test]
     async fn mobile_source_archive_hides_source_and_blocks_regeneration() {
-        let app = router(ApiState::default());
+        let state = ApiState::default();
+        let app = router(state.clone());
         let started = app
             .clone()
             .oneshot(form_request(
@@ -2224,11 +2580,16 @@ mod tests {
         assert_eq!(archived.status(), StatusCode::OK);
         let archived = response_text(archived).await;
         assert!(archived.contains("Source removed"));
-        assert!(archived.contains("Add something you want to learn"));
+        assert!(archived.contains("What do you want to remember?"));
         assert!(!archived.contains("NATO practice notes"));
         assert!(!archived.contains("What is the NATO phonetic alphabet word for A?"));
 
-        let regenerated = app
+        // Regenerating an archived source still enqueues a job — the request only
+        // queues work, it does not validate the source. The worker is where it
+        // fails: the source is gone, so generation surfaces "Source not found."
+        // as the job's error in the activity log rather than as a sync response.
+        let queued = app
+            .clone()
             .oneshot(form_request_with_cookie(
                 "POST",
                 "/app/generate",
@@ -2237,10 +2598,168 @@ mod tests {
             ))
             .await
             .expect("generate archived source");
-        assert_eq!(regenerated.status(), StatusCode::OK);
-        let regenerated = response_text(regenerated).await;
-        assert!(regenerated.contains("Source not found."));
-        assert!(!regenerated.contains("Choose what to keep"));
+        assert_eq!(queued.status(), StatusCode::OK);
+        let queued = response_text(queued).await;
+        assert!(queued.contains("Generating — watch the activity log."));
+
+        state.jobs.run_pending_blocking();
+        let regenerated = workspace_html(&app, &cookie).await;
+        assert!(
+            regenerated.contains(r#"data-status="failed""#),
+            "archived-source job must fail in the worker: {regenerated}"
+        );
+        assert!(
+            regenerated.contains("Source not found."),
+            "failed job meta must surface the source-not-found error: {regenerated}"
+        );
+        assert!(!regenerated.contains("Add all to reviews"));
+        assert!(!regenerated.contains("What is the NATO phonetic alphabet word for A?"));
+    }
+
+    #[tokio::test]
+    async fn mobile_retry_requeues_and_reruns_a_failed_job() {
+        // A failed job is the one thing a learner can act on in the activity
+        // log. Setup mirrors the archive case so the job fails for a real reason
+        // (the source is gone), then we drive the real /app/jobs/retry endpoint
+        // and confirm the worker actually runs it a second time.
+        let state = ApiState::default();
+        let app = router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("title", "NATO practice notes"), ("body", &source_body())],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+
+        app.clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/source/archive",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("archive source");
+        app.clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/generate",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+            ))
+            .await
+            .expect("generate archived source");
+
+        state.jobs.run_pending_blocking();
+        let failed_html = workspace_html(&app, &cookie).await;
+        assert!(
+            failed_html.contains(r#"data-status="failed""#),
+            "precondition: the job must fail first: {failed_html}"
+        );
+
+        // The retry control carries the job id; recover it the way the browser
+        // submits it, then assert the worker ran exactly once so far.
+        let job_id = failed_html
+            .split_once(r#"data-job-id=""#)
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(id, _)| id.to_owned())
+            .expect("activity log renders a job id");
+        assert_eq!(
+            state.jobs.job(&job_id).expect("job exists").attempts,
+            1,
+            "the job ran once before retry"
+        );
+
+        let retried = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/jobs/retry",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("jobId", &job_id)],
+            ))
+            .await
+            .expect("retry");
+        assert_eq!(retried.status(), StatusCode::OK);
+        // The endpoint re-queues the failed job and clears its error before the
+        // worker picks it back up.
+        let requeued = state.jobs.job(&job_id).expect("job exists");
+        assert_eq!(requeued.status, crate::JobStatus::Queued);
+        assert!(requeued.error.is_none());
+
+        // Draining runs it a second time — attempts increments, proving retry
+        // actually re-ran generation (it fails again: the source is still gone).
+        state.jobs.run_pending_blocking();
+        let reran = state.jobs.job(&job_id).expect("job exists");
+        assert_eq!(reran.status, crate::JobStatus::Failed);
+        assert_eq!(reran.attempts, 2, "retry must re-run the worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drains_an_enqueued_capture_and_broadcasts_success() {
+        // The deterministic run_pending_blocking shim covers job *logic*; this is
+        // the one test that exercises the real spawned worker (spawn_blocking +
+        // the semaphore) and the broadcast the SSE activity feed subscribes to.
+        let state = ApiState::default();
+        state.start_worker();
+        let mut updates = state.jobs.subscribe();
+        let app = router(state.clone());
+
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", "seed topic notes")],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let csrf_token = html_value(&response_text(started).await, "csrfToken");
+        app.clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/capture",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("capture", &source_body())],
+            ))
+            .await
+            .expect("capture");
+
+        // The spawned worker — not the test shim — must run the job and fan a
+        // succeeded snapshot out over the broadcast channel.
+        let account_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let update = match updates.recv().await {
+                    Ok(update) => update,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before a succeeded job")
+                    }
+                };
+                let job: serde_json::Value =
+                    serde_json::from_str(&update.payload).expect("job payload is json");
+                if job["status"] == "succeeded" {
+                    return update.account_id;
+                }
+            }
+        })
+        .await
+        .expect("the worker must broadcast a succeeded job within 5s");
+
+        // The broadcast carries the owning account — the field the SSE handler
+        // filters on so a learner only ever receives their own jobs.
+        assert!(
+            !account_id.is_empty(),
+            "a succeeded broadcast must be account-tagged"
+        );
     }
 
     #[tokio::test]
@@ -2796,9 +3315,13 @@ mod tests {
         let csrf_token = html_value(&started, "csrfToken");
         let source_id = html_value(&started, "sourceId");
 
-        let restarted_app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        // Simulate a restart: a fresh ApiState (and a fresh in-memory job queue)
+        // over the same durable Postgres store. The source persisted, so the
+        // resumed process can generate from it asynchronously.
+        let restarted_state = ApiState::new(AccountRegistry::with_postgres_url(
             database.scoped_url.clone(),
-        )));
+        ));
+        let restarted_app = router(restarted_state.clone());
         let generated = restarted_app
             .clone()
             .oneshot(form_request_with_cookie(
@@ -2810,22 +3333,22 @@ mod tests {
             .await
             .expect("generate after restart");
         assert_eq!(generated.status(), StatusCode::OK);
-        let generated = response_text(generated).await;
-        let draft_id = html_value(&generated, "draftId");
 
-        let approved = restarted_app
+        // Drain the enqueued job: generation runs and the cards auto-schedule.
+        restarted_state.jobs.run_pending_blocking();
+
+        let next = restarted_app
             .oneshot(form_request_with_cookie(
                 "POST",
-                "/app/approve",
+                "/app/next",
                 &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+                &[("csrfToken", &csrf_token)],
             ))
             .await
-            .expect("approve after restart");
-
-        assert_eq!(approved.status(), StatusCode::OK);
-        let approved = response_text(approved).await;
-        assert!(approved.contains("Reveal answer"));
+            .expect("next after restart");
+        assert_eq!(next.status(), StatusCode::OK);
+        let next = response_text(next).await;
+        assert!(next.contains("Reveal answer"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3910,26 +4433,31 @@ mod tests {
         html[start..end].to_owned()
     }
 
-    fn html_values(html: &str, name: &str) -> Vec<String> {
-        let marker = format!(r#"name="{name}" value=""#);
-        let mut values = Vec::new();
-        let mut remaining = html;
-        while let Some(index) = remaining.find(&marker) {
-            let start = index + marker.len();
-            let end = remaining[start..].find('"').expect("field end") + start;
-            values.push(remaining[start..end].to_owned());
-            remaining = &remaining[end..];
-        }
-        values
-    }
-
-    fn assert_keep_flow_html(body: &str) {
-        assert!(body.contains("Choose what to keep"));
-        assert!(body.contains("What is the NATO phonetic alphabet word for A?"));
-        assert!(body.contains("Keep this"));
+    /// The async-model successor to `assert_keep_flow_html`: after a job drains,
+    /// the workspace shows a finished activity-log row (a succeeded job with a
+    /// card count, already scheduled for review) rather than a manual keep gate.
+    /// `expected_cards` pins how many cards the generation scheduled.
+    fn assert_activity_succeeded_html(body: &str, expected_cards: usize) {
+        assert!(
+            body.contains(r#"data-status="succeeded""#),
+            "activity log must show a succeeded job: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "{expected_cards} {} · scheduled for review",
+                if expected_cards == 1 { "card" } else { "cards" }
+            )),
+            "activity meta must report {expected_cards} cards scheduled for review: {body}"
+        );
+        assert!(body.contains(r#"<ul id="me-jobs""#));
+        // The keep gate is gone: no manual "Add all to reviews" / per-card Keep,
+        // and no raw generation internals leak into the learner-facing markup.
         assert_not_contains_any(
             body,
             &[
+                "Add all to reviews",
+                ">Keep</button>",
+                "Choose what to keep",
                 "Generated material",
                 "validation",
                 "recognition-3",
@@ -3941,19 +4469,15 @@ mod tests {
         );
     }
 
-    fn assert_due_review_html(body: &str) {
-        assert!(body.contains("1 due"));
+    fn assert_due_review_html(body: &str, due_count: usize) {
+        assert!(body.contains(&format!("{due_count} due")));
         assert!(body.contains("Reveal answer"));
-        assert!(body.contains("What is the NATO phonetic alphabet word for A?"));
         assert_not_contains_any(
             body,
             &[
-                "Sources",
                 "Generated material",
-                "Choose what to keep",
-                "Progress",
+                "Add all to reviews",
                 "drafts",
-                "attempts",
                 "validation",
                 "recognition-3",
                 "Save account email",
@@ -3964,17 +4488,30 @@ mod tests {
     }
 
     fn assert_submitted_review_html(body: &str) {
-        assert!(body.contains("Correct"));
-        assert!(body.contains("Answer feedback"));
-        assert!(body.contains("Expected answer"));
-        assert!(body.contains("This item: 1 attempt"));
-        assert!(body.contains("1 of 1 correct (100.0%)"));
-        assert!(body.contains("last seen just now"));
-        assert!(body.contains("Concept health"));
+        // D graded screen: the verdict, the answer revealed in place (correct
+        // option marked), one quiet line on when it returns, and a primary Next.
+        // The metrics wall and concept health moved to the workspace, off the
+        // per-card loop — so they must NOT appear here.
+        assert!(body.contains(r#"<span class="me-verdict">Correct</span>"#));
+        // The first due card may be MCQ or free response, so accept either reveal
+        // form: a marked correct option, or a one-line answer.
+        let reveals_answer = body
+            .contains(r#"<li class="me-graded-choice me-graded-choice-correct">"#)
+            || body.contains(r#"<p class="me-answer">"#);
+        assert!(
+            reveals_answer,
+            "graded screen must reveal the answer: {body}"
+        );
+        assert!(body.contains("you'll see this again"));
         assert!(body.contains("Next"));
         assert_not_contains_any(
             body,
             &[
+                "Answer feedback",
+                "Expected answer",
+                "This item:",
+                "Concept health",
+                "response time",
                 "Last result",
                 "Progress",
                 "Correct(",
@@ -3989,6 +4526,18 @@ mod tests {
             "CHARLIE ALFA TANGO"
         } else {
             "BRAVO"
+        }
+    }
+
+    /// The *correct* answer for whichever `source_body` card the page is showing:
+    /// the CAT spelling exercise expects "CHARLIE ALFA TANGO", the NATO-A quiz
+    /// expects "ALFA". Lets a flow answer the current card correctly without
+    /// pinning the queue order auto-approve leaves unspecified.
+    fn correct_answer_for_prompt(body: &str) -> &'static str {
+        if body.contains("Spell CAT over the phone") {
+            "CHARLIE ALFA TANGO"
+        } else {
+            "ALFA"
         }
     }
 
@@ -4466,6 +5015,109 @@ mod tests {
         assert!(
             later.current.is_some(),
             "the unit must come due again once enough real time passes"
+        );
+    }
+
+    static RESUBMIT_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+    fn resubmit_clock() -> i64 {
+        RESUBMIT_CLOCK.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn answering_the_same_card_across_due_cycles_does_not_collide() {
+        // Regression: the review form embedded a constant idempotency key
+        // (`review-{review_unit_id}`), so the second-ever review of any card
+        // collided with the persisted first one ("Duplicate applied review") and
+        // a learner could answer each card exactly once — fatal for spaced
+        // repetition. The key must vary per attempt; the form now appends the
+        // rep count. Drive one card through two due cycles under an advancing
+        // clock and confirm the second review applies cleanly.
+        RESUBMIT_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+        let registry = AccountRegistry::default().with_clock(resubmit_clock);
+        let state = ApiState::new(registry);
+        let app = router(state.clone());
+
+        let started = app
+            .clone()
+            .oneshot(form_request(
+                "POST",
+                "/app/start",
+                &[("capture", &source_body())],
+            ))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let started = response_text(started).await;
+        let csrf_token = html_value(&started, "csrfToken");
+        let source_id = html_value(&started, "sourceId");
+        generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+        // First review of the CAT card: capture the rendered idempotency key and
+        // answer wrong, so it relearns and is due again within minutes.
+        let first = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+        let review_unit_id = html_value(&first, "reviewUnitId");
+        let first_key = html_value(&first, "idempotencyKey");
+        let graded_once = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "not the answer"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", &first_key),
+                ],
+            ))
+            .await
+            .expect("first submit");
+        assert_eq!(graded_once.status(), StatusCode::OK);
+        let graded_once = response_text(graded_once).await;
+        assert!(
+            graded_once.contains("me-verdict"),
+            "first answer must grade: {graded_once}"
+        );
+
+        // Real time passes; the card comes due again.
+        RESUBMIT_CLOCK.fetch_add(86_400_000, Ordering::SeqCst);
+
+        // Second review of the same card: the key must differ from the first,
+        // and the submit must apply cleanly rather than colliding.
+        let second =
+            advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+        let second_key = html_value(&second, "idempotencyKey");
+        assert_ne!(
+            first_key, second_key,
+            "the idempotency key must change between review attempts"
+        );
+        let graded_twice = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "CHARLIE ALFA TANGO"),
+                    ("responseTimeMs", "1800"),
+                    ("idempotencyKey", &second_key),
+                ],
+            ))
+            .await
+            .expect("second submit");
+        assert_eq!(graded_twice.status(), StatusCode::OK);
+        let graded_twice = response_text(graded_twice).await;
+        assert!(
+            !graded_twice.contains("Duplicate applied review"),
+            "re-reviewing a card must not collide on idempotency: {graded_twice}"
+        );
+        assert!(
+            graded_twice.contains("me-verdict"),
+            "second answer must grade: {graded_twice}"
         );
     }
 }

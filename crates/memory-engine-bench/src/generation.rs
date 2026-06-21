@@ -17,9 +17,9 @@ use std::{cell::RefCell, fmt::Write as _, fs, path::PathBuf};
 use memory_engine::types::{Prompt, ReviewUnitId};
 use memory_engine_generation::{
     candidates_duplicateish, classify_learning_intent, evidence_quote_matches,
-    run_beta_generation_with_provider, BetaGenerationRequest, BetaGenerationStore,
-    BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
-    FakeModelProvider, LearningIntent, ReviewPerformanceContext,
+    references_source_artifact, run_beta_generation_with_provider, BetaGenerationRequest,
+    BetaGenerationStore, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
+    DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
@@ -85,6 +85,14 @@ pub struct SourceScore {
     /// Same-concept same-stage variant groups with distinct surface forms and
     /// no answer leakage in the question text.
     pub variant_quality: f64,
+    /// Fraction of letter-keyed MCQ cards ("...the letter C?") whose answer and
+    /// every distractor begin with the keyed letter — so the answer is never
+    /// identifiable by its initial alone. 1.0 when no card keys on a letter.
+    pub distractor_cohesion: f64,
+    /// Fraction of cards whose question does not point back at the source
+    /// artifact ("the source text", "the passage", ...). Guards the trust gate's
+    /// self-referential rejection against regression.
+    pub self_referential_free: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: Option<i64>,
@@ -352,6 +360,8 @@ fn score_source(
             key_term_coverage: 0.0,
             intent_shape_match: source.expect.intent.is_none(),
             variant_quality: 0.0,
+            distractor_cohesion: 1.0,
+            self_referential_free: 1.0,
             input_tokens: 0,
             output_tokens: 0,
             cost_usd_micros: None,
@@ -647,6 +657,8 @@ fn deterministic_judges(
         key_term_coverage: fraction(covered_terms, expect.key_terms.len()),
         intent_shape_match: intent_shape_matches(expect, learning_intent, candidates),
         variant_quality: variant_quality(candidates),
+        distractor_cohesion: distractor_cohesion(candidates),
+        self_referential_free: self_referential_free(candidates),
         input_tokens: 0,
         output_tokens: 0,
         cost_usd_micros: None,
@@ -655,6 +667,66 @@ fn deterministic_judges(
         judge: None,
         judge_error: None,
     }
+}
+
+/// Letter-keyed MCQ cohesion. When a multiple-choice question fixes a specific
+/// letter ("...the letter C?"), every option must begin with that letter, or the
+/// answer is identifiable by its initial alone and the distractors are dead
+/// weight (the Charlie/Delta/Bravo/Echo bug). Returns the fraction of such
+/// letter-keyed MCQ cards whose answer and all distractors share the keyed
+/// letter; a source with no letter-keyed MCQ scores 1.0 (nothing to fault).
+fn distractor_cohesion(candidates: &[DraftCandidate]) -> f64 {
+    let keyed = candidates
+        .iter()
+        .filter(|candidate| !candidate.distractors.is_empty())
+        .filter_map(|candidate| {
+            question_target_letter(&candidate.question).map(|letter| (candidate, letter))
+        })
+        .collect::<Vec<_>>();
+    if keyed.is_empty() {
+        return 1.0;
+    }
+    let cohesive = keyed
+        .iter()
+        .filter(|(candidate, letter)| {
+            std::iter::once(&candidate.answer)
+                .chain(candidate.distractors.iter())
+                .all(|option| starts_with_letter(option, *letter))
+        })
+        .count();
+    fraction(cohesive, keyed.len())
+}
+
+/// The single letter a question keys on, e.g. "...the letter C?" -> 'c'.
+fn question_target_letter(question: &str) -> Option<char> {
+    let lower = question.to_lowercase();
+    let start = lower.find("letter ")? + "letter ".len();
+    lower[start..]
+        .chars()
+        .next()
+        .filter(char::is_ascii_alphabetic)
+}
+
+fn starts_with_letter(option: &str, letter: char) -> bool {
+    option
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .is_some_and(|character| character.eq_ignore_ascii_case(&letter))
+}
+
+/// Fraction of cards whose question does not point back at the source artifact.
+/// A self-referential meta-question ("the subject of the source text") is
+/// unanswerable once the source is gone; the trust gate rejects these, and this
+/// eval independently guards that protection against regression.
+fn self_referential_free(candidates: &[DraftCandidate]) -> f64 {
+    if candidates.is_empty() {
+        return 1.0;
+    }
+    let clean = candidates
+        .iter()
+        .filter(|candidate| !references_source_artifact(&candidate.question))
+        .count();
+    fraction(clean, candidates.len())
 }
 
 fn intent_shape_matches(
@@ -955,11 +1027,11 @@ fn render_receipt(
     let _ = writeln!(receipt);
     let _ = writeln!(
         receipt,
-        "| source | category | accepted | rejected | failures | runtime | provenance | answerable | dup | count-ok | terms | shape | variants | tokens in/out | cost | latency |"
+        "| source | category | accepted | rejected | failures | runtime | provenance | answerable | dup | count-ok | terms | shape | variants | cohesion | self-ref | tokens in/out | cost | latency |"
     );
     let _ = writeln!(
         receipt,
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     render_score_rows(&mut receipt, scores);
     let _ = writeln!(receipt);
@@ -974,14 +1046,14 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
         if let Some(error) = &score.provider_error {
             let _ = writeln!(
                 receipt,
-                "| {} | {} | — | — | 1 | 0% | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
+                "| {} | {} | — | — | 1 | 0% | — | — | — | — | — | — | — | — | — | — | — | FAILED: {error} |",
                 score.source_id, score.category
             );
             continue;
         }
         let _ = writeln!(
             receipt,
-            "| {} | {} | {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {:.0}% | {}/{} | {} | {}ms |",
+            "| {} | {} | {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {:.0}% | {:.0}% | {:.0}% | {}/{} | {} | {}ms |",
             score.source_id,
             score.category,
             score.drafts,
@@ -995,6 +1067,8 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
             score.key_term_coverage * 100.0,
             if score.intent_shape_match { "yes" } else { "NO" },
             score.variant_quality * 100.0,
+            score.distractor_cohesion * 100.0,
+            score.self_referential_free * 100.0,
             score.input_tokens,
             score.output_tokens,
             format_cost(score.cost_usd_micros),
@@ -1249,6 +1323,24 @@ mod tests {
         }
     }
 
+    fn mcq(question: &str, answer: &str, distractors: &[&str]) -> DraftCandidate {
+        DraftCandidate {
+            index: 1,
+            concept: question.to_owned(),
+            question: question.to_owned(),
+            answer: answer.to_owned(),
+            evidence: None,
+            distractors: distractors
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            worked_solution: None,
+            activity_kind: GeneratedLearningActivityKind::Quiz,
+            activity_stage: "recognition".to_owned(),
+            unsupported: false,
+        }
+    }
+
     fn expectations() -> Expectations {
         Expectations {
             min_drafts: 1,
@@ -1313,6 +1405,57 @@ mod tests {
         assert!((score.key_term_coverage - 1.0).abs() < f64::EPSILON);
         assert!(score.duplicate_rate.abs() < f64::EPSILON);
         assert!(score.count_in_range);
+    }
+
+    #[test]
+    fn distractor_cohesion_flags_mismatched_initials_on_letter_keyed_mcq() {
+        // The dogfooded bug: a "letter C" question whose distractors do not start
+        // with C, so the answer is identifiable by its initial alone.
+        let bad = vec![mcq(
+            "In the NATO phonetic alphabet, which code word represents the letter C?",
+            "Charlie",
+            &["Delta", "Bravo", "Echo"],
+        )];
+        assert!(
+            distractor_cohesion(&bad).abs() < f64::EPSILON,
+            "mismatched initials on a letter-keyed MCQ must score 0"
+        );
+
+        // Cohesive: every option begins with C, so the initial discriminates nothing.
+        let good = vec![mcq(
+            "In the NATO phonetic alphabet, which code word represents the letter C?",
+            "Charlie",
+            &["Cobra", "Caesar", "Casino"],
+        )];
+        assert!((distractor_cohesion(&good) - 1.0).abs() < f64::EPSILON);
+
+        // A question that does not key on a letter is never penalized by this judge.
+        let unkeyed = vec![mcq(
+            "What is the capital of France?",
+            "Paris",
+            &["London", "Berlin"],
+        )];
+        assert!((distractor_cohesion(&unkeyed) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn self_referential_free_flags_meta_questions() {
+        let meta = vec![mcq(
+            "What is the name of the phonetic alphabet presented as the subject of the source text?",
+            "NATO phonetic alphabet",
+            &["ICAO spelling alphabet", "ITU phonetic alphabet"],
+        )];
+        assert!(
+            self_referential_free(&meta).abs() < f64::EPSILON,
+            "a question referencing the source artifact must score 0"
+        );
+
+        let standalone = vec![mcq(
+            "In the NATO phonetic alphabet, what code word represents the letter A?",
+            "Alfa",
+            &["Apple", "Acorn"],
+        )];
+        assert!((self_referential_free(&standalone) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

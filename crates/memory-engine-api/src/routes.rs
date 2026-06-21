@@ -1,11 +1,20 @@
+use std::{convert::Infallible, time::Duration};
+
 use axum::{
     extract::{Form, Path, Query, State},
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    http::{
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+        HeaderMap, StatusCode,
+    },
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
 use memory_engine_study::infer_capture_title;
 
@@ -177,6 +186,8 @@ pub fn router(state: ApiState) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(app_home))
+        .route("/static/aesthetic.css", get(static_aesthetic_css))
+        .route("/static/app.js", get(static_app_js))
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
@@ -186,14 +197,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/logout", post(logout_app_session))
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
+        .route("/app/capture", post(capture_app_source))
         .route("/app/source/archive", post(archive_app_source))
         .route("/app/generate", post(generate_app_source))
-        .route("/app/approve", post(approve_app_draft))
+        .route("/app/jobs/events", get(app_jobs_events))
+        .route("/app/jobs/retry", post(retry_app_job))
         .route("/app/next", post(next_app_review))
         .route("/app/reveal", post(reveal_app_review))
         .route("/app/reference", post(reference_app_review))
         .route("/app/skip", post(skip_app_review))
         .route("/app/snooze", post(snooze_app_review))
+        .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
         .route(
@@ -247,12 +261,32 @@ async fn healthz() -> Json<HealthResponse> {
     })
 }
 
+/// Serve the vendored Misty Step `aesthetic` stylesheet. Vendored into the
+/// crate (`assets/aesthetic.css`) so the binary is self-contained for deploy.
+async fn static_aesthetic_css() -> impl IntoResponse {
+    const CSS: &str = include_str!("../assets/aesthetic.css");
+    (
+        [
+            (CONTENT_TYPE, "text/css; charset=utf-8"),
+            (CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        CSS,
+    )
+}
+
 async fn v1_openapi() -> impl IntoResponse {
     ([(CONTENT_TYPE, "application/json")], V1_OPENAPI_JSON)
 }
 
-async fn app_home() -> Html<String> {
-    Html(render_app_shell(None, &[], None, None))
+async fn app_home(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+    // The home is the durable entry point, so it must respect an existing
+    // session: a signed-in learner reloading or navigating to "/" lands on their
+    // workspace (with the live due count and Start review CTA), not the
+    // signed-out cover. Read-only session check — a GET carries no CSRF token.
+    match state.accounts.require_browser_session_readonly(&headers) {
+        Ok(account) => Html(render_account_page(&state, &account, None, None)),
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
 }
 
 async fn create_account(
@@ -482,9 +516,9 @@ struct AppSourceActionForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct AppDraftActionForm {
+struct AppJobActionForm {
     csrf_token: Option<String>,
-    draft_id: String,
+    job_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -547,7 +581,7 @@ async fn logout_app_session(
         .accounts
         .revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
     {
-        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, None)),
+        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
         Err(error) => error.into_response(),
     }
 }
@@ -612,7 +646,8 @@ async fn start_app_study(
     let account = match state.accounts.create_account(&email) {
         Ok(account) => account,
         Err(error) => {
-            return Html(render_app_shell(None, &[], None, Some(&error.message))).into_response();
+            return Html(render_app_shell(None, &[], None, &[], Some(&error.message)))
+                .into_response();
         }
     };
     let account = match state.accounts.create_browser_session(&account) {
@@ -657,6 +692,48 @@ async fn create_app_source(
     .into_response()
 }
 
+/// Capture material and enqueue generation. Returns immediately: the source is
+/// saved synchronously (fast, local), then a background job generates cards
+/// while the learner is free to do anything else. Progress shows in the
+/// activity log, live over SSE.
+async fn capture_app_source(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppSourceForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let request = capture_request(form.title, form.body, form.capture);
+    let notice =
+        match state
+            .accounts
+            .save_source(&account.account_id, &account.session_token, &request)
+        {
+            Ok(source) => {
+                state
+                    .jobs
+                    .enqueue(&account.account_id, &source.source_id, &request.title);
+                "Generating your cards — they'll appear below as they're ready."
+            }
+            Err(error) => {
+                return Html(render_account_page(
+                    &state,
+                    &account,
+                    None,
+                    Some(&error.message),
+                ))
+                .into_response()
+            }
+        };
+
+    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+}
+
 fn render_save_result_html(
     state: &ApiState,
     account: &AppAccount,
@@ -686,6 +763,8 @@ fn capture_request(
     CreateSourceRequest { title, body }
 }
 
+/// Re-generate from an already-saved source — enqueues a background job, same
+/// as capture, and returns immediately.
 async fn generate_app_source(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -698,13 +777,28 @@ async fn generate_app_source(
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let result = state.accounts.generate_source(
-        &account.account_id,
-        &account.session_token,
-        &form.source_id,
-    );
+    let title = state
+        .accounts
+        .list_sources(&account.account_id, &account.session_token)
+        .ok()
+        .and_then(|sources| {
+            sources
+                .into_iter()
+                .find(|source| source.source_id == form.source_id)
+                .map(|source| source.title)
+        })
+        .unwrap_or_else(|| "New material".to_owned());
+    state
+        .jobs
+        .enqueue(&account.account_id, &form.source_id, &title);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    Html(render_account_page(
+        &state,
+        &account,
+        None,
+        Some("Generating — watch the activity log."),
+    ))
+    .into_response()
 }
 
 async fn archive_app_source(
@@ -742,10 +836,12 @@ async fn archive_app_source(
     }
 }
 
-async fn approve_app_draft(
+/// Retry a failed generation job. Re-queues it for the worker and re-renders
+/// the activity log with the job back in flight.
+async fn retry_app_job(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Form(form): Form<AppDraftActionForm>,
+    Form(form): Form<AppJobActionForm>,
 ) -> Response {
     let account = match state
         .accounts
@@ -754,12 +850,56 @@ async fn approve_app_draft(
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let result =
-        state
-            .accounts
-            .approve_draft(&account.account_id, &account.session_token, &form.draft_id);
+    let notice = if state.jobs.retry(&account.account_id, &form.job_id) {
+        "Retrying — generating again in the background."
+    } else {
+        "That job can't be retried."
+    };
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+}
+
+/// Live job-status stream (SSE). Pushes this account's job updates as they
+/// happen so the activity log updates without a reload. The page is already
+/// server-authoritative, so this is pure progressive enhancement.
+async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let account = match state.accounts.require_browser_session_readonly(&headers) {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let account_id = account.account_id;
+    // `tokio_stream::StreamExt::filter_map` is synchronous: the closure returns
+    // an `Option` directly, not a future.
+    let stream = BroadcastStream::new(state.jobs.subscribe()).filter_map(move |message| {
+        match message {
+            // Full-state snapshots, scoped to this learner. A lagged subscriber
+            // simply skips to the next event — the page reload is authoritative.
+            Ok(update) if update.account_id == account_id => Some(Ok::<Event, Infallible>(
+                Event::default().event("job").data(update.payload),
+            )),
+            _ => None,
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Serve the progressive-enhancement client script (vendored, like the CSS).
+async fn static_app_js() -> impl IntoResponse {
+    const JS: &str = include_str!("../assets/app.js");
+    (
+        [
+            (CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        JS,
+    )
 }
 
 async fn next_app_review(
@@ -836,6 +976,27 @@ async fn skip_app_review(
         Err(error) => return error.into_response(),
     };
     let result = state.accounts.skip_review(
+        &account.account_id,
+        &account.session_token,
+        &form.review_unit_id,
+    );
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn delete_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account = match state
+        .accounts
+        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
+    {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
+    let result = state.accounts.delete_review(
         &account.account_id,
         &account.session_token,
         &form.review_unit_id,
