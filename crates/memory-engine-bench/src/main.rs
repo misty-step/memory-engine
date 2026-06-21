@@ -164,6 +164,7 @@ impl MemoryServiceStore for BenchStore {
 
 mod generation;
 mod judge;
+mod stats;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

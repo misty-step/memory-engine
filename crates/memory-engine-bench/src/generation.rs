@@ -120,6 +120,7 @@ pub struct GenerationBenchArgs {
     pub judge: Option<String>,
     pub max_drafts: Option<usize>,
     pub out: Option<PathBuf>,
+    pub baseline: Option<PathBuf>,
 }
 
 trait GenerationProvider: DraftProvider + BridgeMaterialProvider {}
@@ -138,6 +139,7 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
         judge: None,
         max_drafts: None,
         out: None,
+        baseline: None,
     };
     let mut iterator = arguments.iter();
     while let Some(flag) = iterator.next() {
@@ -186,9 +188,14 @@ pub fn parse_args(arguments: &[String]) -> Result<GenerationBenchArgs, String> {
                     iterator.next().ok_or("--out requires a file path")?,
                 ));
             }
+            "--baseline" => {
+                parsed.baseline = Some(PathBuf::from(
+                    iterator.next().ok_or("--baseline requires a receipt path")?,
+                ));
+            }
             other => {
                 return Err(format!(
-                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--max-drafts <n>] [--out <path>]"
+                    "unknown flag {other}; usage: generation [--model <id>] [--prompt minimal|principled] [--judge <id>] [--max-drafts <n>] [--out <path>] [--baseline <receipt>]"
                 ))
             }
         }
@@ -246,7 +253,15 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         .map(|source| score_source(provider.as_ref(), judge.as_ref(), source))
         .collect();
     let bridge = bridge_quality_fixture(provider.as_ref());
-    let receipt = render_receipt(&label, &scores, &bridge);
+    let baseline = parsed
+        .baseline
+        .as_ref()
+        .map(|path| -> Result<Vec<(String, f64)>, String> {
+            let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+            Ok(crate::stats::parse_keep_rates(&contents))
+        })
+        .transpose()?;
+    let receipt = render_receipt(&label, &scores, &bridge, baseline.as_deref());
     println!("{receipt}");
     if let Some(path) = parsed.out {
         if let Some(parent) = path.parent() {
@@ -937,7 +952,11 @@ fn fraction(part: usize, whole: usize) -> f64 {
 
 /// Render the model-judge section when `--judge` ran: per-source rubric
 /// means (1-5), keep rate, and the judge's notes on rejected drafts.
-fn render_model_judge(receipt: &mut String, scores: &[SourceScore]) {
+fn render_model_judge(
+    receipt: &mut String,
+    scores: &[SourceScore],
+    baseline: Option<&[(String, f64)]>,
+) {
     if scores
         .iter()
         .all(|score| score.judge.is_none() && score.judge_error.is_none())
@@ -1002,6 +1021,17 @@ fn render_model_judge(receipt: &mut String, scores: &[SourceScore]) {
             mean(|judge| judge.keep_rate) * 100.0,
             format_cost(Some(judge_cost)),
         );
+
+        let current_keep: Vec<(String, f64)> = scores
+            .iter()
+            .filter_map(|score| {
+                score
+                    .judge
+                    .as_ref()
+                    .map(|judge| (score.source_id.clone(), judge.keep_rate))
+            })
+            .collect();
+        render_keep_rate_rigor(receipt, &current_keep, baseline);
     }
     if !reject_notes.is_empty() {
         let _ = writeln!(receipt);
@@ -1014,10 +1044,53 @@ fn render_model_judge(receipt: &mut String, scores: &[SourceScore]) {
     let _ = writeln!(receipt);
 }
 
+/// Keep rate is the binary keep/drop signal; report it with a source-clustered
+/// 95% CI and, against a baseline, a paired verdict — so a few points of keep-rate
+/// movement read as noise, not a win.
+fn render_keep_rate_rigor(
+    receipt: &mut String,
+    current_keep: &[(String, f64)],
+    baseline: Option<&[(String, f64)]>,
+) {
+    let keep_values: Vec<f64> = current_keep.iter().map(|(_, rate)| *rate).collect();
+    let Some(interval) = crate::stats::mean_ci_95(&keep_values) else {
+        return;
+    };
+    let _ = writeln!(
+        receipt,
+        "- Keep rate (source-clustered, n={}): {:.0}% (95% CI ±{:.0}pp)",
+        keep_values.len(),
+        interval.mean * 100.0,
+        interval.half_width * 100.0,
+    );
+    if let Some(verdict) =
+        baseline.and_then(|baseline| crate::stats::paired_verdict(current_keep, baseline))
+    {
+        let _ = writeln!(
+            receipt,
+            "- Paired vs baseline ({} sources): keep Δ {:+.1}pp (95% CI ±{:.1}pp) — {}",
+            verdict.paired,
+            verdict.mean_delta * 100.0,
+            verdict.half_width * 100.0,
+            if verdict.within_noise {
+                "**within noise** — CI includes 0 (not detected; not proof of no change)"
+            } else {
+                "**detectable** — CI excludes 0"
+            },
+        );
+    }
+    let _ = writeln!(
+        receipt,
+        "- Power: ~{} sources resolves only large regressions; a ~3pp change needs ~1000 drafts (Miller 2411.00640). Read this suite as a large-regression guard.",
+        keep_values.len(),
+    );
+}
+
 fn render_receipt(
     label: &str,
     scores: &[SourceScore],
     bridge: &Result<BridgeQualityScore, String>,
+    baseline: Option<&[(String, f64)]>,
 ) -> String {
     let mut receipt = String::new();
     let _ = writeln!(receipt, "# Generation eval receipt");
@@ -1035,7 +1108,7 @@ fn render_receipt(
     );
     render_score_rows(&mut receipt, scores);
     let _ = writeln!(receipt);
-    render_model_judge(&mut receipt, scores);
+    render_model_judge(&mut receipt, scores, baseline);
     render_receipt_totals(&mut receipt, scores, bridge);
 
     receipt
@@ -1493,11 +1566,57 @@ mod tests {
                 duplicate_rate: 0.0,
                 passes: true,
             }),
+            None,
         );
         assert!(
             receipt.contains("| source | category | accepted | rejected | failures | runtime |")
         );
         assert!(receipt.contains("| letters | fixture | 1 | 0 | 1 | 50% |"));
+    }
+
+    #[test]
+    fn keep_rate_rigor_calls_a_small_delta_within_noise() {
+        let mut receipt = String::new();
+        let current = [
+            ("a".to_owned(), 0.75),
+            ("b".to_owned(), 0.50),
+            ("c".to_owned(), 0.90),
+        ];
+        let baseline = [
+            ("a".to_owned(), 0.80),
+            ("b".to_owned(), 0.50),
+            ("c".to_owned(), 0.71),
+        ];
+        render_keep_rate_rigor(&mut receipt, &current, Some(&baseline));
+        assert!(
+            receipt.contains("Keep rate (source-clustered, n=3)"),
+            "missing keep-rate CI: {receipt}"
+        );
+        assert!(
+            receipt.contains("within noise"),
+            "a few points of movement must read as noise: {receipt}"
+        );
+        assert!(receipt.contains("Power:"), "missing power note: {receipt}");
+    }
+
+    #[test]
+    fn keep_rate_rigor_calls_a_large_delta_detectable() {
+        let mut receipt = String::new();
+        let current = [
+            ("a".to_owned(), 0.90),
+            ("b".to_owned(), 0.92),
+            ("c".to_owned(), 0.88),
+        ];
+        let baseline = [
+            ("a".to_owned(), 0.40),
+            ("b".to_owned(), 0.42),
+            ("c".to_owned(), 0.38),
+        ];
+        render_keep_rate_rigor(&mut receipt, &current, Some(&baseline));
+        assert!(
+            receipt.contains("detectable"),
+            "a large consistent gain must be detectable: {receipt}"
+        );
     }
 
     #[test]
