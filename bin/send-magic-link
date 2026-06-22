@@ -18,10 +18,17 @@ base="${MEMORY_ENGINE_PUBLIC_BASE_URL:-https://memory-engine-api.fly.dev}"
 api="${RESEND_API_URL:-https://api.resend.com}"
 sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
 
-# onboarding@resend.dev delivers only to the Resend account owner — exactly
-# the solo-dogfood allowlist. Switch `from` after verifying a domain.
+# Sender. Defaults to onboarding@resend.dev, which Resend delivers only to the
+# account owner (the solo-dogfood allowlist) and which Gmail spam-folders for
+# want of domain reputation. After verifying a domain in Resend, set
+# MEMORY_ENGINE_MAIL_FROM (a fly secret) to a sender on that domain — no edit or
+# redeploy of this script. See docs/runbook.md, "Deliverability". Use a plain
+# display name with no literal double-quote — the value is interpolated into the
+# JSON body unescaped (trusted operator config, like the rest of this script).
+from="${MEMORY_ENGINE_MAIL_FROM:-Memory Engine <onboarding@resend.dev>}"
+
 curl -sf --max-time 10 "$api/emails" \
     -H "Authorization: Bearer $RESEND_API_KEY" \
     -H "Content-Type: application/json" \
-    -d "{\"from\":\"Memory Engine <onboarding@resend.dev>\",\"to\":[\"$MEMORY_ENGINE_AUTH_EMAIL\"],\"subject\":\"Your Memory Engine sign-in link\",\"text\":\"Sign in: $sign_in_url\\n\\nThe link expires shortly. If you did not request it, ignore this email.\"}" \
+    -d "{\"from\":\"$from\",\"to\":[\"$MEMORY_ENGINE_AUTH_EMAIL\"],\"subject\":\"Your Memory Engine sign-in link\",\"text\":\"Sign in: $sign_in_url\\n\\nThe link expires shortly. If you did not request it, ignore this email.\"}" \
     > /dev/null
