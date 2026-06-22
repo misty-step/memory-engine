@@ -44,3 +44,20 @@ this).
    validated.
 2. Switch `from`, review content, redeploy, inbox-placement receipt.
 3. Runbook: deliverability diagnostics section.
+
+## Progress — feat/056-magic-link-deliverability (2026-06-21)
+
+Agent-doable increment shipped: the sender is now the `MEMORY_ENGINE_MAIL_FROM`
+secret (config flip, default unchanged — no code edit to switch domains), the
+runbook has the full API-driven domain-verification + DNS + diagnostic procedure,
+and content is reviewed (already compliant — oracle 4 ✓, oracle 5 ✓). QA: the
+live script against a mock Resend confirms the default and override senders +
+payload (`docs/qa/056-magic-link-deliverability-2026-06-21.md`).
+
+Operator-gated remainder (oracle 1 verify / 2 DNS validate / 3 inbox confirm):
+choose + verify a domain in Resend, add the DNS records, set the
+`MEMORY_ENGINE_MAIL_FROM` secret, confirm a fresh link lands in the Gmail inbox.
+Verifying a sending domain + writing DNS is persistent external config on the
+operator's domain reputation (confirm-first, not autonomous); the inbox check
+needs the operator's eyes. Exact commands are in the runbook's Deliverability
+section. No custom domain is configured on the Fly app today.

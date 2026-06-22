@@ -191,9 +191,49 @@ the outbox file on the machine:
 flyctl ssh console --app memory-engine-api -C "tail -1 <outbox-path>"
 ```
 
-A failed send surfaces as a 500 and therefore lands in Canary. After
-verifying a domain in Resend, update the `from` address in
-`bin/send-magic-link`.
+A failed send surfaces as a 500 and therefore lands in Canary. The sender
+address is the `MEMORY_ENGINE_MAIL_FROM` secret (default
+`Memory Engine <onboarding@resend.dev>`); switching it is a secret change, not
+a code edit — see Deliverability below.
+
+### Deliverability (inbox, not spam)
+
+`onboarding@resend.dev` is a shared sender with no domain reputation, so Gmail
+spam-folders it — expected, not a script bug. To reach the inbox, send from a
+verified domain. Resend verification is fully API-driven (no dashboard):
+
+1. **Choose a domain the operator controls** — a subdomain such as
+   `mail.<domain>` keeps the apex's reputation separate. *Operator decision.*
+2. **Register it** (returns the DNS records to add):
+   ```sh
+   curl -s -X POST https://api.resend.com/domains \
+     -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" \
+     -d '{"name":"mail.<domain>"}'
+   # response.records[] = the SPF (TXT), DKIM (TXT/CNAME), and DMARC (TXT) records.
+   ```
+3. **Add those DNS records** at the domain's host. *Operator / DNS-token-gated.*
+4. **Verify + confirm propagation:**
+   ```sh
+   curl -s -X POST https://api.resend.com/domains/<id>/verify -H "Authorization: Bearer $RESEND_API_KEY"
+   dig +short TXT <selector>._domainkey.mail.<domain>   # DKIM (selector from the step-2 records[])
+   dig +short TXT mail.<domain>                          # SPF (v=spf1 … include:amazonses.com)
+   dig +short TXT _dmarc.mail.<domain>                   # DMARC (v=DMARC1; p=none …)
+   ```
+5. **Switch the sender** (no redeploy of the script):
+   ```sh
+   flyctl secrets set --app memory-engine-api MEMORY_ENGINE_MAIL_FROM="Memory Engine <noreply@mail.<domain>>"
+   ```
+6. **Confirm inbox placement** — trigger a fresh magic link to an allowlist
+   address; verify it lands in the Gmail inbox, not spam. *Operator-confirmed.*
+
+Content is already tuned for deliverability: real from-name, plain-text body, the
+full sign-in URL (no shortener), a plain subject. Keep it that way.
+
+**"Didn't get the email" — first diagnostic:** check Resend's delivery status for
+the send, then Canary for a 500 on the send path:
+```sh
+curl -s https://api.resend.com/emails/<email-id> -H "Authorization: Bearer $RESEND_API_KEY"
+```
 
 `POST /app/account` is abuse-limited in the API boundary before any magic link
 is sent. The fixed window is 5 attempts per 15 minutes per normalized email and
