@@ -1,6 +1,6 @@
 # Magic links land in the inbox, not spam
 
-Priority: P2 · Status: pending · Estimate: S
+Priority: P2 · Status: in progress · Estimate: S
 
 ## Goal
 

@@ -1,6 +1,6 @@
 # Generation quality and latency pass
 
-Priority: P2 · Status: pending · Estimate: M
+Priority: P2 · Status: in progress · Estimate: M
 
 ## Goal
 
