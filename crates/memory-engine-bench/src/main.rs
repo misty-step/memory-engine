@@ -162,14 +162,21 @@ impl MemoryServiceStore for BenchStore {
     }
 }
 
+mod calibrate;
 mod generation;
 mod judge;
 mod stats;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments.first().map(String::as_str) == Some("generation") {
-        if let Err(error) = generation::run(&arguments[1..]) {
+    let subcommand = arguments.first().map(String::as_str);
+    if matches!(subcommand, Some("generation" | "calibrate")) {
+        let rest = &arguments[1..];
+        let result = match subcommand {
+            Some("calibrate") => calibrate::run(rest),
+            _ => generation::run(rest),
+        };
+        if let Err(error) = result {
             eprintln!("{error}");
             std::process::exit(1);
         }

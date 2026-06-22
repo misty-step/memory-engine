@@ -159,6 +159,91 @@ pub fn parse_keep_rates(receipt: &str) -> Vec<(String, f64)> {
     rates
 }
 
+/// A 2×2 confusion of the model judge's keep decision against a human's, for
+/// calibrating the judge before its scores are trusted (the rigor reference's
+/// "validate the judge against human labels" step).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeepConfusion {
+    pub both_keep: u64,
+    /// Judge keep, human drop (the judge is too lenient on these).
+    pub judge_only_keep: u64,
+    /// Judge drop, human keep (the judge is too harsh on these).
+    pub human_only_keep: u64,
+    pub both_drop: u64,
+}
+
+impl KeepConfusion {
+    pub fn record(&mut self, judge_keep: bool, human_keep: bool) {
+        match (judge_keep, human_keep) {
+            (true, true) => self.both_keep += 1,
+            (true, false) => self.judge_only_keep += 1,
+            (false, true) => self.human_only_keep += 1,
+            (false, false) => self.both_drop += 1,
+        }
+    }
+
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.both_keep + self.judge_only_keep + self.human_only_keep + self.both_drop
+    }
+}
+
+/// Judge-vs-human agreement on the keep decision. `kappa` is Cohen's κ
+/// (chance-corrected); the rigor bar is human-level κ ≈ 0.80. TPR/TNR are
+/// reported instead of raw agreement because keep rates are usually imbalanced,
+/// where a uniformly lenient or harsh judge can post high raw agreement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JudgeAgreement {
+    pub kappa: f64,
+    pub accuracy: f64,
+    pub tpr: f64,
+    pub tnr: f64,
+    pub n: u64,
+}
+
+/// Cohen's κ + TPR/TNR for a judge-vs-human keep confusion. `None` for an empty
+/// set. TPR/TNR are `NaN` when a human class is unobserved (no positives /
+/// negatives to score against).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn judge_agreement(confusion: &KeepConfusion) -> Option<JudgeAgreement> {
+    let n = confusion.total();
+    if n == 0 {
+        return None;
+    }
+    let total = n as f64;
+    let keep_keep = confusion.both_keep as f64;
+    let keep_drop = confusion.judge_only_keep as f64;
+    let drop_keep = confusion.human_only_keep as f64;
+    let drop_drop = confusion.both_drop as f64;
+    let observed = (keep_keep + drop_drop) / total;
+    // Chance agreement: P(both call keep) + P(both call drop).
+    let expected = ((keep_keep + keep_drop) / total) * ((keep_keep + drop_keep) / total)
+        + ((drop_keep + drop_drop) / total) * ((keep_drop + drop_drop) / total);
+    let kappa = if (1.0 - expected).abs() < f64::EPSILON {
+        1.0 // perfect-by-construction agreement (one class only)
+    } else {
+        (observed - expected) / (1.0 - expected)
+    };
+    let human_keeps = keep_keep + drop_keep;
+    let human_drops = keep_drop + drop_drop;
+    Some(JudgeAgreement {
+        kappa,
+        accuracy: observed,
+        tpr: if human_keeps == 0.0 {
+            f64::NAN
+        } else {
+            keep_keep / human_keeps
+        },
+        tnr: if human_drops == 0.0 {
+            f64::NAN
+        } else {
+            drop_drop / human_drops
+        },
+        n,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +356,52 @@ mod tests {
             vec![("nato".to_owned(), 0.33), ("curie".to_owned(), 0.50)],
             "must read the judge table, skip the deterministic table and the failed row",
         );
+    }
+
+    #[test]
+    fn judge_agreement_computes_cohens_kappa_and_rates() {
+        // 40 both-keep, 10 judge-only-keep, 5 human-only-keep, 45 both-drop:
+        // observed 0.85, chance 0.50 -> kappa 0.70.
+        let mut confusion = KeepConfusion::default();
+        for _ in 0..40 {
+            confusion.record(true, true);
+        }
+        for _ in 0..10 {
+            confusion.record(true, false);
+        }
+        for _ in 0..5 {
+            confusion.record(false, true);
+        }
+        for _ in 0..45 {
+            confusion.record(false, false);
+        }
+        let agreement = judge_agreement(&confusion).expect("nonempty");
+        assert_eq!(agreement.n, 100);
+        assert!(approx(agreement.kappa, 0.70), "kappa {}", agreement.kappa);
+        assert!(
+            approx(agreement.accuracy, 0.85),
+            "accuracy {}",
+            agreement.accuracy
+        );
+        assert!(approx(agreement.tpr, 40.0 / 45.0), "tpr {}", agreement.tpr);
+        assert!(approx(agreement.tnr, 45.0 / 55.0), "tnr {}", agreement.tnr);
+    }
+
+    #[test]
+    fn judge_agreement_perfect_is_kappa_one() {
+        let mut confusion = KeepConfusion::default();
+        for _ in 0..7 {
+            confusion.record(true, true);
+        }
+        for _ in 0..3 {
+            confusion.record(false, false);
+        }
+        let agreement = judge_agreement(&confusion).expect("nonempty");
+        assert!(approx(agreement.kappa, 1.0), "kappa {}", agreement.kappa);
+    }
+
+    #[test]
+    fn judge_agreement_empty_is_none() {
+        assert_eq!(judge_agreement(&KeepConfusion::default()), None);
     }
 }
