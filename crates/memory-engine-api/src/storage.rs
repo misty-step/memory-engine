@@ -630,11 +630,9 @@ impl StudyStorageAdapter for FileStudyStorage {
             attempts_by_key.push((path, window_start_ms, attempts.saturating_add(1)));
         }
         for (path, window_start_ms, attempts) in attempts_by_key {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
-            }
-            write_atomic(&path, &format!("{window_start_ms}\n{attempts}\n"))?;
+            // `write_atomic` creates the parent directory itself.
+            write_atomic(&path, format!("{window_start_ms}\n{attempts}\n").as_bytes())
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
 
         Ok(true)
