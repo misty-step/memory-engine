@@ -112,18 +112,41 @@ pub struct BridgeMaterial {
 /// A transport- or provider-level failure that prevented draft generation.
 ///
 /// The message is shown to learners verbatim, so providers must phrase it as
-/// a human sentence, never a debug dump.
+/// a human sentence, never a debug dump. The `transient` bit records whether an
+/// identical retry might succeed (the provider was unreachable, timed out, or
+/// returned a 5xx/429) versus a permanent failure (a 4xx rejection, a malformed
+/// response) — so a caller can retry the former without re-classifying a string.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderFailure {
     message: String,
+    transient: bool,
 }
 
 impl ProviderFailure {
+    /// A permanent failure: an identical retry will fail the same way (a 4xx
+    /// rejection, a malformed or unreadable response).
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            transient: false,
         }
+    }
+
+    /// A transient failure: the request never got a usable answer through, so an
+    /// identical retry may succeed. Callers may retry these once.
+    #[must_use]
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    /// Whether an identical retry might succeed. See [`ProviderFailure::transient`].
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        self.transient
     }
 }
 

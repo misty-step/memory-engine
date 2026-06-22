@@ -7,14 +7,18 @@
 //! (`queued → running → succeeded | failed`) is held in memory and pushed to
 //! the browser over SSE; failed jobs can be retried.
 //!
-//! In-memory is the deliberate first cut: the *cards* are durably persisted by
-//! the study store on success, so only ephemeral job history is lost on
-//! restart. Durable job persistence (a file `jobs.json` and a postgres table)
-//! is a planned follow-up behind the same `JobQueue` surface.
+//! Job history is held in memory and, on the file-backed host, mirrored to a
+//! `_jobs.json` file under the store root so the activity log survives a
+//! restart (the *cards* were already durable — the study store persists them on
+//! success). A job still running when the process stops is restored as a
+//! retryable `failed` ("interrupted by a restart"), since no worker owns it
+//! after the restart. The postgres host keeps history in memory for now (a
+//! durable table behind the same `JobQueue` surface is the scale path).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
 use crate::AccountRegistry;
@@ -31,7 +35,7 @@ const UPDATES_BUFFER: usize = 256;
 /// long-lived process. The generated cards are durably persisted regardless.
 const MAX_TERMINAL_JOBS_PER_ACCOUNT: usize = 50;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
@@ -52,7 +56,9 @@ impl JobStatus {
     }
 
     /// Succeeded/failed jobs no longer change on their own, so they are the
-    /// prunable history (see `MAX_TERMINAL_JOBS_PER_ACCOUNT`).
+    /// prunable history (see `MAX_TERMINAL_JOBS_PER_ACCOUNT`). This also governs
+    /// crash-restore: a *non*-terminal job is reset to a retryable failure on
+    /// restart, since no worker owns it after the restart (see [`load_jobs`]).
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
@@ -88,6 +94,74 @@ pub struct GenerationJob {
     pub updated_at: i64,
 }
 
+/// The on-disk shape of a [`GenerationJob`]. Distinct from the UI serialization
+/// (which is camelCase and `skip`s `account_id`/`source_id`): the worker needs
+/// those ids to resume routing after a restart, so the disk record carries every
+/// field. Keeping the two representations separate lets the wire format and the
+/// storage format evolve independently.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedJob {
+    id: String,
+    account_id: String,
+    source_id: String,
+    title: String,
+    status: JobStatus,
+    card_count: usize,
+    attempts: u32,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<&GenerationJob> for PersistedJob {
+    fn from(job: &GenerationJob) -> Self {
+        // Destructured with no `..` on purpose: adding a field to `GenerationJob`
+        // then fails to compile here until it is also persisted, so the on-disk
+        // record can never silently drift out of sync with the in-memory one.
+        let GenerationJob {
+            id,
+            account_id,
+            source_id,
+            title,
+            status,
+            card_count,
+            attempts,
+            error,
+            created_at,
+            updated_at,
+        } = job;
+        Self {
+            id: id.clone(),
+            account_id: account_id.clone(),
+            source_id: source_id.clone(),
+            title: title.clone(),
+            status: *status,
+            card_count: *card_count,
+            attempts: *attempts,
+            error: error.clone(),
+            created_at: *created_at,
+            updated_at: *updated_at,
+        }
+    }
+}
+
+impl From<PersistedJob> for GenerationJob {
+    fn from(record: PersistedJob) -> Self {
+        Self {
+            id: record.id,
+            account_id: record.account_id,
+            source_id: record.source_id,
+            title: record.title,
+            status: record.status,
+            card_count: record.card_count,
+            attempts: record.attempts,
+            error: record.error,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 /// An async queue of generation jobs plus the in-process worker that drains it.
 ///
 /// Cheaply cloneable (`Arc` inside) so it can live in `ApiState`, be handed to
@@ -104,22 +178,55 @@ struct Inner {
     /// Taken once by `spawn_worker`; `None` afterwards (single-consumer mpsc).
     rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
     updates: broadcast::Sender<JobBroadcast>,
+    /// Where job history is mirrored, or `None` for an in-memory queue (tests,
+    /// the postgres host). Every mutation writes the whole Vec through to here.
+    persist_path: Option<PathBuf>,
+    /// Serializes durable writes so two concurrent `finish`es can't race to
+    /// write a stale snapshot. Held only across a snapshot+write, never with the
+    /// jobs lock, so it cannot deadlock against it.
+    persist_lock: Mutex<()>,
 }
 
 impl JobQueue {
-    /// Build a queue bound to `registry`. The worker is not started until
-    /// [`JobQueue::spawn_worker`] is called (so tests can drive jobs directly).
+    /// Build an in-memory queue bound to `registry`. History is lost on restart;
+    /// use [`JobQueue::with_persistence`] for the durable host. The worker is not
+    /// started until [`JobQueue::spawn_worker`] is called (so tests can drive
+    /// jobs directly).
     #[must_use]
     pub fn new(registry: AccountRegistry) -> Self {
+        Self::build(registry, Vec::new(), None)
+    }
+
+    /// Build a queue whose history is mirrored to `path` and restored from it on
+    /// construction. A job left non-terminal by a crash is restored as a
+    /// retryable `failed` (see [`load_jobs`]).
+    #[must_use]
+    pub fn with_persistence(registry: AccountRegistry, path: PathBuf) -> Self {
+        let restored = load_jobs(&path, registry.now());
+        let queue = Self::build(registry, restored, Some(path));
+        // Make the in-flight -> failed reset durable now, so a second crash
+        // before the next mutation doesn't replay against stale on-disk state.
+        // The worker isn't running yet, so this write is uncontended.
+        queue.persist();
+        queue
+    }
+
+    fn build(
+        registry: AccountRegistry,
+        jobs: Vec<GenerationJob>,
+        persist_path: Option<PathBuf>,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (updates, _keep_alive) = broadcast::channel(UPDATES_BUFFER);
         Self {
             inner: Arc::new(Inner {
                 registry,
-                jobs: Mutex::new(Vec::new()),
+                jobs: Mutex::new(jobs),
                 tx,
                 rx: Mutex::new(Some(rx)),
                 updates,
+                persist_path,
+                persist_lock: Mutex::new(()),
             }),
         }
     }
@@ -154,12 +261,17 @@ impl JobQueue {
             created_at: now,
             updated_at: now,
         };
-        self.broadcast(&job);
+        // Commit to the Vec first, then broadcast — so an SSE subscriber that
+        // reacts to the event can always find the job via `jobs_for`/`job`. This
+        // matches the commit-then-broadcast order of the other mutators.
+        let snapshot = job.clone();
         {
             let mut jobs = self.lock_jobs();
             jobs.push(job);
             enforce_terminal_retention(&mut jobs, account_id);
         }
+        self.broadcast(&snapshot);
+        self.persist();
         // Send never fails while the queue is alive (the receiver lives in the
         // worker); if the worker was never started the job simply stays queued.
         let _ = self.inner.tx.send(id.clone());
@@ -189,6 +301,7 @@ impl JobQueue {
         };
         if let Some(job) = requeued {
             self.broadcast(&job);
+            self.persist();
             let _ = self.inner.tx.send(job_id.to_owned());
             true
         } else {
@@ -297,6 +410,7 @@ impl JobQueue {
         };
         let input = (snapshot.account_id.clone(), snapshot.source_id.clone());
         self.broadcast(&snapshot);
+        self.persist();
         Some(input)
     }
 
@@ -326,6 +440,39 @@ impl JobQueue {
             snapshot
         };
         self.broadcast(&snapshot);
+        self.persist();
+    }
+
+    /// Mirror the whole job Vec to disk, when a `persist_path` is configured.
+    ///
+    /// Best-effort: a write failure logs and is swallowed (the in-memory Vec
+    /// stays authoritative and the generated cards are durable regardless). The
+    /// `persist_lock` serializes writers so a slow write cannot land after a
+    /// newer one and leave stale history on disk; each writer re-snapshots the
+    /// latest state under the jobs lock, then writes outside it.
+    fn persist(&self) {
+        let Some(path) = self.inner.persist_path.as_ref() else {
+            return;
+        };
+        let _writing = self
+            .inner
+            .persist_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serialized = {
+            let jobs = self.lock_jobs();
+            let records = jobs.iter().map(PersistedJob::from).collect::<Vec<_>>();
+            serde_json::to_vec_pretty(&records)
+        };
+        let Ok(bytes) = serialized else {
+            return;
+        };
+        if let Err(error) = crate::write_atomic(path, &bytes) {
+            eprintln!(
+                "memory-engine: failed to persist job history to {}: {error}",
+                path.display()
+            );
+        }
     }
 
     fn broadcast(&self, job: &GenerationJob) {
@@ -373,6 +520,42 @@ fn enforce_terminal_retention(jobs: &mut Vec<GenerationJob>, account_id: &str) {
         }
         !drop
     });
+}
+
+/// Restore job history from `path`, or an empty list when the file is absent or
+/// unreadable (a corrupt history must not stop the server from booting). Any job
+/// still non-terminal (queued/running) when the process stopped is restored as a
+/// retryable `failed`: no worker owns it after the restart, so leaving it
+/// "running" would strand it forever. The learner can press Retry. `now` stamps
+/// the reset so the activity log shows the restart time.
+fn load_jobs(path: &Path, now: i64) -> Vec<GenerationJob> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let records = match serde_json::from_slice::<Vec<PersistedJob>>(&bytes) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!(
+                "memory-engine: job history at {} is unreadable ({error}); starting empty",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    records
+        .into_iter()
+        .map(|record| {
+            let mut job = GenerationJob::from(record);
+            if !job.status.is_terminal() {
+                job.status = JobStatus::Failed;
+                job.error = Some(
+                    "Interrupted by a server restart. Press Retry to generate again.".to_owned(),
+                );
+                job.updated_at = now;
+            }
+            job
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,5 +650,123 @@ mod tests {
         })
         .await
         .expect("the whole burst must drain within 10s");
+    }
+
+    /// A unique temp dir that cleans itself up, so durability tests never share
+    /// state or leave litter. Dependency-free (no `tempfile` in the workspace).
+    struct TempStore(PathBuf);
+
+    impl TempStore {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("me-jobs-{tag}-{:032x}", rand::random::<u128>()));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn jobs_path(&self) -> PathBuf {
+            self.0.join("_jobs.json")
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn terminal_history_survives_a_restart() {
+        let store = TempStore::new("restart");
+        let path = store.jobs_path();
+
+        // First "process": enqueue and drain to terminal, then drop the queue.
+        let succeeded_id;
+        {
+            let queue = JobQueue::with_persistence(AccountRegistry::default(), path.clone());
+            succeeded_id = queue.enqueue("acct", GHOST, "first run");
+            queue.run_pending_blocking(); // GHOST fails fast -> terminal
+        }
+
+        // Second "process": a fresh queue over the same file restores history.
+        let queue = JobQueue::with_persistence(AccountRegistry::default(), path);
+        let restored = queue.jobs_for("acct");
+        assert_eq!(restored.len(), 1, "the job must survive the restart");
+        let job = queue.job(&succeeded_id).expect("job restored by id");
+        assert_eq!(job.title, "first run");
+        assert!(job.status.is_terminal(), "terminal status must persist");
+        // The owning account is restored too (skipped on the wire, kept on disk).
+        assert_eq!(job.account_id, "acct");
+        assert_eq!(job.source_id, GHOST);
+    }
+
+    #[test]
+    fn interrupted_in_flight_jobs_restore_as_retryable_failed() {
+        let store = TempStore::new("interrupted");
+        let path = store.jobs_path();
+        // A history file as a crash would leave it: one job of every status.
+        let history = serde_json::json!([
+            { "id": "q", "account_id": "acct", "source_id": "s", "title": "queued",
+              "status": "queued", "card_count": 0, "attempts": 0, "error": null,
+              "created_at": 1, "updated_at": 1 },
+            { "id": "r", "account_id": "acct", "source_id": "s", "title": "running",
+              "status": "running", "card_count": 0, "attempts": 1, "error": null,
+              "created_at": 2, "updated_at": 2 },
+            { "id": "ok", "account_id": "acct", "source_id": "s", "title": "done",
+              "status": "succeeded", "card_count": 3, "attempts": 1, "error": null,
+              "created_at": 3, "updated_at": 3 },
+            { "id": "no", "account_id": "acct", "source_id": "s", "title": "broke",
+              "status": "failed", "card_count": 0, "attempts": 1, "error": "boom",
+              "created_at": 4, "updated_at": 4 },
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&history).unwrap()).unwrap();
+
+        let queue = JobQueue::with_persistence(AccountRegistry::default(), path.clone());
+
+        // In-flight (queued/running) reset to a retryable failure...
+        for id in ["q", "r"] {
+            let job = queue.job(id).expect("restored");
+            assert_eq!(job.status, JobStatus::Failed, "{id} must reset to failed");
+            assert!(
+                job.error.as_deref().is_some_and(|e| e.contains("restart")),
+                "{id} must carry the interrupted-by-restart notice"
+            );
+        }
+        // ...while genuinely terminal jobs are untouched.
+        assert_eq!(queue.job("ok").unwrap().status, JobStatus::Succeeded);
+        assert_eq!(queue.job("ok").unwrap().card_count, 3);
+        assert_eq!(queue.job("no").unwrap().error.as_deref(), Some("boom"));
+
+        // The reset is durable immediately, not just in memory: re-reading the
+        // file shows no surviving in-flight status, so a second crash before any
+        // mutation can't resurrect a "running" job.
+        let on_disk: Vec<PersistedJob> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.iter().all(|job| job.status.is_terminal()),
+            "the in-flight -> failed reset must be written back to disk"
+        );
+    }
+
+    #[test]
+    fn new_queue_is_in_memory_and_ignores_history_on_disk() {
+        let store = TempStore::new("inmem");
+        let path = store.jobs_path();
+        // Leave durable history at the path a persistent queue would use.
+        {
+            let durable = JobQueue::with_persistence(AccountRegistry::default(), path.clone());
+            durable.enqueue("acct", GHOST, "persisted");
+        }
+        assert!(
+            path.exists(),
+            "the persistent queue must have written history"
+        );
+
+        // An in-memory queue never reads it back — restart loses the history.
+        let volatile = JobQueue::new(AccountRegistry::default());
+        assert!(
+            volatile.jobs_for("acct").is_empty(),
+            "JobQueue::new must not restore history from disk"
+        );
     }
 }

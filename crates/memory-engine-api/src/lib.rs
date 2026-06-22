@@ -7,6 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
+    io::Write as _,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -55,7 +56,12 @@ pub struct ApiState {
 impl ApiState {
     #[must_use]
     pub fn new(accounts: AccountRegistry) -> Self {
-        let jobs = JobQueue::new(accounts.clone());
+        // The file-backed host mirrors job history to disk so the activity log
+        // survives a restart; the postgres host keeps it in memory for now.
+        let jobs = match accounts.job_history_path() {
+            Some(path) => JobQueue::with_persistence(accounts.clone(), path),
+            None => JobQueue::new(accounts.clone()),
+        };
         Self { accounts, jobs }
     }
 
@@ -183,6 +189,17 @@ impl AccountRegistry {
 
     pub(crate) fn now(&self) -> i64 {
         (self.clock())()
+    }
+
+    /// Where the job queue should mirror its history, or `None` when there is no
+    /// local file store (the postgres host, which keeps history in memory). The
+    /// `_jobs.json` name sits beside the other store-root sidecars
+    /// (`_rate_limits`), distinct from the per-account `study.json` subdirs.
+    pub(crate) fn job_history_path(&self) -> Option<PathBuf> {
+        match &self.lock_data().storage {
+            StudyStorageConfig::File { store_root } => Some(store_root.join("_jobs.json")),
+            StudyStorageConfig::Postgres { .. } => None,
+        }
     }
 
     fn lock_data(&self) -> MutexGuard<'_, AccountRegistryData> {
@@ -663,10 +680,31 @@ fn rate_limit_path(store_root: &FsPath, key: &str) -> PathBuf {
     store_root.join("_rate_limits").join(secret_hash(key))
 }
 
-fn write_atomic(path: &FsPath, contents: &str) -> Result<(), ApiFailure> {
+/// Write `bytes` to `path` atomically and crash-durably: write a uniquely-named
+/// sibling temp file, fsync it, rename it over the target, then fsync the parent
+/// directory so the rename itself survives a power loss. The rename is atomic on
+/// POSIX, so a crash mid-write leaves either the old file or the new — never a
+/// truncated or half-written one. The randomized temp name lets concurrent
+/// writers to *different* targets share this helper safely.
+pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let temp_path = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
-    fs::write(&temp_path, contents).map_err(|error| ApiFailure::internal(error.to_string()))?;
-    fs::rename(&temp_path, path).map_err(|error| ApiFailure::internal(error.to_string()))
+    {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp_path, path)?;
+    if let Some(parent) = path.parent() {
+        // Best-effort: a crash before this lands could lose the rename, and not
+        // every platform supports directory fsync — neither is worth failing on.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Generate drafts for one source using the configured provider.
@@ -2760,6 +2798,80 @@ mod tests {
             !account_id.is_empty(),
             "a succeeded broadcast must be account-tagged"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_history_survives_a_restart_through_the_file_backed_host() {
+        // Two ApiState "processes" over one file-backed store: capture a job in
+        // the first, then prove a fresh state built on the same store restores
+        // it. Exercises the real router, the spawned worker, and the
+        // ApiState::new -> with_persistence wiring end to end — the integration
+        // the JobQueue unit tests can't reach on their own.
+        let store =
+            std::env::temp_dir().join(format!("me-057-restart-{:032x}", rand::random::<u128>()));
+
+        let account_id;
+        let job_id;
+        {
+            // Process 1: capture through the real router + spawned worker.
+            let state = ApiState::new(AccountRegistry::with_store_root(store.clone()));
+            state.start_worker();
+            let app = router(state.clone());
+            let started = app
+                .clone()
+                .oneshot(form_request("POST", "/app/start", &[("capture", "seed")]))
+                .await
+                .expect("start");
+            let cookie = session_cookie(&started);
+            let csrf = html_value(&response_text(started).await, "csrfToken");
+            app.clone()
+                .oneshot(form_request_with_cookie(
+                    "POST",
+                    "/app/capture",
+                    &cookie,
+                    &[("csrfToken", &csrf), ("capture", &source_body())],
+                ))
+                .await
+                .expect("capture");
+
+            // Wait for the durable write the next "process" will read — not just
+            // the broadcast, which fires a step before persist().
+            let jobs_file = store.join("_jobs.json");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !std::fs::read_to_string(&jobs_file)
+                    .is_ok_and(|text| text.contains("\"succeeded\""))
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("the worker must persist a succeeded job within 10s");
+
+            let disk: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&jobs_file).unwrap()).unwrap();
+            account_id = disk[0]["account_id"].as_str().unwrap().to_owned();
+            job_id = disk[0]["id"].as_str().unwrap().to_owned();
+        }
+
+        // Process 2: a fresh state on the same store restores the history.
+        let restarted = ApiState::new(AccountRegistry::with_store_root(store.clone()));
+        let restored = restarted
+            .jobs
+            .job(&job_id)
+            .expect("the job must be restored after a restart");
+        assert_eq!(restored.status.as_str(), "succeeded");
+        assert!(
+            restored.card_count >= 1,
+            "restored job keeps its card count"
+        );
+        assert_eq!(restored.account_id, account_id);
+        assert_eq!(
+            restarted.jobs.jobs_for(&account_id).len(),
+            1,
+            "the restored job is visible in the learner's activity log"
+        );
+
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[tokio::test]
