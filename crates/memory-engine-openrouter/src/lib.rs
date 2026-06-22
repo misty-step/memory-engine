@@ -41,6 +41,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// target.
 const DEFAULT_MAX_DRAFTS: usize = 60;
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Total tries for one model call: the first attempt plus a single retry, taken
+/// only when the failure is a transient transport error.
+const MAX_REQUEST_ATTEMPTS: u32 = 2;
+/// Pause before the lone retry, so a brief provider blip has a moment to clear
+/// and we don't instantly re-hit a rate limit.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Prompt strategy under evaluation; see
 /// `docs/research/prose-to-quiz-generation.md`.
@@ -150,12 +156,39 @@ impl OpenRouterProvider {
             "usage": { "include": true },
         });
 
+        // One model call, retried once on a transient transport failure (the
+        // provider unreachable or returning 5xx/429) so a single blip doesn't
+        // surface as a failed generation. Permanent failures (4xx, malformed
+        // body) return on the first attempt. This is per call: a generation that
+        // also runs the repair pass can issue two retried calls, so worst-case
+        // model spend per source doubles under sustained transient failure.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.attempt_structured(&url, &payload) {
+                Ok(response) => return Ok(response),
+                Err(failure) if failure.is_transient() && attempt < MAX_REQUEST_ATTEMPTS => {
+                    std::thread::sleep(RETRY_BACKOFF);
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+    }
+
+    /// One attempt at the structured completion: send the request, read the
+    /// bounded response, and shape it. [`Self::complete_structured`] owns the
+    /// retry policy around this.
+    fn attempt_structured(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+    ) -> Result<StructuredResponse, ProviderFailure> {
         let started = Instant::now();
         let mut response = self
             .agent
-            .post(&url)
+            .post(url)
             .header("Authorization", &format!("Bearer {}", self.config.api_key))
-            .send_json(&payload)
+            .send_json(payload)
             .map_err(|error| transport_failure(&error))?;
         let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -339,10 +372,19 @@ fn cost_to_micros(cost: f64) -> i64 {
 
 fn transport_failure(error: &ureq::Error) -> ProviderFailure {
     match error {
-        ureq::Error::StatusCode(code) => ProviderFailure::new(format!(
-            "The model provider rejected the request (HTTP {code})."
-        )),
-        _ => ProviderFailure::new("The model provider could not be reached."),
+        // A 5xx or 429 is the provider faltering, not our request — worth one
+        // retry. A 4xx (bad key, bad request) is permanent: retrying won't help.
+        ureq::Error::StatusCode(code) => {
+            let message = format!("The model provider rejected the request (HTTP {code}).");
+            if *code >= 500 || *code == 429 {
+                ProviderFailure::transient(message)
+            } else {
+                ProviderFailure::new(message)
+            }
+        }
+        // Connection refused, DNS, TLS, timeout — never reached the provider, so
+        // an identical retry may land.
+        _ => ProviderFailure::transient("The model provider could not be reached."),
     }
 }
 

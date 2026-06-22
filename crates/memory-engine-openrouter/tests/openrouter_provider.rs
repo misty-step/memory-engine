@@ -1,9 +1,9 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use memory_engine_core::ReviewUnitId;
@@ -289,6 +289,60 @@ fn http_error_status_is_a_human_readable_failure() {
         message.contains("The model provider rejected the request"),
         "expected human-readable message, got: {message}"
     );
+}
+
+/// A bare-bones success body: valid envelope, zero drafts. Enough to make
+/// `generate_drafts` return `Ok` so a retry test can assert success vs failure
+/// without caring about card content.
+fn empty_success_body() -> String {
+    serde_json::json!({
+        "choices": [{
+            "message": { "content": "{\"learning_intent\":\"fact_recall\",\"drafts\":[]}" }
+        }]
+    })
+    .to_string()
+}
+
+#[test]
+fn retries_once_on_transient_5xx_then_succeeds() {
+    let ok_body = empty_success_body();
+    let (base_url, served) = serve_sequence(&[
+        (503, r#"{"error":{"message":"upstream busy"}}"#),
+        (200, &ok_body),
+    ]);
+
+    let provider = OpenRouterProvider::new(test_config(base_url));
+    let drafts = provider
+        .generate_drafts(&topic_source())
+        .expect("a transient 503 must be retried, and the retry succeeds");
+    assert!(drafts.candidates.is_empty());
+
+    let connections = served.recv_timeout(Duration::from_secs(5)).expect("count");
+    assert_eq!(connections, 2, "exactly one retry after the 503");
+}
+
+#[test]
+fn does_not_retry_on_permanent_client_error() {
+    let ok_body = empty_success_body();
+    // A 400 first, with a success queued behind it that must never be reached.
+    let (base_url, served) = serve_sequence(&[
+        (400, r#"{"error":{"message":"bad request"}}"#),
+        (200, &ok_body),
+    ]);
+
+    let provider = OpenRouterProvider::new(test_config(base_url));
+    let failure = provider
+        .generate_drafts(&topic_source())
+        .expect_err("a 400 is permanent and must fail fast");
+    assert!(
+        failure
+            .to_string()
+            .contains("rejected the request (HTTP 400)"),
+        "got: {failure}"
+    );
+
+    let connections = served.recv_timeout(Duration::from_secs(5)).expect("count");
+    assert_eq!(connections, 1, "a permanent 4xx must not be retried");
 }
 
 #[test]
@@ -675,6 +729,43 @@ fn topic_source() -> SourceDocument {
     }
 }
 
+/// Read one full HTTP request (headers + any content-length body) from `stream`.
+fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).expect("read");
+        request.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&request);
+        if let Some(header_end) = text.find("\r\n\r\n") {
+            let content_length = text
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().expect("length"))
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        if read == 0 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+/// A minimal HTTP/1.1 response that closes the connection after the body.
+fn http_response(status: u16, body: &str) -> String {
+    let reason = if status == 200 { "OK" } else { "Error" };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 /// Serve exactly one HTTP request with a canned response; returns the base
 /// URL and a channel yielding the raw request for assertions.
 fn serve_once(status: u16, body: &str) -> (String, mpsc::Receiver<String>) {
@@ -684,39 +775,51 @@ fn serve_once(status: u16, body: &str) -> (String, mpsc::Receiver<String>) {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = stream.read(&mut buffer).expect("read");
-            request.extend_from_slice(&buffer[..read]);
-            let text = String::from_utf8_lossy(&request);
-            if let Some(header_end) = text.find("\r\n\r\n") {
-                let content_length = text
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|value| value.trim().parse::<usize>().expect("length"))
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-            if read == 0 {
-                break;
-            }
-        }
-        sender
-            .send(String::from_utf8_lossy(&request).into_owned())
-            .expect("send request");
-        let reason = if status == 200 { "OK" } else { "Error" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).expect("write");
+        let request = read_request(&mut stream);
+        sender.send(request).expect("send request");
+        stream
+            .write_all(http_response(status, &body).as_bytes())
+            .expect("write");
     });
 
     (format!("http://{address}/api/v1"), receiver)
+}
+
+/// Serve a sequence of canned responses, one per inbound connection, and report
+/// how many connections were actually made. Lets a test prove a retry happened
+/// (two connections) or did not (one). A short deadline keeps an unmade
+/// connection from hanging the server thread.
+fn serve_sequence(responses: &[(u16, &str)]) -> (String, mpsc::Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let responses: Vec<(u16, String)> = responses
+        .iter()
+        .map(|(status, body)| (*status, (*body).to_owned()))
+        .collect();
+    let (served_tx, served_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut served = 0;
+        while served < responses.len() && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    let _ = read_request(&mut stream);
+                    let (status, body) = &responses[served];
+                    stream
+                        .write_all(http_response(*status, body).as_bytes())
+                        .expect("write");
+                    served += 1;
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = served_tx.send(served);
+    });
+
+    (format!("http://{address}/api/v1"), served_rx)
 }
