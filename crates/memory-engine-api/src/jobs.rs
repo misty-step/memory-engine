@@ -25,6 +25,11 @@ const MAX_CONCURRENT_JOBS: usize = 4;
 /// Capacity of the SSE broadcast buffer. Events are full job snapshots, so a
 /// slow subscriber that lags simply skips to the latest state.
 const UPDATES_BUFFER: usize = 256;
+/// Per-account cap on *terminal* (succeeded/failed) job history. In-flight jobs
+/// are never pruned (the worker still owns them by id); this just keeps the
+/// activity log and the in-memory Vec from growing without bound over a
+/// long-lived process. The generated cards are durably persisted regardless.
+const MAX_TERMINAL_JOBS_PER_ACCOUNT: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +49,13 @@ impl JobStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
         }
+    }
+
+    /// Succeeded/failed jobs no longer change on their own, so they are the
+    /// prunable history (see `MAX_TERMINAL_JOBS_PER_ACCOUNT`).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
     }
 }
 
@@ -143,7 +155,11 @@ impl JobQueue {
             updated_at: now,
         };
         self.broadcast(&job);
-        self.lock_jobs().push(job);
+        {
+            let mut jobs = self.lock_jobs();
+            jobs.push(job);
+            enforce_terminal_retention(&mut jobs, account_id);
+        }
         // Send never fails while the queue is alive (the receiver lives in the
         // worker); if the worker was never started the job simply stays queued.
         let _ = self.inner.tx.send(id.clone());
@@ -303,7 +319,11 @@ impl JobQueue {
                 }
             }
             job.updated_at = now;
-            job.clone()
+            let snapshot = job.clone();
+            // Now that this job is terminal, prune the account's terminal history
+            // so the cap holds continuously, not only at enqueue time.
+            enforce_terminal_retention(&mut jobs, &snapshot.account_id);
+            snapshot
         };
         self.broadcast(&snapshot);
     }
@@ -330,5 +350,122 @@ impl JobQueue {
             .rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Keep at most `MAX_TERMINAL_JOBS_PER_ACCOUNT` terminal jobs for `account_id`,
+/// dropping the oldest first. In-flight (queued/running) jobs are untouched —
+/// the worker still owns them by id. Jobs are pushed in creation order, so
+/// `retain` walks oldest-to-newest and drops the leading excess.
+fn enforce_terminal_retention(jobs: &mut Vec<GenerationJob>, account_id: &str) {
+    let terminal = jobs
+        .iter()
+        .filter(|job| job.account_id == account_id && job.status.is_terminal())
+        .count();
+    let mut excess = terminal.saturating_sub(MAX_TERMINAL_JOBS_PER_ACCOUNT);
+    if excess == 0 {
+        return;
+    }
+    jobs.retain(|job| {
+        let drop = excess > 0 && job.account_id == account_id && job.status.is_terminal();
+        if drop {
+            excess -= 1;
+        }
+        !drop
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AccountRegistry;
+
+    // A ghost source fails fast in the worker (no model call), so every job
+    // becomes terminal (failed) without touching the network.
+    const GHOST: &str = "ghost-source";
+
+    #[test]
+    fn terminal_history_is_bounded_per_account() {
+        let queue = JobQueue::new(AccountRegistry::default());
+        for i in 0..(MAX_TERMINAL_JOBS_PER_ACCOUNT + 12) {
+            queue.enqueue("acct", GHOST, &format!("job {i}"));
+        }
+        queue.run_pending_blocking();
+        let newest = queue.enqueue("acct", GHOST, "newest"); // triggers the prune
+
+        let jobs = queue.jobs_for("acct");
+        let terminal = jobs.iter().filter(|job| job.status.is_terminal()).count();
+        assert!(
+            terminal <= MAX_TERMINAL_JOBS_PER_ACCOUNT,
+            "terminal history must stay bounded, got {terminal}"
+        );
+        assert!(
+            jobs.len() <= MAX_TERMINAL_JOBS_PER_ACCOUNT + 1,
+            "total grew unbounded: {}",
+            jobs.len()
+        );
+        assert!(
+            queue.job(&newest).is_some(),
+            "the newest enqueue must survive pruning"
+        );
+        // Oldest-first: the very first job is gone, a recent one remains.
+        // (Newest-first pruning would invert both of these.)
+        let titles: Vec<&str> = jobs.iter().map(|job| job.title.as_str()).collect();
+        assert!(
+            !titles.contains(&"job 0"),
+            "the oldest terminal job must be pruned first"
+        );
+        let recent = format!("job {}", MAX_TERMINAL_JOBS_PER_ACCOUNT + 11);
+        assert!(
+            titles.contains(&recent.as_str()),
+            "a recent terminal job must survive"
+        );
+    }
+
+    #[test]
+    fn retention_is_per_account() {
+        let queue = JobQueue::new(AccountRegistry::default());
+        for i in 0..(MAX_TERMINAL_JOBS_PER_ACCOUNT + 5) {
+            queue.enqueue("noisy", GHOST, &format!("n {i}"));
+        }
+        let quiet = queue.enqueue("quiet", GHOST, "quiet-one");
+        queue.run_pending_blocking();
+        queue.enqueue("noisy", GHOST, "trigger"); // prunes the noisy account only
+
+        let noisy_terminal = queue
+            .jobs_for("noisy")
+            .iter()
+            .filter(|job| job.status.is_terminal())
+            .count();
+        assert!(noisy_terminal <= MAX_TERMINAL_JOBS_PER_ACCOUNT);
+        assert!(
+            queue.job(&quiet).is_some(),
+            "another account's job must survive the noisy account's pruning"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_drains_a_burst_without_losing_jobs() {
+        // The semaphore bounds concurrency to MAX_CONCURRENT_JOBS; this proves a
+        // burst several times larger still fully drains — no lost or stuck job.
+        let queue = JobQueue::new(AccountRegistry::default());
+        queue.spawn_worker();
+        let ids: Vec<String> = (0..(MAX_CONCURRENT_JOBS * 4))
+            .map(|i| queue.enqueue("acct", GHOST, &format!("burst {i}")))
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let done = ids
+                    .iter()
+                    .filter(|id| queue.job(id).is_some_and(|job| job.status.is_terminal()))
+                    .count();
+                if done == ids.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the whole burst must drain within 10s");
     }
 }
