@@ -22,12 +22,16 @@ per the eval-rigor doctrine now in the harness
       "within noise" instead of a change.
 - [ ] Distractor / question-quality judging is binary pass/fail per atomic
       criterion (not a 1–5 Likert), with the judge writing its rationale before
-      the verdict. **Coupled to the next item** — a binary judge you cannot
-      validate is no more trustworthy than the Likert one.
-- [ ] The judge is calibrated against a small human-labeled holdout (target
-      Cohen's κ ≈ 0.80; report TPR/TNR, then bias-correct the rate), with the
-      calibration receipt committed under `docs/evals/`. **User-gated**: needs
-      ~30–50 operator pass/fail labels on generated cards.
+      the verdict. **Deferred to ship *with* calibration**: binarizing now is a
+      receipt-format churn + re-baseline whose value is the per-criterion
+      calibration (below). Build the binary judge and calibrate it directly when
+      the operator's labels exist — not as a standalone uncalibrated swap.
+- [~] The judge is calibrated against a human-labeled holdout (target Cohen's
+      κ ≈ 0.80; report TPR/TNR). **Tooling shipped** — `calibrate --labels <file>`
+      computes κ + TPR/TNR from a judge-vs-human keep-labels file against the 0.80
+      bar. The calibration *run* is operator-gated: it needs ~30–50 expert
+      keep/drop labels on a judged batch (no agent can be the human rater). Then
+      commit the receipt under `docs/evals/`.
 - [x] The suite's power is documented: the receipt prints a power note (~12
       sources detects only large regressions; a ~3pp delta needs ~1000 drafts;
       read it as a large-regression guard).
@@ -48,6 +52,15 @@ Shipped: a `stats` module (source-clustered Student-t CI, paired-vs-baseline
 verdict, receipt keep-rate parser) wired into the generation receipt behind
 `--baseline`. The receipt now prints the keep-rate CI, the paired verdict
 (within noise / detectable), and a power note. Oracles 1, 2, 5 met.
+
+## Progress — feat/058-judge-calibration (2026-06-21)
+
+Shipped oracle 4's tooling: `stats::judge_agreement` (Cohen's κ + TPR/TNR from a
+judge-vs-human keep confusion) and a `calibrate --labels <file>` bench subcommand
+reporting κ against the 0.80 human bar. Live-checked on a sample labels file
+(κ 0.52 → "not yet calibrated"). The calibration *run* — labeling ~30–50 drafts
+and confirming κ ≥ 0.80 — is operator-gated (an agent can't be the human rater).
+Oracle 3 (binary judge) defers to ship with that calibration.
 
 Remaining (oracles 3 + 4, a coupled pair): the binary-criteria judge and its
 human calibration. Deferred because an uncalibrated binary judge violates the
