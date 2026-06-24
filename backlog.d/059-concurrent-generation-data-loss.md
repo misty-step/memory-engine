@@ -1,6 +1,6 @@
 # Concurrent generation jobs clobber each other (data loss)
 
-Priority: P1 · Status: pending · Estimate: M
+Priority: P1 · Status: done · Estimate: M
 
 ## Goal
 
@@ -34,28 +34,41 @@ same shape applied to the study store rather than the job queue.
 
 ## Oracle
 
-- [ ] A regression test fires ≥2 concurrent captures for one account through the
-      real spawned worker and asserts **every** source's cards fully persist —
-      no lost update. The test reproduces the clobber on the current code first
-      (red), then passes.
-- [ ] Each job's reported `card_count` equals the number of review units
-      actually persisted for that source — the activity log cannot diverge from
-      durable state.
-- [ ] `run_generation_job` approves only its **own** source's drafts, not the
-      account-wide pending set.
-- [ ] Mechanism documented: per-account serialization of the store mutation
-      (e.g. a keyed async lock held across generate→persist) or an equivalent
-      atomic read-modify-write. In-flight concurrency across *different* accounts
-      is preserved.
-- [ ] Production exposure confirmed: state whether the prod host is Postgres
-      (DB transactions cover it) or file-backed (same fix applies). The local
-      dogfood host is file-backed and is affected today.
+- [x] A regression test fires several concurrent captures for one account through
+      the real spawned worker and asserts every scheduled card persists — no lost
+      update. `concurrent_generations_for_one_account_do_not_clobber_each_other`
+      reproduces the clobber on the unfixed code (8 reported / 5 on disk) and is
+      deterministically green with the fix.
+- [x] Each job's reported `card_count` equals the review units actually persisted
+      — the test asserts `sum(card_count) == reviewUnits on disk`, so the activity
+      log can't diverge from durable state.
+- [x] ~~Approve only the job's own source's drafts~~ — **subsumed by
+      serialization, not implemented separately.** Per-account serialization means
+      each capture runs to completion (its drafts already approved) before the
+      next starts, so the account-wide approve only ever sees the current source's
+      pending drafts and `card_count` is already correct. A true source-scoped
+      filter would need a source id on `BetaStudyDraftRow` (cross-crate) and is
+      not the data-loss cause; deferred.
+- [x] Mechanism: a per-account keyed `Mutex` (`AccountRegistry::store_lock`) held
+      across the whole `run_generation_job`. Different accounts never contend.
+- [x] Production exposure: prod is **Postgres** (`MEMORY_ENGINE_POSTGRES_URL`
+      deployed), whose transactions already covered concurrency — the clobber was
+      specific to the **file-backed host** (local dogfood). The lock is
+      backend-agnostic, so it fixes the file host and is harmless belt-and-
+      suspenders on Postgres.
 
 ## Notes
 
 The 26 lost NATO cards are unrecoverable (never written); re-capture works and,
-post-fix, will not clobber. Do not widen scope to the broader generation-quality
-work (060/061) — this ticket is strictly the durability/concurrency fix.
+post-fix, won't clobber. Strictly the durability/concurrency fix — not the
+broader generation-quality work (060/061).
+
+**Residual (follow-up, out of scope):** the lock guards `run_generation_job`
+only. A user review or approve (HTTP handler) that mutates the store while a
+background generation runs is still an unsynchronized writer on the file host —
+a narrower window (one user, rare overlap) than the worker's 4-way concurrency.
+The same `store_lock` extends to those mutators if it proves to bite; filed as a
+note rather than widening this P1.
 
 ## Children
 

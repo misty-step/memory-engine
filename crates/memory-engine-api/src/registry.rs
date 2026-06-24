@@ -260,6 +260,13 @@ impl AccountRegistry {
         account_id: &str,
         source_id: &str,
     ) -> Result<usize, ApiFailure> {
+        // Serialize generation per account: two captures otherwise read-modify-
+        // write the whole study store concurrently and clobber each other's
+        // cards (059). Held across the whole run; different accounts never block.
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
         storage.generate_source(account_id, &store_path, source_id)?;

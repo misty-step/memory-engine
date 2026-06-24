@@ -4,7 +4,7 @@
 //! stays outside `memory-engine-core`, which remains pure learning semantics.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     fs,
     io::Write as _,
@@ -136,6 +136,11 @@ impl AuthConfig {
 #[derive(Clone, Debug, Default)]
 pub struct AccountRegistry {
     inner: Arc<Mutex<AccountRegistryData>>,
+    /// Per-account locks that serialize study-store read-modify-write, so
+    /// concurrent generation jobs for one account can't clobber each other's
+    /// cards (059). Shared across clones — the worker runs on clones — and keyed
+    /// by account id, so different accounts never contend.
+    store_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AccountRegistry {
@@ -146,6 +151,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::file(store_root),
                 ..AccountRegistryData::default()
             })),
+            store_locks: Arc::default(),
         }
     }
 
@@ -156,6 +162,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::postgres(database_url),
                 ..AccountRegistryData::default()
             })),
+            store_locks: Arc::default(),
         }
     }
 
@@ -189,6 +196,20 @@ impl AccountRegistry {
 
     pub(crate) fn now(&self) -> i64 {
         (self.clock())()
+    }
+
+    /// The lock guarding `account_id`'s study store. One `Mutex` per account,
+    /// created on first use; held across a whole generation run so concurrent
+    /// captures for the same account serialize their read-modify-write instead
+    /// of clobbering each other. The map only grows by distinct account, so it
+    /// stays small for a beta host.
+    pub(crate) fn store_lock(&self, account_id: &str) -> Arc<Mutex<()>> {
+        self.store_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(account_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Where the job queue should mirror its history, or `None` when there is no
@@ -2869,6 +2890,143 @@ mod tests {
             restarted.jobs.jobs_for(&account_id).len(),
             1,
             "the restored job is visible in the learner's activity log"
+        );
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Six distinct NATO-letter cards in the proven `source_body()` shape:
+    /// same-category distractors so the distractor gate passes, distinct content
+    /// so the dedup pass never collapses them across sources. Structured blocks
+    /// route through the deterministic provider — no network.
+    fn nato_letter_sources() -> Vec<String> {
+        let words = [
+            ('A', "ALFA"),
+            ('B', "BRAVO"),
+            ('C', "CHARLIE"),
+            ('D', "DELTA"),
+            ('E', "ECHO"),
+            ('F', "FOXTROT"),
+        ];
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, (letter, word))| {
+                let d1 = words[(i + 1) % words.len()].1;
+                let d2 = words[(i + 2) % words.len()].1;
+                format!(
+                    "Concept: NATO letter {letter}\nActivity: quiz\nStage: recognition-3\n\
+                     Question: What is the NATO phonetic alphabet word for {letter}?\n\
+                     Answer: {word}\nDistractors: {d1}, {d2}\n\
+                     Reference: The NATO phonetic alphabet word for {letter} is {word}."
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
+        // Regression for the lost-update race (dogfood 2026-06-23): capturing
+        // several sources for one account queues several generation jobs that the
+        // worker runs concurrently, each read-modify-writing the whole study.json.
+        // Without per-account serialization the writes clobber one another and
+        // cards are silently lost — a NATO capture's 26 cards vanished when an
+        // overlapping capture won the write race. Invariant under test: every card
+        // a job reports scheduling is actually persisted.
+        let store =
+            std::env::temp_dir().join(format!("me-059-concurrent-{:032x}", rand::random::<u128>()));
+
+        // Worker stays OFF while we save the sources *sequentially* (so the source
+        // writes themselves don't race) and queue one generation job each.
+        let state = ApiState::new(AccountRegistry::with_store_root(store.clone()));
+        let app = router(state.clone());
+        let started = app
+            .clone()
+            .oneshot(form_request("POST", "/app/start", &[("capture", "seed")]))
+            .await
+            .expect("start");
+        let cookie = session_cookie(&started);
+        let csrf = html_value(&response_text(started).await, "csrfToken");
+
+        let sources = nato_letter_sources();
+        let source_count = sources.len();
+        for body in &sources {
+            app.clone()
+                .oneshot(form_request_with_cookie(
+                    "POST",
+                    "/app/capture",
+                    &cookie,
+                    &[("csrfToken", &csrf), ("capture", body)],
+                ))
+                .await
+                .expect("capture");
+        }
+
+        // Now drain every queued job at once — this is the race.
+        state.start_worker();
+
+        let jobs_file = store.join("_jobs.json");
+        let terminal_count = |text: &str| {
+            serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|jobs| {
+                    jobs.as_array().map(|a| {
+                        a.iter()
+                            .filter(|j| {
+                                matches!(j["status"].as_str(), Some("succeeded" | "failed"))
+                            })
+                            .count()
+                    })
+                })
+                .unwrap_or(0)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while std::fs::read_to_string(&jobs_file)
+                .map(|text| terminal_count(&text))
+                .unwrap_or(0)
+                != source_count
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all generation jobs must finish within 20s");
+
+        // The cards each job reported scheduling must all be on disk.
+        let jobs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&jobs_file).unwrap()).unwrap();
+        let reported: i64 = jobs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["card_count"].as_i64().unwrap_or(0))
+            .sum();
+
+        let account_dir = std::fs::read_dir(&store)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("acct_"))
+            })
+            .expect("account store dir");
+        let study: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(account_dir.join("study.json")).unwrap())
+                .unwrap();
+        let persisted = i64::try_from(study["reviewUnits"].as_array().map_or(0, Vec::len)).unwrap();
+
+        assert_eq!(
+            jobs.as_array().unwrap().len(),
+            source_count,
+            "every capture must have produced a job"
+        );
+        assert!(reported > 0, "the jobs must have scheduled some cards");
+        assert_eq!(
+            persisted, reported,
+            "every scheduled card must persist: {reported} reported across jobs, \
+             {persisted} on disk — a shortfall is the concurrent-write clobber"
         );
 
         let _ = std::fs::remove_dir_all(&store);
