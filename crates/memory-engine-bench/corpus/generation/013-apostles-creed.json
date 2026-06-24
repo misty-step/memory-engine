@@ -1,0 +1,23 @@
+{
+  "id": "apostles-creed",
+  "title": "Apostles' Creed excerpt",
+  "category": "verbatim-sequential",
+  "body": "I believe in God, the Father almighty, creator of heaven and earth. I believe in Jesus Christ, his only Son, our Lord. He was conceived by the Holy Spirit and born of the Virgin Mary. He suffered under Pontius Pilate, was crucified, died, and was buried. On the third day he rose again. He ascended into heaven and is seated at the right hand of the Father.",
+  "expect": {
+    "min_drafts": 6,
+    "max_drafts": 8,
+    "key_terms": ["Father almighty", "Jesus Christ", "Pontius Pilate"],
+    "content_fit": {
+      "expected_type": "verbatim_sequential",
+      "required_shape": "next_line_recall",
+      "coverage_units": [
+        { "id": "creed-1", "answer_terms": ["I believe in God, the Father almighty, creator of heaven and earth"] },
+        { "id": "creed-2", "answer_terms": ["I believe in Jesus Christ, his only Son, our Lord"] },
+        { "id": "creed-3", "answer_terms": ["He was conceived by the Holy Spirit and born of the Virgin Mary"] },
+        { "id": "creed-4", "answer_terms": ["He suffered under Pontius Pilate, was crucified, died, and was buried"] },
+        { "id": "creed-5", "answer_terms": ["On the third day he rose again"] },
+        { "id": "creed-6", "answer_terms": ["He ascended into heaven and is seated at the right hand of the Father"] }
+      ]
+    }
+  }
+}

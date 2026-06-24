@@ -9,6 +9,10 @@
     "key_terms": ["adenosine triphosphate", "endosymbiotic", "apoptosis"],
     "intent": "concept_understanding",
     "required_activity_kinds": ["quiz"],
-    "required_activity_stage_terms": ["free"]
+    "required_activity_stage_terms": ["free"],
+    "content_fit": {
+      "expected_type": "conceptual",
+      "required_shape": "conceptual_free_recall"
+    }
   }
 }
