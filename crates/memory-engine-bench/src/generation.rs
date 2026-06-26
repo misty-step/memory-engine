@@ -29,6 +29,10 @@ use memory_engine_persistence::{
 };
 use serde::Deserialize;
 
+mod content_fit;
+
+use content_fit::{ContentFitExpectation, ContentFitScore};
+
 const NOW: i64 = 1_780_162_400_000;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,33 +63,6 @@ struct Expectations {
     requires_variants: bool,
     #[serde(default)]
     content_fit: Option<ContentFitExpectation>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ContentFitExpectation {
-    #[serde(default)]
-    expected_type: Option<String>,
-    #[serde(default)]
-    coverage_units: Vec<ContentCoverageUnit>,
-    #[serde(default)]
-    required_shape: Option<String>,
-    #[serde(default)]
-    forbidden_directions: Vec<ForbiddenDirection>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ContentCoverageUnit {
-    id: String,
-    #[serde(default)]
-    prompt_terms: Vec<String>,
-    answer_terms: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ForbiddenDirection {
-    #[serde(default)]
-    prompt_terms: Vec<String>,
-    answer_terms: Vec<String>,
 }
 
 /// Deterministic judge scores for one source's provider output.
@@ -134,45 +111,6 @@ pub struct SourceScore {
     /// Model-judge rubric aggregate when `--judge` is enabled.
     pub judge: Option<crate::judge::JudgeAggregate>,
     pub judge_error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ContentFitScore {
-    pub classification: ContentFitCheck,
-    pub covered_units: usize,
-    pub required_units: usize,
-    pub coverage: f64,
-    pub shape: ContentFitCheck,
-    pub directionality: ContentFitCheck,
-}
-
-impl ContentFitScore {
-    fn passes(&self) -> bool {
-        self.classification.passes()
-            && (self.coverage - 1.0).abs() < f64::EPSILON
-            && self.shape.passes()
-            && self.directionality.passes()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContentFitCheck {
-    Pass,
-    Fail,
-}
-
-impl ContentFitCheck {
-    fn from_bool(pass: bool) -> Self {
-        if pass {
-            Self::Pass
-        } else {
-            Self::Fail
-        }
-    }
-
-    fn passes(self) -> bool {
-        self == Self::Pass
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -729,7 +667,7 @@ fn deterministic_judges(
             })
         })
         .count();
-    let content_fit = content_fit_score(expect, learning_intent, candidates);
+    let content_fit = content_fit::score(expect.content_fit.as_ref(), learning_intent, candidates);
 
     SourceScore {
         source_id: String::new(),
@@ -868,176 +806,6 @@ fn intent_shape_matches(
         && forbidden_kinds_absent
         && distractors_match
         && variants_match
-}
-
-fn content_fit_score(
-    expect: &Expectations,
-    learning_intent: Option<LearningIntent>,
-    candidates: &[DraftCandidate],
-) -> Option<ContentFitScore> {
-    let content = expect.content_fit.as_ref()?;
-    let classification = ContentFitCheck::from_bool(
-        content
-            .expected_type
-            .as_deref()
-            .is_none_or(|expected| content_type_matches(expected, learning_intent)),
-    );
-    let covered_units = content
-        .coverage_units
-        .iter()
-        .filter(|unit| !unit.id.trim().is_empty() && coverage_unit_covered(unit, candidates))
-        .count();
-    let required_units = content.coverage_units.len();
-    let coverage = if required_units == 0 {
-        1.0
-    } else {
-        fraction(covered_units, required_units)
-    };
-    let shape = ContentFitCheck::from_bool(
-        content
-            .required_shape
-            .as_deref()
-            .is_none_or(|shape| content_shape_matches(shape, candidates, &content.coverage_units)),
-    );
-    let directionality = ContentFitCheck::from_bool(forbidden_directions_absent(
-        &content.forbidden_directions,
-        candidates,
-    ));
-
-    Some(ContentFitScore {
-        classification,
-        covered_units,
-        required_units,
-        coverage,
-        shape,
-        directionality,
-    })
-}
-
-fn content_type_matches(expected: &str, learning_intent: Option<LearningIntent>) -> bool {
-    let Some(intent) = learning_intent else {
-        return false;
-    };
-    let actual = match intent {
-        LearningIntent::VerbatimMemorization => "verbatim_sequential",
-        LearningIntent::ConceptUnderstanding => "conceptual",
-        LearningIntent::FactRecall => "fact_recall",
-        LearningIntent::ProcedureProcess => "procedure_process",
-    };
-    actual == expected
-}
-
-fn coverage_unit_covered(unit: &ContentCoverageUnit, candidates: &[DraftCandidate]) -> bool {
-    candidates.iter().any(|candidate| {
-        let prompt_haystack = format!("{} {}", candidate.concept, candidate.question);
-        let prompt_matches = unit.prompt_terms.is_empty()
-            || unit
-                .prompt_terms
-                .iter()
-                .any(|term| contains_normalized_phrase(&prompt_haystack, term));
-        let answer_matches = unit
-            .answer_terms
-            .iter()
-            .any(|term| normalized_equals(&candidate.answer, term));
-
-        prompt_matches && answer_matches
-    })
-}
-
-fn content_shape_matches(
-    shape: &str,
-    candidates: &[DraftCandidate],
-    coverage_units: &[ContentCoverageUnit],
-) -> bool {
-    match shape {
-        "next_line_recall" => {
-            let covered = content_coverage_candidates(candidates, coverage_units);
-            !covered.is_empty()
-                && candidates.iter().all(|candidate| {
-                    candidate.distractors.is_empty()
-                        && candidate.activity_kind == GeneratedLearningActivityKind::Exercise
-                        && (candidate.activity_stage.to_lowercase().contains("recall")
-                            || candidate.activity_stage.to_lowercase().contains("cloze")
-                            || contains_normalized_phrase(&candidate.question, "next line")
-                            || contains_normalized_phrase(&candidate.question, "recite"))
-                })
-        }
-        "production_recall" => {
-            let covered = content_coverage_candidates(candidates, coverage_units);
-            !covered.is_empty()
-                && candidates
-                    .iter()
-                    .all(|candidate| candidate.distractors.is_empty())
-        }
-        "conceptual_free_recall" => candidates.iter().any(|candidate| {
-            candidate.activity_stage.to_lowercase().contains("free")
-                && candidate.distractors.is_empty()
-        }),
-        _ => false,
-    }
-}
-
-fn content_coverage_candidates<'a>(
-    candidates: &'a [DraftCandidate],
-    coverage_units: &[ContentCoverageUnit],
-) -> Vec<&'a DraftCandidate> {
-    if coverage_units.is_empty() {
-        return candidates.iter().collect();
-    }
-    candidates
-        .iter()
-        .filter(|candidate| {
-            coverage_units.iter().any(|unit| {
-                !unit.id.trim().is_empty()
-                    && coverage_unit_covered(unit, std::slice::from_ref(candidate))
-            })
-        })
-        .collect()
-}
-
-fn forbidden_directions_absent(
-    directions: &[ForbiddenDirection],
-    candidates: &[DraftCandidate],
-) -> bool {
-    directions.iter().all(|direction| {
-        candidates.iter().all(|candidate| {
-            let prompt_haystack = format!("{} {}", candidate.concept, candidate.question);
-            let prompt_matches = direction
-                .prompt_terms
-                .iter()
-                .any(|term| contains_normalized_phrase(&prompt_haystack, term));
-            let answer_matches = direction
-                .answer_terms
-                .iter()
-                .any(|term| forbidden_answer_matches(&candidate.answer, term));
-
-            !(prompt_matches && answer_matches)
-        })
-    })
-}
-
-fn forbidden_answer_matches(answer: &str, term: &str) -> bool {
-    let normalized_term = normalize(term);
-    if normalized_term.chars().count() == 1 {
-        return normalized_equals(answer, &normalized_term)
-            || contains_normalized_phrase(answer, &format!("letter {normalized_term}"))
-            || contains_normalized_phrase(answer, &format!("the letter {normalized_term}"));
-    }
-
-    contains_normalized_phrase(answer, term)
-}
-
-fn contains_normalized_phrase(haystack: &str, needle: &str) -> bool {
-    let haystack = normalize(haystack);
-    let needle = normalize(needle);
-    if needle.is_empty() {
-        return false;
-    }
-    format!(" {haystack} ").contains(&format!(" {needle} "))
-}
-
-fn normalized_equals(left: &str, right: &str) -> bool {
-    normalize(left) == normalize(right)
 }
 
 fn variant_quality(candidates: &[DraftCandidate]) -> f64 {
@@ -1369,7 +1137,7 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
             continue;
         }
         let (content_kind, content_cover, content_shape, direction) =
-            content_fit_cells(score.content_fit.as_ref());
+            content_fit::cells(score.content_fit.as_ref());
         let _ = writeln!(
             receipt,
             "| {} | {} | {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {} | {:.0}% | {} | {} | {} | {} | {} | {:.0}% | {:.0}% | {:.0}% | {}/{} | {} | {}ms |",
@@ -1397,35 +1165,6 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
             format_cost(score.cost_usd_micros),
             score.latency_ms,
         );
-    }
-}
-
-fn content_fit_cells(score: Option<&ContentFitScore>) -> (String, String, String, String) {
-    match score {
-        Some(score) => (
-            check_cell(score.classification).to_owned(),
-            format!(
-                "{}/{} ({:.0}%)",
-                score.covered_units,
-                score.required_units,
-                score.coverage * 100.0
-            ),
-            check_cell(score.shape).to_owned(),
-            check_cell(score.directionality).to_owned(),
-        ),
-        None => (
-            "—".to_owned(),
-            "—".to_owned(),
-            "—".to_owned(),
-            "—".to_owned(),
-        ),
-    }
-}
-
-fn check_cell(check: ContentFitCheck) -> &'static str {
-    match check {
-        ContentFitCheck::Pass => "yes",
-        ContentFitCheck::Fail => "NO",
     }
 }
 
@@ -1825,251 +1564,6 @@ mod tests {
             &["Apple", "Acorn"],
         )];
         assert!((self_referential_free(&standalone) - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn content_fit_flags_current_verbatim_and_enumerable_failures() {
-        let mut creed_expect = expectations();
-        creed_expect.content_fit = Some(ContentFitExpectation {
-            expected_type: Some("verbatim_sequential".to_owned()),
-            coverage_units: vec![
-                coverage_unit("creed-1", &[], &["I believe in God the Father almighty"]),
-                coverage_unit("creed-2", &[], &["creator of heaven and earth"]),
-            ],
-            required_shape: Some("next_line_recall".to_owned()),
-            forbidden_directions: Vec::new(),
-        });
-        let creed_candidates = vec![mcq(
-            "God the Father is creator of which two realms?",
-            "heaven and earth",
-            &["sea and sky", "time and space"],
-        )];
-
-        let creed = deterministic_judges(
-            "I believe in God the Father almighty; creator of heaven and earth.",
-            &creed_expect,
-            Some(LearningIntent::ConceptUnderstanding),
-            &creed_candidates,
-        );
-        let creed_fit = creed.content_fit.expect("creed content fit");
-        assert_eq!(creed_fit.classification, ContentFitCheck::Fail);
-        assert!(creed_fit.coverage < 1.0);
-        assert_eq!(creed_fit.shape, ContentFitCheck::Fail);
-        assert!(!creed_fit.passes());
-
-        let mut nato_expect = expectations();
-        nato_expect.content_fit = Some(ContentFitExpectation {
-            expected_type: Some("enumerable_set".to_owned()),
-            coverage_units: vec![
-                coverage_unit("nato-a", &["what is a", "letter a"], &["Alfa"]),
-                coverage_unit("nato-b", &["what is b", "letter b"], &["Bravo"]),
-                coverage_unit("nato-c", &["what is c", "letter c"], &["Charlie"]),
-            ],
-            required_shape: Some("production_recall".to_owned()),
-            forbidden_directions: Vec::new(),
-        });
-        let nato_candidates = vec![
-            mcq(
-                "According to \"NATO alphabet\", what is A?",
-                "Alfa",
-                &["Bravo", "Charlie"],
-            ),
-            mcq(
-                "According to \"NATO alphabet\", what is B?",
-                "Bravo",
-                &["Alfa", "Charlie"],
-            ),
-        ];
-
-        let nato = deterministic_judges(
-            BODY,
-            &nato_expect,
-            Some(LearningIntent::FactRecall),
-            &nato_candidates,
-        );
-        let nato_fit = nato.content_fit.expect("nato content fit");
-        assert_eq!(nato_fit.classification, ContentFitCheck::Fail);
-        assert!((nato_fit.coverage - (2.0 / 3.0)).abs() < 0.01);
-        assert_eq!(nato_fit.shape, ContentFitCheck::Fail);
-        assert!(!nato_fit.passes());
-    }
-
-    #[test]
-    fn content_fit_rejects_redundant_word_to_letter_direction() {
-        let mut expect = expectations();
-        expect.content_fit = Some(ContentFitExpectation {
-            expected_type: Some("enumerable_set".to_owned()),
-            coverage_units: vec![coverage_unit("nato-b", &["letter b"], &["Bravo"])],
-            required_shape: Some("production_recall".to_owned()),
-            forbidden_directions: vec![ForbiddenDirection {
-                prompt_terms: vec!["bravo".to_owned()],
-                answer_terms: vec!["B".to_owned()],
-            }],
-        });
-        let bloat = vec![DraftCandidate {
-            activity_kind: GeneratedLearningActivityKind::Exercise,
-            activity_stage: "cued-recall".to_owned(),
-            distractors: Vec::new(),
-            ..candidate(
-                "What letter does Bravo represent?",
-                "the letter B",
-                "B is Bravo.",
-            )
-        }];
-
-        let score = deterministic_judges(BODY, &expect, Some(LearningIntent::FactRecall), &bloat);
-
-        let fit = score.content_fit.expect("content fit");
-        assert_eq!(fit.directionality, ContentFitCheck::Fail);
-        assert!(!fit.passes());
-    }
-
-    #[test]
-    fn content_fit_direction_ignores_single_letter_articles() {
-        let mut expect = expectations();
-        expect.content_fit = Some(ContentFitExpectation {
-            expected_type: None,
-            coverage_units: Vec::new(),
-            required_shape: None,
-            forbidden_directions: vec![ForbiddenDirection {
-                prompt_terms: vec!["alfa".to_owned()],
-                answer_terms: vec!["A".to_owned()],
-            }],
-        });
-        let not_a_letter_answer = vec![DraftCandidate {
-            activity_kind: GeneratedLearningActivityKind::Exercise,
-            activity_stage: "free-recall".to_owned(),
-            distractors: Vec::new(),
-            ..candidate(
-                "Explain why Alfa is spelled that way.",
-                "Alfa is a deliberate spelling for multilingual pronunciation.",
-                "The spelling Alfa prevents mispronunciation.",
-            )
-        }];
-
-        let score = deterministic_judges(
-            BODY,
-            &expect,
-            Some(LearningIntent::FactRecall),
-            &not_a_letter_answer,
-        );
-
-        let fit = score.content_fit.expect("content fit");
-        assert_eq!(fit.directionality, ContentFitCheck::Pass);
-        assert!(fit.passes());
-    }
-
-    #[test]
-    fn content_fit_shape_rejects_mixed_recognition_cards() {
-        let mut expect = expectations();
-        expect.content_fit = Some(ContentFitExpectation {
-            expected_type: Some("enumerable_set".to_owned()),
-            coverage_units: vec![coverage_unit("nato-a", &["letter a"], &["Alfa"])],
-            required_shape: Some("production_recall".to_owned()),
-            forbidden_directions: Vec::new(),
-        });
-        let mixed = vec![
-            DraftCandidate {
-                activity_kind: GeneratedLearningActivityKind::Exercise,
-                activity_stage: "cued-recall".to_owned(),
-                distractors: Vec::new(),
-                ..candidate("What is the code word for letter A?", "Alfa", "A is Alfa.")
-            },
-            mcq(
-                "In the NATO phonetic alphabet, what code word represents the letter B?",
-                "Bravo",
-                &["Alfa", "Charlie"],
-            ),
-        ];
-
-        let score = deterministic_judges(BODY, &expect, Some(LearningIntent::FactRecall), &mixed);
-
-        let fit = score.content_fit.expect("content fit");
-        assert!((fit.coverage - 1.0).abs() < f64::EPSILON);
-        assert_eq!(fit.shape, ContentFitCheck::Fail);
-        assert!(!fit.passes());
-    }
-
-    #[test]
-    fn content_fit_allows_conceptual_free_recall_without_coverage_bloat() {
-        let mut expect = expectations();
-        expect.content_fit = Some(ContentFitExpectation {
-            expected_type: Some("conceptual".to_owned()),
-            coverage_units: Vec::new(),
-            required_shape: Some("conceptual_free_recall".to_owned()),
-            forbidden_directions: Vec::new(),
-        });
-        let conceptual = vec![DraftCandidate {
-            activity_stage: "free-recall".to_owned(),
-            distractors: Vec::new(),
-            ..candidate(
-                "Explain why mitochondria matter.",
-                "Mitochondria generate ATP for cells.",
-                "Mitochondria generate ATP.",
-            )
-        }];
-
-        let score = deterministic_judges(
-            "Mitochondria generate ATP for cells because they convert chemical energy.",
-            &expect,
-            Some(LearningIntent::ConceptUnderstanding),
-            &conceptual,
-        );
-
-        let fit = score.content_fit.expect("content fit");
-        assert_eq!(fit.classification, ContentFitCheck::Pass);
-        assert!((fit.coverage - 1.0).abs() < f64::EPSILON);
-        assert_eq!(fit.shape, ContentFitCheck::Pass);
-        assert_eq!(fit.directionality, ContentFitCheck::Pass);
-        assert!(fit.passes());
-    }
-
-    #[test]
-    fn content_fit_corpus_records_current_red_cases() {
-        let corpus = load_corpus().expect("corpus");
-        let scores = corpus
-            .iter()
-            .map(|source| score_source(&FakeModelProvider, None, source))
-            .filter_map(|score| score.content_fit.map(|fit| (score.source_id, fit)))
-            .collect::<std::collections::BTreeMap<_, _>>();
-
-        let scored_sources = scores.keys().map(String::as_str).collect::<Vec<_>>();
-        assert_eq!(
-            scored_sources,
-            ["apostles-creed", "mitochondria", "nato-alphabet"]
-        );
-
-        let mitochondria = scores.get("mitochondria").expect("mitochondria fit");
-        assert!(
-            mitochondria.passes(),
-            "conceptual prose is the regression guard"
-        );
-
-        let nato = scores.get("nato-alphabet").expect("nato fit");
-        assert_eq!(nato.classification, ContentFitCheck::Fail);
-        assert_eq!(nato.covered_units, 5);
-        assert_eq!(nato.required_units, 26);
-        assert_eq!(nato.shape, ContentFitCheck::Fail);
-        assert!(!nato.passes());
-
-        let creed = scores.get("apostles-creed").expect("creed fit");
-        assert_eq!(creed.classification, ContentFitCheck::Fail);
-        assert_eq!(creed.covered_units, 0);
-        assert_eq!(creed.required_units, 6);
-        assert_eq!(creed.shape, ContentFitCheck::Fail);
-        assert!(!creed.passes());
-    }
-
-    fn coverage_unit(
-        id: &str,
-        prompt_terms: &[&str],
-        answer_terms: &[&str],
-    ) -> ContentCoverageUnit {
-        ContentCoverageUnit {
-            id: id.to_owned(),
-            prompt_terms: prompt_terms.iter().map(|term| (*term).to_owned()).collect(),
-            answer_terms: answer_terms.iter().map(|term| (*term).to_owned()).collect(),
-        }
     }
 
     #[test]
