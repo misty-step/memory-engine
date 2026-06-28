@@ -20,7 +20,9 @@
     "rust:web-shell:receipt": "cargo run -p memory-engine-web-shell -- --receipt",
     "rust:dogfood": "cargo run -p memory-engine-cli && cargo run -p memory-engine-import && cargo run -p memory-engine-web-shell -- --receipt",
     "rust:ci": "cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo doc --workspace --no-deps",
-    "ci:local": "bun run rust:ci",
-    "ci": "dagger call check --source=."
+    "ci:fast": "bun run rust:ci",
+    "ci:local": "bun run ci:fast",
+    "ci:full": "dagger call check --source=.",
+    "ci": "bun run ci:fast"
   }
 }

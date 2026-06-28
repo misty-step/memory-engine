@@ -27,10 +27,18 @@ identity, analytics, and model clients until repeated proof justifies promotion.
 
 ## Gate Contract
 
-`bun run ci` IS the gate. It shells out to `dagger call check --source=.` and
-runs Rust formatting, workspace tests, Clippy, rustdoc, and Gitleaks.
+`bun run ci` IS the default fast gate. It runs directly on the host through
+Cargo: Rust formatting, workspace tests, Clippy, and rustdoc. It is the
+pre-push and day-to-day agent loop.
 
-`bun run ci:local` is the inner loop only. `bun run qa` is the full QA sweep and ends with `bun run ci`, but it does not replace the gate. Delivery requires `bun run ci` plus any ticket-named proof oracle.
+`bun run ci:full` is the Dagger-backed full/ship parity gate. Keep it when the
+containerized Postgres service, pinned Rust image, and Gitleaks scan matter.
+Hosted CI calls this repo-owned script instead of raw Dagger.
+
+`bun run ci:local` remains a compatibility alias for the fast gate. `bun run qa`
+is the full QA sweep and ends with `bun run ci:full`, but it does not replace
+the fast gate. Delivery requires `bun run ci`, `bun run ci:full` before handoff,
+and any ticket-named proof oracle.
 
 ## Invariants
 

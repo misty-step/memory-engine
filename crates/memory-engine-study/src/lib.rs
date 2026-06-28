@@ -1624,11 +1624,11 @@ fn concept_identity_for_review_unit(
 }
 
 fn health_sort_key(progress: &BetaStudyConceptProgress) -> usize {
-    if progress.attempts == 0 {
-        usize::MAX
-    } else {
-        progress.correct.saturating_mul(10_000) / progress.attempts
-    }
+    progress
+        .correct
+        .saturating_mul(10_000)
+        .checked_div(progress.attempts)
+        .unwrap_or(usize::MAX)
 }
 
 fn success_rate(correct: usize, attempts: usize) -> String {

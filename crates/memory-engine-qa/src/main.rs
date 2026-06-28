@@ -2,7 +2,7 @@
 //!
 //! This binary owns QA orchestration and receipt formatting. The individual
 //! lanes execute the Rust tools that prove each surface, with Dagger retained as
-//! the canonical CI handoff.
+//! the full/ship parity handoff.
 
 use std::{
     env, fmt,
@@ -231,11 +231,11 @@ fn handoff_lanes() -> Vec<QaLane> {
             modes: &[QaMode::Local, QaMode::Full],
         },
         QaLane {
-            id: "ci.canonical",
-            title: "Canonical Dagger CI gate",
+            id: "ci.full",
+            title: "Full Dagger CI gate",
             surface: "Rust fmt, test, clippy, doc, and Gitleaks",
-            purpose: "Prove handoff quality with the repository gate, not adjacent evidence.",
-            command: &["bun", "run", "ci"],
+            purpose: "Prove handoff quality with the full/ship parity gate, not adjacent evidence.",
+            command: &["bun", "run", "ci:full"],
             gating: true,
             modes: &[QaMode::Full],
         },
@@ -389,15 +389,15 @@ mod tests {
     }
 
     #[test]
-    fn lane_selection_keeps_full_as_local_plus_canonical_ci() {
+    fn lane_selection_keeps_full_as_local_plus_full_ci() {
         let local = selected_lanes(QaMode::Local);
         let full = selected_lanes(QaMode::Full);
 
         assert_eq!(local.len(), 13);
         assert_eq!(full.len(), 14);
         assert_eq!(local.first().map(|lane| lane.id), Some("static.rustfmt"));
-        assert_eq!(full.last().map(|lane| lane.id), Some("ci.canonical"));
-        assert!(!local.iter().any(|lane| lane.id == "ci.canonical"));
+        assert_eq!(full.last().map(|lane| lane.id), Some("ci.full"));
+        assert!(!local.iter().any(|lane| lane.id == "ci.full"));
         assert!(local
             .iter()
             .all(|lane| full.iter().any(|full_lane| full_lane.id == lane.id)));

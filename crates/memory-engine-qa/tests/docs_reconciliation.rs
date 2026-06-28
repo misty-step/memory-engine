@@ -93,6 +93,7 @@ fn readme_quickstart_points_to_current_rust_and_deployed_surface() {
             "cargo doc --workspace --no-deps",
             "bun run ci:local",
             "bun run ci",
+            "bun run ci:full",
             "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
             "cargo run -p memory-engine-api",
             "curl -fsS http://127.0.0.1:18080/healthz",
