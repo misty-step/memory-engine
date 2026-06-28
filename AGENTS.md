@@ -12,6 +12,8 @@ identity, analytics, and model clients until repeated proof justifies promotion.
 
 ## Ground Truth
 
+- `VISION.md` is the north star for the Rust kernel boundary, dogfood product
+  surface, and extraction strategy.
 - `SPEC.md` is the strategy document.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
