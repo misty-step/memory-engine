@@ -53,7 +53,8 @@ production infrastructure.
 
 ## Constraints / Invariants
 
-- `bun run ci` remains the canonical repo gate.
+- `bun run ci` remains the fast repo gate; `bun run ci:full` remains the
+  Dagger-backed handoff gate.
 - `memory-engine-core` stays framework-free and persistence-free.
 - `memory-engine-service` remains the command boundary for queue selection and
   grade/apply-review.
@@ -181,7 +182,7 @@ single-writer and no account-isolation guarantees.
   - focused tests for API routes, auth isolation, Postgres store contracts, and
     generation adapter receipts;
   - `cargo run -p memory-engine-qa -- --local`;
-  - `bun run ci`;
+  - `bun run ci:full`;
   - staging deploy smoke against `/healthz`, source/generate/keep/review, and
     restart/resume.
 - ADR decision: required. Production shell, account boundary, and database
@@ -199,7 +200,8 @@ single-writer and no account-isolation guarantees.
 - ADR decision: required for production shell and account/data boundary.
 - Infrastructure path: CLI/API-managed Fly deploy plus managed Postgres; avoid
   dashboard-only state.
-- Gate: `bun run ci`, with staging deploy smoke once deployment config exists.
+- Gate: `bun run ci` and `bun run ci:full`, with staging deploy smoke once
+  deployment config exists.
 - Evidence storage: `docs/qa/`, `docs/beta/`, and future `.tmp/qa/` or
   non-source receipt path for screenshots/reports.
 - Mock policy impact: preserved if tests use real repo-owned service/store
@@ -270,14 +272,15 @@ from this repo alone without the session transcript.
   review, reveal, submit, next, restart/resume, and no horizontal overflow.
 - [x] Staging deploy proof includes `/healthz` and one account-scoped
   source-to-review round trip.
-- [x] `cargo run -p memory-engine-qa -- --local` and `bun run ci` pass.
+- [x] `cargo run -p memory-engine-qa -- --local`, `bun run ci`, and
+  `bun run ci:full` pass.
 
 ## Deliverable
 
 - Output: production mobile study app boundary, deploy config, QA evidence, and
   updated docs.
 - Acceptance oracle: context packet plus backlog ticket plus executable tests,
-  staging deployment smoke, and canonical CI.
+  staging deployment smoke, and full CI.
 - Evidence artifacts: test output, Dagger output, staging URL, screenshots,
   `/state` or API receipts, and deploy command output.
 - Residual risk: production auth provider, Postgres provider, and model vendor
@@ -307,7 +310,7 @@ from this repo alone without the session transcript.
   - `MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test cargo test -p memory-engine-persistence-postgres live_postgres_store_scopes_accounts_and_persists_idempotent_reviews -- --nocapture`;
   - `cargo test -p memory-engine-generation -p memory-engine-study -p memory-engine-beta-app -p memory-engine-persistence`;
   - `cargo run -p memory-engine-qa -- --local`;
-  - `bun run ci`;
+  - `bun run ci:full`;
   - `flyctl deploy -a memory-engine-api --remote-only`;
   - `curl -fsS https://memory-engine-api.fly.dev/healthz`;
   - deployed JSON account-scoped source-to-review routes;

@@ -54,8 +54,8 @@ persistence contracts without moving production concerns into
 - New production crates may use HTTP, async, database, auth, logging, and model
   client dependencies.
 - `memory-engine-core` must remain free of those dependencies.
-- Dagger should remain the canonical CI gate and later gain an explicit staging
-  deploy/smoke lane.
+- Dagger should remain the full/ship parity CI gate and later gain an explicit
+  staging deploy/smoke lane.
 - Product proof must include rendered/mobile and deployed-route evidence, not
   only package tests.
 
@@ -66,7 +66,7 @@ persistence contracts without moving production concerns into
 - Mobile browser smoke at 390 x 844.
 - Staging deployment smoke against `/healthz` and one account-scoped
   source-to-review path.
-- Canonical `bun run ci`.
+- Fast `bun run ci` plus full `bun run ci:full`.
 
 2026-06-06 staging verification deployed `memory-engine-api` to Fly Machines
 with Fly Managed Postgres cluster `memory-engine-api-pg` in `ord`, using

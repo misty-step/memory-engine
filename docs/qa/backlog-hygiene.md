@@ -16,7 +16,8 @@ Active ticket evidence must name:
 
 - the files or executable surfaces that satisfy each oracle;
 - the exact focused command for any ticket-specific proof;
-- the canonical gate, `bun run ci`, when the branch is ready for handoff.
+- the fast gate, `bun run ci`, plus the full `bun run ci:full` handoff gate
+  when the branch is ready for handoff.
 
 ## Archived Tickets
 

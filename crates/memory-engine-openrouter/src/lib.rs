@@ -34,7 +34,7 @@ pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
 /// ~$0.0004/source.
 pub const DEFAULT_MODEL: &str = "google/gemini-3.5-flash";
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 /// Per-generation card ceiling. High enough that a finite enumerable set (an
 /// alphabet, the 50 US states) is covered completely; the prompt restrains
 /// open-ended material to a few high-value cards, so this is a ceiling, not a

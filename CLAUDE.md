@@ -16,12 +16,12 @@ workflows.
 
 ## Gate
 
-`bun run ci` is the canonical gate. It shells out to
-`dagger call check --source=.` and runs Rust formatting, workspace tests,
-Clippy, rustdoc, and Gitleaks.
+`bun run ci` is the default fast gate. It runs host Cargo directly for Rust
+formatting, workspace tests, Clippy, and rustdoc.
 
-Use `bun run ci:local` / `bun run rust:ci` while iterating, but never hand off
-without a green `bun run ci`.
+Use `bun run ci:local` / `bun run rust:ci` as compatibility aliases while
+iterating. Before handoff, also run `bun run ci:full`, which keeps the
+Dagger-backed Postgres service, pinned Rust image, and Gitleaks scan.
 
 ## Invariants (load-bearing, do not violate)
 

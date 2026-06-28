@@ -157,7 +157,9 @@ use memory_engine::testkit::{grading_fixtures, scheduler_fixtures};
 
 ## Quickstart
 
-Prerequisites: a Rust toolchain, Bun, and Dagger for the canonical CI handoff.
+Prerequisites: the pinned Rust toolchain from `rust-toolchain.toml` and Bun for
+the fast gate. Dagger is required for the full/ship parity handoff; it uses the
+same Rust 1.94 line through the Dagger image.
 
 Set the repository hook and run the local Rust verification loop:
 
@@ -167,13 +169,14 @@ cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
-bun run ci:local
+bun run ci
+bun run ci:local # compatibility alias for bun run ci
 ```
 
-Run the canonical gate before handoff:
+Run the Dagger-backed full gate before handoff:
 
 ```sh
-bun run ci
+bun run ci:full
 ```
 
 Run the production-shaped API locally with a file store:
