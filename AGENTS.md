@@ -3,7 +3,8 @@
 
 ## Stack & Boundaries
 
-`memory-engine` is a Rust learning-kernel and repo-local dogfood workspace.
+`memory-engine` is a Rust human-learning engine and repo-local dogfood
+workspace for the Anki-killer product direction described in `VISION.md`.
 Runtime code in `crates/memory-engine-core` must stay framework-free and
 persistence-free. No Convex, React, Hono, Node/Bun APIs, filesystem, network
 calls, logging, auth, analytics, UI state, or vendor SDKs belong in the pure
@@ -12,9 +13,10 @@ identity, analytics, and model clients until repeated proof justifies promotion.
 
 ## Ground Truth
 
-- `VISION.md` is the north star for the Rust kernel boundary, dogfood product
-  surface, and extraction strategy.
-- `SPEC.md` is the strategy document.
+- `VISION.md` is the north star for the human learning product premise, Rust
+  kernel boundary, dogfood product surface, and application/service boundary.
+- `SPEC.md` is the older strategy document. Use it for technical history and
+  boundary context; `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
 - `backlog.d/` contains active work; `backlog.d/_done/` contains closed work.
