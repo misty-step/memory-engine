@@ -77,3 +77,22 @@ from it rather than re-researching. The verbatim/enumerable misgeneration
 (061 — creed/NATO rendered as conceptual trivia) is this epic's centerpiece:
 it is a CORRECTNESS failure for memorization content, not a polish item —
 sequence it first.
+
+
+## Lead groom addition (2026-07-02, supervisor): Child 0 — bench-gated model bake-off
+
+Live finding: production default is `google/gemini-3.5-flash` ($1.50/$9.00 per 1M)
+— the most expensive candidate on the live OpenRouter list by 6-45x — with no
+`MEMORY_ENGINE_GENERATION_MODEL` override set. The bench this epic needs already
+exists (memory-engine-bench: judged runs, kappa calibration, keep-rate CIs).
+
+Child 0 (sequence FIRST, before new eval work): run the existing judged generation
+evals across the current default vs 3-4 cheap candidates — `openai/gpt-oss-120b`
+($0.03/$0.15), `mistralai/mistral-small-3.2-24b-instruct` ($0.075/$0.20),
+`google/gemini-2.5-flash-lite` ($0.10/$0.40), `deepseek/deepseek-chat` ($0.20/$0.80)
+— pick the cheapest that clears the keep-rate bar within noise (paired, CI-reported,
+per the bench's own stats discipline), set it via the Fly secret, and convert the
+hardcoded default to a dated pin per the landmark refresh pattern. Potential ~10-40x
+generation-cost reduction, quality-gated by our own instrument.
+Oracle: bench comparison table committed; secret set; a real capture generates
+on the new model; keep-rate delta vs old default reported with CI.
