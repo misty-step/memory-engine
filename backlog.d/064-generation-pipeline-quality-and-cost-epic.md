@@ -64,3 +64,16 @@ than citing a document that could not be found.
 3. Live OpenRouter pricing pull + cost-per-generation comparison vs current
    default model.
 4. Production cost-per-generation measurement, recorded alongside latency.
+
+
+## Lead groom review (2026-07-02, supervisor)
+
+A July-2026 model/pricing research pass EXISTS:
+`~/.factory-lanes/wave1/landmark-model-refresh.md` (OpenRouter-priced;
+deepseek-v4-flash $0.089/$0.18 per 1M for high-volume structured work,
+haiku-4.5 $1/$5 fallback, sonnet-5 $2/$10 for quality prose). Scoped to
+landmark's stages but the price table transfers; start generation-cost work
+from it rather than re-researching. The verbatim/enumerable misgeneration
+(061 — creed/NATO rendered as conceptual trivia) is this epic's centerpiece:
+it is a CORRECTNESS failure for memorization content, not a polish item —
+sequence it first.

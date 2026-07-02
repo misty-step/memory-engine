@@ -78,3 +78,18 @@ work to audit now.
 4. Only after (1): either a Bastion-tailnet-routing plan for the existing
    Fly app (narrow, additive), or a full redeploy plan to whatever "Sanctum"
    actually is (large, needs its own ticket) — do not conflate the two.
+
+
+## Lead groom review (2026-07-02, supervisor)
+
+The "Sanctum contradiction" resolves partially: **Sanctum is the operator-ratified
+new name for bastion** (renamed 2026-07-02; not yet executed in-repo, which is why
+no file names it). The lane's substantive point STANDS and is sharper with that
+fact: memory-engine is a live, multi-account, Postgres-backed, CI-gated production
+service on Fly — bastion/Sanctum's single-writer SQLite+Litestream app pattern
+would be an architectural downgrade, not a deploy target. The REAL operator
+question, now crisply posed: keep memory-engine's current public-service shape
+(Fly + Neon, as-is), or bring it under the Sanctum doctrine (tailnet-only access,
+private reads) — which is a networking/access decision, NOT a re-platforming.
+Migration to the bastion app pattern is NOT recommended by this groom.
+UX-audit children proceed unblocked either way.
