@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use memory_engine_canary::{CanaryConfig, CanaryReporter, ErrorEvent, Severity};
+use memory_engine_canary::{
+    CanaryConfig, CanaryReporter, CheckInEvent, CheckInStatus, ErrorEvent, Severity,
+};
 
 #[test]
 fn posts_the_canary_error_contract() {
@@ -48,6 +50,34 @@ fn reporting_failures_never_reach_the_caller() {
 
     reporter.report(&simple_event("unreachable"));
     reporter.drain(Duration::from_secs(3));
+}
+
+#[test]
+fn posts_the_canary_check_in_contract() {
+    let (endpoint, request) = serve_once(201, r#"{"id":"CHK-1"}"#);
+    let reporter = CanaryReporter::new(test_config(endpoint));
+
+    reporter.check_in(&CheckInEvent {
+        monitor: "memory-engine-api".to_owned(),
+        status: CheckInStatus::Alive,
+        summary: "memory-engine-api heartbeat".to_owned(),
+        ttl_ms: 120_000,
+        context: Some(serde_json::json!({ "source": "memory-engine-api" })),
+    });
+    reporter.drain(Duration::from_secs(2));
+
+    let request = request
+        .recv_timeout(Duration::from_secs(2))
+        .expect("request");
+    assert!(request.starts_with("POST /api/v1/check-ins"));
+    assert!(request.contains("Bearer sk_test_key"));
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(payload["monitor"], "memory-engine-api");
+    assert_eq!(payload["status"], "alive");
+    assert_eq!(payload["summary"], "memory-engine-api heartbeat");
+    assert_eq!(payload["ttl_ms"], 120_000);
+    assert_eq!(payload["context"]["source"], "memory-engine-api");
 }
 
 #[test]
