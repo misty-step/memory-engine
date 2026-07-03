@@ -450,6 +450,35 @@ pub fn init_error_reporting() {
     );
 }
 
+pub fn report_health_check_in() {
+    if let Some(reporter) = CANARY.get().and_then(Option::as_ref) {
+        reporter.check_in(&memory_engine_canary::CheckInEvent {
+            monitor: "memory-engine-api".to_owned(),
+            status: memory_engine_canary::CheckInStatus::Alive,
+            summary: "memory-engine-api heartbeat".to_owned(),
+            ttl_ms: 120_000,
+            context: Some(serde_json::json!({
+                "source": "memory-engine-api",
+            })),
+        });
+    }
+}
+
+pub fn start_health_reporting_loop() {
+    if CANARY.get().and_then(Option::as_ref).is_none() {
+        return;
+    }
+
+    report_health_check_in();
+    std::thread::Builder::new()
+        .name("canary-health".to_owned())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            report_health_check_in();
+        })
+        .ok();
+}
+
 fn report_internal_error(message: &str) {
     if let Some(reporter) = CANARY.get().and_then(Option::as_ref) {
         reporter.report(&memory_engine_canary::ErrorEvent {

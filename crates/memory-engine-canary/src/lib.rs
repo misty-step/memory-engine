@@ -45,6 +45,25 @@ impl Severity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckInStatus {
+    Alive,
+    InProgress,
+    Ok,
+    Error,
+}
+
+impl CheckInStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::InProgress => "in_progress",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// One error occurrence to record in Canary.
 #[derive(Clone, Debug)]
 pub struct ErrorEvent {
@@ -54,6 +73,15 @@ pub struct ErrorEvent {
     pub context: Option<serde_json::Value>,
     /// Grouping hint; empty lets Canary group by its own heuristics.
     pub fingerprint: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckInEvent {
+    pub monitor: String,
+    pub status: CheckInStatus,
+    pub summary: String,
+    pub ttl_ms: u64,
+    pub context: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +194,43 @@ impl CanaryReporter {
         // Builder::spawn returns Err instead of panicking when the OS cannot
         // create a thread; the moved slot was dropped with the closure, so
         // accounting stays correct and the event is simply lost.
+        drop(spawned);
+    }
+
+    /// Send one monitor check-in in the background. Uses the same bounded
+    /// in-flight accounting as error reporting.
+    pub fn check_in(&self, event: &CheckInEvent) {
+        if self.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+
+        let url = format!("{}/api/v1/check-ins", self.config.endpoint);
+        let authorization = format!("Bearer {}", self.config.api_key);
+        let body = serde_json::json!({
+            "monitor": event.monitor,
+            "status": event.status.label(),
+            "summary": event.summary,
+            "ttl_ms": event.ttl_ms,
+            "context": event.context,
+        });
+        let agent = self.agent.clone();
+        let slot = InFlightSlot(Arc::clone(&self.in_flight));
+        let spawned = thread::Builder::new()
+            .name("canary-check-in".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                for _ in 0..2 {
+                    let sent = agent
+                        .post(&url)
+                        .header("Authorization", &authorization)
+                        .send_json(&body)
+                        .is_ok();
+                    if sent {
+                        break;
+                    }
+                }
+            });
         drop(spawned);
     }
 
