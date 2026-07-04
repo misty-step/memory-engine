@@ -18,6 +18,8 @@
     "rust:import-probe": "cargo run -p memory-engine-import",
     "rust:web-shell": "cargo run -p memory-engine-web-shell",
     "rust:web-shell:receipt": "cargo run -p memory-engine-web-shell -- --receipt",
+    "rust:morning-review": "cargo run -p memory-engine-review",
+    "rust:morning-review:streak": "cargo run -p memory-engine-review -- streak",
     "rust:dogfood": "cargo run -p memory-engine-cli && cargo run -p memory-engine-import && cargo run -p memory-engine-web-shell -- --receipt",
     "rust:ci": "cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo doc --workspace --no-deps",
     "ci:fast": "bun run rust:ci",
