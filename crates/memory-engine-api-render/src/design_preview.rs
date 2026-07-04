@@ -6,7 +6,7 @@
 //! browser without booting the server or driving auth. Run it with:
 //!
 //! ```text
-//! cargo test -p memory-engine-api --lib emit_preview_pages -- --ignored --nocapture
+//! cargo test -p memory-engine-api-render --lib emit_preview_pages -- --ignored --nocapture
 //! ```
 //!
 //! The non-ignored `conformance_*` tests assert the aesthetic-kit Law and the
@@ -24,16 +24,19 @@ use memory_engine_study::{
     BetaStudyGrade, BetaStudyItemHistory, BetaStudySummary,
 };
 
-use crate::render::{render_app_shell, render_login_requested};
-use crate::{AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse};
+use crate::{render_app_shell, render_login_requested};
+use memory_engine_api_state::{
+    ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
+};
 
 fn account() -> AppAccount {
-    AppAccount {
-        browser_session_id: "preview-session-id".to_owned(),
-        account_id: "preview-account-id".to_owned(),
-        session_token: "preview-session-token".to_owned(),
-        csrf_token: "preview-csrf".to_owned(),
-    }
+    let state = ApiState::default();
+    let created = state
+        .create_account("preview@example.com")
+        .unwrap_or_else(|error| panic!("preview account must be valid: {}", error.message));
+    state
+        .create_browser_session(&created)
+        .unwrap_or_else(|error| panic!("preview browser session must be valid: {}", error.message))
 }
 
 fn source(id: &str, title: &str) -> SourceRecord {
@@ -374,16 +377,15 @@ fn pages() -> Vec<(&'static str, String)> {
 
 #[test]
 #[ignore = "writes HTML preview files; run explicitly with --ignored"]
-fn emit_preview_pages() {
+fn emit_preview_pages() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/design-preview");
-    fs::create_dir_all(out.join("static")).expect("create preview dir");
+    fs::create_dir_all(out.join("static"))?;
     // Mirror the served path `/static/aesthetic.css` so the pages resolve their
     // stylesheet when this directory is served at the root over HTTP.
     fs::write(
         out.join("static/aesthetic.css"),
         include_str!("../assets/aesthetic.css"),
-    )
-    .expect("write vendored css");
+    )?;
 
     let pages = pages();
     let mut index = String::from(
@@ -394,20 +396,20 @@ fn emit_preview_pages() {
 <p style='color:#fff;font:13px/1.4 system-ui;padding:14px 18px;margin:0'>Memory Engine — every UI state. Each frame is a full rendered page.</p>",
     );
     for (name, html) in &pages {
-        fs::write(out.join(format!("{name}.html")), html).expect("write page");
-        write!(
+        fs::write(out.join(format!("{name}.html")), html)?;
+        let _ = write!(
             index,
             "<section style='margin:0 0 18px'>\
 <p style='color:#d4d4d4;font:600 12px/1 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;padding:10px 18px;margin:0'>{name}</p>\
 <iframe src='{name}.html' loading='lazy' style='display:block;width:100%;max-width:920px;margin:0 auto;height:780px;border:0;background:#fff'></iframe>\
 </section>"
-        )
-        .expect("write index section");
+        );
     }
     index.push_str("</body></html>");
-    fs::write(out.join("index.html"), index).expect("write index");
+    fs::write(out.join("index.html"), index)?;
 
     eprintln!("\ndesign preview written to {}\n", out.display());
+    Ok(())
 }
 
 /// Durable aesthetic-kit conformance gate: every rendered state must consume the
@@ -451,11 +453,9 @@ fn conformance_every_state_consumes_the_design_system() {
 #[test]
 fn conformance_graded_review_carries_a_status_glyph_and_no_escape_hatches() {
     let pages = pages();
-    let graded = &pages
-        .iter()
-        .find(|(name, _)| *name == "07-graded-correct")
-        .expect("graded-correct preview state")
-        .1;
+    let Some((_, graded)) = pages.iter().find(|(name, _)| *name == "07-graded-correct") else {
+        panic!("graded-correct preview state missing");
+    };
     // Verdict reads as ink with the hue on the glyph, never as a colored word.
     assert!(
         graded.contains(r#"class="ae-icon ae-ok""#),

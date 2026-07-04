@@ -18,10 +18,13 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
 use memory_engine_study::infer_capture_title;
 
-use crate::{
+use memory_engine_api_render::{
+    render_account_page, render_action_result_html, render_app_shell, render_login_requested,
+    AESTHETIC_CSS,
+};
+use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
-    html_with_cleared_browser_session, normalize_email, read_session_token, render_account_page,
-    render_action_result_html, render_app_shell, render_login_requested, AccountCreated,
+    html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateSourceRequest, HealthResponse,
     SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
@@ -261,16 +264,15 @@ async fn healthz() -> Json<HealthResponse> {
     })
 }
 
-/// Serve the vendored Misty Step `aesthetic` stylesheet. Vendored into the
-/// crate (`assets/aesthetic.css`) so the binary is self-contained for deploy.
+/// Serve the vendored Misty Step `aesthetic` stylesheet. The render crate owns
+/// the markup and CSS; this HTTP crate only exposes the deployed static path.
 async fn static_aesthetic_css() -> impl IntoResponse {
-    const CSS: &str = include_str!("../assets/aesthetic.css");
     (
         [
             (CONTENT_TYPE, "text/css; charset=utf-8"),
             (CACHE_CONTROL, "public, max-age=3600"),
         ],
-        CSS,
+        AESTHETIC_CSS,
     )
 }
 
@@ -283,7 +285,7 @@ async fn app_home(State(state): State<ApiState>, headers: HeaderMap) -> Html<Str
     // session: a signed-in learner reloading or navigating to "/" lands on their
     // workspace (with the live due count and Start review CTA), not the
     // signed-out cover. Read-only session check — a GET carries no CSRF token.
-    match state.accounts.require_browser_session_readonly(&headers) {
+    match state.require_browser_session_readonly(&headers) {
         Ok(account) => Html(render_account_page(&state, &account, None, None)),
         Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
     }
@@ -295,7 +297,7 @@ async fn create_account(
 ) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
     let email = normalize_email(&request.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))?;
-    let account = state.accounts.create_account(&email)?;
+    let account = state.create_account(&email)?;
 
     Ok((StatusCode::CREATED, Json(account)))
 }
@@ -307,9 +309,7 @@ async fn create_source(
     Json(request): Json<CreateSourceRequest>,
 ) -> Result<(StatusCode, Json<SourceRecord>), ApiFailure> {
     let session_token = read_session_token(&headers)?;
-    let source = state
-        .accounts
-        .save_source(&account_id, session_token, &request)?;
+    let source = state.save_source(&account_id, session_token, &request)?;
 
     Ok((StatusCode::CREATED, Json(source)))
 }
@@ -322,7 +322,7 @@ async fn list_sources(
     let session_token = read_session_token(&headers)?;
 
     Ok(Json(SourceList {
-        sources: state.accounts.list_sources(&account_id, session_token)?,
+        sources: state.list_sources(&account_id, session_token)?,
     }))
 }
 
@@ -333,7 +333,7 @@ async fn generate_source(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.generate_source(
+    Ok(Json(state.generate_source(
         &account_id,
         session_token,
         &source_id,
@@ -346,9 +346,7 @@ async fn archive_source(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiFailure> {
     let session_token = read_session_token(&headers)?;
-    state
-        .accounts
-        .archive_source(&account_id, session_token, &source_id)?;
+    state.archive_source(&account_id, session_token, &source_id)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -360,7 +358,7 @@ async fn approve_draft(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.approve_draft(
+    Ok(Json(state.approve_draft(
         &account_id,
         session_token,
         &draft_id,
@@ -374,9 +372,7 @@ async fn next_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(
-        state.accounts.next_review(&account_id, session_token)?,
-    ))
+    Ok(Json(state.next_review(&account_id, session_token)?))
 }
 
 async fn reveal_review(
@@ -386,7 +382,7 @@ async fn reveal_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.reveal_review(
+    Ok(Json(state.reveal_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -400,7 +396,7 @@ async fn reference_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.learn_more_review(
+    Ok(Json(state.learn_more_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -414,7 +410,7 @@ async fn skip_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.skip_review(
+    Ok(Json(state.skip_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -428,7 +424,7 @@ async fn snooze_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.snooze_review(
+    Ok(Json(state.snooze_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -442,7 +438,7 @@ async fn bridge_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.bridge_review(
+    Ok(Json(state.bridge_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -457,7 +453,7 @@ async fn submit_review(
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
 
-    Ok(Json(state.accounts.submit_review(
+    Ok(Json(state.submit_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -543,9 +539,7 @@ async fn create_app_account(
     headers: HeaderMap,
     Form(form): Form<AppAccountForm>,
 ) -> Response {
-    let result = state
-        .accounts
-        .request_magic_link(&form.email, &client_rate_limit_key(&headers));
+    let result = state.request_magic_link(&form.email, &client_rate_limit_key(&headers));
 
     match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
@@ -557,12 +551,9 @@ async fn verify_app_login(
     State(state): State<ApiState>,
     Query(query): Query<AppLoginVerifyQuery>,
 ) -> Response {
-    match state.accounts.verify_magic_link(&query.token) {
+    match state.verify_magic_link(&query.token) {
         Ok(account) => {
-            let view = state
-                .accounts
-                .study_view(&account.account_id, &account.session_token)
-                .ok();
+            let view = state.app_study_view(&account).ok();
             html_with_browser_session(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
@@ -577,10 +568,7 @@ async fn logout_app_session(
     headers: HeaderMap,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
-    match state
-        .accounts
-        .revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
+    match state.revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
         Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
         Err(error) => error.into_response(),
     }
@@ -591,38 +579,23 @@ async fn save_app_account(
     headers: HeaderMap,
     Form(form): Form<AppSaveAccountForm>,
 ) -> Response {
-    let source_account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let source_view = state
-        .accounts
-        .study_view(&source_account.account_id, &source_account.session_token)
-        .ok();
+    let source_account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let source_view = state.app_study_view(&source_account).ok();
     let result = normalize_email(&form.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))
-        .and_then(|email| {
-            state.accounts.save_account(
-                &source_account.account_id,
-                &source_account.session_token,
-                &email,
-            )
-        });
+        .and_then(|email| state.save_account(&source_account, &email));
 
     match result {
         Ok(account) => {
-            let account = match state.accounts.create_browser_session(&account) {
+            let account = match state.create_browser_session(&account) {
                 Ok(account) => account,
                 Err(error) => return error.into_response(),
             };
-            let view = state
-                .accounts
-                .study_view(&account.account_id, &account.session_token)
-                .ok()
-                .or(source_view);
+            let view = state.app_study_view(&account).ok().or(source_view);
             html_with_browser_session(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
@@ -643,20 +616,19 @@ async fn start_app_study(
     Form(form): Form<AppStartForm>,
 ) -> Response {
     let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
-    let account = match state.accounts.create_account(&email) {
+    let account = match state.create_account(&email) {
         Ok(account) => account,
         Err(error) => {
             return Html(render_app_shell(None, &[], None, &[], Some(&error.message)))
                 .into_response();
         }
     };
-    let account = match state.accounts.create_browser_session(&account) {
+    let account = match state.create_browser_session(&account) {
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let result = state.accounts.save_source(
-        &account.account_id,
-        &account.session_token,
+    let result = state.save_app_source(
+        &account,
         &capture_request(form.title, form.body, form.capture),
     );
 
@@ -671,16 +643,13 @@ async fn create_app_source(
     headers: HeaderMap,
     Form(form): Form<AppSourceForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.save_source(
-        &account.account_id,
-        &account.session_token,
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.save_app_source(
+        &account,
         &capture_request(form.title, form.body, form.capture),
     );
 
@@ -701,35 +670,28 @@ async fn capture_app_source(
     headers: HeaderMap,
     Form(form): Form<AppSourceForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let request = capture_request(form.title, form.body, form.capture);
-    let notice =
-        match state
-            .accounts
-            .save_source(&account.account_id, &account.session_token, &request)
-        {
-            Ok(source) => {
-                state
-                    .jobs
-                    .enqueue(&account.account_id, &source.source_id, &request.title);
-                "Generating your cards — they'll appear below as they're ready."
-            }
-            Err(error) => {
-                return Html(render_account_page(
-                    &state,
-                    &account,
-                    None,
-                    Some(&error.message),
-                ))
-                .into_response()
-            }
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
         };
+    let request = capture_request(form.title, form.body, form.capture);
+    let notice = match state.save_app_source(&account, &request) {
+        Ok(source) => {
+            let _ =
+                state.enqueue_generation_job_by_source(&account, &source.source_id, &request.title);
+            "Generating your cards — they'll appear below as they're ready."
+        }
+        Err(error) => {
+            return Html(render_account_page(
+                &state,
+                &account,
+                None,
+                Some(&error.message),
+            ))
+            .into_response()
+        }
+    };
 
     Html(render_account_page(&state, &account, None, Some(notice))).into_response()
 }
@@ -770,16 +732,13 @@ async fn generate_app_source(
     headers: HeaderMap,
     Form(form): Form<AppSourceActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
     let title = state
-        .accounts
-        .list_sources(&account.account_id, &account.session_token)
+        .list_app_sources(&account)
         .ok()
         .and_then(|sources| {
             sources
@@ -788,9 +747,7 @@ async fn generate_app_source(
                 .map(|source| source.title)
         })
         .unwrap_or_else(|| "New material".to_owned());
-    state
-        .jobs
-        .enqueue(&account.account_id, &form.source_id, &title);
+    let _ = state.enqueue_generation_job_by_source(&account, &form.source_id, &title);
 
     Html(render_account_page(
         &state,
@@ -806,17 +763,12 @@ async fn archive_app_source(
     headers: HeaderMap,
     Form(form): Form<AppSourceActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result =
-        state
-            .accounts
-            .archive_source(&account.account_id, &account.session_token, &form.source_id);
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.archive_app_source(&account, &form.source_id);
 
     match result {
         Ok(view) => Html(render_account_page(
@@ -843,14 +795,12 @@ async fn retry_app_job(
     headers: HeaderMap,
     Form(form): Form<AppJobActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let notice = if state.jobs.retry(&account.account_id, &form.job_id) {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let notice = if state.retry_generation_job(&account, &form.job_id) {
         "Retrying — generating again in the background."
     } else {
         "That job can't be retried."
@@ -863,14 +813,14 @@ async fn retry_app_job(
 /// happen so the activity log updates without a reload. The page is already
 /// server-authoritative, so this is pure progressive enhancement.
 async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    let account = match state.accounts.require_browser_session_readonly(&headers) {
+    let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
         Err(error) => return error.into_response(),
     };
-    let account_id = account.account_id;
+    let account_id = account.account_id().to_owned();
     // `tokio_stream::StreamExt::filter_map` is synchronous: the closure returns
     // an `Option` directly, not a future.
-    let stream = BroadcastStream::new(state.jobs.subscribe()).filter_map(move |message| {
+    let stream = BroadcastStream::new(state.subscribe_jobs()).filter_map(move |message| {
         match message {
             // Full-state snapshots, scoped to this learner. A lagged subscriber
             // simply skips to the next event — the page reload is authoritative.
@@ -907,16 +857,12 @@ async fn next_app_review(
     headers: HeaderMap,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state
-        .accounts
-        .next_review(&account.account_id, &account.session_token);
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.next_app_review(&account);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -926,18 +872,12 @@ async fn reveal_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.reveal_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.reveal_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -947,18 +887,12 @@ async fn reference_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.learn_more_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.learn_more_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -968,18 +902,12 @@ async fn skip_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.skip_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.skip_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -989,18 +917,12 @@ async fn delete_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.delete_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.delete_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -1010,18 +932,12 @@ async fn snooze_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.snooze_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.snooze_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -1031,18 +947,12 @@ async fn bridge_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.bridge_review(
-        &account.account_id,
-        &account.session_token,
-        &form.review_unit_id,
-    );
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.bridge_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
@@ -1052,16 +962,13 @@ async fn submit_app_review(
     headers: HeaderMap,
     Form(form): Form<AppReviewSubmitForm>,
 ) -> Response {
-    let account = match state
-        .accounts
-        .require_browser_session(&headers, csrf_token(form.csrf_token.as_ref()))
-    {
-        Ok(account) => account,
-        Err(error) => return error.into_response(),
-    };
-    let result = state.accounts.submit_review(
-        &account.account_id,
-        &account.session_token,
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.submit_app_review(
+        &account,
         &form.review_unit_id,
         &SubmitReviewRequest {
             answer: form.answer,

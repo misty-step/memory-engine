@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+
 use std::{env, net::SocketAddr, process};
 
 use memory_engine_api::{

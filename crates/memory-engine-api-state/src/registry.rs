@@ -18,6 +18,11 @@ impl AccountRegistry {
     ///
     /// The first slice keeps this registry in-memory while the Postgres adapter
     /// is shaped behind the same account-scoped route contract.
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
         // Found live during ticket-42 QA: this route issued a session token to
         // any email, bypassing the allowlist the magic-link flow enforces.
@@ -56,6 +61,11 @@ impl AccountRegistry {
         Ok(account)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn save_account(
         &self,
         source_account_id: &str,
@@ -100,6 +110,11 @@ impl AccountRegistry {
         Ok(target)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn request_magic_link(
         &self,
         email: &str,
@@ -135,6 +150,11 @@ impl AccountRegistry {
         })
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
         let token_hash = secret_hash(token.trim());
         let email = self
@@ -196,6 +216,11 @@ impl AccountRegistry {
         Ok(account)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn save_source(
         &self,
         account_id: &str,
@@ -226,6 +251,11 @@ impl AccountRegistry {
         Ok(source)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn list_sources(
         &self,
         account_id: &str,
@@ -237,6 +267,11 @@ impl AccountRegistry {
         storage.list_sources(account_id, &account.store_path)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn generate_source(
         &self,
         account_id: &str,
@@ -255,6 +290,11 @@ impl AccountRegistry {
     /// Session-free by design — enqueueing was already authorized in the request
     /// that created the job, and the background worker is trusted, so it keys off
     /// the account id alone rather than carrying a credential.
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn run_generation_job(
         &self,
         account_id: &str,
@@ -287,6 +327,11 @@ impl AccountRegistry {
         Ok(card_count)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn archive_source(
         &self,
         account_id: &str,
@@ -298,6 +343,11 @@ impl AccountRegistry {
             .archive_source(account_id, &account.store_path, source_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn approve_draft(
         &self,
         account_id: &str,
@@ -309,6 +359,11 @@ impl AccountRegistry {
             .approve_draft(account_id, &account.store_path, draft_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn next_review(
         &self,
         account_id: &str,
@@ -318,6 +373,11 @@ impl AccountRegistry {
         self.storage().next_review(account_id, &account.store_path)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn study_view(
         &self,
         account_id: &str,
@@ -327,6 +387,11 @@ impl AccountRegistry {
         self.storage().study_view(account_id, &account.store_path)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn reveal_review(
         &self,
         account_id: &str,
@@ -338,6 +403,11 @@ impl AccountRegistry {
             .reveal_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn learn_more_review(
         &self,
         account_id: &str,
@@ -349,6 +419,11 @@ impl AccountRegistry {
             .learn_more_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn skip_review(
         &self,
         account_id: &str,
@@ -363,6 +438,11 @@ impl AccountRegistry {
     /// Permanently remove a review card from the learner's queue. Backed by
     /// archival (`archived_at`), so the card never resurfaces in review while
     /// the underlying record stays recoverable in storage.
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn delete_review(
         &self,
         account_id: &str,
@@ -374,6 +454,11 @@ impl AccountRegistry {
             .delete_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn snooze_review(
         &self,
         account_id: &str,
@@ -385,6 +470,11 @@ impl AccountRegistry {
             .snooze_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn bridge_review(
         &self,
         account_id: &str,
@@ -396,6 +486,11 @@ impl AccountRegistry {
             .bridge_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn submit_review(
         &self,
         account_id: &str,
@@ -440,6 +535,11 @@ impl AccountRegistry {
         Ok(response)
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn create_browser_session(
         &self,
         account: &AccountCreated,
@@ -466,6 +566,11 @@ impl AccountRegistry {
         })
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn require_browser_session(
         &self,
         headers: &HeaderMap,
@@ -510,6 +615,11 @@ impl AccountRegistry {
     /// returned account still carries the session's derived CSRF token so a
     /// rendered home can emit valid forms (the actual CSRF guard runs when those
     /// forms POST back through [`AccountRegistry::require_browser_session`]).
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn require_browser_session_readonly(
         &self,
         headers: &HeaderMap,
@@ -545,6 +655,11 @@ impl AccountRegistry {
         })
     }
 
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn revoke_browser_session(
         &self,
         headers: &HeaderMap,

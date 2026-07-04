@@ -2,6 +2,8 @@
 members = [
     "crates/memory-engine",
     "crates/memory-engine-api",
+    "crates/memory-engine-api-render",
+    "crates/memory-engine-api-state",
     "crates/memory-engine-beta-app",
     "crates/memory-engine-bench",
     "crates/memory-engine-canary",

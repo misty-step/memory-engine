@@ -833,6 +833,36 @@ name = "memory-engine-api"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "memory-engine-api-render",
+ "memory-engine-api-state",
+ "memory-engine-core",
+ "memory-engine-persistence",
+ "memory-engine-persistence-postgres",
+ "memory-engine-study",
+ "postgres",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower",
+]
+
+[[package]]
+name = "memory-engine-api-render"
+version = "0.0.0"
+dependencies = [
+ "memory-engine-api-state",
+ "memory-engine-core",
+ "memory-engine-persistence",
+ "memory-engine-study",
+]
+
+[[package]]
+name = "memory-engine-api-state"
+version = "0.0.0"
+dependencies = [
+ "axum",
  "memory-engine-canary",
  "memory-engine-core",
  "memory-engine-generation",
@@ -841,14 +871,11 @@ dependencies = [
  "memory-engine-persistence-postgres",
  "memory-engine-service",
  "memory-engine-study",
- "postgres",
  "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
- "tokio-stream",
- "tower",
 ]
 
 [[package]]

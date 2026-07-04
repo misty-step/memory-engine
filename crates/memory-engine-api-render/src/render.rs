@@ -12,11 +12,12 @@ use std::fmt::Write as _;
 
 use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent};
 
-use crate::{
+use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
 };
 
-pub(crate) fn render_action_result_html(
+#[must_use]
+pub fn render_action_result_html(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
@@ -27,27 +28,22 @@ pub(crate) fn render_action_result_html(
     }
 }
 
-pub(crate) fn render_account_page(
+#[must_use]
+pub fn render_account_page(
     state: &ApiState,
     account: &AppAccount,
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
 ) -> String {
-    let sources = state
-        .accounts
-        .list_sources(&account.account_id, &account.session_token)
-        .unwrap_or_default();
-    let jobs = state.jobs.jobs_for(&account.account_id);
+    let sources = state.list_app_sources(account).unwrap_or_default();
+    let jobs = state.jobs_for_app_account(account);
     // When the caller doesn't supply a view (capture, generate, retry-refresh,
     // GET home), fetch the live study view so the due count and "Start review"
     // CTA reflect committed state instead of rendering an empty placeholder that
     // reads "0 due" and hides the way into review. Review screens pass their own
     // view (with an active `current`) and keep it.
     let fetched = if view.is_none() {
-        state
-            .accounts
-            .study_view(&account.account_id, &account.session_token)
-            .ok()
+        state.app_study_view(account).ok()
     } else {
         None
     };
@@ -55,7 +51,8 @@ pub(crate) fn render_account_page(
     render_app_shell(Some(account), &sources, view, &jobs, notice)
 }
 
-pub(crate) fn render_app_shell(
+#[must_use]
+pub fn render_app_shell(
     account: Option<&AppAccount>,
     sources: &[SourceRecord],
     view: Option<&StudyViewResponse>,
@@ -69,7 +66,8 @@ pub(crate) fn render_app_shell(
     document(&inner)
 }
 
-pub(crate) fn render_login_requested(debug_link: Option<&str>) -> String {
+#[must_use]
+pub fn render_login_requested(debug_link: Option<&str>) -> String {
     let debug = debug_link.map_or_else(String::new, |link| {
         format!(
             r#"<p><a href="{}" class="ae-accent">Open sign-in link</a></p>"#,
@@ -270,7 +268,7 @@ fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
 
     let mut rows = String::new();
     for source in sources {
-        write!(
+        let _ = write!(
             rows,
             r#"<article class="me-source">
 <p class="ae-item">{title}</p>
@@ -284,8 +282,7 @@ fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
             id = escape_html(&source.source_id),
             csrf_archive = hidden_csrf_input(account),
             id_archive = escape_html(&source.source_id),
-        )
-        .expect("write source html");
+        );
     }
 
     format!(
@@ -437,12 +434,11 @@ fn render_answer_reveal(current: &BetaStudyCurrent) -> String {
             "me-graded-choice me-graded-choice-dim"
         };
         let mark = if is_correct { ICON_OK } else { "" };
-        write!(
+        let _ = write!(
             rows,
             r#"<li class="{class}"><span>{}</span>{mark}</li>"#,
             escape_html(choice)
-        )
-        .expect("write graded choice html");
+        );
     }
     format!(r#"<ol class="me-choices me-choices-graded">{rows}</ol>"#)
 }
@@ -480,13 +476,12 @@ fn render_answer_block(account: &AppAccount, current: &BetaStudyCurrent) -> Stri
 fn render_choice_buttons(account: &AppAccount, current: &BetaStudyCurrent) -> String {
     let mut buttons = String::new();
     for choice in &current.choices {
-        write!(
+        let _ = write!(
             buttons,
             r#"<button class="me-choice" type="submit" name="answer" value="{value}">{label}</button>"#,
             value = escape_html(choice),
             label = escape_html(choice),
-        )
-        .expect("write choice button html");
+        );
     }
     format!(
         r#"<form class="me-choices-form" action="/app/submit" method="post">{hidden}{buttons}</form>"#,
@@ -572,7 +567,7 @@ fn render_concept_progress(concepts: &[BetaStudyConceptProgress]) -> String {
         } else {
             0
         };
-        write!(
+        let _ = write!(
             rows,
             r#"<div class="me-concept">
 <div class="me-concept-head"><strong>{label}</strong><span class="me-trend ae-dim">{trend_icon} {trend}</span></div>
@@ -585,8 +580,7 @@ fn render_concept_progress(concepts: &[BetaStudyConceptProgress]) -> String {
             fill = health_fill_class(&concept.health),
             success_rate = escape_html(&concept.success_rate),
             summary = escape_html(&concept.summary),
-        )
-        .expect("write concept progress html");
+        );
     }
 
     format!(
@@ -681,7 +675,7 @@ fn trend_icon(trend: &str) -> &'static str {
 fn hidden_csrf_input(account: &AppAccount) -> String {
     format!(
         r#"<input type="hidden" name="csrfToken" value="{}">"#,
-        escape_html(&account.csrf_token)
+        escape_html(account.csrf_token())
     )
 }
 
