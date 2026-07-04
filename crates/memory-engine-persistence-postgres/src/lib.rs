@@ -7,7 +7,8 @@
 use std::{cell::RefCell, error::Error, fmt};
 
 use memory_engine_core::{
-    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ScheduleState,
+    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ReviewUnitLifecycle,
+    ScheduleState,
 };
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
@@ -785,6 +786,23 @@ impl AccountStudyStore<'_> {
         Ok(review_unit)
     }
 
+    /// Replace volatile lifecycle metadata without changing schedule history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the review unit is unknown.
+    pub fn set_review_unit_lifecycle(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        lifecycle: ReviewUnitLifecycle,
+    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+        let mut review_unit = self.review_unit(review_unit_id)?;
+        review_unit.queue.lifecycle = lifecycle;
+        self.save_review_unit(&review_unit)?;
+
+        Ok(review_unit)
+    }
+
     /// Save or replace source material for the scoped account.
     ///
     /// # Errors
@@ -1249,6 +1267,14 @@ impl BetaStudyStore for AccountStudyStore<'_> {
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::snooze_review_unit_until(self, review_unit_id, snoozed_until)
     }
+
+    fn set_review_unit_lifecycle(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        lifecycle: ReviewUnitLifecycle,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::set_review_unit_lifecycle(self, review_unit_id, lifecycle)
+    }
 }
 
 fn query_json_column<T>(
@@ -1601,7 +1627,8 @@ fn _receipt_type_anchor(_: &AppliedReviewReceipt) {}
 #[cfg(test)]
 mod tests {
     use memory_engine_core::{
-        ExactPrompt, ExactPromptKind, Prompt, ReviewUnitId, ScheduleState, ScheduleStatus,
+        ExactPrompt, ExactPromptKind, Prompt, ReviewUnitId, ReviewUnitLifecycle, ScheduleState,
+        ScheduleStatus,
     };
 
     #[test]
@@ -1980,10 +2007,12 @@ mod tests {
             id: id.to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Live Postgres source".to_owned(),
+            project_key: None,
             body: Some("Pater noster means Our Father.".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         }
@@ -2011,6 +2040,8 @@ mod tests {
                 "Reference: C is CHARLIE. A is ALFA. T is TANGO.",
             ]
             .join("\n"),
+            project_key: None,
+            ttl_expires_at: None,
         }
     }
 
@@ -2117,6 +2148,7 @@ mod tests {
         PersistedQueueCandidate {
             review_unit_id: review_unit_id.clone(),
             due: NOW - 60_000,
+            lifecycle: ReviewUnitLifecycle::active(),
             progression: None,
             concept_key: Some("latin-prayer-opening".to_owned()),
             source_key: Some("live-postgres-source".to_owned()),

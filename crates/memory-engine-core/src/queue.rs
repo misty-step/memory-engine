@@ -36,6 +36,7 @@ pub fn reviewable_queue_candidates(
 ) -> Vec<QueueCandidate> {
     let due_candidates = candidates
         .iter()
+        .filter(|candidate| candidate.lifecycle.is_schedulable(options.now))
         .filter(|candidate| candidate.due <= options.now)
         .cloned()
         .collect::<Vec<_>>();
@@ -43,9 +44,18 @@ pub fn reviewable_queue_candidates(
         return Vec::new();
     }
 
-    let population = options.population.unwrap_or(candidates);
-    let eligibility =
-        filter_eligible_candidates_with_fallback(&due_candidates, mastery_policy, Some(population));
+    let population = options
+        .population
+        .unwrap_or(candidates)
+        .iter()
+        .filter(|candidate| candidate.lifecycle.is_schedulable(options.now))
+        .cloned()
+        .collect::<Vec<_>>();
+    let eligibility = filter_eligible_candidates_with_fallback(
+        &due_candidates,
+        mastery_policy,
+        Some(&population),
+    );
     let available_ids = eligibility
         .available
         .iter()
@@ -247,7 +257,10 @@ fn to_progression_candidate(candidate: &QueueCandidate) -> ProgressionCandidate<
 
 #[cfg(test)]
 mod tests {
-    use crate::{ProgressionMetadata, QueueSeparationPass, ReviewUnitId};
+    use crate::{
+        ProgressionMetadata, QueueSeparationPass, ReviewUnitId, ReviewUnitLifecycle,
+        ReviewUnitRetirement, ReviewUnitRetirementReason,
+    };
 
     use super::*;
 
@@ -277,6 +290,7 @@ mod tests {
             review_unit_id: ReviewUnitId::new(id),
             schedule_state,
             due,
+            lifecycle: ReviewUnitLifecycle::active(),
             progression: None,
             concept_key: None,
             source_key: source_key.map(str::to_owned),
@@ -393,5 +407,88 @@ mod tests {
         );
 
         assert_eq!(next, Some(locked));
+    }
+
+    #[test]
+    fn skips_ttl_expired_candidates_before_queue_priority() {
+        let mut expired = candidate(
+            "expired",
+            Some(state(ScheduleStatus::Review, 4, 7, NOW - 60_000)),
+            NOW - 60_000,
+            Some("project-a"),
+        );
+        expired.lifecycle = ReviewUnitLifecycle::ttl_expires_at(NOW - 1);
+        let active = candidate(
+            "active",
+            Some(state(ScheduleStatus::Review, 4, 7, NOW - 30_000)),
+            NOW - 30_000,
+            Some("project-a"),
+        );
+
+        let reviewable = reviewable_queue_candidates(
+            &[expired.clone(), active.clone()],
+            mastered,
+            &options(&[], None),
+        );
+        let next = pick_next_queue_candidate(&[expired, active], mastered, &options(&[], None));
+
+        assert_eq!(
+            reviewable
+                .iter()
+                .map(|candidate| candidate.review_unit_id.clone())
+                .collect::<Vec<_>>(),
+            vec![ReviewUnitId::new("active")]
+        );
+        assert_eq!(
+            next.map(|candidate| candidate.review_unit_id),
+            Some(ReviewUnitId::new("active"))
+        );
+    }
+
+    #[test]
+    fn skips_invalidated_candidates_before_queue_priority() {
+        let mut invalidated = candidate(
+            "invalidated",
+            Some(state(ScheduleStatus::Review, 5, 7, NOW - 120_000)),
+            NOW - 120_000,
+            Some("project-a"),
+        );
+        invalidated.lifecycle = ReviewUnitLifecycle::invalidated_at(NOW - 60_000);
+        let active = candidate(
+            "active",
+            Some(state(ScheduleStatus::Review, 4, 7, NOW - 30_000)),
+            NOW - 30_000,
+            Some("project-a"),
+        );
+
+        let next = pick_next_queue_candidate(&[invalidated, active], mastered, &options(&[], None));
+
+        assert_eq!(
+            next.map(|candidate| candidate.review_unit_id),
+            Some(ReviewUnitId::new("active"))
+        );
+    }
+
+    #[test]
+    fn describes_lifecycle_retirement_as_pure_policy_over_passed_now() {
+        let active = ReviewUnitLifecycle::ttl_expires_at(NOW + 60_000);
+        let expired = ReviewUnitLifecycle::ttl_expires_at(NOW);
+        let invalidated = ReviewUnitLifecycle::invalidated_at(NOW - 1);
+
+        assert_eq!(active.retirement_at(NOW), None);
+        assert_eq!(
+            expired.retirement_at(NOW),
+            Some(ReviewUnitRetirement {
+                reason: ReviewUnitRetirementReason::TtlExpired,
+                occurred_at: NOW
+            })
+        );
+        assert_eq!(
+            invalidated.retirement_at(NOW),
+            Some(ReviewUnitRetirement {
+                reason: ReviewUnitRetirementReason::Invalidated,
+                occurred_at: NOW - 1
+            })
+        );
     }
 }

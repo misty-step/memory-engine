@@ -7,8 +7,8 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use memory_engine_core::{
-    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, ReviewUnitId, ScheduleState,
-    ScheduleStatus, Verdict,
+    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, ReviewUnitId, ReviewUnitLifecycle,
+    ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceStore, NextQueueCommand, NextQueueOptions,
@@ -201,6 +201,7 @@ impl MemoryServiceStore for ImportProbeStore {
                         .as_ref()
                         .map_or(candidate.due, |state| state.due),
                     schedule_state,
+                    lifecycle: candidate.lifecycle,
                     progression: candidate.progression.clone(),
                     concept_key: candidate.concept_key.clone(),
                     source_key: candidate.source_key.clone(),
@@ -296,6 +297,7 @@ fn compile_authored_fixture(fixture: &AuthoredFixture, now: i64) -> CompiledImpo
             due: schedule_state
                 .as_ref()
                 .map_or(now - ONE_MINUTE_MS, |state| state.due),
+            lifecycle: ReviewUnitLifecycle::active(),
             progression: None,
             concept_key: Some(card.concept_key.to_owned()),
             source_key: Some(fixture.source_key.to_owned()),

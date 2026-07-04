@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ME-069 Volatile Knowledge Plan</title>
+  <style>
+    body { margin: 0; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172026; background: #f7f8f8; }
+    main { width: min(1100px, calc(100% - 40px)); margin: 0 auto; padding: 40px 0 64px; }
+    h1, h2 { line-height: 1.1; margin: 0; }
+    h1 { font-size: clamp(36px, 5vw, 64px); max-width: 850px; }
+    h2 { font-size: 17px; letter-spacing: .04em; text-transform: uppercase; color: #2d5c51; }
+    p { margin: 12px 0 0; }
+    code { background: #e9eeee; padding: 1px 5px; border-radius: 4px; }
+    .hero { display: grid; grid-template-columns: 1.25fr .75fr; gap: 32px; align-items: end; padding: 32px 0; border-bottom: 1px solid #ccd5d2; }
+    .panel, .cell { background: #fff; border: 1px solid #d7dfdc; border-radius: 8px; padding: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
+    .grid.two { grid-template-columns: repeat(2, 1fr); }
+    .muted { color: #5e6d69; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
+    th, td { border: 1px solid #d7dfdc; padding: 10px; text-align: left; vertical-align: top; }
+    th { background: #edf3f1; color: #284d45; }
+    @media (max-width: 840px) { .hero, .grid, .grid.two { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <div>
+      <p class="muted">ME-069 / Powder card / volatile-knowledge mode</p>
+      <h1>Add a pure two-clocks model: FSRS handles forgetting; volatile decision cards retire on obsolescence.</h1>
+      <p>Chosen design: core owns JSON-safe lifecycle policy and queue eligibility over a caller-supplied <code>now</code>; API/state/persistence own project deck creation, TTL assignment, event invalidation, and source/deck retirement.</p>
+    </div>
+    <aside class="panel">
+      <h2>Quality System</h2>
+      <p><strong>Outcome:</strong> a project deck can produce review cards, then TTL or architecture-change invalidation removes those cards from scheduling.</p>
+      <p><strong>Standards:</strong> pure kernel, Rust-only runtime, #27 API split respected, no hidden clocks in core, backward-compatible persisted snapshots.</p>
+      <p><strong>Proof:</strong> core tests, API route test, live local request transcript, <code>bun run ci</code>, and <code>bun run ci:full</code>.</p>
+    </aside>
+  </section>
+
+  <section class="grid">
+    <article class="cell">
+      <h2>Acceptance</h2>
+      <p>ADR documents two clocks, TTL cards, project decks, webhook/API retirement, promotion, and core exclusions.</p>
+      <p>Core exposes lifecycle types and filters expired/invalidated cards through pure passed-in time.</p>
+    </article>
+    <article class="cell">
+      <h2>Verification</h2>
+      <p>Claim: retired volatile cards stop scheduling. Falsifier: <code>/review/next</code> still returns the retired review unit after TTL/invalidation.</p>
+      <p>Driver: focused Rust tests plus a local API request replay written into the receipt.</p>
+    </article>
+    <article class="cell">
+      <h2>Stop If</h2>
+      <p>Stop if project deck behavior requires moving persistence, clocks, webhooks, HTTP, or source-specific triggers into <code>memory-engine-core</code>.</p>
+      <p>Stop if full CI exposes an unrelated dirty or infra failure that cannot be locally resolved without operator approval.</p>
+    </article>
+  </section>
+
+  <section class="grid two">
+    <article class="cell">
+      <h2>Change Shape</h2>
+      <p>Docs: add <code>docs/architecture/adr-002-volatile-knowledge-two-clocks.md</code>.</p>
+      <p>Kernel: add lifecycle metadata to <code>QueueCandidate</code> and reference queue filtering behavior.</p>
+      <p>Boundary: persist lifecycle metadata and expose minimal v1 project deck create/invalidate routes in the #27 split crates.</p>
+    </article>
+    <article class="cell">
+      <h2>Non-goals</h2>
+      <p>No generic agent memory store, no external webhook runner, no production auth changes, no model-generated event classifiers, no core clock reads, no storage in core.</p>
+    </article>
+  </section>
+
+  <section class="cell" style="margin-top: 18px">
+    <h2>Alternatives</h2>
+    <table>
+      <thead><tr><th>Option</th><th>Why it helps</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Reuse source archive only</td><td>Smallest boundary behavior; already retires generated cards.</td><td>Insufficient: no typed TTL/invalidated core policy.</td></tr>
+        <tr><td>Add lifecycle to scheduler state</td><td>Puts all timing on the schedule object.</td><td>Rejected: FSRS state models recall, not source obsolescence.</td></tr>
+        <tr><td>Add lifecycle to queue candidate</td><td>Queue selection is where schedulability is decided; pure, caller-timed, backward-compatible.</td><td>Chosen.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="cell" style="margin-top: 18px">
+    <h2>Review Focus</h2>
+    <p>Use the works critique lens: public API coherence, hidden workflow ordering, compatibility of persisted JSON, and whether a future operator can tell why a deck stopped scheduling. Ignore naming nits unless they hide one of those failures.</p>
+  </section>
+</main>
+</body>
+</html>

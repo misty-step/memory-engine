@@ -5,12 +5,13 @@ use memory_engine_persistence::GeneratedPromptValidationStatus;
 
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
-    new_session_token, normalize_email, normalize_required_text, read_browser_session_id,
-    require_account_session, secret_hash, session_csrf_token, source_id_for, AccountCreated,
-    AccountRecord, AccountRegistry, ApiFailure, AppAccount, AuthConfig, AuthLinkDelivery,
-    BrowserSessionRecord, CreateSourceRequest, MagicLinkRequest, SourceRecord, StudyStorage,
-    StudyViewResponse, SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
-    APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS,
+    new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
+    read_browser_session_id, require_account_session, secret_hash, session_csrf_token,
+    source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
+    AuthConfig, AuthLinkDelivery, BrowserSessionRecord, CreateProjectDeckRequest,
+    CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
+    SourceRecord, StudyStorage, StudyViewResponse, SubmitReviewRequest,
+    APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS,
 };
 
 impl AccountRegistry {
@@ -234,6 +235,8 @@ impl AccountRegistry {
             source_id: source_id_for(account_id, &title, &body),
             title,
             body,
+            project_key: None,
+            ttl_expires_at: None,
         };
 
         let storage = self.storage();
@@ -249,6 +252,66 @@ impl AccountRegistry {
             .or_insert_with(|| source.clone());
 
         Ok(source)
+    }
+
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, validation, or storage rejects the deck.
+    pub(crate) fn create_project_deck(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        request: &CreateProjectDeckRequest,
+    ) -> Result<ProjectDeckRecord, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let project_key = normalize_required_text(&request.project_key, "Project key")?;
+        let title = normalize_required_text(&request.title, "Project deck title")?;
+        let body = normalize_required_text(&request.body, "Project deck body")?;
+        let source = SourceRecord {
+            source_id: project_deck_id_for(account_id, &project_key, &title, &body),
+            title,
+            body,
+            project_key: Some(project_key.clone()),
+            ttl_expires_at: request.ttl_expires_at,
+        };
+
+        let storage = self.storage();
+        storage.save_source(account_id, &account.store_path, &source)?;
+        let mut data = self.lock_data();
+        let record = data
+            .accounts
+            .entry(account_id.to_owned())
+            .or_insert_with(|| account.clone());
+        record
+            .sources
+            .entry(source.source_id.clone())
+            .or_insert_with(|| source.clone());
+
+        Ok(ProjectDeckRecord {
+            deck_id: source.source_id.clone(),
+            project_key,
+            source,
+        })
+    }
+
+    /// Runs an API registry operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, deck lookup, or storage rejects the event.
+    pub(crate) fn invalidate_project_deck(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        deck_id: &str,
+        request: &InvalidateProjectDeckRequest,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        normalize_required_text(&request.event, "Invalidation event")?;
+        self.storage()
+            .invalidate_project_deck(account_id, &account.store_path, deck_id, self.now())
     }
 
     /// Runs an API registry operation.

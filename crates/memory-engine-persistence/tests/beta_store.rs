@@ -1,6 +1,6 @@
 use memory_engine_core::{
-    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, Rating, ReviewUnitId, ScheduleState,
-    ScheduleStatus,
+    ExactPrompt, ExactPromptKind, Prompt, QueueCandidate, Rating, ReviewUnitId,
+    ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
 };
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
@@ -89,6 +89,7 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
             review_unit_id: review_unit_id("beta-pater-noster"),
             schedule_state: Some(review.schedule_state.clone()),
             due: review.schedule_state.due,
+            lifecycle: ReviewUnitLifecycle::active(),
             progression: None,
             concept_key: Some("lords-prayer-opening".to_owned()),
             source_key: Some("latin-prayer-note".to_owned()),
@@ -499,10 +500,12 @@ fn source_document(id: &str) -> SourceDocument {
         id: id.to_owned(),
         kind: SourceDocumentKind::Text,
         title: "Latin prayer note".to_owned(),
+        project_key: None,
         body: Some("Pater noster means Our Father.".to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     }
@@ -639,6 +642,7 @@ fn queue_candidate(review_unit_id: &ReviewUnitId, due: i64) -> PersistedQueueCan
     PersistedQueueCandidate {
         review_unit_id: review_unit_id.clone(),
         due,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression: None,
         concept_key: Some("lords-prayer-opening".to_owned()),
         source_key: Some("latin-prayer-note".to_owned()),

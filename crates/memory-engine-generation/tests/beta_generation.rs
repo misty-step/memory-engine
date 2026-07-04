@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf};
 
-use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
+use memory_engine_core::{
+    ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId, ReviewUnitLifecycle,
+};
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
     BetaGenerationError, BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial,
@@ -26,10 +28,12 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
             id: "src-nato".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "NATO phonetic alphabet notes".to_owned(),
+            project_key: None,
             body: Some(source_body()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -132,10 +136,12 @@ fn browser_form_line_endings_preserve_multiple_structured_blocks() {
             id: "src-browser".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Browser textarea source".to_owned(),
+            project_key: None,
             body: Some(source_body().replace('\n', "\r\n")),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -174,6 +180,7 @@ fn structured_generation_preserves_same_stage_variants_for_one_concept() {
             id: "src-variants".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "NATO variants".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: NATO letter A",
@@ -205,6 +212,7 @@ fn structured_generation_preserves_same_stage_variants_for_one_concept() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -269,6 +277,7 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
             id: "src-options".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Options notes".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: Gamma definition",
@@ -299,6 +308,7 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
             uri: None,
             permission: SourcePermission::LocalOnly,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -347,6 +357,7 @@ fn rejects_near_duplicate_questions_before_persistence_acceptance() {
             id: "src-gamma-near".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Gamma notes".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: Gamma definition",
@@ -368,6 +379,7 @@ fn rejects_near_duplicate_questions_before_persistence_acceptance() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -410,10 +422,12 @@ fn repairs_zero_accepted_source_once_and_counts_repair_usage() {
             id: "src-repair".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Repairable notes".to_owned(),
+            project_key: None,
             body: Some("Repairable notes say spaced practice needs feedback.".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -474,10 +488,12 @@ fn repairs_rejected_candidates_even_when_source_has_accepted_drafts() {
             id: "src-partial-repair".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Partial repair notes".to_owned(),
+            project_key: None,
             body: Some("Partial repair notes say feedback improves recall.".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -531,10 +547,12 @@ fn repair_feedback_is_capped_before_provider_retry() {
             id: "src-repair-cap".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Repair cap notes".to_owned(),
+            project_key: None,
             body: Some("Repair cap notes require worked solutions.".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -615,6 +633,7 @@ fn authored_block_without_a_reference_is_a_world_knowledge_card() {
             id: "src-no-reference".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Authored note".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: nato letter a",
@@ -627,6 +646,7 @@ fn authored_block_without_a_reference_is_a_world_knowledge_card() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -744,10 +764,12 @@ fn world_knowledge_card_without_a_quote_is_accepted_and_seeded() {
             id: "src-topic".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "NATO phonetic alphabet".to_owned(),
+            project_key: None,
             body: Some("nato phonetic alphabet".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -802,6 +824,7 @@ fn fabricated_source_quote_is_rejected() {
             id: "src-passage".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Mitochondria".to_owned(),
+            project_key: None,
             body: Some(
                 "Mitochondria are membrane-bound organelles found in the cytoplasm of nearly \
                  all eukaryotic cells, where they generate most of the cell's supply of \
@@ -811,6 +834,7 @@ fn fabricated_source_quote_is_rejected() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -859,6 +883,7 @@ fn flagged_unsupported_card_is_rejected_even_without_a_quote() {
             id: "src-flagged".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Flagged note".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: dubious",
@@ -872,6 +897,7 @@ fn flagged_unsupported_card_is_rejected_even_without_a_quote() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -914,10 +940,12 @@ fn generation_preserves_retrieval_depth_progression_tiers() {
             id: "src-depths".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Retrieval depth notes".to_owned(),
+            project_key: None,
             body: Some(retrieval_depth_body()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -1001,10 +1029,12 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
             id: "empty-source".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Empty source".to_owned(),
+            project_key: None,
             body: Some("   ".to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -1103,6 +1133,7 @@ fn save_manual_parent(store: &mut BetaPersistenceStore) -> ReviewUnitId {
             queue: PersistedQueueCandidate {
                 review_unit_id: review_unit_id.clone(),
                 due: NOW - 60_000,
+                lifecycle: ReviewUnitLifecycle::active(),
                 progression: Some(ProgressionMetadata {
                     progression_group: Some("nato-cat-composition".to_owned()),
                     stage_order: 4,

@@ -5,8 +5,8 @@
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionCandidate,
-    ProgressionMetadata, Prompt, QueueCandidate, Rating, ReviewUnitId, ScheduleState,
-    ScheduleStatus, Verdict,
+    ProgressionMetadata, Prompt, QueueCandidate, Rating, ReviewUnitId, ReviewUnitLifecycle,
+    ScheduleState, ScheduleStatus, Verdict,
 };
 use serde::Deserialize;
 
@@ -563,6 +563,7 @@ fn queue_candidate(
         review_unit_id: ReviewUnitId::new(review_unit_id),
         schedule_state,
         due,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression,
         concept_key: concept_key.map(str::to_owned),
         source_key: source_key.map(str::to_owned),

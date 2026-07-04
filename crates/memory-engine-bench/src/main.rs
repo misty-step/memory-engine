@@ -17,7 +17,7 @@ use memory_engine::{
         NextQueueOptions, ServiceAttemptRecord,
     },
     ExactPrompt, ExactPromptKind, GradeContext, Grader, Prompt, QueueCandidate, Rating,
-    ReviewUnitId, ScheduleState, ScheduleStatus,
+    ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
 };
 
 const NOW: i64 = 1_779_465_600_000;
@@ -521,6 +521,7 @@ fn queue_candidate(prefix: &str, index: usize) -> QueueCandidate {
             )
         }),
         due: NOW - due_offset,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression: None,
         concept_key: Some(format!("concept-{}", index % 17)),
         source_key: Some(format!("source-{}", index % 11)),
@@ -539,6 +540,7 @@ fn science_queue_candidate(
         review_unit_id: ReviewUnitId::new(review_unit_id),
         schedule_state: Some(schedule_state(3, 8, due)),
         due,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression: None,
         concept_key: Some(concept_key.to_owned()),
         source_key: Some(source_key.to_owned()),

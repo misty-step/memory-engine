@@ -23,7 +23,9 @@ pub use provider::{
     StructuredBlockProvider,
 };
 
-use memory_engine_core::{ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId};
+use memory_engine_core::{
+    ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId, ReviewUnitLifecycle,
+};
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
@@ -1097,6 +1099,7 @@ fn build_draft(
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due,
+            lifecycle: ReviewUnitLifecycle::active().with_ttl_expires_at(source.ttl_expires_at),
             progression: Some(ProgressionMetadata {
                 progression_group: Some(slug(&candidate.concept)),
                 stage_order: stage_order(&candidate.activity_stage, &candidate.activity_kind),
@@ -1180,6 +1183,7 @@ fn bridge_draft(
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due.saturating_add(i64::from(stage_order)),
+            lifecycle: ReviewUnitLifecycle::active(),
             progression: Some(ProgressionMetadata {
                 progression_group: Some(parent_group),
                 stage_order,

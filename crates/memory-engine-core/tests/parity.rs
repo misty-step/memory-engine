@@ -3,8 +3,8 @@ use std::cmp::Ordering;
 use memory_engine_core::{
     compare_queue_priority, default_rating_policy, pick_next_queue_candidate, ExactPrompt,
     ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata, Prompt,
-    QueueCandidate, QueueSelectionOptions, Rating, ReviewUnitId, ScheduleState, ScheduleStatus,
-    Verdict,
+    QueueCandidate, QueueSelectionOptions, Rating, ReviewUnitId, ReviewUnitLifecycle,
+    ScheduleState, ScheduleStatus, Verdict,
 };
 
 const NOW: i64 = 1_775_650_400_000;
@@ -242,6 +242,7 @@ fn candidate(
         review_unit_id: ReviewUnitId::new(id),
         schedule_state,
         due,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression,
         concept_key: None,
         source_key: None,

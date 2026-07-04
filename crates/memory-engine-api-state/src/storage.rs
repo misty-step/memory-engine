@@ -8,11 +8,12 @@ use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, persisted_source_exists, persisted_sources, postgres_failure,
-    rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
-    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
-    ApiFailure, BrowserSessionRecord, SourceRecord, StudyViewResponse,
+    browser_session_path, persisted_project_deck_exists, persisted_source_exists,
+    persisted_sources, postgres_failure, rate_limit_path, require_current_review,
+    require_current_review_postgres, run_bridge_generation, run_reference_generation,
+    run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, SourceRecord,
+    StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -222,6 +223,17 @@ impl StudyStorage {
         self.inner.archive_source(account_id, store_path, source_id)
     }
 
+    pub(crate) fn invalidate_project_deck(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        deck_id: &str,
+        invalidated_at: i64,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .invalidate_project_deck(account_id, store_path, deck_id, invalidated_at)
+    }
+
     pub(crate) fn approve_draft(
         &self,
         account_id: &str,
@@ -393,6 +405,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         source_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn invalidate_project_deck(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        deck_id: &str,
+        invalidated_at: i64,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn approve_draft(
         &self,
@@ -686,6 +705,8 @@ impl StudyStorageAdapter for FileStudyStorage {
                 id: source.source_id.clone(),
                 title: source.title.clone(),
                 body: source.body.clone(),
+                project_key: source.project_key.clone(),
+                ttl_expires_at: source.ttl_expires_at,
             })
             .map_err(study_failure)?;
         Ok(())
@@ -725,6 +746,24 @@ impl StudyStorageAdapter for FileStudyStorage {
         }
         let mut study = crate::open_study_session(store_path, self.now)?;
         let view = study.archive_source(source_id).map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn invalidate_project_deck(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        deck_id: &str,
+        invalidated_at: i64,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        if !persisted_project_deck_exists(store_path, deck_id)? {
+            return Err(ApiFailure::not_found("Project deck not found."));
+        }
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        let view = study
+            .invalidate_project_deck(deck_id, invalidated_at)
+            .map_err(study_failure)?;
 
         Ok(StudyViewResponse::from_view(view))
     }
@@ -1073,6 +1112,8 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     id: source.source_id.clone(),
                     title: source.title.clone(),
                     body: source.body.clone(),
+                    project_key: source.project_key.clone(),
+                    ttl_expires_at: source.ttl_expires_at,
                 })
                 .map(drop)
                 .map_err(study_failure)
@@ -1095,6 +1136,8 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     source_id: source.id,
                     title: source.title,
                     body: source.body.unwrap_or_default(),
+                    project_key: source.project_key,
+                    ttl_expires_at: source.ttl_expires_at,
                 })
                 .collect())
         })
@@ -1141,6 +1184,36 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             }
             let mut study = BetaStudySession::from_store(account, self.now);
             let view = study.archive_source(source_id).map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn invalidate_project_deck(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        deck_id: &str,
+        invalidated_at: i64,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            if !account
+                .snapshot()
+                .map_err(postgres_failure)?
+                .source_documents
+                .iter()
+                .any(|source| {
+                    source.id == deck_id
+                        && source.archived_at.is_none()
+                        && source.project_key.is_some()
+                })
+            {
+                return Err(ApiFailure::not_found("Project deck not found."));
+            }
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study
+                .invalidate_project_deck(deck_id, invalidated_at)
+                .map_err(study_failure)?;
 
             Ok(StudyViewResponse::from_view(view))
         })

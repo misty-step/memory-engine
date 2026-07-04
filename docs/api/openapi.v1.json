@@ -131,6 +131,76 @@
         }
       }
     },
+    "/v1/accounts/{account_id}/project-decks": {
+      "post": {
+        "summary": "Create a project-scoped volatile deck",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectDeckRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created project deck",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDeckRecord"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/project-decks/{deck_id}/invalidate": {
+      "post": {
+        "summary": "Invalidate a project deck after an external event",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DeckId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvalidateProjectDeckRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Study view after volatile cards were retired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/sources/{source_id}/generate": {
       "post": {
         "summary": "Generate draft review items from one source",
@@ -390,6 +460,14 @@
           "type": "string"
         }
       },
+      "DeckId": {
+        "name": "deck_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
       "DraftId": {
         "name": "draft_id",
         "in": "path",
@@ -462,6 +540,39 @@
           }
         }
       },
+      "CreateProjectDeckRequest": {
+        "type": "object",
+        "required": [
+          "projectKey",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "projectKey": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "ttlExpiresAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "InvalidateProjectDeckRequest": {
+        "type": "object",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "event": {
+            "type": "string"
+          }
+        }
+      },
       "SourceList": {
         "type": "object",
         "required": [
@@ -492,6 +603,31 @@
           },
           "body": {
             "type": "string"
+          },
+          "projectKey": {
+            "type": "string"
+          },
+          "ttlExpiresAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "ProjectDeckRecord": {
+        "type": "object",
+        "required": [
+          "deckId",
+          "projectKey",
+          "source"
+        ],
+        "properties": {
+          "deckId": {
+            "type": "string"
+          },
+          "projectKey": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceRecord"
           }
         }
       },

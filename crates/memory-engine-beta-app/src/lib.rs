@@ -349,7 +349,13 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
                 format!("source-{}", slug_fragment(&source_slug_text(&title, &body)))
             });
 
-        return Ok(BetaStudySourceInput { id, title, body });
+        return Ok(BetaStudySourceInput {
+            id,
+            title,
+            body,
+            project_key: None,
+            ttl_expires_at: None,
+        });
     }
 
     let payload: SourcePayload = serde_json::from_slice(body)
@@ -368,7 +374,13 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
         None => format!("source-{}", slug_fragment(&source_slug_text(&title, &body))),
     };
 
-    Ok(BetaStudySourceInput { id, title, body })
+    Ok(BetaStudySourceInput {
+        id,
+        title,
+        body,
+        project_key: None,
+        ttl_expires_at: None,
+    })
 }
 
 fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
