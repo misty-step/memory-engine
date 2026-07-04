@@ -1,0 +1,17 @@
+[package]
+name = "memory-engine-api-render"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Server-rendered HTML and design previews for the Memory Engine HTTP API."
+
+[dependencies]
+memory-engine-api-state = { path = "../memory-engine-api-state" }
+memory-engine-study = { path = "../memory-engine-study" }
+
+[dev-dependencies]
+memory-engine-core = { path = "../memory-engine-core" }
+memory-engine-persistence = { path = "../memory-engine-persistence" }
+
+[lints]
+workspace = true

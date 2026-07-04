@@ -101,6 +101,12 @@ oracle.
 - `crates/memory-engine-openrouter` — OpenRouter-dialect HTTP draft provider
   (model-backed generation); the only crate that talks to a model network.
 - `crates/memory-engine-study` — beta session/API boundary.
+- `crates/memory-engine-api` — Fly-facing HTTP route registration, request
+  handlers, static assets, and binary entrypoint.
+- `crates/memory-engine-api-state` — API account/session state, auth, storage
+  adapters, and background generation jobs.
+- `crates/memory-engine-api-render` — server-rendered study UI and design
+  preview conformance fixtures.
 - `crates/memory-engine-beta-app` and `crates/memory-engine-web-shell` —
   local Rust HTTP dogfood hosts.
 - `crates/memory-engine-cli`, `crates/memory-engine-import`,

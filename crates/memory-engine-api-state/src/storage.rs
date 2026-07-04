@@ -61,7 +61,7 @@ impl StudyStorageConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct StudyStorage {
+pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
 }
 
@@ -81,8 +81,8 @@ impl StudyStorage {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn file(store_root: impl Into<PathBuf>, now: fn() -> i64) -> Self {
+    #[must_use]
+    pub fn file(store_root: impl Into<PathBuf>, now: fn() -> i64) -> Self {
         Self::new(FileStudyStorage {
             store_root: store_root.into(),
             now,
@@ -133,7 +133,12 @@ impl StudyStorage {
         self.inner.revoke_browser_session(session_id, now_ms)
     }
 
-    pub(crate) fn save_auth_challenge(
+    /// Persists a magic-link auth challenge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the storage adapter cannot persist the challenge.
+    pub fn save_auth_challenge(
         &self,
         challenge_hash: &str,
         email: &str,
@@ -143,7 +148,12 @@ impl StudyStorage {
             .save_auth_challenge(challenge_hash, email, expires_at_ms)
     }
 
-    pub(crate) fn consume_auth_challenge(
+    /// Consumes a magic-link auth challenge at most once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the storage adapter cannot read or mark the challenge.
+    pub fn consume_auth_challenge(
         &self,
         challenge_hash: &str,
         now_ms: i64,

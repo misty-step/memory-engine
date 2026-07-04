@@ -58,7 +58,7 @@ impl JobStatus {
     /// Succeeded/failed jobs no longer change on their own, so they are the
     /// prunable history (see `MAX_TERMINAL_JOBS_PER_ACCOUNT`). This also governs
     /// crash-restore: a *non*-terminal job is reset to a retryable failure on
-    /// restart, since no worker owns it after the restart (see [`load_jobs`]).
+    /// restart, since no worker owns it after the restart (see `load_jobs`).
     #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed)
@@ -199,7 +199,7 @@ impl JobQueue {
 
     /// Build a queue whose history is mirrored to `path` and restored from it on
     /// construction. A job left non-terminal by a crash is restored as a
-    /// retryable `failed` (see [`load_jobs`]).
+    /// retryable `failed` (see `load_jobs`).
     #[must_use]
     pub fn with_persistence(registry: AccountRegistry, path: PathBuf) -> Self {
         let restored = load_jobs(&path, registry.now());
