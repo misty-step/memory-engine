@@ -19,8 +19,9 @@ pub use memory_engine_api_state::{
 #[cfg(test)]
 pub use memory_engine_api_state::{
     app_session_max_age_ms, AccountCreated, ApiError, ApiFailure, AppAccount, AuthLinkDelivery,
-    CreateAccountRequest, CreateSourceRequest, GenerationJob, HealthResponse, JobBroadcast,
-    JobQueue, JobStatus, SourceList, SourceRecord, StudyStorage, StudyViewResponse,
+    CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, GenerationJob,
+    HealthResponse, InvalidateProjectDeckRequest, JobBroadcast, JobQueue, JobStatus,
+    ProjectDeckRecord, SourceList, SourceRecord, StudyStorage, StudyViewResponse,
     SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_SESSION_COOKIE_NAME,
     AUTH_CHALLENGE_TTL_MS,
 };

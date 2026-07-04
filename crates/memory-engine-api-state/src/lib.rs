@@ -179,6 +179,37 @@ impl ApiState {
             .save_source(account.account_id(), account.session_token(), request)
     }
 
+    /// Create a project-scoped volatile deck through the API state boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, validation, or persistence rejects the deck.
+    pub fn create_project_deck(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        request: &CreateProjectDeckRequest,
+    ) -> Result<ProjectDeckRecord, ApiFailure> {
+        self.accounts
+            .create_project_deck(account_id, session_token, request)
+    }
+
+    /// Retire cards generated from a project deck after an external event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, deck lookup, or persistence rejects the event.
+    pub fn invalidate_project_deck(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        deck_id: &str,
+        request: &InvalidateProjectDeckRequest,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .invalidate_project_deck(account_id, session_token, deck_id, request)
+    }
+
     /// List saved material through the API state boundary.
     ///
     /// # Errors
@@ -820,6 +851,33 @@ pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProjectDeckRequest {
+    pub project_key: String,
+    pub title: String,
+    pub body: String,
+    pub ttl_expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InvalidateProjectDeckRequest {
+    pub event: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDeckRecord {
+    pub deck_id: String,
+    pub project_key: String,
+    pub source: SourceRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1254,6 +1312,17 @@ fn source_id_for(account_id: &str, title: &str, body: &str) -> String {
     format!("src_{stable:016x}")
 }
 
+fn project_deck_id_for(account_id: &str, project_key: &str, title: &str, body: &str) -> String {
+    let stable = [account_id, project_key, title, body]
+        .into_iter()
+        .flat_map(str::bytes)
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+
+    format!("deck_{stable:016x}")
+}
+
 fn account_store_path(store_root: &FsPath, account_id: &str) -> PathBuf {
     store_root.join(account_id).join("study.json")
 }
@@ -1506,6 +1575,8 @@ fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
             source_id: source.id,
             title: source.title,
             body: source.body.unwrap_or_default(),
+            project_key: source.project_key,
+            ttl_expires_at: source.ttl_expires_at,
         })
         .collect())
 }
@@ -1517,6 +1588,13 @@ fn persisted_source_exists(path: &FsPath, source_id: &str) -> Result<bool, ApiFa
         .source_documents
         .iter()
         .any(|source| source.id == source_id && source.archived_at.is_none()))
+}
+
+fn persisted_project_deck_exists(path: &FsPath, deck_id: &str) -> Result<bool, ApiFailure> {
+    let store = open_persistence_store(path)?;
+    Ok(store.snapshot().source_documents.iter().any(|source| {
+        source.id == deck_id && source.archived_at.is_none() && source.project_key.is_some()
+    }))
 }
 
 fn study_failure<E: std::fmt::Display>(

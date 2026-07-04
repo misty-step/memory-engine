@@ -2884,6 +2884,145 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
 }
 
 #[tokio::test]
+async fn v1_project_deck_ttl_and_event_invalidation_stop_scheduling() {
+    let store_root = temp_store_root("volatile-project-deck");
+    let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+    let account = create_account_v1(&app, "volatile@example.com").await;
+    let deck = create_project_deck_v1(
+        &app,
+        &account,
+        "memory-engine",
+        "API split decision notes",
+        &source_body(),
+        Some(i64::MAX),
+    )
+    .await;
+    let deck_id = deck["deckId"].as_str().expect("deck id");
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, deck_id).await;
+    let draft_id = draft_ids.first().expect("first deck draft").to_owned();
+    let stale_unapproved_draft_id = draft_ids
+        .iter()
+        .find(|candidate| candidate.as_str() != draft_id.as_str())
+        .expect("unapproved stale deck draft")
+        .to_owned();
+    let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+
+    assert_eq!(
+        next_review_v1(&app, &account).await,
+        review_unit_id,
+        "project deck starts as schedulable while TTL is in the future"
+    );
+
+    let invalidated = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/project-decks/{deck_id}/invalidate",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "event": "architecture-change: api-state split accepted"
+            }),
+        ))
+        .await
+        .expect("invalidate project deck");
+    assert_eq!(invalidated.status(), StatusCode::OK);
+    let invalidated = response_json(invalidated).await;
+    assert_eq!(invalidated["current"], json!(null));
+    assert_eq!(invalidated["dueCount"], json!(0));
+
+    let next_after_event = next_review_v1_body(&app, &account).await;
+    assert_eq!(next_after_event["current"], json!(null));
+    assert_eq!(next_after_event["dueCount"], json!(0));
+
+    let approved_stale_draft = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/drafts/{stale_unapproved_draft_id}/approve",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("approve stale invalidated draft");
+    assert_eq!(approved_stale_draft.status(), StatusCode::OK);
+    let approved_stale_draft = response_json(approved_stale_draft).await;
+    assert_eq!(approved_stale_draft["current"], json!(null));
+    assert_eq!(approved_stale_draft["dueCount"], json!(0));
+
+    let expired_deck = create_project_deck_v1(
+        &app,
+        &account,
+        "memory-engine",
+        "Expired deployment note",
+        &expired_project_deck_body(),
+        Some(0),
+    )
+    .await;
+    let expired_deck_id = expired_deck["deckId"].as_str().expect("expired deck id");
+    let expired_draft_id = generate_source_v1_latest_draft(&app, &account, expired_deck_id).await;
+    let approved_expired = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/drafts/{expired_draft_id}/approve",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("approve expired deck draft");
+    assert_eq!(approved_expired.status(), StatusCode::OK);
+    let approved_expired = response_json(approved_expired).await;
+    assert_eq!(approved_expired["current"], json!(null));
+    assert_eq!(approved_expired["dueCount"], json!(0));
+}
+
+#[tokio::test]
+async fn v1_project_deck_invalidation_rejects_regular_sources() {
+    let store_root = temp_store_root("volatile-project-deck-regular-source");
+    let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+    let account = create_account_v1(&app, "regular-source@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Stable NATO note",
+        &expired_project_deck_body(),
+    )
+    .await;
+
+    let invalidated = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/project-decks/{source_id}/invalidate",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "event": "architecture-change: should not hit stable source"
+            }),
+        ))
+        .await
+        .expect("invalidate regular source as project deck");
+    assert_eq!(invalidated.status(), StatusCode::NOT_FOUND);
+
+    let draft_id = generate_source_v1(&app, &account, &source_id).await;
+    let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+    assert_eq!(
+        next_review_v1(&app, &account).await,
+        review_unit_id,
+        "regular source must remain active after rejected project-deck invalidation"
+    );
+}
+
+#[tokio::test]
 async fn v1_json_api_returns_post_answer_feedback_and_concept_progress() {
     let app = router(ApiState::default());
     let account = create_account_v1(&app, "feedback@example.com").await;
@@ -3413,7 +3552,47 @@ async fn create_source_v1(
         .to_owned()
 }
 
+async fn create_project_deck_v1(
+    app: &axum::Router,
+    account: &TestAccount,
+    project_key: &str,
+    title: &str,
+    body: &str,
+    ttl_expires_at: Option<i64>,
+) -> Value {
+    let response = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!("/v1/accounts/{}/project-decks", account.account_id),
+            &account.session_token,
+            &json!({
+                "projectKey": project_key,
+                "title": title,
+                "body": body,
+                "ttlExpiresAt": ttl_expires_at
+            }),
+        ))
+        .await
+        .expect("create project deck");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    response_json(response).await
+}
+
 async fn generate_source_v1(app: &axum::Router, account: &TestAccount, source_id: &str) -> String {
+    generate_source_v1_draft_ids(app, account, source_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("draft id")
+}
+
+async fn generate_source_v1_draft_ids(
+    app: &axum::Router,
+    account: &TestAccount,
+    source_id: &str,
+) -> Vec<String> {
     let response = app
         .clone()
         .oneshot(v1_empty_request(
@@ -3428,7 +3607,39 @@ async fn generate_source_v1(app: &axum::Router, account: &TestAccount, source_id
         .expect("generate source");
     assert_eq!(response.status(), StatusCode::OK);
 
-    response_json(response).await["drafts"][0]["id"]
+    response_json(response).await["drafts"]
+        .as_array()
+        .expect("drafts")
+        .iter()
+        .map(|draft| draft["id"].as_str().expect("draft id").to_owned())
+        .collect()
+}
+
+async fn generate_source_v1_latest_draft(
+    app: &axum::Router,
+    account: &TestAccount,
+    source_id: &str,
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/sources/{source_id}/generate",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("generate source");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response_json(response).await;
+    body["drafts"]
+        .as_array()
+        .expect("drafts")
+        .last()
+        .expect("latest draft")["id"]
         .as_str()
         .expect("draft id")
         .to_owned()
@@ -3471,6 +3682,21 @@ async fn next_review_v1(app: &axum::Router, account: &TestAccount) -> String {
         .as_str()
         .expect("review unit id")
         .to_owned()
+}
+
+async fn next_review_v1_body(app: &axum::Router, account: &TestAccount) -> Value {
+    let response = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!("/v1/accounts/{}/review/next", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("next review");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    response_json(response).await
 }
 
 async fn reveal_review_v1(
@@ -3978,6 +4204,19 @@ fn shared_concept_body() -> String {
         "Answer: ALFA",
         "Distractors: BRAVO, CHARLIE",
         "Reference: A is represented by ALFA in the NATO phonetic alphabet.",
+    ]
+    .join("\n")
+}
+
+fn expired_project_deck_body() -> String {
+    [
+        "Concept: NATO letter D",
+        "Activity: quiz",
+        "Stage: recognition-3",
+        "Question: What is the NATO phonetic alphabet word for D?",
+        "Answer: DELTA",
+        "Distractors: ALFA, BRAVO",
+        "Reference: The NATO phonetic alphabet word for D is DELTA.",
     ]
     .join("\n")
 }

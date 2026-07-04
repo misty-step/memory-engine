@@ -44,6 +44,8 @@ fn source(id: &str, title: &str) -> SourceRecord {
         source_id: id.to_owned(),
         title: title.to_owned(),
         body: String::new(),
+        project_key: None,
+        ttl_expires_at: None,
     }
 }
 

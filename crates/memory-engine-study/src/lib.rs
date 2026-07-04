@@ -15,7 +15,7 @@ use std::{
 
 use memory_engine_core::{
     reviewable_queue_candidates, GradeResult, Prompt, QueueCandidate, QueueSelectionOptions,
-    ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
+    ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
@@ -77,6 +77,8 @@ pub struct BetaStudySourceInput {
     pub id: String,
     pub title: String,
     pub body: String,
+    pub project_key: Option<String>,
+    pub ttl_expires_at: Option<i64>,
 }
 
 impl BetaStudySourceInput {
@@ -87,6 +89,8 @@ impl BetaStudySourceInput {
             id: id.into(),
             title: infer_capture_title(&body),
             body,
+            project_key: None,
+            ttl_expires_at: None,
         }
     }
 }
@@ -367,6 +371,18 @@ pub trait BetaStudyStore:
         review_unit_id: &ReviewUnitId,
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Replace volatile lifecycle metadata on a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the review unit is unknown, archived, or
+    /// cannot be updated.
+    fn set_review_unit_lifecycle(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        lifecycle: ReviewUnitLifecycle,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
 }
 
 impl BetaStudyStore for BetaPersistenceStore {
@@ -421,6 +437,14 @@ impl BetaStudyStore for BetaPersistenceStore {
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         BetaPersistenceStore::snooze_review_unit_until(self, review_unit_id, snoozed_until)
+    }
+
+    fn set_review_unit_lifecycle(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        lifecycle: ReviewUnitLifecycle,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::set_review_unit_lifecycle(self, review_unit_id, lifecycle)
     }
 }
 
@@ -513,10 +537,12 @@ where
                 id: input.id,
                 kind: SourceDocumentKind::Text,
                 title,
+                project_key: input.project_key,
                 body: Some(body),
                 uri: None,
                 permission: SourcePermission::ModelEligible,
                 freshness: Some((self.now)()),
+                ttl_expires_at: input.ttl_expires_at,
                 created_at: (self.now)(),
                 archived_at: None,
             })
@@ -577,6 +603,70 @@ where
         } else {
             BetaStudyStatus::Empty
         };
+        self.view()
+    }
+
+    /// Mark a project deck/source and its generated reviews obsolete.
+    ///
+    /// This is event invalidation, not human forgetting: the source remains in
+    /// persisted receipts, but it stops acting as an active deck source and
+    /// generated cards stop scheduling through lifecycle policy evaluated by
+    /// the kernel queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when persistence fails.
+    pub fn invalidate_project_deck(
+        &mut self,
+        source_document_id: &str,
+        invalidated_at: i64,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let related_review_unit_ids = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .filter(|draft| draft_references_source(draft, source_document_id))
+            .map(|draft| draft.review_unit_id.clone())
+            .collect::<Vec<_>>();
+
+        self.store
+            .archive_source_document(source_document_id, invalidated_at)
+            .map_err(BetaStudyError::Store)?;
+
+        for review_unit_id in related_review_unit_ids {
+            if let Some(review_unit) = snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == review_unit_id && unit.archived_at.is_none())
+            {
+                self.store
+                    .set_review_unit_lifecycle(
+                        &review_unit_id,
+                        review_unit
+                            .queue
+                            .lifecycle
+                            .with_invalidated_at(Some(invalidated_at)),
+                    )
+                    .map_err(BetaStudyError::Store)?;
+            }
+        }
+
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|draft| draft_references_source(draft, source_document_id))
+        {
+            self.current = None;
+            self.expected_answer = None;
+            self.reference_text = None;
+            self.grade = None;
+            self.schedule_change = None;
+        }
+        self.select_next()?;
+        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        if self.current.is_none() && !has_active_sources(&snapshot) {
+            self.status = BetaStudyStatus::Empty;
+        }
         self.view()
     }
 
@@ -1020,20 +1110,21 @@ where
             .iter()
             .filter(|draft| draft_has_active_source(draft, &active_source_ids))
             .collect::<Vec<_>>();
+        let now = (self.now)();
         let active_queue = queue
             .iter()
             .filter(|candidate| {
-                queue_candidate_has_active_source(
-                    &snapshot.generated_prompt_drafts,
-                    candidate,
-                    &active_source_ids,
-                )
+                candidate.lifecycle.is_schedulable(now)
+                    && queue_candidate_has_active_source(
+                        &snapshot.generated_prompt_drafts,
+                        candidate,
+                        &active_source_ids,
+                    )
             })
             .collect::<Vec<_>>();
         let next_review_unit_id = active_queue
             .first()
             .map(|candidate| candidate.review_unit_id.clone());
-        let now = (self.now)();
         let due_count = active_queue
             .iter()
             .filter(|candidate| candidate.due <= now)
@@ -1173,7 +1264,7 @@ where
             queue.sort_by_key(|candidate| candidate.due);
             self.current = queue
                 .iter()
-                .filter(|candidate| candidate.due <= now)
+                .filter(|candidate| candidate.lifecycle.is_schedulable(now) && candidate.due <= now)
                 .find_map(|candidate| {
                     find_approved_draft(&snapshot, candidate)
                         .filter(|draft| draft_has_active_source(draft, &active_source_ids))
@@ -1789,7 +1880,8 @@ fn select_due_variant(
     now: i64,
     selected: Option<&QueueCandidate>,
 ) -> Option<GeneratedPromptDraft> {
-    let selected = selected.filter(|candidate| candidate.due <= now)?;
+    let selected = selected
+        .filter(|candidate| candidate.lifecycle.is_schedulable(now) && candidate.due <= now)?;
     let selected_draft = find_approved_draft(snapshot, selected)?;
     if !draft_has_active_source(&selected_draft, active_source_ids) {
         return None;

@@ -25,7 +25,8 @@ use memory_engine_api_render::{
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
-    ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateSourceRequest, HealthResponse,
+    ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateProjectDeckRequest,
+    CreateSourceRequest, HealthResponse, InvalidateProjectDeckRequest, ProjectDeckRecord,
     SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
@@ -42,6 +43,8 @@ enum V1Route {
     Accounts,
     Sources,
     Source,
+    ProjectDecks,
+    ProjectDeckInvalidate,
     Generate,
     Approve,
     Next,
@@ -58,6 +61,9 @@ const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
 const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
 const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
 const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
+const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
+const V1_PROJECT_DECK_INVALIDATE_PATH: &str =
+    "/v1/accounts/{account_id}/project-decks/{deck_id}/invalidate";
 const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/generate";
 const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
@@ -73,6 +79,8 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Accounts,
     V1Route::Sources,
     V1Route::Source,
+    V1Route::ProjectDecks,
+    V1Route::ProjectDeckInvalidate,
     V1Route::Generate,
     V1Route::Approve,
     V1Route::Next,
@@ -91,6 +99,11 @@ impl V1Route {
             Self::Accounts => router.route(V1_ACCOUNTS_PATH, post(create_account)),
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
             Self::Source => router.route(V1_SOURCE_PATH, delete(archive_source)),
+            Self::ProjectDecks => router.route(V1_PROJECT_DECKS_PATH, post(create_project_deck)),
+            Self::ProjectDeckInvalidate => router.route(
+                V1_PROJECT_DECK_INVALIDATE_PATH,
+                post(invalidate_project_deck),
+            ),
             Self::Generate => router.route(V1_GENERATE_PATH, post(generate_source)),
             Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
@@ -127,6 +140,14 @@ impl V1Route {
             Self::Source => &[V1ContractOperation {
                 method: "DELETE",
                 path: V1_SOURCE_PATH,
+            }],
+            Self::ProjectDecks => &[V1ContractOperation {
+                method: "POST",
+                path: V1_PROJECT_DECKS_PATH,
+            }],
+            Self::ProjectDeckInvalidate => &[V1ContractOperation {
+                method: "POST",
+                path: V1_PROJECT_DECK_INVALIDATE_PATH,
             }],
             Self::Generate => &[V1ContractOperation {
                 method: "POST",
@@ -312,6 +333,34 @@ async fn create_source(
     let source = state.save_source(&account_id, session_token, &request)?;
 
     Ok((StatusCode::CREATED, Json(source)))
+}
+
+async fn create_project_deck(
+    State(state): State<ApiState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateProjectDeckRequest>,
+) -> Result<(StatusCode, Json<ProjectDeckRecord>), ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    let deck = state.create_project_deck(&account_id, session_token, &request)?;
+
+    Ok((StatusCode::CREATED, Json(deck)))
+}
+
+async fn invalidate_project_deck(
+    State(state): State<ApiState>,
+    Path((account_id, deck_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<InvalidateProjectDeckRequest>,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.invalidate_project_deck(
+        &account_id,
+        session_token,
+        &deck_id,
+        &request,
+    )?))
 }
 
 async fn list_sources(

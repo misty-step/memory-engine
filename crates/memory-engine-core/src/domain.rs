@@ -121,6 +121,101 @@ pub struct ScheduleState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReviewUnitLifecycle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated_at: Option<i64>,
+}
+
+impl ReviewUnitLifecycle {
+    #[must_use]
+    pub const fn active() -> Self {
+        Self {
+            ttl_expires_at: None,
+            invalidated_at: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn ttl_expires_at(ttl_expires_at: i64) -> Self {
+        Self {
+            ttl_expires_at: Some(ttl_expires_at),
+            invalidated_at: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn invalidated_at(invalidated_at: i64) -> Self {
+        Self {
+            ttl_expires_at: None,
+            invalidated_at: Some(invalidated_at),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_ttl_expires_at(mut self, ttl_expires_at: Option<i64>) -> Self {
+        self.ttl_expires_at = ttl_expires_at;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_invalidated_at(mut self, invalidated_at: Option<i64>) -> Self {
+        self.invalidated_at = invalidated_at;
+        self
+    }
+
+    #[must_use]
+    pub fn retirement_at(&self, now: i64) -> Option<ReviewUnitRetirement> {
+        if let Some(invalidated_at) = self.invalidated_at {
+            if now >= invalidated_at {
+                return Some(ReviewUnitRetirement {
+                    reason: ReviewUnitRetirementReason::Invalidated,
+                    occurred_at: invalidated_at,
+                });
+            }
+        }
+
+        if let Some(ttl_expires_at) = self.ttl_expires_at {
+            if now >= ttl_expires_at {
+                return Some(ReviewUnitRetirement {
+                    reason: ReviewUnitRetirementReason::TtlExpired,
+                    occurred_at: ttl_expires_at,
+                });
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn is_schedulable(&self, now: i64) -> bool {
+        self.retirement_at(now).is_none()
+    }
+}
+
+impl Default for ReviewUnitLifecycle {
+    fn default() -> Self {
+        Self::active()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewUnitRetirement {
+    pub reason: ReviewUnitRetirementReason,
+    pub occurred_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewUnitRetirementReason {
+    TtlExpired,
+    Invalidated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GradeContext {
     pub response_time_ms: u32,
     pub prior_reps: u32,
@@ -447,6 +542,8 @@ pub struct QueueCandidate {
     pub review_unit_id: ReviewUnitId,
     pub schedule_state: Option<ScheduleState>,
     pub due: i64,
+    #[serde(default)]
+    pub lifecycle: ReviewUnitLifecycle,
     pub progression: Option<ProgressionMetadata>,
     pub concept_key: Option<String>,
     pub source_key: Option<String>,

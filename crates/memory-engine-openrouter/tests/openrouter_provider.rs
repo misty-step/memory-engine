@@ -683,10 +683,12 @@ fn eval_source(title: &str, body: &str) -> SourceDocument {
         id: "src-eval".to_owned(),
         kind: SourceDocumentKind::Text,
         title: title.to_owned(),
+        project_key: None,
         body: Some(body.to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     }
@@ -697,6 +699,7 @@ fn prose_source() -> SourceDocument {
         id: "src-prose".to_owned(),
         kind: SourceDocumentKind::Text,
         title: "Mitochondria notes".to_owned(),
+        project_key: None,
         // A short passage — one sentence — to pin that prose stays in
         // passage-extraction mode even when brief: it ends with sentence
         // punctuation, so the provenance gate stays on.
@@ -708,6 +711,7 @@ fn prose_source() -> SourceDocument {
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     }
@@ -720,10 +724,12 @@ fn topic_source() -> SourceDocument {
         id: "src-topic".to_owned(),
         kind: SourceDocumentKind::Text,
         title: "NATO phonetic alphabet".to_owned(),
+        project_key: None,
         body: Some("nato phonetic alphabet".to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     }

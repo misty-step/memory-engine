@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, QueueCandidate, Rating,
-    ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
+    ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceStore, NextQueueCommand, NextQueueOptions,
@@ -188,6 +188,7 @@ impl MemoryServiceStore for CliReviewStore {
                         .as_ref()
                         .map_or(NOW - 60_000, |state| state.due),
                     schedule_state,
+                    lifecycle: ReviewUnitLifecycle::active(),
                     progression: unit.queue.progression.clone(),
                     concept_key: unit.queue.concept_key.clone(),
                     source_key: unit.queue.source_key.clone(),

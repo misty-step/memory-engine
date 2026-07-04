@@ -13,8 +13,9 @@ mod scheduler;
 pub use domain::{
     ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata,
     Prompt, QueueCandidate, QueueSelectionOptions, QueueSeparationPass, Rating, ReviewUnitId,
-    RubricAssessment, RubricCriterion, RubricCriterionResult, RubricCriterionVerdict,
-    RubricDefinition, RubricPrompt, ScheduleState, ScheduleStatus, Verdict,
+    ReviewUnitLifecycle, ReviewUnitRetirement, ReviewUnitRetirementReason, RubricAssessment,
+    RubricCriterion, RubricCriterionResult, RubricCriterionVerdict, RubricDefinition, RubricPrompt,
+    ScheduleState, ScheduleStatus, Verdict,
 };
 pub use grading::{default_rating_policy, Grader, RatingPolicy};
 pub use progression::{

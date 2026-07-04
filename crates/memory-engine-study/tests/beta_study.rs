@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, GradeResult, GraderKind, ProgressionMetadata, Prompt, Rating,
-    ReviewUnitId, ScheduleStatus, Verdict,
+    ReviewUnitId, ReviewUnitLifecycle, ScheduleStatus, Verdict,
 };
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
@@ -915,6 +915,8 @@ fn generates_drafts_from_arbitrary_prose_via_model_provider() {
             body: "Mitochondria generate most of the cell's supply of adenosine triphosphate. \
                    They are sometimes called the powerhouse of the cell."
                 .to_owned(),
+            project_key: None,
+            ttl_expires_at: None,
         })
         .expect("source");
 
@@ -950,6 +952,8 @@ fn infers_a_title_when_capture_does_not_provide_one() {
             title: String::new(),
             body: "  Mitochondria generate ATP for cells. The second sentence stays body text.  "
                 .to_owned(),
+            project_key: None,
+            ttl_expires_at: None,
         })
         .expect("source");
 
@@ -973,6 +977,8 @@ fn surfaces_a_human_readable_notice_when_a_source_yields_no_drafts() {
             id: "src-bare".to_owned(),
             title: "Unparseable note".to_owned(),
             body: "just some prose with no structured blocks".to_owned(),
+            project_key: None,
+            ttl_expires_at: None,
         })
         .expect("source");
 
@@ -997,6 +1003,8 @@ fn source_input() -> BetaStudySourceInput {
         id: "src-nato".to_owned(),
         title: "NATO practice notes".to_owned(),
         body: source_body(),
+        project_key: None,
+        ttl_expires_at: None,
     }
 }
 
@@ -1026,6 +1034,8 @@ fn shared_concept_input() -> BetaStudySourceInput {
         id: "src-shared".to_owned(),
         title: "Shared concept practice".to_owned(),
         body: shared_concept_body(),
+        project_key: None,
+        ttl_expires_at: None,
     }
 }
 
@@ -1080,6 +1090,8 @@ fn variant_concept_input() -> BetaStudySourceInput {
             "Reference: The NATO phonetic alphabet word for A is ALFA.",
         ]
         .join("\n"),
+        project_key: None,
+        ttl_expires_at: None,
     }
 }
 
@@ -1173,10 +1185,12 @@ fn seed_spanless_review(path: &std::path::Path) {
         id: "src-spanless".to_owned(),
         kind: SourceDocumentKind::Text,
         title: "NATO note".to_owned(),
+        project_key: None,
         body: Some("The NATO phonetic alphabet word for A is ALFA.".to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     };
@@ -1203,6 +1217,7 @@ fn seed_spanless_review(path: &std::path::Path) {
             queue: PersistedQueueCandidate {
                 review_unit_id: review_unit_id.clone(),
                 due: NOW - 60_000,
+                lifecycle: ReviewUnitLifecycle::active(),
                 progression: Some(ProgressionMetadata {
                     progression_group: Some("nato-letter-a".to_owned()),
                     stage_order: 1,
@@ -1237,6 +1252,7 @@ fn seed_spanless_review(path: &std::path::Path) {
             queue: PersistedQueueCandidate {
                 review_unit_id,
                 due: NOW - 60_000,
+                lifecycle: ReviewUnitLifecycle::active(),
                 progression: Some(ProgressionMetadata {
                     progression_group: Some("nato-letter-a".to_owned()),
                     stage_order: 1,

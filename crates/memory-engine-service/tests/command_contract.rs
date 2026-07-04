@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, QueueCandidate, Rating,
-    ReviewUnitId, ScheduleState, ScheduleStatus, Verdict,
+    ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus, Verdict,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceCommand, MemoryServiceResult,
@@ -267,6 +267,7 @@ impl MemoryServiceStore for SharedScenarioStore {
                         .as_ref()
                         .map_or(self.now - 60_000, |state| state.due),
                     schedule_state,
+                    lifecycle: ReviewUnitLifecycle::active(),
                     progression: unit.queue.progression.clone(),
                     concept_key: unit.queue.concept_key.clone(),
                     source_key: unit.queue.source_key.clone(),
@@ -494,6 +495,7 @@ fn candidate(id: &str, schedule_state: Option<ScheduleState>, due: i64) -> Queue
         review_unit_id: review_unit_id(id),
         schedule_state,
         due,
+        lifecycle: ReviewUnitLifecycle::active(),
         progression: None,
         concept_key: None,
         source_key: None,

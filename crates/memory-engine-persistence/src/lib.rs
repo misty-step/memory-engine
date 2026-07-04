@@ -11,7 +11,8 @@ use std::{
 };
 
 use memory_engine_core::{
-    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ScheduleState,
+    defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ReviewUnitLifecycle,
+    ScheduleState,
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use serde::{Deserialize, Serialize};
@@ -44,10 +45,14 @@ pub struct SourceDocument {
     pub id: String,
     pub kind: SourceDocumentKind,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
     pub body: Option<String>,
     pub uri: Option<String>,
     pub permission: SourcePermission,
     pub freshness: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_expires_at: Option<i64>,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<i64>,
@@ -184,6 +189,8 @@ pub struct BetaReviewUnitRecord {
 pub struct PersistedQueueCandidate {
     pub review_unit_id: ReviewUnitId,
     pub due: i64,
+    #[serde(default)]
+    pub lifecycle: ReviewUnitLifecycle,
     pub progression: Option<memory_engine_core::ProgressionMetadata>,
     pub concept_key: Option<String>,
     pub source_key: Option<String>,
@@ -196,6 +203,7 @@ impl PersistedQueueCandidate {
         Self {
             review_unit_id: candidate.review_unit_id.clone(),
             due: candidate.due,
+            lifecycle: candidate.lifecycle,
             progression: candidate.progression.clone(),
             concept_key: candidate.concept_key.clone(),
             source_key: candidate.source_key.clone(),
@@ -209,6 +217,7 @@ impl PersistedQueueCandidate {
             review_unit_id: self.review_unit_id.clone(),
             due: schedule_state.as_ref().map_or(self.due, |state| state.due),
             schedule_state,
+            lifecycle: self.lifecycle,
             progression: self.progression.clone(),
             concept_key: self.concept_key.clone(),
             source_key: self.source_key.clone(),
@@ -730,6 +739,32 @@ impl BetaPersistenceStore {
         self.commit(next)?;
 
         Ok(snoozed)
+    }
+
+    /// Replace an approved review unit's volatile lifecycle metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the review unit is unknown or archived.
+    pub fn set_review_unit_lifecycle(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        lifecycle: ReviewUnitLifecycle,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        let mut next = self.data.clone();
+        let review_unit = next
+            .review_units
+            .iter_mut()
+            .find(|unit| &unit.review_unit_id == review_unit_id)
+            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+        if review_unit.archived_at.is_some() {
+            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+        }
+        review_unit.queue.lifecycle = lifecycle;
+        let updated = review_unit.clone();
+        self.commit(next)?;
+
+        Ok(updated)
     }
 
     /// Save or replace a beta review unit.

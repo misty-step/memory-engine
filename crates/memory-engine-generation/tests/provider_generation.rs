@@ -388,6 +388,7 @@ fn fallback_stamps_drafts_with_the_provider_that_actually_ran() {
             id: "src-structured".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Structured".to_owned(),
+            project_key: None,
             body: Some(
                 [
                     "Concept: Mitochondria role",
@@ -400,6 +401,7 @@ fn fallback_stamps_drafts_with_the_provider_that_actually_ran() {
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -467,10 +469,12 @@ fn open_store_with_prose(directory: &TempDirectory) -> BetaPersistenceStore {
             id: "src-prose".to_owned(),
             kind: SourceDocumentKind::Text,
             title: "Mitochondria notes".to_owned(),
+            project_key: None,
             body: Some(PROSE.to_owned()),
             uri: None,
             permission: SourcePermission::ModelEligible,
             freshness: Some(NOW),
+            ttl_expires_at: None,
             created_at: NOW,
             archived_at: None,
         })
@@ -484,10 +488,12 @@ fn source_document(id: &str, title: &str, body: &str) -> SourceDocument {
         id: id.to_owned(),
         kind: SourceDocumentKind::Text,
         title: title.to_owned(),
+        project_key: None,
         body: Some(body.to_owned()),
         uri: None,
         permission: SourcePermission::ModelEligible,
         freshness: Some(NOW),
+        ttl_expires_at: None,
         created_at: NOW,
         archived_at: None,
     }

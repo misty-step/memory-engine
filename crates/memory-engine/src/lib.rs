@@ -94,6 +94,7 @@ pub mod queue {
     pub use memory_engine_core::{
         compare_queue_priority, defer_queue_availability, pick_next_queue_candidate,
         reviewable_queue_candidates, QueueCandidate, QueueSelectionOptions, QueueSeparationPass,
+        ReviewUnitLifecycle, ReviewUnitRetirement, ReviewUnitRetirementReason,
     };
 }
 
@@ -122,8 +123,9 @@ pub mod types {
     pub use memory_engine_core::{
         ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, ProgressionMetadata,
         Prompt, QueueCandidate, QueueSelectionOptions, QueueSeparationPass, Rating, ReviewUnitId,
-        RubricAssessment, RubricCriterion, RubricCriterionResult, RubricCriterionVerdict,
-        RubricDefinition, RubricPrompt, ScheduleState, ScheduleStatus, Verdict,
+        ReviewUnitLifecycle, ReviewUnitRetirement, ReviewUnitRetirementReason, RubricAssessment,
+        RubricCriterion, RubricCriterionResult, RubricCriterionVerdict, RubricDefinition,
+        RubricPrompt, ScheduleState, ScheduleStatus, Verdict,
     };
 }
 
@@ -140,7 +142,8 @@ pub use progression::{
 };
 pub use queue::{
     compare_queue_priority, defer_queue_availability, pick_next_queue_candidate,
-    reviewable_queue_candidates,
+    reviewable_queue_candidates, ReviewUnitLifecycle, ReviewUnitRetirement,
+    ReviewUnitRetirementReason,
 };
 pub use scheduling::next;
 pub use types::{
@@ -155,8 +158,9 @@ mod tests {
         adapters, default_rating_policy, dogfood, filter_eligible_candidates,
         filter_eligible_candidates_with_fallback, grading, next, pick_next_queue_candidate, queue,
         scheduling, testkit, types, ExactPrompt, ExactPromptKind, Grader, ProgressionCandidate,
-        Prompt, Rating, ReviewUnitId, RubricAssessment, RubricCriterion, RubricCriterionResult,
-        RubricCriterionVerdict, RubricDefinition, RubricPrompt, StaticRubricGrader,
+        Prompt, Rating, ReviewUnitId, ReviewUnitLifecycle, RubricAssessment, RubricCriterion,
+        RubricCriterionResult, RubricCriterionVerdict, RubricDefinition, RubricPrompt,
+        StaticRubricGrader,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -430,6 +434,7 @@ mod tests {
                 review_unit_id: prerequisite.clone(),
                 schedule_state: Some(mastered.clone()),
                 due: mastered.due,
+                lifecycle: ReviewUnitLifecycle::active(),
                 progression: Some(ProgressionMetadata {
                     progression_group: Some("api".to_owned()),
                     stage_order: 1,
@@ -444,6 +449,7 @@ mod tests {
                 review_unit_id: advanced.clone(),
                 schedule_state: None,
                 due: NOW - 60_000,
+                lifecycle: ReviewUnitLifecycle::active(),
                 progression: Some(ProgressionMetadata {
                     progression_group: Some("api".to_owned()),
                     stage_order: 2,

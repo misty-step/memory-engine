@@ -253,6 +253,7 @@ impl MemoryServiceStore for WebShellStore {
                         .as_ref()
                         .map_or(unit.queue.due, |state| state.due),
                     schedule_state,
+                    lifecycle: unit.queue.lifecycle,
                     progression: unit.queue.progression.clone(),
                     concept_key: unit.queue.concept_key.clone(),
                     source_key: unit.queue.source_key.clone(),
