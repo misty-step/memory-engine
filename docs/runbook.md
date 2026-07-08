@@ -11,8 +11,13 @@ running pending decommission; do not point new consumers at it.
 ## Agent surface summary
 
 - App: `memory-engine-api`.
-- Platform: DigitalOcean App Platform (id `5ab05b73-9265-43c9-a01c-fef53f5f46a4`).
-- URL: `https://memory-engine-api-i2xcr.ondigitalocean.app`.
+- Primary platform: DigitalOcean App Platform (id
+  `5ab05b73-9265-43c9-a01c-fef53f5f46a4`), URL
+  `https://memory-engine-api-i2xcr.ondigitalocean.app`.
+- Standby platform: Fly Machines, org `misty-step`, primary region `ord`,
+  URL `https://memory-engine-api.fly.dev` — still deployed by CI on every
+  push (see Deployed smoke below) and kept warm pending decommission, but
+  no longer where consumers should point.
 - Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
 - Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
@@ -25,10 +30,12 @@ running pending decommission; do not point new consumers at it.
 
 ## Deployed smoke
 
-These commands mirror the post-deploy smoke in `.github/workflows/deploy.yml`.
+These commands mirror the post-deploy smoke in `.github/workflows/deploy.yml`,
+which still targets the Fly standby app. For the primary DO app, rerun the
+same three checks against `https://memory-engine-api-i2xcr.ondigitalocean.app`.
 
 ```sh
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://memory-engine-api.fly.dev"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}" "$base/healthz")
 test "$status" = "200"
