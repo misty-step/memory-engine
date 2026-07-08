@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client;
 
-pub const DEFAULT_BASE_URL: &str = "https://memory-engine-api.fly.dev";
+pub const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

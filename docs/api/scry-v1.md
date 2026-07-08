@@ -45,7 +45,7 @@ a pre-provisioned account without printing the session token:
 MEMORY_ENGINE_ACCOUNT_ID=acct_... \
 MEMORY_ENGINE_SESSION_TOKEN="$SESSION_TOKEN" \
 cargo run -p memory-engine-contract -- \
-  --base-url https://memory-engine-api.fly.dev
+  --base-url https://memory-engine-api-i2xcr.ondigitalocean.app
 ```
 
 The runner creates a disposable source, generates drafts, approves the first

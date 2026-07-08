@@ -4,7 +4,8 @@ description: |
   QA memory-engine changes by exercising the real running surface, not just tests.
   memory-engine is a Rust workspace: a framework-free learning kernel + facade
   library, an HTTP API/server-rendered study UI (memory-engine-api, deployed to
-  Fly), model-backed generation, and dogfood clients. "Tests pass" is not QA.
+  DigitalOcean App Platform), model-backed generation, and dogfood clients.
+  "Tests pass" is not QA.
   Use when: "QA this", "verify the feature", "smoke test", "check the app",
   "test memory-engine". Trigger: /memory-engine-qa.
 argument-hint: "[api|kernel|ui|generation|gate|prod-smoke]"
@@ -89,9 +90,12 @@ cargo run -p memory-engine-qa -- --full     # handoff sweep; ends with bun run c
 
 ## Production smoke (optional)
 
-Live at `https://memory-engine-api.fly.dev` (Fly, `misty-step`/`ord`). Mirror the
-deploy smoke (health/home/anon boundary) per `docs/runbook.md`; e.g.
-`curl -fsS https://memory-engine-api.fly.dev/healthz` → `{"status":"ok",...}`.
+Live at `https://memory-engine-api-i2xcr.ondigitalocean.app` (DigitalOcean App
+Platform; standby copy still running at `memory-engine-api.fly.dev`, Fly
+`misty-step`/`ord`, pending decommission). Mirror the deploy smoke
+(health/home/anon boundary) per `docs/runbook.md`; e.g.
+`curl -fsS https://memory-engine-api-i2xcr.ondigitalocean.app/healthz` →
+`{"status":"ok",...}`.
 
 ## Gotchas
 

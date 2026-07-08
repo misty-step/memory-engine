@@ -20,7 +20,7 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 
-const DEFAULT_BASE_URL: &str = "https://memory-engine-api.fly.dev";
+const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Safety cap on cards reviewed in a single run. A real due queue should
@@ -1137,7 +1137,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("credentials.json");
         let credentials = StoredCredentials {
-            base_url: "https://memory-engine-api.fly.dev".to_owned(),
+            base_url: "https://memory-engine-api-i2xcr.ondigitalocean.app".to_owned(),
             account_id: "acct_demo".to_owned(),
             session_token: "secret".to_owned(),
         };

@@ -9,7 +9,7 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 
-const DEFAULT_BASE_URL: &str = "https://memory-engine-api.fly.dev";
+const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SOURCE_BODY: &str = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.\n\nConcept: NATO CAT composition\nActivity: exercise\nStage: composition\nQuestion: Spell CAT over the phone using the NATO phonetic alphabet.\nAnswer: CHARLIE ALFA TANGO\nWorked Solution: C is CHARLIE, A is ALFA, and T is TANGO.\nReference: C is CHARLIE. A is ALFA. T is TANGO.";
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn receipt_serialization_does_not_include_session_token() {
         let receipt = ContractReceipt {
-            base_url: "https://memory-engine-api.fly.dev".to_owned(),
+            base_url: "https://memory-engine-api-i2xcr.ondigitalocean.app".to_owned(),
             openapi_version: "3.1.0".to_owned(),
             contract_path_count: 9,
             account_id: "acct_demo".to_owned(),

@@ -1,15 +1,18 @@
 # Production runbook — memory-engine-api
 
 Everything here is CLI/API-driven; no dashboards required. The app is
-`memory-engine-api` on Fly (org `misty-step`, region `ord`), serving both the
+`memory-engine-api` on DigitalOcean App Platform (cut over from Fly
+2026-07-08; Postgres is Neon, unchanged by the cutover), serving both the
 JSON API and the server-rendered study UI from one Rust binary at
-`https://memory-engine-api.fly.dev`.
+`https://memory-engine-api-i2xcr.ondigitalocean.app`. The Fly app
+(`memory-engine-api.fly.dev`, org `misty-step`, region `ord`) is left
+running pending decommission; do not point new consumers at it.
 
 ## Agent surface summary
 
 - App: `memory-engine-api`.
-- Platform: Fly Machines, org `misty-step`, primary region `ord`.
-- URL: `https://memory-engine-api.fly.dev`.
+- Platform: DigitalOcean App Platform (id `5ab05b73-9265-43c9-a01c-fef53f5f46a4`).
+- URL: `https://memory-engine-api-i2xcr.ondigitalocean.app`.
 - Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
 - Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
@@ -25,7 +28,7 @@ JSON API and the server-rendered study UI from one Rust binary at
 These commands mirror the post-deploy smoke in `.github/workflows/deploy.yml`.
 
 ```sh
-base="https://memory-engine-api.fly.dev"
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}" "$base/healthz")
 test "$status" = "200"
@@ -50,7 +53,7 @@ token first.
 ```sh
 set -euo pipefail
 
-base="https://memory-engine-api.fly.dev"
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
 receipt_dir="docs/qa"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
@@ -93,27 +96,33 @@ printf '%s\n' "$generate_status" \
 
 ## Deploy and rollback
 
-Deploys are automatic and gated: pushing `master` runs the `ci` workflow;
-`deploy.yml` runs only when ci succeeds for that SHA, deploys that exact SHA,
-and fails on a post-deploy smoke regression (healthz, home page, anonymous
-auth boundary).
+DigitalOcean App Platform is git-integrated on `master`: every push builds
+and deploys automatically (`doctl apps list-deployments memory-engine-api`
+to watch). The legacy Fly `deploy.yml` workflow still runs in parallel
+(gated on the `ci` workflow, deploys the same SHA, fails on a post-deploy
+smoke regression) and keeps the standby Fly app current until it is
+decommissioned — do not remove it without an explicit decommission ticket.
 
-Manual deploy (emergency only — bypasses the CI gate):
+Manual DO deploy / rollback:
+
+```sh
+doctl apps create-deployment 5ab05b73-9265-43c9-a01c-fef53f5f46a4   # redeploy current spec
+doctl apps list-deployments 5ab05b73-9265-43c9-a01c-fef53f5f46a4    # find a prior deployment id to roll back to
+```
+
+Manual Fly deploy (standby app, emergency only):
 
 ```sh
 flyctl deploy --remote-only --app memory-engine-api
 ```
 
-Rollback: redeploy the previous image.
-
-```sh
-flyctl releases --app memory-engine-api          # find prior image ref
-flyctl deploy --app memory-engine-api --image <previous-image-ref>
-```
-
 ## Health
 
 ```sh
+curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status":"ok",...}
+doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
+
+# Fly standby (not primary traffic):
 curl -s https://memory-engine-api.fly.dev/healthz   # {"status":"ok",...}
 flyctl status --app memory-engine-api
 flyctl logs --app memory-engine-api

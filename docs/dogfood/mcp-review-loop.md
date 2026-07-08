@@ -49,7 +49,8 @@ terminal — so a brand-new local server instead bootstraps its own account
 non-interactively from `MEMORY_ENGINE_MCP_EMAIL`, persisting the result to
 `~/.memory-engine/mcp/credentials.json` (mode `0600`) for reuse across
 restarts. `MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
-`https://memory-engine-api.fly.dev`, matching `memory-engine-review`).
+`https://memory-engine-api-i2xcr.ondigitalocean.app`, matching
+`memory-engine-review`).
 
 Resolution order: env vars -> credentials file -> `MEMORY_ENGINE_MCP_EMAIL`
 bootstrap -> fail loudly. There is no in-memory fallback
@@ -64,7 +65,7 @@ ephemeral in-memory mode silently evaporated claims on process exit.
 cargo build -p memory-engine-mcp
 cargo test -p memory-engine-mcp
 MEMORY_ENGINE_ACCOUNT_ID=... MEMORY_ENGINE_SESSION_TOKEN=... \
-  MEMORY_ENGINE_MCP_BASE_URL=https://memory-engine-api.fly.dev \
+  MEMORY_ENGINE_MCP_BASE_URL=https://memory-engine-api-i2xcr.ondigitalocean.app \
   ./target/debug/memory-engine-mcp
 ```
 
