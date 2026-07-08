@@ -14,7 +14,7 @@ set -eu
 : "${MEMORY_ENGINE_AUTH_EMAIL:?MEMORY_ENGINE_AUTH_EMAIL is required}"
 : "${MEMORY_ENGINE_AUTH_LINK:?MEMORY_ENGINE_AUTH_LINK is required}"
 
-base="${MEMORY_ENGINE_PUBLIC_BASE_URL:-https://memory-engine-api.fly.dev}"
+base="${MEMORY_ENGINE_PUBLIC_BASE_URL:-https://memory-engine-api-i2xcr.ondigitalocean.app}"
 api="${RESEND_API_URL:-https://api.resend.com}"
 sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
 
