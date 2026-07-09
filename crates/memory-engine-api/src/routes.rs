@@ -579,7 +579,12 @@ struct AppReviewSubmitForm {
     csrf_token: Option<String>,
     review_unit_id: String,
     answer: String,
-    response_time_ms: u32,
+    // Raw text, not a number: the field is filled by a client-side timer, so
+    // it can arrive blank (JavaScript off), malformed, or hostile. Rejecting
+    // those shapes would block the learner's answer; instead the submit
+    // handler sanitizes them to a conservative value that can never rate
+    // `Easy`.
+    response_time_ms: Option<String>,
     idempotency_key: String,
 }
 
@@ -1006,6 +1011,28 @@ async fn bridge_app_review(
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
+/// Ceiling for a plausible single-answer response time (ten minutes).
+///
+/// The browser owns the timer, so the server cannot make the reported value
+/// true — it can only refuse dishonest shapes. Anything missing, blank,
+/// malformed, non-positive, or beyond this ceiling grades as the ceiling
+/// itself: the slowest plausible answer. A broken or lying client can
+/// therefore never manufacture the fast-answer `Easy` rating, and a learner
+/// who walked away mid-card records ten minutes, not an absurd outlier.
+pub(crate) const MAX_PLAUSIBLE_RESPONSE_TIME_MS: u32 = 600_000;
+
+/// Sanitize the client-reported response time before it reaches the typed
+/// review boundary. Valid positive millisecond counts pass through, clamped
+/// to [`MAX_PLAUSIBLE_RESPONSE_TIME_MS`]; every other shape maps to that same
+/// conservative ceiling.
+pub(crate) fn sanitize_response_time_ms(raw: Option<&str>) -> u32 {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|&elapsed| elapsed > 0)
+        .map_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS, |elapsed| {
+            elapsed.min(MAX_PLAUSIBLE_RESPONSE_TIME_MS)
+        })
+}
+
 async fn submit_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1021,7 +1048,7 @@ async fn submit_app_review(
         &form.review_unit_id,
         &SubmitReviewRequest {
             answer: form.answer,
-            response_time_ms: form.response_time_ms,
+            response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
             idempotency_key: form.idempotency_key,
         },
     );

@@ -512,11 +512,16 @@ fn review_submit_fields(account: &AppAccount, current: &BetaStudyCurrent) -> Str
     // per-attempt discriminator — stable across an accidental double-submit of
     // one answer (so that stays idempotent), and incremented before the card is
     // shown again — so each attempt gets its own key. Fresh card: reps 0.
+    // The response time ships blank on purpose: app.js fills in the real
+    // presentation-to-submit elapsed milliseconds at the moment of submission,
+    // and the server grades a blank (or otherwise unvouchable) value
+    // conservatively — it can never rate `Easy`. A fabricated constant here
+    // once made every mature correct answer look like fast recall.
     let reps = current.review_state.as_ref().map_or(0, |state| state.reps);
     format!(
         r#"{csrf}
 <input type="hidden" name="reviewUnitId" value="{id}">
-<input type="hidden" name="responseTimeMs" value="1800">
+<input type="hidden" name="responseTimeMs" value="">
 <input type="hidden" name="idempotencyKey" value="review-{id}-{reps}">"#,
         csrf = hidden_csrf_input(account),
         id = escape_html(&current.review_unit_id.to_string()),
