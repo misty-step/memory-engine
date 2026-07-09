@@ -27,9 +27,9 @@
   ],
   "nodes": [
     {
-      "id": "node.backlog.16",
+      "id": "node.powder.016",
       "label": "Ticket 16 Workbench",
-      "kind": "backlog",
+      "kind": "powder",
       "summary": "Defines this architecture workbench scope and acceptance criteria.",
       "viewTags": ["architecture-boundary", "extraction-decision-map"],
       "layout": {
@@ -44,9 +44,9 @@
       },
       "refs": [
         {
-          "kind": "backlog",
-          "path": "backlog.d/16-system-visualization-workbench.md",
-          "label": "backlog.d/16-system-visualization-workbench.md"
+          "kind": "powder",
+          "path": "memory-engine-016",
+          "label": "Powder card memory-engine-016"
         }
       ]
     },
@@ -672,9 +672,9 @@
           "label": "docs/dogfood/extraction-decision.md"
         },
         {
-          "kind": "backlog",
-          "path": "backlog.d/_done/24-extraction-decision-gate.md",
-          "label": "backlog 24 closure"
+          "kind": "powder",
+          "path": "memory-engine-024",
+          "label": "Powder card memory-engine-024 closure"
         }
       ]
     },
@@ -706,7 +706,7 @@
   "edges": [
     {
       "id": "edge.backlog16.owns.workbench",
-      "from": "node.backlog.16",
+      "from": "node.powder.016",
       "to": "node.docs.architecture.workbench",
       "label": "Defines artifact scope",
       "kind": "defines",
@@ -714,9 +714,9 @@
       "viewTags": ["architecture-boundary", "extraction-decision-map"],
       "refs": [
         {
-          "kind": "backlog",
-          "path": "backlog.d/16-system-visualization-workbench.md",
-          "label": "oracle section"
+          "kind": "powder",
+          "path": "memory-engine-016",
+          "label": "Powder card memory-engine-016 oracle"
         }
       ]
     },
@@ -1267,9 +1267,9 @@
       "viewTags": ["extraction-decision-map"],
       "refs": [
         {
-          "kind": "backlog",
-          "path": "backlog.d/16-system-visualization-workbench.md",
-          "label": "use as decision aid"
+          "kind": "powder",
+          "path": "memory-engine-016",
+          "label": "Powder card memory-engine-016"
         }
       ]
     }

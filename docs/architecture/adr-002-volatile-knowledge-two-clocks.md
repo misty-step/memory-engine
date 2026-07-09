@@ -2,7 +2,7 @@
 
 Status: proposed
 Date: 2026-07-04
-Refs-backlog: 069
+Refs-Powder: memory-engine-069
 
 ## Context
 

@@ -1,6 +1,6 @@
 # Extraction Decision
 
-Refs-backlog: 24
+Refs-Powder: memory-engine-024
 
 ## Decision
 
@@ -70,7 +70,7 @@ workflows need the same abstraction.
   real dogfood review sessions.
 - `29-service-contract-v0-hardening`: decide DTOs, reveal semantics, typed
   failures, and public-subpath-only service tests.
-- `30-backlog-hygiene-and-qa-receipts`: reduce tracker drift and persist QA
+- Powder card `memory-engine-030`: reduce tracker drift and persist QA
   receipts when useful.
 - `31-beta-extraction-decision`: revisit extraction, helper promotion, and
   database ownership after durable beta evidence exists.

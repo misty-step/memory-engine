@@ -1,7 +1,7 @@
 # QA receipt — persistent dogfood deployment
 
-Date: 2026-06-11. Ticket: backlog.d/044-production-hardening.md (partial; see
-ticket for remaining scope). Production: `https://memory-engine-api.fly.dev`.
+Date: 2026-06-11. Powder card: `memory-engine-044` (partial; see card for
+remaining scope). Production: `https://memory-engine-api.fly.dev`.
 
 ## Pipeline (first real runs of the gated deploy)
 

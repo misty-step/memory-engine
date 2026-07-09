@@ -1,6 +1,6 @@
 # Contract Promotion Candidate
 
-Refs-backlog: 34
+Refs-Powder: memory-engine-034
 
 ## Chosen Candidate
 

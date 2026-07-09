@@ -1,6 +1,6 @@
 # MCP Review Loop Dogfood
 
-Refs-backlog: Powder card `memory-engine-071`
+Refs-Powder: memory-engine-071
 
 ## Purpose
 

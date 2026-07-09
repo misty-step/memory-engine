@@ -1,12 +1,12 @@
 # Beta Interface Scope
 
-Refs-backlog: 24
-Refs-backlog: 26
-Refs-backlog: 27
-Refs-backlog: 28
-Refs-backlog: 29
-Refs-backlog: 30
-Refs-backlog: 31
+Refs-Powder: memory-engine-024
+Refs-Powder: memory-engine-026
+Refs-Powder: memory-engine-027
+Refs-Powder: memory-engine-028
+Refs-Powder: memory-engine-029
+Refs-Powder: memory-engine-030
+Refs-Powder: memory-engine-031
 
 ## Purpose
 
@@ -86,7 +86,7 @@ Belongs in the shared kernel/API:
 | `27-ai-content-generation-probe` | Generate source-grounded quiz/exercise drafts with provenance and validation. | AI output must be cited, evaluated, and approved before entering review or practice. |
 | `28-mobile-beta-study-interface` | Mobile-first local study shell for real dogfood use. | Low-friction retrieval attempts and simple exercises are the product proof. |
 | `29-service-contract-v0-hardening` | Decide DTOs, reveal semantics, activity-kind metadata, typed failures, and shared store harness after beta pressure. | Stable contracts should follow repeated interface evidence. |
-| `30-backlog-hygiene-and-qa-receipts` | Keep tracker and QA evidence trustworthy. | Long-running product learning needs reliable evidence trails. |
+| Powder card `memory-engine-030` | Keep tracker and QA evidence trustworthy. | Long-running product learning needs reliable evidence trails. |
 | `31-beta-extraction-decision` | Decide whether to extract/promote/keep experimenting after beta evidence. | Extraction requires repeated pressure across clients or workflows. |
 | `32-graduated-activity-ladder` | Add concept-level variant ladders and deterministic exercise progression after the basic beta loop exists. | Transfer requires varied practice and guidance fading, but the kernel should not absorb pedagogy prematurely. |
 

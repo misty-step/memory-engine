@@ -1,9 +1,9 @@
 # Quality Improvement Register
 
-Refs-backlog: 25
+Refs-Powder: memory-engine-025
 
 This register records quality opportunities found by QA. These are not all
-bugs. Promote an item to `backlog.d/` when it becomes necessary for delivery,
+bugs. Create a Powder card when an item becomes necessary for delivery,
 beta/product proof, or a shaped extraction decision.
 
 ## Active Opportunities

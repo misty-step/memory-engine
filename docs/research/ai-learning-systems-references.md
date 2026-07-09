@@ -5,16 +5,16 @@ embeddings, retrieval, agents, and model-based graders around `memory-engine`.
 Provider calls, prompts, vector indexes, and agent loops stay outside the pure
 kernel unless repeated experiments prove a stable adapter contract.
 
-Refs-backlog: 20
-Refs-backlog: 21
-Refs-backlog: 22
-Refs-backlog: 23
-Refs-backlog: 24
-Refs-backlog: 26
-Refs-backlog: 27
-Refs-backlog: 28
-Refs-backlog: 29
-Refs-backlog: 31
+Refs-Powder: memory-engine-020
+Refs-Powder: memory-engine-021
+Refs-Powder: memory-engine-022
+Refs-Powder: memory-engine-023
+Refs-Powder: memory-engine-024
+Refs-Powder: memory-engine-026
+Refs-Powder: memory-engine-027
+Refs-Powder: memory-engine-028
+Refs-Powder: memory-engine-029
+Refs-Powder: memory-engine-031
 
 ## Core Findings
 

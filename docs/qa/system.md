@@ -1,11 +1,11 @@
 # Memory Engine QA System
 
-Refs-backlog: 25
-Refs-backlog: 051
-Refs-backlog: 052
-Refs-backlog: 053
-Refs-backlog: 054
-Refs-backlog: 055
+Refs-Powder: memory-engine-025
+Refs-Powder: memory-engine-051
+Refs-Powder: memory-engine-052
+Refs-Powder: memory-engine-053
+Refs-Powder: memory-engine-054
+Refs-Powder: memory-engine-055
 
 ## Purpose
 
@@ -134,7 +134,7 @@ Register entries should name:
 - quality dimension
 - current evidence
 - improvement
-- trigger for promoting it into a shaped backlog ticket
+- trigger for creating a shaped Powder card
 
 Do not use the register for vague wishes. If an item is actionable now and
 blocks the active work, fix it instead of recording it.
