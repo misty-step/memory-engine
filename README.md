@@ -16,9 +16,11 @@ It started as a framework-free kernel extracted from four learning apps:
 - Vault SRS
 
 Scry and the Vault FSRS app are now decommission targets. The current product
-direction is a world-class modular API for building learning and memorization
-applications, plus experimental clients that dogfood the API. Winning clients
-can be extracted into their own repositories after executable evidence.
+direction is a human-facing system for learning and memorizing anything without
+hand-designing cards or scheduling policy. The modular API, Rust kernel, and
+experimental clients exist to prove and support that product; they are not the
+category or the end state. Winning client contracts may be extracted only after
+repeated learner evidence.
 
 ## What It Owns
 
@@ -54,9 +56,11 @@ The Rust migration is complete for the main runtime:
 - Rust QA and benchmark receipt runners
 - historical Scry and Vault SRS canary branches
 
-The current production dogfood surface is `memory-engine-api`, a Rust binary
-deployed to Fly in `ord`. Agent-facing deployment, environment, auth, storage,
-and smoke-test details live in [docs/runbook.md](./docs/runbook.md).
+The current production dogfood surface is `memory-engine-api`, a Rust binary on
+DigitalOcean App Platform backed by Neon Postgres. The former Fly deployment in
+`ord` is a temporary standby pending explicit decommission. Agent-facing
+deployment, environment, auth, storage, and smoke-test details live in
+[docs/runbook.md](./docs/runbook.md).
 
 Current strategy and verification docs:
 

@@ -1,6 +1,6 @@
 # Recall-loop dogfood client #1 — morning review CLI against the deployed API
 
-Priority: P1 · Status: in-progress · Estimate: M
+Priority: P1 · Status: shipped · Estimate: M
 
 Origin: Powder card `memory-engine-070` (recall-loop dogfood client #1, the T2
 rung after the in-process `memory-engine-cli` fixture client).
@@ -32,31 +32,31 @@ for a human's actual morning routine, not just a scripted fixture).
 
 ## Oracle
 
-- [ ] `crates/memory-engine-review` is a standalone Rust binary crate that
+- [x] `crates/memory-engine-review` is a standalone Rust binary crate that
       speaks the v1 HTTP contract directly (`ureq`, matching
       `memory-engine-contract`'s idiom) — no dependency on
       `memory-engine-core`/`-service` (this is an external client, not an
       in-process dogfood harness like `memory-engine-cli`).
-- [ ] `cargo test -p memory-engine-review` includes a real end-to-end test
+- [x] `cargo test -p memory-engine-review` includes a real end-to-end test
       that boots a local `memory-engine-api` axum server, creates an account,
       seeds a source, generates and approves a draft, then drives the review
       loop through piped stdin to a natural `dueCount == 0` completion.
-- [ ] The CLI has a documented one-time `login` step (`--email` for a new
+- [x] The CLI has a documented one-time `login` step (`--email` for a new
       account, or `--account-id`/`--session-token` to import an existing
       one) that persists credentials locally and is never checked in.
-- [ ] The CLI loops `review/next` -> answer -> `review/submit` until
+- [x] The CLI loops `review/next` -> answer -> `review/submit` until
       `dueCount` reaches 0 (or a `--max-cards` safety cap, which is reported
       as an incomplete session, not silently swallowed).
-- [ ] Every graded attempt and every completed session is appended to a local
+- [x] Every graded attempt and every completed session is appended to a local
       NDJSON log (no new server surface) with enough fields to reconstruct a
       30-day streak and a cold-recall rate later.
-- [ ] `memory-engine-review streak` reads that log and reports: hit rate over
+- [x] `memory-engine-review streak` reads that log and reports: hit rate over
       a window (default 30 days), current consecutive-day streak, and
       cold-recall accuracy (attempts where the review unit had
       `scheduleChange.before.reps >= 1`, i.e. this was not the first exposure).
-- [ ] `docs/dogfood/morning-review-cli.md` records the falsifier, the
+- [x] `docs/dogfood/morning-review-cli.md` records the falsifier, the
       self-run transcript, and residual risk.
-- [ ] `bun run rust:ci` (fast gate) and `bun run ci:full` (Dagger gate) both
+- [x] `bun run rust:ci` (fast gate) and `bun run ci:full` (Dagger gate) both
       pass.
 
 ## Falsifier
@@ -77,3 +77,11 @@ this ticket's non-goal).
 Reuses the existing `.memory-engine/` local-state convention (already used
 by the dev server's file-store and by prior QA receipts) for credentials and
 the streak log, under `~/.memory-engine/review/`.
+
+## Shipped — 2026-07-04
+
+PR #30 merged as `b694b41` with green CI and fresh-context review. The real
+binary completed the full loop against a local instance of the production Rust
+server; `docs/dogfood/morning-review-cli.md` carries the transcript. Residual:
+the operator has not yet run a real production morning or accumulated a cold
+attempt, so this ships the client—not the 30-day habit claim now owned by 073.

@@ -1,6 +1,6 @@
 # MCP face: wrap the study/review API as a stdio MCP server
 
-Priority: P1 · Status: in-progress · Estimate: M
+Priority: P1 · Status: shipped · Estimate: M
 
 Origin: Powder card `memory-engine-071`. Closes a cell in the fleet-wide
 "five faces" coverage matrix (skill / CLI / API / MCP / UI) — `memory-engine-api`
@@ -51,7 +51,7 @@ proved for this fleet.
 - [x] `docs/dogfood/mcp-review-loop.md` records the tool contract, the
       credential model, the falsifier, and a hand-run transcript from a real
       terminal (not test output) plus the factory-mcps registry entry shape.
-- [ ] `bun run ci` (fast gate) and `bun run ci:full` (Dagger gate) both pass.
+- [x] `bun run ci` (fast gate) and `bun run ci:full` (Dagger gate) both pass.
 
 ## Falsifier
 
@@ -74,3 +74,11 @@ account. No interactive `login` subcommand exists here (stdin is the JSON-RPC
 channel), so a brand-new local server bootstraps its own account
 non-interactively from `MEMORY_ENGINE_MCP_EMAIL` instead, persisting to
 `~/.memory-engine/mcp/credentials.json`.
+
+## Shipped — 2026-07-04
+
+PR #31 merged as `4db426f` with green CI. The committed dogfood transcript
+drives the compiled stdio server through deck create, review, submit,
+invalidation, and empty-queue proof against a real local API. Residual: live
+harness registration and a production-account replay remain deliberately
+outside this ticket.

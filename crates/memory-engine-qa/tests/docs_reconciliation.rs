@@ -32,7 +32,7 @@ fn agent_docs_match_post_cutover_contract() {
     );
     assert!(
         agents.contains("docs/runbook.md"),
-        "AGENTS.md must point cold agents at the deployed Fly surface runbook"
+        "AGENTS.md must point cold agents at the production deployment runbook"
     );
     assert!(
         agents.contains("historical extraction context"),
@@ -115,11 +115,13 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
         &runbook,
         &[
             "App: `memory-engine-api`",
-            "primary region `ord`",
+            "Primary platform: DigitalOcean App Platform",
+            "Standby platform: Fly Machines",
             "MEMORY_ENGINE_POSTGRES_URL",
             "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
             "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS",
             "## Deployed smoke",
+            "base=\"https://memory-engine-api-i2xcr.ondigitalocean.app\"",
             "base=\"https://memory-engine-api.fly.dev\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w \"%{http_code}\" \"$base/healthz\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-home -w \"%{http_code}\" \"$base/\"",

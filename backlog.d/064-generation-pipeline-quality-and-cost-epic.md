@@ -1,6 +1,6 @@
 # Generation pipeline quality + cost — epic
 
-Priority: P1 · Status: pending · Estimate: L
+Priority: P1 · Status: in progress · Estimate: L
 
 ## Goal
 
@@ -11,19 +11,19 @@ research item; it does not duplicate their oracles.
 
 ## Oracle
 
-- [ ] 060 (content-type/coverage/shape/directionality evals) ships and is
-      **green**, proving the eval suite catches the creed/NATO misclassification
-      class of bug before generation changes, not after.
+- [x] 060 (content-type/coverage/shape/directionality evals) ships **red** on
+      the known creed/NATO failure, proving the eval suite catches the bug
+      before generation changes. PR #23 merged 2026-06-28.
 - [ ] 061 (verbatim/sequential/enumerable generation) ships and 060's suite
       goes green on real output, not fixtures.
-- [ ] A live OpenRouter model-selection pass: pull current pricing for
+- [x] A live OpenRouter model-selection pass: pull current pricing for
       generation-suitable models via the OpenRouter models API, compare against
       the production default (`google/gemini-3.5-flash`, per
       `docs/runbook.md`) on cost-per-generation and 058's judged quality
       metrics (keep-rate CI, distractor cohesion), and record a decision
-      (keep or switch) with the pricing snapshot as evidence. Do not assume a
-      cheaper model exists without pricing evidence — none was found
-      pre-verified in this repo or the fleet at investigation time.
+      (keep or switch) with the pricing snapshot as evidence. PR #28 recorded
+      the decision to keep `google/gemini-3.5-flash`; no cheaper candidate
+      cleared the product evidence bar.
 - [ ] Production cost-per-generation is measured and recorded (tokens in/out ×
       current price) alongside the existing latency runbook procedure, so
       "affordable" has a number attached, not a feeling.
@@ -64,6 +64,16 @@ than citing a document that could not be found.
 3. Live OpenRouter pricing pull + cost-per-generation comparison vs current
    default model.
 4. Production cost-per-generation measurement, recorded alongside latency.
+
+## Groom Update — 2026-07-09
+
+The model-decision child is complete and deliberately did **not** switch the
+provider: PR #28 found only statistically defensible regressions among the
+cheaper candidates. Content fit remained 0/3 across every model, so 061—not
+another model bakeoff—is the epic's next child. The remaining cost work is to
+record production tokens and dollars per generation on the DigitalOcean
+primary. Powder run `run-8pikDVqgcFEv` has an expired claim and no work log; it
+was flagged rather than silently transferred.
 
 
 ## Lead groom review (2026-07-02, supervisor)

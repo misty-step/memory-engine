@@ -101,8 +101,9 @@ by hand.
 2. Model learning material and quiz material as distinct but connected objects.
 3. Use AI to turn arbitrary learner input into atomic concepts, explanations,
    quizzes, and adaptive follow-up material.
-4. Keep the current Fly-hosted `memory-engine-api` as the living proof surface
-   while the full-stack-vs-service boundary remains open.
+4. Keep the current DigitalOcean-hosted `memory-engine-api` as the primary
+   living proof surface while the full-stack-vs-service boundary remains open;
+   the Fly deployment is a temporary standby, not a second product target.
 5. Push performance and data-shape decisions early enough that large concept
    graphs remain plausible.
 6. Keep `bun run ci` as the canonical gate and add ticket-specific QA, evals, or
@@ -119,6 +120,13 @@ clarifying questions, generates multiple quiz types, uses AI grading for free
 response, adapts difficulty from learner performance, and remains fast over a
 large personal concept graph.
 
+**6–12 month proof.** One learner uses the production system for at least 30
+days across enumerable facts, verbatim sequences, and conceptual material. The
+attempt history shows whether the daily loop became a habit, how much work it
+cost, which generated material was rejected, and whether later cold recall held
+up. Product claims are made from that receipt, not from seeded fixtures or a
+green aggregate gate.
+
 **Ideal.** Memory Engine is the default tool for learning and memorizing
 anything: simpler than Anki at the surface, deeper than Anki in the engine, and
 powered by explicit learning-science logic plus AI-assisted material generation
@@ -130,9 +138,10 @@ and personalization.
 - `SPEC.md` is the older strategy document; when product positioning conflicts,
   this vision governs.
 - `README.md` explains the Rust workspace, status, usage, and current docs.
-- `docs/runbook.md` is the production Fly/API runbook and smoke contract.
+- `docs/runbook.md` is the production API/deployment runbook and smoke contract.
 - `docs/qa/system.md`, `docs/qa/quality-register.md`, `docs/dogfood/`, and
   `docs/beta/` hold executable QA and dogfood evidence.
 - `backlog.d/` is the active shaped-work queue; `backlog.d/_done/` is closed
   history.
-- `bun run ci` shells to Dagger and is the closeout gate.
+- `bun run ci` is the direct host Cargo fast gate; `bun run ci:full` is the
+  Dagger-backed ship-parity gate.

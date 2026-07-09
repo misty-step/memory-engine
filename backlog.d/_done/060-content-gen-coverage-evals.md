@@ -1,6 +1,6 @@
 # Content-type, coverage, and shape evals for generation
 
-Priority: P2 · Status: pending · Estimate: M
+Priority: P2 · Status: shipped · Estimate: M
 
 ## Goal
 
@@ -15,24 +15,24 @@ becomes a deterministic eval.
 
 ## Oracle
 
-- [ ] Fixtures: a verbatim/sequential text (a creed or short poem), an enumerable
+- [x] Fixtures: a verbatim/sequential text (a creed or short poem), an enumerable
       set (the NATO phonetic alphabet), and an existing prose-concept source as a
       regression guard against over-applying the new rules.
-- [ ] **Classification eval:** creed → verbatim/sequential; NATO → enumerable
+- [x] **Classification eval:** creed → verbatim/sequential; NATO → enumerable
       set; prose → conceptual. Goes red on the current misclassification (creed
       treated as conceptual).
-- [ ] **Coverage eval:** for memorize-the-whole-thing input, the card set covers
+- [x] **Coverage eval:** for memorize-the-whole-thing input, the card set covers
       every line/element in `[1..N]` with no gaps — creed → ≥1 card per line;
       NATO → all 26 letters. This **inverts** the conceptual "fewer, better"
       rule and must be explicit. Currently red.
-- [ ] **Shape eval:** verbatim → cloze / next-line recall, not 4-option
+- [x] **Shape eval:** verbatim → cloze / next-line recall, not 4-option
       recognition trivia; set → production recall, not guess-from-4.
-- [ ] **Directionality / anti-bloat eval:** for a paired-associate set, cards
+- [x] **Directionality / anti-bloat eval:** for a paired-associate set, cards
       exist for the **non-derivable** direction only. NATO = letter→word
       (arbitrary, must memorize); word→letter is just the word's first letter
       (Bravo→B is free) and must **not** generate cards. Assert the redundant
       direction is absent.
-- [ ] The suite is the comparison artifact and is **red on current generation**.
+- [x] The suite is the comparison artifact and is **red on current generation**.
       Deterministic graders where possible (count, coverage `[1..N]`,
       direction); a model judge only for shape/classification, sized per the 058
       rigor doctrine (CI, judge ≠ generator family).
@@ -44,6 +44,14 @@ creed/NATO fix instead of us eyeballing it. Connects to the graduated-difficulty
 vision (recognition → recall → free recall by mastery). Keep grading
 deterministic wherever the property is structural — coverage and directionality
 are countable, not judgment calls.
+
+## Shipped — 2026-06-28
+
+PR #23 merged the typed corpus plus deterministic classification, coverage,
+shape, and directionality scoring. The committed red comparison artifact is
+`docs/evals/generation-060-content-fit-red-2026-06-24.md`; it intentionally
+hands the still-failing generation behavior to 061 rather than claiming the
+product output is fixed.
 
 ## Children
 
