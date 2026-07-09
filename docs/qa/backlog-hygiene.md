@@ -1,34 +1,27 @@
-# Backlog Hygiene
+# Powder Hygiene
 
-The backlog is a work queue, not a historical archive. Active tickets live in
-`backlog.d/`; completed tickets live in `backlog.d/_done/`. A ticket in
-`_done/` must not carry `status: ready`, because that makes the next-work
-selector treat closed work as available scope.
+Powder is the work queue and historical ledger. A `ready` card must be
+claimable with an executable oracle; a `done` card must not appear in the
+ready query.
 
 ## Active Tickets
 
-An active ticket must describe work that is not yet proved complete. If current
-repo evidence already satisfies every oracle, archive the ticket instead of
-leaving it active. If the implementation only satisfies part of the oracle,
-reshape the ticket so the remaining work is explicit and executable.
+An active card must describe work that is not yet proved complete. If current
+repo evidence already satisfies every oracle, complete the card with proof
+instead of leaving it active. If implementation only satisfies part of the
+oracle, reshape the card so the remaining work is explicit and executable.
 
-Active ticket evidence must name:
+Active card evidence must name:
 
 - the files or executable surfaces that satisfy each oracle;
 - the exact focused command for any ticket-specific proof;
 - the fast gate, `bun run ci`, plus the full `bun run ci:full` handoff gate
   when the branch is ready for handoff.
 
-## Archived Tickets
+## Completed Cards
 
-Archived tickets are historical receipts. Their frontmatter should use
-`status: shipped` when the ticket was delivered and moved into `_done/`.
-Do not leave archived tickets with `status: ready`.
-
-When an active ticket is archived because existing code already satisfies it,
-add closure evidence to the ticket or preserve the verification commands in the
-commit message. The evidence should be concrete enough for a cold reviewer to
-re-run the proof without reading the old conversation.
+Completed Powder cards are historical receipts. Attach closure evidence or a
+commit/PR link concrete enough for a cold reviewer to re-run the proof.
 
 ## QA Receipts
 
@@ -43,7 +36,7 @@ stable report files, such as release notes, a PR bot, dashboard import, or
 cross-repo comparison. Until then, copy the relevant command receipts into the
 handoff, trace, or commit message.
 
-## Backlog 30 Delivery Receipt
+## Powder 30 Delivery Receipt
 
 This hygiene pass used stdout receipts rather than adding
 `memory-engine-qa --report <path>`.
@@ -59,8 +52,8 @@ This hygiene pass used stdout receipts rather than adding
 
 ## Current Slice 6 Queue
 
-Backlog hygiene archived the completed beta persistence, beta generation, and
-backlog hygiene tickets. The remaining active Slice 6 path starts with the
+The prior Powder hygiene pass completed the beta persistence, beta generation,
+and hygiene cards. The remaining historical Slice 6 path started with the
 mobile beta interface as the highest-priority product proof:
 
 - `28-mobile-beta-study-interface`

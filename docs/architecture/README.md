@@ -1,6 +1,6 @@
 # Architecture Workbench
 
-Refs-backlog: 16
+Refs-Powder: memory-engine-016
 
 This folder is the repo-local system visualization workbench for `memory-engine`.
 It is intentionally static and diffable:
@@ -17,7 +17,7 @@ It is intentionally static and diffable:
 3. For every node/edge change, update all of:
    - `viewTags` for relevant views;
    - `summary` text that describes invariant intent;
-   - `refs` pointing to concrete source/test/doc/backlog evidence.
+   - `refs` pointing to concrete source/test/doc/Powder evidence.
 4. Run a local parse/smoke check:
    - `python3 -m json.tool docs/architecture/memory-engine.map.json >/dev/null`
    - `test -f docs/architecture/workbench.html`

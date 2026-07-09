@@ -31,7 +31,8 @@ promotion.
   `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
-- `backlog.d/` contains active work; `backlog.d/_done/` contains closed work.
+- Powder is the sole work ledger: cards hold active work, closure, relations,
+  and proof. Git history holds archived source history.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
   consumer-facing Rust facade and module exports.
@@ -61,8 +62,7 @@ oracle.
 
 1. One ticket, one branch, one PR. Branch from `master`; use `cx/...` by
    default.
-2. Do not implement feature work without an active shaped `backlog.d/`
-   ticket.
+2. Do not implement feature work without an active shaped Powder card.
 3. TDD is the default — test behavior, not implementation; do not mock
    repo-owned pure collaborators (see Conventions for the full statement).
 4. Core is pure: no Convex, React, Hono, Node/Bun APIs, filesystem,
@@ -114,7 +114,7 @@ oracle.
   import, benchmark, and QA tooling.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
-- `backlog.d/` — shaped tickets awaiting `/deliver`.
+- Powder — shaped tickets, claims, closure, and proof for `/deliver`.
 - `SPEC.md` / `docs/rust-migration.md` — authoritative on strategy and
   cutover state.
 
@@ -131,17 +131,13 @@ oracle.
 - **No non-Dagger TypeScript runtime.** The QA crate has a regression test
   for this (see Known Debt for cutover completion status).
 
-## Backlog Lifecycle
+## Work Lifecycle
 
-Active work lives in `backlog.d/`; closed work lives in `backlog.d/_done/`.
-Work references use `Refs-backlog: NN`; closure uses `Closes-backlog: NN` or
-`Ships-backlog: NN`. Archive by sourcing `scripts/lib/backlog.sh` and using
-`backlog_archive`.
-
-`/deliver` stops at merge-ready. `/ship` archives tickets, preserves closure
-trailers, merges, verifies archive state, writes final trace when available,
-and invokes bounded `/reflect`. `/groom` always reconciles tracker truth
-before strategy.
+Powder is authoritative. Claim the shaped card before implementation; record
+status, proof links, and completion on that card. Use `Refs-Powder:` trailers
+when a Git commit needs ticket attribution. `/deliver` stops at merge-ready;
+`/ship` records the landed commit and completion proof in Powder, then invokes
+bounded `/reflect`. `/groom` always reconciles Powder before strategy.
 
 ## Known Debt
 

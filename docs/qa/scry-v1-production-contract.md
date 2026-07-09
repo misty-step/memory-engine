@@ -1,6 +1,6 @@
 # QA receipt - Scry v1 production contract
 
-Date: 2026-06-12. Ticket: backlog.d/_done/049-scry-consumable-api.md.
+Date: 2026-06-12. Powder card: memory-engine-049.
 Production: `https://memory-engine-api.fly.dev`.
 
 ## Live Verification

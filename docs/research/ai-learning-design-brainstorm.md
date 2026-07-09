@@ -4,11 +4,11 @@ This brainstorm turns AI/embedding/agent research into concrete experiments and
 future contracts. The bias is: build AI-heavy clients around a pure learning
 kernel, not AI glue inside the kernel.
 
-Refs-backlog: 20
-Refs-backlog: 21
-Refs-backlog: 22
-Refs-backlog: 23
-Refs-backlog: 24
+Refs-Powder: memory-engine-020
+Refs-Powder: memory-engine-021
+Refs-Powder: memory-engine-022
+Refs-Powder: memory-engine-023
+Refs-Powder: memory-engine-024
 
 ## North-Star Ideas
 
@@ -182,7 +182,7 @@ Build an eval where agents are graded on tool use and pedagogy:
 - did it produce schema-valid commands?
 - did it update schedule only after a real attempt?
 
-## Candidate Backlog Additions
+## Candidate Powder Card Additions
 
 ### AI Content Compiler Experiment
 

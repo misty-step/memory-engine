@@ -1,6 +1,6 @@
 # Generation model decision — KEEP `google/gemini-3.5-flash` (2026-07-04)
 
-Decision for backlog `064` child 0, written by the lead from the five-model
+Decision for Powder card `memory-engine-064` child 0, written by the lead from the five-model
 bakeoff receipts (`generation-064-bakeoff-*-2026-07-03.md`) and the rollup
 (`bench/results/memory-bakeoff-rerun-064-child-0.md`), honoring `058`'s
 statistical-rigor disclosures.
@@ -45,7 +45,7 @@ uncalibrated (058's κ-vs-human-labels run has not happened). What the data
 - Generation volume growing to where the cost delta exceeds ~$10/month —
   then rerun at a sample size 058's power math says can resolve ~5pp.
 
-## Follow-ups this decision creates (backlog, not blockers)
+## Follow-ups this decision creates (Powder cards, not blockers)
 
 - `058`: the judge-calibration run is now the highest-leverage bench
   investment — every verdict above inherits its uncertainty.

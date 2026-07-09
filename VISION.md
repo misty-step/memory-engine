@@ -141,7 +141,6 @@ and personalization.
 - `docs/runbook.md` is the production API/deployment runbook and smoke contract.
 - `docs/qa/system.md`, `docs/qa/quality-register.md`, `docs/dogfood/`, and
   `docs/beta/` hold executable QA and dogfood evidence.
-- `backlog.d/` is the active shaped-work queue; `backlog.d/_done/` is closed
-  history.
+- Powder is the shaped-work queue, claim ledger, and closure history.
 - `bun run ci` is the direct host Cargo fast gate; `bun run ci:full` is the
   Dagger-backed ship-parity gate.

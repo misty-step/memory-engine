@@ -1,6 +1,6 @@
 # Extract Beta App Readiness Gate
 
-Refs-backlog: 35
+Refs-Powder: memory-engine-035
 
 ## Decision
 

@@ -78,7 +78,7 @@ active delivery oracles:
 - [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
 - [exemplars.md](./exemplars.md)
 
-Active backlog now tracks production dogfood usefulness, service hardening,
+The active Powder queue tracks production dogfood usefulness, service hardening,
 learning-science quality, input capture, and extraction decisions on top of the
 Rust stack.
 

@@ -258,8 +258,8 @@ from this repo alone without the session transcript.
 
 ## Oracle (Definition of Done)
 
-- [x] `backlog.d/040-production-mobile-study-app-boundary.md` exists and names
-  the production-app acceptance oracle.
+- [x] Powder card `memory-engine-040` records the production-app acceptance
+  oracle.
 - [x] ADR records Fly Machines + managed Postgres as the chosen production
   shell and rejects Vercel as the backend.
 - [x] A Rust API boundary exists outside `memory-engine-core`.
@@ -279,7 +279,7 @@ from this repo alone without the session transcript.
 
 - Output: production mobile study app boundary, deploy config, QA evidence, and
   updated docs.
-- Acceptance oracle: context packet plus backlog ticket plus executable tests,
+- Acceptance oracle: context packet plus Powder card plus executable tests,
   staging deployment smoke, and full CI.
 - Evidence artifacts: test output, Dagger output, staging URL, screenshots,
   `/state` or API receipts, and deploy command output.
@@ -302,7 +302,7 @@ from this repo alone without the session transcript.
 
 - Acceptance source: this context packet, `SPEC.md`,
   `docs/beta/extract-beta-app-readiness.md`, `docs/beta/mobile-study.md`,
-  `docs/qa/quality-register.md`, and the future backlog ticket.
+  `docs/qa/quality-register.md`, and the future Powder card.
 - Evidence that proves it: implementation tests, browser/mobile screenshots,
   deployed smoke, and Dagger output.
 - Exact command/path/route exercised:

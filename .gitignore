@@ -30,11 +30,10 @@ bun-debug.log*
 # Dagger
 .dagger/sdk/
 
-# Flywheel / deliver state
+# Local delivery state
 .spellbook/
 !.spellbook/
 !.spellbook/repo-brief.md
-backlog.d/_cycles/
 
 # Local provider handoff state
 .pi/state/

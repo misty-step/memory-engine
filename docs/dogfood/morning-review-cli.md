@@ -1,6 +1,6 @@
 # Morning Review CLI Dogfood
 
-Refs-backlog: 070 (Powder card `memory-engine-070`)
+Refs-Powder: memory-engine-070
 
 ## Purpose
 

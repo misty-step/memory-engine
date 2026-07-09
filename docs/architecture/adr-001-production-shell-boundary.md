@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-06-06
-Refs-backlog: 040
+Refs-Powder: memory-engine-040
 
 ## Context
 
