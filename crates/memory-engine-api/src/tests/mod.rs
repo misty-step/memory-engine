@@ -4631,3 +4631,292 @@ async fn answering_the_same_card_across_due_cycles_does_not_collide() {
         "second answer must grade: {graded_twice}"
     );
 }
+
+#[tokio::test]
+async fn review_form_leaves_response_time_blank_for_honest_measurement() {
+    // The review form used to embed a fabricated constant response time, so
+    // every browser answer looked like a fast 1.8-second recall. The rendered
+    // form must instead leave the field blank for the progressive-enhancement
+    // script to fill with the real presentation-to-submit elapsed time; with
+    // JavaScript off the blank submits as-is and the server grades it
+    // conservatively.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    assert!(
+        page.contains(r#"<input type="hidden" name="responseTimeMs" value="">"#),
+        "review form must render a blank response time for the script to fill: {page}"
+    );
+    assert!(
+        !page.contains(r#"name="responseTimeMs" value="1800""#),
+        "review form must not fabricate a constant response time: {page}"
+    );
+}
+
+static HONEST_TIMING_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+fn honest_timing_clock() -> i64 {
+    HONEST_TIMING_CLOCK.load(Ordering::SeqCst)
+}
+
+/// Sign back in over the rendered magic-link flow and return the fresh
+/// browser session cookie and CSRF token. Maturing a card spans weeks of
+/// simulated clock, which outlives any single 14-day browser session — the
+/// learner signs back in between review sessions, exactly like the product.
+async fn refresh_login(app: &axum::Router, email: &str) -> (String, String) {
+    let requested = app
+        .clone()
+        .oneshot(form_request("POST", "/app/account", &[("email", email)]))
+        .await
+        .expect("request magic link");
+    assert_eq!(requested.status(), StatusCode::OK);
+    let verify_path = debug_sign_in_path(&response_text(requested).await);
+    let verified = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&verify_path)
+                .body(Body::empty())
+                .expect("verify request"),
+        )
+        .await
+        .expect("verify magic link");
+    assert_eq!(verified.status(), StatusCode::OK);
+    let cookie = session_cookie(&verified);
+    let verified = response_text(verified).await;
+    let csrf_token = html_value(&verified, "csrfToken");
+    (cookie, csrf_token)
+}
+
+/// Bootstrap a fresh account, mature its CAT card through three correct
+/// reviews under the advancing test clock (signing back in as each session
+/// expires), then submit a fourth correct answer carrying `timing` exactly as
+/// a browser form field would (`None` omits the field entirely, as a client
+/// that never rendered it). Returns the graded page for that fourth, mature
+/// review.
+async fn mature_cat_card_then_submit(
+    app: &axum::Router,
+    state: &ApiState,
+    label: &str,
+    timing: Option<&str>,
+) -> String {
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &source_body())],
+        ))
+        .await
+        .expect("start");
+    let guest_cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let guest_csrf_token = html_value(&started, "csrfToken");
+
+    // Attach an email so the account survives session expiry via magic-link
+    // sign-in while the clock advances through the review cycles below.
+    // Saving rotates the account and session, so adopt the rotated cookie,
+    // CSRF token, and source id from the saved page.
+    let email = format!("{label}@example.com");
+    let saved = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &guest_cookie,
+            &[("csrfToken", &guest_csrf_token), ("email", &email)],
+        ))
+        .await
+        .expect("save account email");
+    assert_eq!(saved.status(), StatusCode::OK, "save email for {label}");
+    let mut cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let mut csrf_token = html_value(&saved, "csrfToken");
+    let source_id = html_value(&saved, "sourceId");
+
+    generate_source_html(app, state, &cookie, &csrf_token, &source_id).await;
+
+    for cycle in 0..3 {
+        let page = advance_to_prompt(app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+        let review_unit_id = html_value(&page, "reviewUnitId");
+        let idempotency_key = html_value(&page, "idempotencyKey");
+        let graded = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/submit",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", &review_unit_id),
+                    ("answer", "CHARLIE ALFA TANGO"),
+                    ("responseTimeMs", "1500"),
+                    ("idempotencyKey", &idempotency_key),
+                ],
+            ))
+            .await
+            .expect("maturing submit");
+        assert_eq!(graded.status(), StatusCode::OK, "maturing cycle {cycle}");
+        // Advance just past the card's next-review horizon so it is due
+        // again, then sign back in: the horizon can outlive the fixed 14-day
+        // browser session.
+        advance_clock_past_next_review(&response_text(graded).await);
+        (cookie, csrf_token) = refresh_login(app, &email).await;
+    }
+
+    let page = advance_to_prompt(app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let idempotency_key = html_value(&page, "idempotencyKey");
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("csrfToken", &csrf_token),
+        ("reviewUnitId", &review_unit_id),
+        ("answer", "CHARLIE ALFA TANGO"),
+        ("idempotencyKey", &idempotency_key),
+    ];
+    if let Some(timing) = timing {
+        fields.push(("responseTimeMs", timing));
+    }
+    let graded = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &fields,
+        ))
+        .await
+        .expect("mature submit");
+    assert_eq!(
+        graded.status(),
+        StatusCode::OK,
+        "mature submit with timing {timing:?}"
+    );
+    response_text(graded).await
+}
+
+/// Advance the test clock just past the graded page's next-review horizon so
+/// the card is due again on the next cycle. Hour-scale (or missing) horizons
+/// advance one day; day-scale horizons advance one day beyond the rounded
+/// count to absorb the phrase's rounding.
+fn advance_clock_past_next_review(page: &str) {
+    let marker = "you'll see this again in ~";
+    let days = page.find(marker).map_or(1, |start| {
+        let rest = &page[start + marker.len()..];
+        let digits = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if rest[digits.len()..].trim_start().starts_with("day") {
+            digits.parse::<i64>().unwrap_or(0) + 1
+        } else {
+            1
+        }
+    });
+    HONEST_TIMING_CLOCK.fetch_add(days * 86_400_000, Ordering::SeqCst);
+}
+
+/// Parse the "~N days" horizon out of a graded page's next-review phrase.
+/// Panics when the phrase is missing or hour-scale: a mature card's next
+/// interval must be day-scale for the rating comparison to mean anything.
+fn next_review_days(page: &str) -> i64 {
+    let marker = "you'll see this again in ~";
+    let start = page
+        .find(marker)
+        .unwrap_or_else(|| panic!("graded page carries no next-review phrase: {page}"))
+        + marker.len();
+    let rest = &page[start..];
+    let digits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let unit = rest[digits.len()..].trim_start();
+    assert!(
+        unit.starts_with("day"),
+        "mature card must schedule in days, got: {}",
+        &rest[..rest.len().min(40)]
+    );
+    digits.parse().expect("day count")
+}
+
+#[tokio::test]
+async fn mature_correct_answers_rate_easy_only_when_genuinely_fast() {
+    // The scheduler rates a mature correct answer Easy only when it was
+    // genuinely fast. A slow correct answer rates Good — a strictly shorter
+    // next interval — and any timing shape the client cannot vouch for
+    // (missing, blank, malformed, negative, zero, absurdly large) grades as
+    // the slowest plausible answer: the same Good-rated interval as the slow
+    // control, never the longer Easy interval.
+    HONEST_TIMING_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let registry = AccountRegistry::default()
+        .with_clock(honest_timing_clock)
+        .with_auth_config(AuthConfig::default().with_debug_links(true));
+    let state = ApiState::new(registry);
+    let app = router(state.clone());
+
+    let slow = mature_cat_card_then_submit(&app, &state, "slow", Some("6500")).await;
+    assert!(slow.contains(r#"<span class="me-verdict">Correct</span>"#));
+    let slow_days = next_review_days(&slow);
+
+    let fast = mature_cat_card_then_submit(&app, &state, "fast", Some("900")).await;
+    assert!(fast.contains(r#"<span class="me-verdict">Correct</span>"#));
+    let fast_days = next_review_days(&fast);
+    assert!(
+        fast_days > slow_days,
+        "a genuinely fast mature correct answer must rate Easy and schedule \
+         further out than a slow one: fast {fast_days} vs slow {slow_days} days"
+    );
+
+    for (label, dishonest) in [
+        ("missing", None),
+        ("blank", Some("")),
+        ("malformed", Some("not-a-number")),
+        ("negative", Some("-250")),
+        ("zero", Some("0")),
+        ("huge", Some("99999999999999999999")),
+    ] {
+        let graded = mature_cat_card_then_submit(&app, &state, label, dishonest).await;
+        assert!(
+            graded.contains(r#"<span class="me-verdict">Correct</span>"#),
+            "dishonest timing {dishonest:?} must still grade the answer: {graded}"
+        );
+        assert_eq!(
+            next_review_days(&graded),
+            slow_days,
+            "dishonest timing {dishonest:?} must grade conservatively (Good), never Easy"
+        );
+    }
+}
+
+#[test]
+fn sanitize_response_time_maps_dishonest_shapes_to_the_conservative_ceiling() {
+    use super::routes::{sanitize_response_time_ms, MAX_PLAUSIBLE_RESPONSE_TIME_MS};
+
+    for dishonest in [
+        None,
+        Some(""),
+        Some("   "),
+        Some("not-a-number"),
+        Some("-250"),
+        Some("0"),
+        Some("1.5"),
+        Some("99999999999999999999"),
+    ] {
+        assert_eq!(
+            sanitize_response_time_ms(dishonest),
+            MAX_PLAUSIBLE_RESPONSE_TIME_MS,
+            "dishonest shape {dishonest:?} must map to the conservative ceiling"
+        );
+    }
+
+    assert_eq!(sanitize_response_time_ms(Some("900")), 900);
+    assert_eq!(sanitize_response_time_ms(Some(" 6500 ")), 6_500);
+    assert_eq!(
+        sanitize_response_time_ms(Some("86400000")),
+        MAX_PLAUSIBLE_RESPONSE_TIME_MS,
+        "implausibly large timings clamp to the ceiling"
+    );
+}

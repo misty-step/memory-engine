@@ -1,3 +1,26 @@
+// Honest response timing for review submissions.
+//
+// The server renders every review form with a blank responseTimeMs and grades
+// a blank value conservatively (it can never rate Easy), so with JavaScript
+// off the flow still works and never overstates the learner's speed. This
+// script records when the card was presented — script evaluation, right after
+// the server-rendered card became visible — and fills in the real
+// presentation-to-submit elapsed time at the moment of submission.
+(function () {
+  "use strict";
+  if (!document.querySelector('input[name="responseTimeMs"]')) return;
+  var monotonic = window.performance && typeof performance.now === "function";
+  var shownAt = monotonic ? performance.now() : Date.now();
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form || !form.querySelector) return;
+    var input = form.querySelector('input[name="responseTimeMs"]');
+    if (!input) return;
+    var elapsed = (monotonic ? performance.now() : Date.now()) - shownAt;
+    input.value = String(Math.max(1, Math.round(elapsed)));
+  });
+})();
+
 // Progressive enhancement for the generation activity log.
 //
 // The server renders the authoritative list of jobs on every full page load,
