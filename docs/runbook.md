@@ -30,12 +30,13 @@ running pending decommission; do not point new consumers at it.
 
 ## Deployed smoke
 
-These commands mirror the post-deploy smoke in `.github/workflows/deploy.yml`,
-which still targets the Fly standby app. For the primary DO app, rerun the
-same three checks against `https://memory-engine-api-i2xcr.ondigitalocean.app`.
+These commands exercise the DigitalOcean primary. The post-deploy smoke in
+`.github/workflows/deploy.yml` currently runs the same checks against the Fly
+standby; ticket 075 owns gating the primary before that difference can be
+removed safely.
 
 ```sh
-base="https://memory-engine-api.fly.dev"
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}" "$base/healthz")
 test "$status" = "200"
@@ -47,6 +48,9 @@ test "$status" = "200"
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_code}" -X POST "$base/app/generate")
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
 ```
+
+To compare the temporary standby, rerun the same block with
+`base="https://memory-engine-api.fly.dev"`.
 
 ## Production generation latency
 

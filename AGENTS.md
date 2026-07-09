@@ -37,8 +37,8 @@ promotion.
   consumer-facing Rust facade and module exports.
 - `docs/qa/system.md`, `docs/dogfood/`, and `docs/beta/` record executable QA
   and dogfood evidence.
-- `docs/runbook.md` documents the deployed Fly surface and production smoke
-  contract for agents.
+- `docs/runbook.md` documents the DigitalOcean primary, temporary Fly standby,
+  and production smoke contract for agents.
 - Authority order overall: tests > type system > code > docs > lore.
 
 ## Gate Contract
@@ -101,7 +101,7 @@ oracle.
 - `crates/memory-engine-openrouter` — OpenRouter-dialect HTTP draft provider
   (model-backed generation); the only crate that talks to a model network.
 - `crates/memory-engine-study` — beta session/API boundary.
-- `crates/memory-engine-api` — Fly-facing HTTP route registration, request
+- `crates/memory-engine-api` — production-facing HTTP route registration, request
   handlers, static assets, and binary entrypoint.
 - `crates/memory-engine-api-state` — API account/session state, auth, storage
   adapters, and background generation jobs.
@@ -147,7 +147,7 @@ before strategy.
 
 - Keep the Rust cutover complete: no non-Dagger TypeScript runtime/test files
   should return, and operator docs must point at Rust crates, Cargo
-  commands, Dagger CI, and the Fly runbook.
+  commands, Dagger CI, and the production runbook.
 - After cutover, prioritize repeated phone-sized dogfood receipts over new
   abstractions. Beta app extraction or promotion needs repeated evidence
   from the Rust app, not archived TypeScript-era tickets.
@@ -157,5 +157,5 @@ before strategy.
 
 ## Non-goals
 
-Production hosting, auth, billing, chat tutoring, generalized content
-import, and extracting the beta app into another repository.
+General-purpose hosting or auth frameworks, billing, chat tutoring, generalized
+content import, and extracting the beta app into another repository.
