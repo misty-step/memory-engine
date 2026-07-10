@@ -135,7 +135,7 @@ fn nato_jobs() -> Vec<GenerationJob> {
             "Spanish irregular verbs",
             JobStatus::Failed,
             0,
-            Some("Couldn't generate — the model timed out."),
+            Some("Couldn't generate. The model timed out."),
             300,
         ),
         job(
@@ -279,7 +279,7 @@ fn pages() -> Vec<(&'static str, String)> {
                 &sources,
                 Some(&view(vec![], None, vec![], 0, vec![])),
                 &jobs,
-                Some("Generating your cards — they'll appear below as they're ready."),
+                Some("Generating your cards. They'll appear below as they're ready."),
             ),
         ),
         (
@@ -382,11 +382,11 @@ fn pages() -> Vec<(&'static str, String)> {
 fn emit_preview_pages() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/design-preview");
     fs::create_dir_all(out.join("static"))?;
-    // Mirror the served path `/static/aesthetic.css` so the pages resolve their
+    // Mirror the served path `/static/ledger.css` so the pages resolve their
     // stylesheet when this directory is served at the root over HTTP.
     fs::write(
-        out.join("static/aesthetic.css"),
-        include_str!("../assets/aesthetic.css"),
+        out.join("static/ledger.css"),
+        include_str!("../assets/ledger.css"),
     )?;
 
     let pages = pages();
@@ -414,62 +414,114 @@ fn emit_preview_pages() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Durable aesthetic-kit conformance gate: every rendered state must consume the
-/// design system and must not reintroduce the Law violations a review caught.
-/// Runs in the normal suite (not ignored), so a regression fails the gate.
+/// Durable Ledger conformance gate (root `DESIGN.md`): every rendered state
+/// must consume the design system and must not reintroduce the defects the
+/// operator's LAB-001 verdicts named. Runs in the normal suite (not
+/// ignored), so a regression fails the gate.
 #[test]
 fn conformance_every_state_consumes_the_design_system() {
     for (name, html) in pages() {
         assert!(
-            html.contains(r#"<link rel="stylesheet" href="/static/aesthetic.css">"#),
-            "{name}: must link the vendored design system"
+            html.contains(r#"<link rel="stylesheet" href="/static/ledger.css">"#),
+            "{name}: must link the Ledger design system"
         );
         assert!(
             html.contains(r#"class="ae-screen""#),
             "{name}: must use the .ae-screen chrome archetype"
         );
-        // The app glue must never round a corner — the kit's box radius is 0.
-        // (aesthetic.css is linked, not inlined, so any hit comes from STYLE.)
-        // The lone sanctioned exception is `border-radius: 50%`, which is not a
-        // rounded rectangle but a full circle: the activity-log spinner and the
-        // live-status dot. Forbid every other radius so the synthetic "card"
-        // look the review caught cannot return.
-        let foreign_radius = html
-            .match_indices("border-radius")
-            .filter(|(index, _)| !html[*index..].starts_with("border-radius: 50%"))
+        // Token discipline: no <style> blocks and no raw hex in markup — the
+        // whole visual system lives in ledger.css. The one sanctioned inline
+        // style is a data-driven meter width, whose value is state, not
+        // design.
+        assert!(
+            !html.contains("<style>"),
+            "{name}: markup must not carry inline stylesheets; the system lives in ledger.css"
+        );
+        let foreign_inline_style = html
+            .match_indices(" style=\"")
+            .filter(|(index, _)| !html[*index..].starts_with(" style=\"width:"))
             .count();
         assert_eq!(
-            foreign_radius, 0,
-            "{name}: app CSS must not round corners (only the circular 50% status glyphs are allowed)"
+            foreign_inline_style, 0,
+            "{name}: inline styles beyond the data-driven meter width are forbidden"
         );
-        // The synthetic uppercase register the kit forbids must not return.
-        let lower = html.to_ascii_lowercase();
         assert!(
-            !lower.contains("text-transform: uppercase")
-                && !lower.contains("text-transform:uppercase"),
-            "{name}: must not force uppercase (no register the kit does not sanction)"
+            !html.contains("background: #") && !html.contains("color: #"),
+            "{name}: raw hex belongs in ledger.css tokens, never in markup"
+        );
+        // The left-border accent stripe is a named operator kill (LAB-001);
+        // it must never return in any state.
+        assert!(
+            !html.contains("border-left"),
+            "{name}: left-border accent stripes are a design defect"
+        );
+        // The six-button permanent hatch row is a named operator kill: hatches
+        // collapse behind the single More disclosure.
+        assert!(
+            !html.contains(r#"class="me-hatches""#),
+            "{name}: the permanent hatch row must stay dead; use the More disclosure"
         );
     }
 }
 
 #[test]
-fn conformance_graded_review_carries_a_status_glyph_and_no_escape_hatches() {
+fn conformance_graded_review_carries_the_dossier_and_two_speed_advance() {
     let pages = pages();
     let Some((_, graded)) = pages.iter().find(|(name, _)| *name == "07-graded-correct") else {
         panic!("graded-correct preview state missing");
     };
-    // Verdict reads as ink with the hue on the glyph, never as a colored word.
     assert!(
         graded.contains(r#"class="ae-icon ae-ok""#),
-        "graded verdict must carry a status glyph"
+        "graded verdict must carry its status glyph"
     );
     assert!(
         graded.contains(r#"class="me-verdict""#),
-        "graded verdict must use the loud-by-weight register"
+        "graded verdict must use the verdict register"
+    );
+    // The card's dossier is post-grade only (DESIGN.md): present here…
+    assert!(
+        graded.contains(r#"class="me-meta-ledger""#),
+        "graded review must show the meta ledger"
+    );
+    // …and a correct verdict carries the auto-advance affordance.
+    assert!(
+        graded.contains("data-auto-advance"),
+        "graded-correct must carry the auto-advance affordance"
     );
     // Skip/Snooze/Bridge are pre-answer moves; they must vanish once graded.
     assert!(
-        !graded.contains(r#"class="me-hatches""#),
+        !graded.contains(r#"class="me-more""#),
         "graded review must not show escape hatches"
+    );
+
+    // The miss holds for study: no auto-advance on a wrong verdict.
+    let Some((_, wrong)) = pages.iter().find(|(name, _)| *name == "08-graded-wrong") else {
+        panic!("graded-wrong preview state missing");
+    };
+    assert!(
+        !wrong.contains("data-auto-advance"),
+        "a miss must hold for study, never auto-advance"
+    );
+    assert!(
+        wrong.contains(r#"class="me-meta-ledger""#),
+        "the dossier shows on misses too"
+    );
+
+    // The pre-grade card is minimal: no dossier, hatches collapsed behind
+    // the single More disclosure.
+    let Some((_, answering)) = pages.iter().find(|(name, _)| *name == "06-review-open") else {
+        panic!("review-open preview state missing");
+    };
+    assert!(
+        !answering.contains(r#"class="me-meta-ledger""#),
+        "card meta must never render pre-grade"
+    );
+    assert!(
+        answering.contains(r#"<details class="me-more">"#),
+        "pre-grade hatches must collapse behind the More disclosure"
+    );
+    assert!(
+        answering.contains(r#"class="me-more-capture""#),
+        "the More disclosure must carry the capture punch-out"
     );
 }

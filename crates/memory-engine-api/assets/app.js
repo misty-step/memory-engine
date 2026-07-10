@@ -21,6 +21,37 @@
   });
 })();
 
+// Two-speed graded advance (DESIGN.md, interaction law).
+//
+// The graded page always renders a working Continue form, so with JavaScript
+// off the learner taps Continue and nothing is lost. This script adds the
+// frictionless path: a correct verdict (the form carries data-auto-advance)
+// moves on after a short readable hold, and on any graded page a tap or
+// Enter anywhere outside a control advances immediately. A miss never
+// auto-advances — the learner is studying it.
+(function () {
+  "use strict";
+  var next = document.querySelector("form.me-next");
+  if (!next) return;
+  var advanced = false;
+  function advance() {
+    if (advanced) return;
+    advanced = true;
+    if (typeof next.requestSubmit === "function") next.requestSubmit();
+    else next.submit();
+  }
+  var hold = parseInt(next.getAttribute("data-auto-advance") || "", 10);
+  if (hold > 0) setTimeout(advance, hold);
+  document.addEventListener("click", function (event) {
+    if (event.target.closest("a, button, input, textarea, select, summary, details, form")) return;
+    advance();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" || event.target.closest("a, button, input, textarea, select, summary")) return;
+    advance();
+  });
+})();
+
 // Progressive enhancement for the generation activity log.
 //
 // The server renders the authoritative list of jobs on every full page load,
@@ -45,7 +76,7 @@
         var n = job.cardCount || 0;
         return n + " " + (n === 1 ? "card" : "cards") + " · scheduled for review";
       case "failed":
-        return job.error || "Generation failed — try again.";
+        return job.error || "Generation failed. Try again.";
       default:
         return "";
     }

@@ -7,7 +7,7 @@ mod render;
 #[cfg(test)]
 mod design_preview;
 
-pub const AESTHETIC_CSS: &str = include_str!("../assets/aesthetic.css");
+pub const LEDGER_CSS: &str = include_str!("../assets/ledger.css");
 
 pub use render::{
     render_account_page, render_action_result_html, render_app_shell, render_login_requested,

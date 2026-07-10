@@ -99,7 +99,7 @@ async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
         .expect("capture");
     assert_eq!(captured.status(), StatusCode::OK);
     let captured = response_text(captured).await;
-    assert!(captured.contains("Generating your cards — they'll appear below as they're ready."));
+    assert!(captured.contains("Generating your cards. They'll appear below as they're ready."));
     assert!(captured.contains(r#"<ul id="me-jobs""#));
     assert_not_contains_any(&captured, &["Add all to reviews", ">Keep</button>"]);
 
@@ -551,21 +551,22 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
     assert_eq!(submitted.status(), StatusCode::OK);
     let submitted = response_text(submitted).await;
 
-    // D graded screen, wrong answer: the verdict reads "Try again", the
-    // correct option is still revealed (marked) so the learner sees it, and a
-    // quiet line says when the card returns. No metrics wall, no concept note
-    // — those live on the workspace now.
+    // Ledger graded screen, wrong answer: the verdict reads "Try again", the
+    // correct option is still revealed (marked) so the learner sees it, the
+    // card's dossier renders (stage, last seen, success record — DESIGN.md
+    // puts meta post-grade only), and a quiet line says when it returns. Raw
+    // internals still never leak.
     assert!(submitted.contains(r#"<span class="me-verdict">Try again</span>"#));
     assert!(submitted.contains("ALFA"));
     assert!(submitted.contains(r#"<li class="me-graded-choice me-graded-choice-correct">"#));
     assert!(submitted.contains("you'll see this again"));
+    assert!(submitted.contains(r#"class="me-meta-ledger""#));
+    assert!(submitted.contains("Last seen"));
     assert_not_contains_any(
         &submitted,
         &[
             "Expected answer",
             "This item:",
-            "last seen",
-            "nato letter a",
             "Answer feedback",
             "Concept health",
             "Wrong(",
@@ -664,9 +665,12 @@ async fn mobile_submit_review_shows_concept_rollup_for_shared_concept() {
     assert_eq!(submitted.status(), StatusCode::OK);
     let submitted = response_text(submitted).await;
 
-    // D keeps the graded screen to the verdict — no concept note piled on.
+    // Ledger puts the card's dossier on the graded screen, including its
+    // concept line — the shared concept shows here AND rolls up on the
+    // workspace.
     assert!(submitted.contains(r#"<span class="me-verdict">Try again</span>"#));
-    assert_not_contains_any(&submitted, &["nato letter a", "Concept health"]);
+    assert!(submitted.contains(r#"class="me-meta-ledger""#));
+    assert!(submitted.contains("nato letter a"));
 
     // Concept health rolls up on the workspace, off the per-card loop: once
     // the queue drains, Next lands there with both attempts on the shared
@@ -1040,7 +1044,7 @@ async fn generate_source_html(
     // The handler returns immediately with the queued job, before any card
     // exists. Drain the queue so the deck is generated and scheduled, then
     // re-render the workspace so the activity log shows the finished job.
-    assert!(generated.contains("Generating — watch the activity log."));
+    assert!(generated.contains("Generating. Watch the activity log."));
     state.run_pending_jobs_blocking();
     workspace_html(app, cookie).await
 }
@@ -1683,7 +1687,7 @@ async fn mobile_source_archive_hides_source_and_blocks_regeneration() {
         .expect("generate archived source");
     assert_eq!(queued.status(), StatusCode::OK);
     let queued = response_text(queued).await;
-    assert!(queued.contains("Generating — watch the activity log."));
+    assert!(queued.contains("Generating. Watch the activity log."));
 
     state.run_pending_jobs_blocking();
     let regenerated = workspace_html(&app, &cookie).await;
@@ -3991,10 +3995,10 @@ fn assert_due_review_html(body: &str, due_count: usize) {
 }
 
 fn assert_submitted_review_html(body: &str) {
-    // D graded screen: the verdict, the answer revealed in place (correct
-    // option marked), one quiet line on when it returns, and a primary Next.
-    // The metrics wall and concept health moved to the workspace, off the
-    // per-card loop — so they must NOT appear here.
+    // Ledger graded screen (DESIGN.md): the verdict, the answer revealed in
+    // place (correct option marked), the card's meta ledger, one quiet line
+    // on when it returns, and a primary Continue. Raw internals still never
+    // leak.
     assert!(body.contains(r#"<span class="me-verdict">Correct</span>"#));
     // The first due card may be MCQ or free response, so accept either reveal
     // form: a marked correct option, or a one-line answer.
@@ -4005,7 +4009,8 @@ fn assert_submitted_review_html(body: &str) {
         "graded screen must reveal the answer: {body}"
     );
     assert!(body.contains("you'll see this again"));
-    assert!(body.contains("Next"));
+    assert!(body.contains("Continue"));
+    assert!(body.contains(r#"class="me-meta-ledger""#));
     assert_not_contains_any(
         body,
         &[
@@ -4918,5 +4923,173 @@ fn sanitize_response_time_maps_dishonest_shapes_to_the_conservative_ceiling() {
         sanitize_response_time_ms(Some("86400000")),
         MAX_PLAUSIBLE_RESPONSE_TIME_MS,
         "implausibly large timings clamp to the ceiling"
+    );
+}
+
+#[tokio::test]
+async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
+    // Ledger interaction law (DESIGN.md): before grading, the card shows the
+    // prompt and the answer mechanism plus exactly one visible hatch (Reveal
+    // answer) and one More disclosure. The other actions live inside the
+    // disclosure with a capture punch-out. No card meta of any kind renders
+    // pre-grade.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    assert!(
+        page.contains(r#"<details class="me-more">"#),
+        "pre-grade must collapse secondary hatches behind one disclosure: {page}"
+    );
+    assert!(page.contains("Reveal answer"));
+    for action in ["Reference", "Skip", "Snooze", "Bridge", "Delete"] {
+        assert!(
+            page.contains(&format!(">{action}</button>")),
+            "the {action} hatch must survive inside the disclosure: {page}"
+        );
+    }
+    assert!(
+        page.contains(r#"class="me-more-capture""#),
+        "the disclosure must carry the capture punch-out: {page}"
+    );
+    assert!(
+        !page.contains(r#"class="me-hatches""#),
+        "the permanent six-button hatch row is a design defect: {page}"
+    );
+    for meta_marker in ["me-meta-ledger", "Last seen", "last seen", "success rate"] {
+        assert!(
+            !page.contains(meta_marker),
+            "card meta must not render pre-grade ({meta_marker}): {page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn graded_review_shows_meta_ledger_and_two_speed_advance() {
+    // Ledger interaction law (DESIGN.md): after grading the card shows its
+    // dossier (stage, last seen, success rate, next horizon) and a Continue
+    // control. A correct answer carries the auto-advance affordance for the
+    // enhancement script; a miss holds for study and must not auto-advance.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    // Correct free-response answer: meta ledger + auto-advance.
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let idempotency_key = html_value(&page, "idempotencyKey");
+    let graded = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("answer", "CHARLIE ALFA TANGO"),
+                ("responseTimeMs", "1500"),
+                ("idempotencyKey", &idempotency_key),
+            ],
+        ))
+        .await
+        .expect("correct submit");
+    assert_eq!(graded.status(), StatusCode::OK);
+    let graded = response_text(graded).await;
+    assert!(graded.contains(r#"<span class="me-verdict">Correct</span>"#));
+    assert!(
+        graded.contains(r#"class="me-meta-ledger""#),
+        "graded card must show its meta ledger: {graded}"
+    );
+    for key in ["Stage", "Last seen", "Success"] {
+        assert!(
+            graded.contains(key),
+            "meta ledger must carry {key}: {graded}"
+        );
+    }
+    assert!(graded.contains("you'll see this again"));
+    assert!(
+        graded.contains("data-auto-advance"),
+        "a correct verdict must carry the auto-advance affordance: {graded}"
+    );
+    assert!(
+        graded.contains(">Continue"),
+        "the JS-off fallback control must be visible: {graded}"
+    );
+
+    // Wrong MCQ answer: dossier still shows, but no auto-advance — the
+    // learner is studying the miss.
+    let mcq = advance_to_prompt(&app, &cookie, &csrf_token, "What is the NATO phonetic").await;
+    let review_unit_id = html_value(&mcq, "reviewUnitId");
+    let idempotency_key = html_value(&mcq, "idempotencyKey");
+    let missed = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("answer", "BRAVO"),
+                ("responseTimeMs", "1500"),
+                ("idempotencyKey", &idempotency_key),
+            ],
+        ))
+        .await
+        .expect("wrong submit");
+    assert_eq!(missed.status(), StatusCode::OK);
+    let missed = response_text(missed).await;
+    assert!(missed.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(missed.contains(r#"class="me-meta-ledger""#));
+    assert!(
+        !missed.contains("data-auto-advance"),
+        "a miss must hold for study, never auto-advance: {missed}"
+    );
+    assert!(missed.contains(">Continue"));
+}
+
+#[tokio::test]
+async fn every_page_serves_the_ledger_design_system() {
+    // DESIGN.md: assets/ledger.css is the single stylesheet of record.
+    let state = ApiState::default();
+    let app = router(state.clone());
+
+    let css = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/ledger.css")
+                .body(Body::empty())
+                .expect("css request"),
+        )
+        .await
+        .expect("css response");
+    assert_eq!(css.status(), StatusCode::OK);
+    let css = response_text(css).await;
+    assert!(css.contains("--lg-paper"), "ledger tokens must ship");
+    assert!(css.contains("prefers-reduced-motion"));
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home");
+    let home = response_text(home).await;
+    assert!(
+        home.contains(r#"<link rel="stylesheet" href="/static/ledger.css">"#),
+        "pages must link the Ledger system: {home}"
+    );
+    assert!(
+        !home.contains("aesthetic.css"),
+        "the vendored aesthetic kit is superseded on this surface: {home}"
     );
 }

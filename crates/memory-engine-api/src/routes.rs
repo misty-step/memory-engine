@@ -20,7 +20,7 @@ use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_app_shell, render_login_requested,
-    AESTHETIC_CSS,
+    LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -210,7 +210,7 @@ pub fn router(state: ApiState) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(app_home))
-        .route("/static/aesthetic.css", get(static_aesthetic_css))
+        .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
         .route("/accounts", post(create_account));
 
@@ -285,15 +285,15 @@ async fn healthz() -> Json<HealthResponse> {
     })
 }
 
-/// Serve the vendored Misty Step `aesthetic` stylesheet. The render crate owns
-/// the markup and CSS; this HTTP crate only exposes the deployed static path.
-async fn static_aesthetic_css() -> impl IntoResponse {
+/// Serve the Ledger design system stylesheet (DESIGN.md). The render crate
+/// owns the markup and CSS; this HTTP crate only exposes the deployed path.
+async fn static_ledger_css() -> impl IntoResponse {
     (
         [
             (CONTENT_TYPE, "text/css; charset=utf-8"),
             (CACHE_CONTROL, "public, max-age=3600"),
         ],
-        AESTHETIC_CSS,
+        LEDGER_CSS,
     )
 }
 
@@ -734,7 +734,7 @@ async fn capture_app_source(
         Ok(source) => {
             let _ =
                 state.enqueue_generation_job_by_source(&account, &source.source_id, &request.title);
-            "Generating your cards — they'll appear below as they're ready."
+            "Generating your cards. They'll appear below as they're ready."
         }
         Err(error) => {
             return Html(render_account_page(
@@ -807,7 +807,7 @@ async fn generate_app_source(
         &state,
         &account,
         None,
-        Some("Generating — watch the activity log."),
+        Some("Generating. Watch the activity log."),
     ))
     .into_response()
 }
