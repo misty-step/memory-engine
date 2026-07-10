@@ -556,10 +556,16 @@ where
     /// # Errors
     ///
     /// Returns [`BetaStudyError`] when the source is unknown or persistence fails.
+    ///
+    /// Returns the resulting view plus the count of review units actually
+    /// archived by this call — every card generated from this source, across
+    /// every generation run, that was still live. The learner-facing notice
+    /// (memory-engine-088) reports this count instead of a generic message,
+    /// since this single action can silently retire many cards.
     pub fn archive_source(
         &mut self,
         source_document_id: &str,
-    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+    ) -> Result<(BetaStudyView, usize), BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
         let archived_at = (self.now)();
         let related_review_unit_ids = snapshot
@@ -573,6 +579,7 @@ where
             .archive_source_document(source_document_id, archived_at)
             .map_err(BetaStudyError::Store)?;
 
+        let mut archived_count = 0usize;
         for review_unit_id in related_review_unit_ids {
             if snapshot
                 .review_units
@@ -582,6 +589,7 @@ where
                 self.store
                     .archive_review_unit(&review_unit_id, archived_at)
                     .map_err(BetaStudyError::Store)?;
+                archived_count += 1;
             }
         }
 
@@ -603,7 +611,7 @@ where
         } else {
             BetaStudyStatus::Empty
         };
-        self.view()
+        Ok((self.view()?, archived_count))
     }
 
     /// Mark a project deck/source and its generated reviews obsolete.

@@ -214,12 +214,16 @@ impl StudyStorage {
             .generate_source(account_id, store_path, source_id)
     }
 
+    /// Archive a source and every review unit generated from it. Returns the
+    /// view plus the count of cards actually retired by this call (across
+    /// every generation run for the source) — the caller reports this count
+    /// to the learner rather than a generic notice (memory-engine-088).
     pub(crate) fn archive_source(
         &self,
         account_id: &str,
         store_path: &FsPath,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         self.inner.archive_source(account_id, store_path, source_id)
     }
 
@@ -405,7 +409,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure>;
+    ) -> Result<(StudyViewResponse, usize), ApiFailure>;
     fn invalidate_project_deck(
         &self,
         account_id: &str,
@@ -740,14 +744,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         if !persisted_source_exists(store_path, source_id)? {
             return Err(ApiFailure::not_found("Source not found."));
         }
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = study.archive_source(source_id).map_err(study_failure)?;
+        let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
 
-        Ok(StudyViewResponse::from_view(view))
+        Ok((StudyViewResponse::from_view(view), archived_count))
     }
 
     fn invalidate_project_deck(
@@ -1171,7 +1175,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         _store_path: &FsPath,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             if !account
                 .snapshot()
@@ -1183,9 +1187,9 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 return Err(ApiFailure::not_found("Source not found."));
             }
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = study.archive_source(source_id).map_err(study_failure)?;
+            let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
 
-            Ok(StudyViewResponse::from_view(view))
+            Ok((StudyViewResponse::from_view(view), archived_count))
         })
     }
 

@@ -5392,3 +5392,67 @@ async fn served_assets_carry_the_instant_acknowledgment_enhancement() {
         assert!(css.contains(hook), "ledger.css must style {hook}");
     }
 }
+
+#[tokio::test]
+async fn saved_material_remove_discloses_scope_before_the_tap() {
+    // memory-engine-088: the operator dogfood found Remove was a bare,
+    // unlabeled single-tap button archiving a source and every card
+    // generated from it (across every generation run) with zero warning.
+    // The control must now be a disclosure that states that truthfully
+    // before the destructive submit is reachable.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let workspace = workspace_html(&app, &cookie).await;
+    assert!(
+        workspace.contains(r#"<details class="me-remove-confirm">"#),
+        "Remove must be a disclosure, not a bare button: {workspace}"
+    );
+    assert!(
+        workspace.contains("every card generated from it")
+            && workspace.contains("every generation run"),
+        "the disclosure must truthfully state the destructive scope: {workspace}"
+    );
+    // The confirming submit is the one that actually archives; a bare
+    // "Remove" label alone (outside the disclosure) must not exist as a
+    // reachable submit control.
+    assert!(
+        workspace.contains("Remove permanently"),
+        "the confirming action must be explicit, not a repeat of the bare label: {workspace}"
+    );
+}
+
+#[tokio::test]
+async fn saved_material_remove_reports_how_many_cards_were_retired() {
+    // memory-engine-088: after archiving, the notice must name the actual
+    // count of cards retired, not a generic "Source removed."
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    // The NATO fixture schedules 2 review units.
+    assert_activity_succeeded_html(&generated, 2);
+
+    let archived = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/archive",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("archive");
+    assert_eq!(archived.status(), StatusCode::OK);
+    let archived = response_text(archived).await;
+    assert!(
+        archived.contains("2 cards retired"),
+        "the notice must name the actual retired count: {archived}"
+    );
+    assert!(
+        !archived.contains("Source removed.</p>") || archived.contains("2 cards retired"),
+        "a generic notice with no count no longer satisfies the disclosure requirement: {archived}"
+    );
+}

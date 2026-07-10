@@ -275,12 +275,15 @@ impl ApiState {
         account_id: &str,
         session_token: &str,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         self.accounts
             .archive_source(account_id, session_token, source_id)
     }
 
-    /// Archive saved material for a browser-authenticated account.
+    /// Archive saved material for a browser-authenticated account. Returns
+    /// the view plus the count of cards actually retired (across every
+    /// generation run for the source) so the caller can report it rather
+    /// than a generic notice (memory-engine-088).
     ///
     /// # Errors
     ///
@@ -289,7 +292,7 @@ impl ApiState {
         &self,
         account: &AppAccount,
         source_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         self.accounts
             .archive_source(account.account_id(), account.session_token(), source_id)
     }

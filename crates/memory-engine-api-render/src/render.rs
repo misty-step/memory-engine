@@ -305,7 +305,11 @@ fn render_sources(
 <p class="ae-item">{title}</p>
 <div class="me-row-actions">
 {generate}
-<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit" title="Remove this saved material.">Remove</button></form>
+<details class="me-remove-confirm">
+<summary class="ae-button-quiet ae-button-compact" title="Remove this saved material.">Remove</summary>
+<p class="me-remove-warning">This removes the material and stops every card generated from it, across every generation run, from being reviewed.</p>
+<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit">Remove permanently</button></form>
+</details>
 </div>
 </article>"#,
             title = escape_html(&source.title),

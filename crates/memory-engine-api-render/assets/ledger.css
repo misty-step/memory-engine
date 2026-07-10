@@ -284,7 +284,7 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-jobs-list, .me-material { margin: 0; padding: 0; list-style: none; }
 .me-job, .me-source {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 11px;
   padding: 11px 0;
   border-top: 1px solid var(--lg-line);
@@ -292,8 +292,36 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-job-body { flex: 1; min-width: 0; }
 .me-job-title { margin: 0; font-size: 14px; font-weight: 560; }
 .me-job-meta { margin: 0; font: 500 11px/1.4 var(--lg-mono); color: var(--lg-ink-2); }
-.me-row-actions { display: flex; gap: 8px; }
+.me-row-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
 .me-live-hint { font: 500 11px/1.4 var(--lg-mono); color: var(--lg-ink-2); }
+
+/* Remove is a disclosure, not a bare tap: the summary reads as the quiet
+   button it always was, but opening it must state the destructive scope
+   (every card generated from the source, across every generation run)
+   before the confirming submit is reachable (memory-engine-088). */
+.me-remove-confirm { flex: 1 1 100%; }
+.me-remove-confirm summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  width: fit-content;
+}
+.me-remove-confirm summary::-webkit-details-marker { display: none; }
+.me-remove-confirm[open] summary { border-color: var(--lg-clay); color: var(--lg-clay); }
+.me-remove-warning {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--lg-line);
+  border-radius: var(--lg-r);
+  background: var(--lg-paper-2);
+  font-size: 13px;
+  color: var(--lg-ink-2);
+  max-width: 32em;
+}
+.me-remove-confirm form .ae-button-quiet {
+  border-color: var(--lg-clay);
+  color: var(--lg-clay);
+}
 
 /* job status glyphs: the generating pulse is the app's only loop. Each is a
    single flat dot — no icon glyph layered on top, so nothing overlaps it. */
