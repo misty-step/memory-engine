@@ -1,12 +1,13 @@
 //! Server-rendered study UI.
 //!
-//! The markup consumes the Misty Step `aesthetic` design system (vendored at
-//! `assets/aesthetic.css`, served from `/static/aesthetic.css`): one font size
-//! per surface, hierarchy from ink and weight, hairlines and radius 0, status
-//! on the glyph, motion as feedback. The app is a single adaptive screen that
-//! swaps between a workspace (capture, keep, manage, reflect) and a review
-//! (prompt, answer, grade). Every interaction is a full-page form POST; there
-//! is no client JavaScript.
+//! The markup consumes the Ledger design system (repo-owned at
+//! `assets/ledger.css`, served from `/static/ledger.css`; the binding
+//! contract is the root `DESIGN.md`): warm paper and ink, register-based
+//! type, mono tabular numerals, verdicts as printed marks. The app is a
+//! single adaptive screen that swaps between a workspace (capture, manage,
+//! reflect) and a review (prompt, answer, grade). Every interaction is a
+//! full-page form POST; `assets/app.js` layers progressive enhancement
+//! (honest response timing, job SSE, the two-speed graded advance) on top.
 
 use std::fmt::Write as _;
 
@@ -95,8 +96,7 @@ fn document(inner: &str) -> String {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">
-<link rel="stylesheet" href="/static/aesthetic.css">
-<style>{STYLE}</style>
+<link rel="stylesheet" href="/static/ledger.css">
 <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -151,7 +151,7 @@ fn render_signed_out(notice: Option<&str>) -> String {
 <form action="/app/account" method="post">
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password — we’ll email you a sign-in link.</span></div>
+<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email you a sign-in link.</span></div>
 </form>
 </section>
 </div>"#,
@@ -238,7 +238,7 @@ fn render_review_status(account: &AppAccount, view: &StudyViewResponse) -> Strin
     // Caught up: only worth saying once the learner actually has reviews.
     if view.summary.approved_review_unit_count > 0 {
         return format!(
-            r#"<section class="ae-group me-caughtup"><p class="me-caughtup-line">{ICON_OK}<span class="ae-item">You're all caught up.</span></p><p class="ae-dim me-hint">Nothing is due right now — add more below, or come back later.</p></section>"#
+            r#"<section class="ae-group me-caughtup"><p class="me-caughtup-line">{ICON_OK}<span class="ae-item">You're all caught up.</span></p><p class="ae-dim me-hint">Nothing is due right now. Add more below, or come back later.</p></section>"#
         );
     }
     String::new()
@@ -254,7 +254,7 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
-<div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background — keep going.</span></div>
+<div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background. Keep going.</span></div>
 </form>
 </section>"#,
         csrf = hidden_csrf_input(account),
@@ -341,7 +341,7 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Failed => escape_html(
             job.error
                 .as_deref()
-                .unwrap_or("Generation failed — try again."),
+                .unwrap_or("Generation failed. Try again."),
         ),
     }
 }
@@ -374,8 +374,10 @@ fn render_answering(account: &AppAccount, current: &BetaStudyCurrent) -> String 
 {answer_block}
 {revealed}
 {reference}
+<div class="me-hatch-row">
 {reveal}
-{escape_hatches}"#,
+{escape_hatches}
+</div>"#,
         prompt = escape_html(&current.prompt),
         answer_block = render_answer_block(account, current),
         reference = render_reference(current),
@@ -395,14 +397,52 @@ fn render_graded_review(account: &AppAccount, current: &BetaStudyCurrent) -> Str
         r#"<p class="me-prompt">{prompt}</p>
 {reveal}
 {verdict}
+{meta}
 {reference}
 {next}"#,
         prompt = escape_html(&current.prompt),
         reveal = render_answer_reveal(current),
         verdict = render_graded_verdict(current),
+        meta = render_meta_ledger(current),
         reference = render_reference(current),
         next = render_next(account, current),
     )
+}
+
+/// The card's dossier — post-grade only (DESIGN.md): stage, last seen, and
+/// success record, plus the concept line when the grade rolled one up. This
+/// never renders pre-grade; before the answer the question owns the screen.
+fn render_meta_ledger(current: &BetaStudyCurrent) -> String {
+    let Some(feedback) = current.feedback.as_ref() else {
+        return String::new();
+    };
+    let history = &feedback.item_history;
+    let mut rows = String::new();
+    let _ = write!(
+        rows,
+        r"<div><dt>Stage</dt><dd>{}</dd></div>",
+        escape_html(&history.stage)
+    );
+    let _ = write!(
+        rows,
+        r"<div><dt>Last seen</dt><dd>{}</dd></div>",
+        escape_html(&history.last_seen_summary)
+    );
+    let _ = write!(
+        rows,
+        r"<div><dt>Success</dt><dd>{} · {}</dd></div>",
+        escape_html(&history.success_rate),
+        escape_html(&history.trend)
+    );
+    if let Some(concept) = feedback.concept_progress.as_ref() {
+        let _ = write!(
+            rows,
+            r"<div><dt>Concept</dt><dd>{} · {}</dd></div>",
+            escape_html(&concept.concept_label),
+            escape_html(&concept.health)
+        );
+    }
+    format!(r#"<dl class="me-meta-ledger">{rows}</dl>"#)
 }
 
 /// Reveal the answer in place. Multiple-choice marks the correct option and dims
@@ -551,11 +591,21 @@ fn render_verdict(current: &BetaStudyCurrent) -> String {
 }
 
 fn render_next(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    if current.grade.is_none() {
+    let Some(grade) = current.grade.as_ref() else {
         return String::new();
-    }
+    };
+    // Two-speed advance (DESIGN.md): a correct verdict carries the
+    // auto-advance affordance for the enhancement script — the page holds
+    // long enough to read the verdict and horizon, then moves on; tapping
+    // anywhere advances sooner. A miss holds for study. Continue is the
+    // JS-off path and the visible affordance in both cases.
+    let auto = if format!("{:?}", grade.verdict) == "Correct" {
+        r#" data-auto-advance="2000""#
+    } else {
+        ""
+    };
     format!(
-        r#"<form class="me-next" action="/app/next" method="post">{csrf}<button class="ae-button" type="submit">Next {ICON_ARROW}</button></form>"#,
+        r#"<form class="me-next" action="/app/next" method="post"{auto}>{csrf}<button class="ae-button" type="submit">Continue {ICON_ARROW}</button></form>"#,
         csrf = hidden_csrf_input(account),
     )
 }
@@ -602,11 +652,13 @@ fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'stati
 }
 
 fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    // Reference/Skip/Snooze/Bridge defer or assist the current card; Delete is
-    // the "this card is bad" exit — it removes the card from review for good.
-    // Kept last and visually set apart so it isn't a stray tap.
+    // Only Reveal earns a permanent spot beside the card (DESIGN.md,
+    // interaction law): Reference/Skip/Snooze/Bridge/Delete and the capture
+    // punch-out live one tap deeper behind a single More disclosure, so
+    // nothing competes with the answer. Delete stays last and visually set
+    // apart so it isn't a stray tap.
     format!(
-        r#"<div class="me-hatches">{reference}{skip}{snooze}{bridge}<span class="me-hatch-delete">{delete}</span></div>"#,
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/">+ Capture more</a></div></details>"#,
         reference = render_review_action(account, current, "/app/reference", "Reference"),
         skip = render_review_action(account, current, "/app/skip", "Skip"),
         snooze = render_review_action(account, current, "/app/snooze", "Snooze"),
@@ -705,124 +757,3 @@ const ICON_ARROW: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden
 const ICON_CLOCK: &str = r#"<svg class="ae-icon ae-dim" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"#;
 const ICON_UP: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>"#;
 const ICON_DOWN: &str = r#"<svg class="ae-icon ae-warn" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7 17 17"/><path d="M17 7v10H7"/></svg>"#;
-
-// App-specific page glue. Structure and rhythm only — every costume comes from
-// aesthetic.css. The accent (ultramarine) is the one steered token.
-const STYLE: &str = r#"
-:root { --ae-accent: #2643d0; --ae-accent-dark: #8c9eff; }
-.dark, [data-ae-mode='dark'] { --ae-accent: var(--ae-accent-dark); }
-/* Scrollbar fix: the kit puts the scroll on the measure-width column, so its
-   bar floats mid-screen. Move the scroll to the full-width stage and keep the
-   content in the measure via the view wrapper — now the bar hugs the screen
-   edge. (Scoped to the scrolling stage; short centered screens are unaffected.) */
-.ae-stage-scroll { width: 100%; }
-.ae-stage-scroll > .ae-view { width: min(var(--ae-measure), 100% - 5rem); margin-inline: auto; }
-.me-due { font-variant-numeric: tabular-nums; color: var(--ae-ink-muted); }
-.me-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 1em; margin-top: 1.2em; }
-.me-hint { font-size: 13px; }
-/* the signed-out cover — the one surface where type goes to display scale.
-   App screens stay strictly one size; this register is cover-only. A clean
-   candidate to promote into misty-step as a sanctioned .ae-display primitive. */
-.me-kicker { font-family: var(--ae-font-mono); font-size: 13px; font-weight: var(--ae-w-medium); letter-spacing: 0.1em; color: var(--ae-ink-muted); margin: 0 0 1.2em; }
-.me-cover { padding-top: clamp(1.5rem, 9vh, 6rem); }
-.me-display { font-weight: var(--ae-w-black); font-size: clamp(2.1rem, 1.1rem + 4vw, 2.9rem); line-height: 1.04; letter-spacing: -0.02em; margin: 0 0 0.55em; max-width: 13em; text-wrap: balance; }
-.me-support { margin: 0 0 2em; }
-.me-capture-hero { max-width: 34em; }
-.me-hero-email { border: 1px solid var(--ae-line); padding: 0 0.85em; height: 46px; max-width: 26em; margin-top: 0.5em; }
-.me-hero-email:focus-visible { border-color: var(--ae-ink); outline: 2px solid var(--ae-accent); outline-offset: 2px; }
-@media (max-width: 640px) {
-  .me-cover { padding-top: 1.4rem; }
-  .me-support { margin-bottom: 1.3em; }
-  textarea.ae-input { min-height: 4em; }
-}
-.me-callout-line { margin-bottom: 1.1em; }
-.me-callout-n { font-family: var(--ae-font-mono); font-variant-numeric: tabular-nums; font-weight: var(--ae-w-black); margin-right: 0.15em; }
-.me-caughtup-line { display: flex; align-items: center; gap: 0.5em; font-weight: var(--ae-w-medium); margin: 0 0 0.3em; }
-/* the prompt is the focus of the review — loud by weight, never by size */
-.me-prompt { font-weight: var(--ae-w-black); line-height: 1.45; max-width: 30em; margin: 0.2em 0 1.6em; }
-/* post-grade recap: a quiet read-only list of the options that were offered */
-.me-choices { list-style: none; margin: 0 0 1.6em; padding: 0; counter-reset: choice; }
-.me-choices li { counter-increment: choice; display: flex; gap: 0.7em; padding: 0.28em 0; }
-.me-choices li::before { content: counter(choice, upper-alpha) "."; color: var(--ae-ink-muted); font-family: var(--ae-font-mono); font-size: 13px; min-width: 1.3em; }
-/* pre-grade: the options ARE the control — full-width clickable rows, one tap
-   to answer. Lettered like the recap so they read as the same set. */
-.me-choices-form { display: flex; flex-direction: column; gap: 0.5em; margin: 0 0 1.6em; counter-reset: choice; }
-.me-choice { counter-increment: choice; display: flex; gap: 0.7em; align-items: baseline; width: 100%; text-align: left; font: inherit; color: var(--ae-ink); background: transparent; border: 1px solid var(--ae-line); padding: 0.7em 0.9em; cursor: pointer; transition: border-color var(--ae-quick) var(--ae-ease); }
-.me-choice::before { content: counter(choice, upper-alpha) "."; color: var(--ae-ink-muted); font-family: var(--ae-font-mono); font-size: 13px; min-width: 1.3em; }
-.me-choice:hover { border-color: var(--ae-ink); }
-.me-choice:focus-visible { outline: 2px solid var(--ae-accent); outline-offset: 2px; }
-/* free-response field: a clearly bounded box, not the hairline underline that
-   read as a divider */
-.me-answer-input { border: 1px solid var(--ae-line); padding: 0.7em 0.85em; }
-.me-answer-input:focus-visible { border-color: var(--ae-ink); outline: 2px solid var(--ae-accent); outline-offset: 2px; }
-/* graded multiple choice: the options become a read-only reveal — the correct
-   one marked and tinted, the rest dimmed. Not a control: no hover, no pointer. */
-.me-choices-graded { list-style: none; margin: 0 0 1.2em; padding: 0; display: flex; flex-direction: column; gap: 0.45em; }
-.me-graded-choice { display: flex; align-items: center; gap: 0.7em; padding: 0.55em 0.7em; border: 1px solid transparent; }
-.me-graded-choice > span { flex: 1; }
-.me-graded-choice .ae-icon { width: 1.05em; height: 1.05em; color: var(--ae-ok); flex: none; }
-.me-graded-choice-correct { border-color: var(--ae-ok); background: color-mix(in srgb, var(--ae-ok) 8%, transparent); font-weight: var(--ae-w-black); }
-.me-graded-choice-dim { color: var(--ae-ink-faint); }
-.me-answer { display: flex; flex-direction: column; gap: 0.2em; padding: 0.7em 0 0.7em 1em; border-left: 2px solid var(--ae-accent); margin: 0 0 1.2em; }
-.me-answer-label { font-size: 13px; letter-spacing: 0.06em; color: var(--ae-ink-muted); }
-/* the verdict is the moment: loud by weight, the glyph carries the hue and
-   draws on once (reduced-motion users get it instantly via the kit's reset).
-   One quiet line beneath says when the card returns; then Next is primary. */
-.me-result { display: flex; align-items: center; gap: 0.55em; margin: 0.4em 0 0.35em; }
-.me-result .ae-icon { width: 1.5em; height: 1.5em; }
-.me-verdict { font-weight: var(--ae-w-black); }
-.me-result .ae-ok { stroke-dasharray: 26; animation: me-draw var(--ae-gentle) var(--ae-ease) both; }
-@keyframes me-draw { from { stroke-dashoffset: 26; } }
-.me-next-when { font-size: 13px; margin: 0 0 1.5em; }
-.me-next { margin: 0 0 1.6em; }
-.me-reference { padding: 0.9em 0; border-top: 1px solid var(--ae-line); border-bottom: 1px solid var(--ae-line); margin: 0 0 1.5em; }
-.me-reference p { margin: 0; }
-.ae-lede { margin-bottom: 1.7em; }
-.me-source { padding: 1.1em 0; border-top: 1px solid var(--ae-line); }
-.me-source:first-of-type { border-top: 0; padding-top: 0.2em; }
-.me-row-actions, .me-hatches { display: flex; flex-wrap: wrap; gap: 0.6em; margin-top: 0.8em; }
-/* the activity log: one row per background generation job. data-status drives
-   the status glyph, the meta colour, and retry visibility, so the SSE script
-   only has to flip one attribute and rewrite one line of text. */
-.me-jobs-list { list-style: none; margin: 0; padding: 0; }
-.me-job { display: flex; gap: 13px; align-items: flex-start; padding: 0.95em 0; border-top: 1px solid var(--ae-line); }
-.me-job:first-child { border-top: 0; padding-top: 0.3em; }
-.me-job-body { flex: 1; min-width: 0; }
-.me-job-title { font-weight: var(--ae-w-medium); margin: 0; }
-.me-job-meta { font-size: 13px; color: var(--ae-ink-muted); margin: 0.2em 0 0; }
-.me-job[data-status="failed"] .me-job-meta { color: var(--ae-err); }
-.me-job-glyphs { flex: none; width: 18px; height: 18px; }
-.me-job-glyphs > span { display: none; }
-.me-job-glyphs .ae-icon { width: 18px; height: 18px; }
-.me-job[data-status="queued"] .g-queued,
-.me-job[data-status="running"] .g-running,
-.me-job[data-status="succeeded"] .g-succeeded,
-.me-job[data-status="failed"] .g-failed { display: inline-flex; }
-.me-job-retry { margin: 0; flex: none; display: none; }
-.me-job[data-status="failed"] .me-job-retry { display: block; }
-.me-job-retry-btn { border: 0; background: none; padding: 0.1em 0; font: inherit; font-size: 13px; font-weight: var(--ae-w-medium); color: var(--ae-accent); cursor: pointer; }
-.me-job-retry-btn:hover { text-decoration: underline; }
-/* a loading ring is the one sanctioned round shape (radius 0 elsewhere) */
-.me-spinner { display: inline-block; width: 15px; height: 15px; border: 2px solid var(--ae-line); border-top-color: var(--ae-accent); border-radius: 50%; animation: me-spin 0.8s linear infinite; }
-@keyframes me-spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .me-spinner { animation: none; } }
-.me-live-hint::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 0.5em; background: var(--ae-accent); border-radius: 50%; vertical-align: middle; }
-.me-capture-label { display: block; }
-.me-welcome { margin-bottom: 1.7em; }
-.me-hatches { margin: 1.9em 0 2.4em; }
-.me-hatch-delete { margin-left: auto; }
-.me-reveal { margin-top: 1.1em; }
-/* the capture textarea is the hero affordance: give it a hairline frame so an
-   empty field never reads as dead space (single-line inputs keep the line). */
-textarea.ae-input { min-height: 5em; border: 1px solid var(--ae-line); padding: 0.7em 0.85em; margin-top: 0.5em; }
-textarea.ae-input:focus-visible { border-color: var(--ae-ink); outline: 2px solid var(--ae-accent); outline-offset: 2px; }
-.me-concept { margin-bottom: 1.4em; }
-.me-concept:last-child { margin-bottom: 0; }
-.me-concept-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1em; margin-bottom: 0.55em; }
-.me-concept-head strong { font-weight: var(--ae-w-medium); }
-.me-concept-note { font-size: 13px; margin: 0.5em 0 0; }
-.me-trend { display: inline-flex; align-items: center; gap: 0.3em; white-space: nowrap; }
-.me-notice { display: flex; gap: 0.6em; align-items: baseline; padding: 0.85em 1em; border: 1px solid var(--ae-line); margin: 0 0 1.9em; }
-.me-foot-form { margin: 0; }
-.me-submit { margin: 0; }
-"#;
