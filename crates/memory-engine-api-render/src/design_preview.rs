@@ -461,11 +461,19 @@ fn conformance_every_state_consumes_the_design_system() {
             !html.contains(r#"class="me-hatches""#),
             "{name}: the permanent hatch row must stay dead; use the More disclosure"
         );
+        // Operator ruling (live dogfood, memory-engine-081): auto-advance is
+        // dead law across every state — only an explicit Continue tap (or
+        // Enter while it is focused) ever moves a graded page on. This
+        // reverses the two-speed advance shipped in memory-engine-078.
+        assert!(
+            !html.contains("data-auto-advance"),
+            "{name}: graded pages must never carry the auto-advance affordance"
+        );
     }
 }
 
 #[test]
-fn conformance_graded_review_carries_the_dossier_and_two_speed_advance() {
+fn conformance_graded_review_holds_until_continue() {
     let pages = pages();
     let Some((_, graded)) = pages.iter().find(|(name, _)| *name == "07-graded-correct") else {
         panic!("graded-correct preview state missing");
@@ -483,18 +491,14 @@ fn conformance_graded_review_carries_the_dossier_and_two_speed_advance() {
         graded.contains(r#"class="me-meta-ledger""#),
         "graded review must show the meta ledger"
     );
-    // …and a correct verdict carries the auto-advance affordance.
-    assert!(
-        graded.contains("data-auto-advance"),
-        "graded-correct must carry the auto-advance affordance"
-    );
     // Skip/Snooze/Bridge are pre-answer moves; they must vanish once graded.
     assert!(
         !graded.contains(r#"class="me-more""#),
         "graded review must not show escape hatches"
     );
 
-    // The miss holds for study: no auto-advance on a wrong verdict.
+    // The miss holds for study too — a correct verdict never advances on its
+    // own either, so both states must be identical in this respect.
     let Some((_, wrong)) = pages.iter().find(|(name, _)| *name == "08-graded-wrong") else {
         panic!("graded-wrong preview state missing");
     };
@@ -523,5 +527,68 @@ fn conformance_graded_review_carries_the_dossier_and_two_speed_advance() {
     assert!(
         answering.contains(r#"class="me-more-capture""#),
         "the More disclosure must carry the capture punch-out"
+    );
+}
+
+/// Operator dogfood finding (memory-engine-081): the "Generating…" notice
+/// must not linger once nothing is actually queued or running — it is
+/// checked against live job state, not just echoed from the route that
+/// enqueued it.
+#[test]
+fn conformance_generating_notice_only_shows_while_a_job_is_actually_in_flight() {
+    let acct = account();
+    let generating = "Generating your cards. They'll appear below as they're ready.";
+
+    let in_flight = vec![job(
+        "run-1",
+        "Spanish irregular verbs",
+        JobStatus::Running,
+        0,
+        None,
+        100,
+    )];
+    let live = render_app_shell(Some(&acct), &[], None, &in_flight, Some(generating));
+    assert!(
+        live.contains(generating),
+        "a live job must show the generating notice: {live}"
+    );
+
+    let resolved = vec![job(
+        "run-1",
+        "Spanish irregular verbs",
+        JobStatus::Succeeded,
+        12,
+        None,
+        100,
+    )];
+    let stale = render_app_shell(Some(&acct), &[], None, &resolved, Some(generating));
+    assert!(
+        !stale.contains(generating),
+        "the generating notice must not linger once nothing is in flight: {stale}"
+    );
+
+    // Notices unrelated to generation are unconditional.
+    let removed = render_app_shell(Some(&acct), &[], None, &resolved, Some("Source removed."));
+    assert!(removed.contains("Source removed."));
+}
+
+/// Operator dogfood finding (memory-engine-081): too much explainer text on
+/// the workspace. The welcome lede and capture hint are each one short line —
+/// no second sentence restating the product pitch.
+#[test]
+fn conformance_workspace_copy_trims_to_one_line_each() {
+    let acct = account();
+    let empty_workspace = render_app_shell(Some(&acct), &[], None, &[], None);
+    assert!(
+        empty_workspace.contains(
+            r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#
+        ),
+        "the welcome lede must be a single short line: {empty_workspace}"
+    );
+    assert!(
+        empty_workspace.contains(
+            r#"<span class="ae-dim me-hint me-live-hint">Generates in the background.</span>"#
+        ),
+        "the capture hint must be a single short line: {empty_workspace}"
     );
 }

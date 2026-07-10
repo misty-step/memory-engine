@@ -7,7 +7,10 @@
 //! single adaptive screen that swaps between a workspace (capture, manage,
 //! reflect) and a review (prompt, answer, grade). Every interaction is a
 //! full-page form POST; `assets/app.js` layers progressive enhancement
-//! (honest response timing, job SSE, the two-speed graded advance) on top.
+//! (honest response timing, job SSE, the Create pending state) on top.
+//! Graded pages never auto-advance on their own — the learner reviews the
+//! verdict, answer key, and dossier until they explicitly tap Continue
+//! (operator ruling, memory-engine-081).
 
 use std::fmt::Write as _;
 
@@ -155,7 +158,7 @@ fn render_signed_out(notice: Option<&str>) -> String {
 </form>
 </section>
 </div>"#,
-        notice = render_notice(notice),
+        notice = render_notice(notice, &[]),
     );
     screen("", &view, FOOTER_TAGLINE)
 }
@@ -180,7 +183,7 @@ fn render_signed_in(
     } else {
         render_workspace(account, sources, view, jobs)
     };
-    let view_inner = format!("{}{}", render_notice(notice), body);
+    let view_inner = format!("{}{}", render_notice(notice, jobs), body);
 
     screen(&header_right, &view_inner, &footer)
 }
@@ -201,25 +204,40 @@ fn render_workspace(
     }
     if sources.is_empty() && jobs.is_empty() {
         html.push_str(
-            r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering. Memory Engine turns it into review, timed so it sticks.</p>"#,
+            r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
         );
     }
     html.push_str(&render_capture(account));
     html.push_str(&render_jobs(account, jobs));
-    html.push_str(&render_sources(account, sources));
+    html.push_str(&render_sources(account, sources, jobs));
     if let Some(view) = view {
         html.push_str(&render_concept_progress(&view.concept_progress));
     }
     html
 }
 
-fn render_notice(message: Option<&str>) -> String {
+fn render_notice(message: Option<&str>, jobs: &[GenerationJob]) -> String {
+    let message = message.filter(|text| generating_notice_is_live(text, jobs));
     message.map_or_else(String::new, |message| {
         format!(
             r#"<p class="me-notice" role="status">{ICON_INFO}<span>{}</span></p>"#,
             escape_html(message)
         )
     })
+}
+
+/// A "Generating…" notice only tells the truth while a job it could be
+/// describing is actually queued or running. Every other notice (errors,
+/// confirmations like "Source removed.") is unconditional — only a
+/// generation-in-progress notice needs to be checked against live job state,
+/// so it never lingers once nothing is left in flight (operator dogfood
+/// finding, memory-engine-081).
+fn generating_notice_is_live(text: &str, jobs: &[GenerationJob]) -> bool {
+    if !text.contains("Generating") {
+        return true;
+    }
+    jobs.iter()
+        .any(|job| matches!(job.status, JobStatus::Queued | JobStatus::Running))
 }
 
 fn render_review_status(account: &AppAccount, view: &StudyViewResponse) -> String {
@@ -250,36 +268,47 @@ fn render_capture(account: &AppAccount) -> String {
     // review while cards generate. Progress shows in the activity log below.
     format!(
         r#"<section class="ae-group me-capture">
-<form action="/app/capture" method="post">
+<form class="me-capture-form" action="/app/capture" method="post">
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
-<div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background. Keep going.</span></div>
+<div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
         csrf = hidden_csrf_input(account),
     )
 }
 
-fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
+fn render_sources(
+    account: &AppAccount,
+    sources: &[SourceRecord],
+    jobs: &[GenerationJob],
+) -> String {
     if sources.is_empty() {
         return String::new();
     }
 
     let mut rows = String::new();
     for source in sources {
+        let generate = if source_generation_in_progress_or_done(source, jobs) {
+            String::new()
+        } else {
+            format!(
+                r#"<form action="/app/generate" method="post">{csrf_generate}<input type="hidden" name="sourceId" value="{id}"><button class="ae-button ae-button-compact" type="submit" title="Turn this material into review cards.">Generate cards</button></form>"#,
+                csrf_generate = hidden_csrf_input(account),
+                id = escape_html(&source.source_id),
+            )
+        };
         let _ = write!(
             rows,
             r#"<article class="me-source">
 <p class="ae-item">{title}</p>
 <div class="me-row-actions">
-<form action="/app/generate" method="post">{csrf_generate}<input type="hidden" name="sourceId" value="{id}"><button class="ae-button ae-button-compact" type="submit">Create review</button></form>
-<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit">Remove</button></form>
+{generate}
+<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit" title="Remove this saved material.">Remove</button></form>
 </div>
 </article>"#,
             title = escape_html(&source.title),
-            csrf_generate = hidden_csrf_input(account),
-            id = escape_html(&source.source_id),
             csrf_archive = hidden_csrf_input(account),
             id_archive = escape_html(&source.source_id),
         );
@@ -288,6 +317,21 @@ fn render_sources(account: &AppAccount, sources: &[SourceRecord]) -> String {
     format!(
         r#"<section class="ae-group me-material"><h2 class="ae-h">Saved material</h2>{rows}</section>"#
     )
+}
+
+/// A source whose generation is already queued, running, or done never
+/// offers "Generate cards" again — the operator's first dogfood session hit
+/// a duplicate generation run by tapping it while a job for the same source
+/// was still in flight (memory-engine-081; the server-side duplicate guard
+/// is memory-engine-082).
+fn source_generation_in_progress_or_done(source: &SourceRecord, jobs: &[GenerationJob]) -> bool {
+    jobs.iter().any(|job| {
+        job.source_id == source.source_id
+            && matches!(
+                job.status,
+                JobStatus::Queued | JobStatus::Running | JobStatus::Succeeded
+            )
+    })
 }
 
 /// The activity log: one row per background generation job, newest first.
@@ -312,18 +356,35 @@ fn render_jobs(account: &AppAccount, jobs: &[GenerationJob]) -> String {
 fn render_job_row(account: &AppAccount, job: &GenerationJob) -> String {
     format!(
         r#"<li class="me-job" data-job-id="{id}" data-status="{status}">
-<span class="me-job-glyphs" aria-hidden="true"><span class="g-queued">{ICON_CLOCK}</span><span class="g-running"><span class="me-spinner"></span></span><span class="g-succeeded">{ICON_OK}</span><span class="g-failed">{ICON_ERR}</span></span>
+<span class="me-job-glyphs" aria-hidden="true"><span class="g-queued"></span><span class="g-running"><span class="me-spinner"></span></span><span class="g-succeeded"></span><span class="g-failed"></span></span>
 <div class="me-job-body">
 <p class="me-job-title">{title}</p>
 <p class="me-job-meta">{meta}</p>
 </div>
-<form class="me-job-retry" action="/app/jobs/retry" method="post">{csrf}<input type="hidden" name="jobId" value="{id}"><button class="me-job-retry-btn" type="submit">Retry</button></form>
+{retry}
 </li>"#,
         id = escape_html(&job.id),
         status = job.status.as_str(),
         title = escape_html(&job.title),
         meta = job_meta(job),
+        retry = render_job_retry(account, job),
+    )
+}
+
+/// Retry only ever makes sense once a job has actually failed — the
+/// operator's first dogfood session hit an unstyled Retry button rendered
+/// next to a RUNNING job (memory-engine-081). A queued or running job has
+/// nothing to retry, so it renders no control at all; `app.js`'s SSE
+/// enhancement never adds one either (the list is server-authoritative, so a
+/// job that fails live gets its Retry button on the next full page load).
+fn render_job_retry(account: &AppAccount, job: &GenerationJob) -> String {
+    if job.status != JobStatus::Failed {
+        return String::new();
+    }
+    format!(
+        r#"<form class="me-job-retry" action="/app/jobs/retry" method="post">{csrf}<input type="hidden" name="jobId" value="{id}"><button class="me-job-retry-btn" type="submit">Retry</button></form>"#,
         csrf = hidden_csrf_input(account),
+        id = escape_html(&job.id),
     )
 }
 
@@ -591,21 +652,16 @@ fn render_verdict(current: &BetaStudyCurrent) -> String {
 }
 
 fn render_next(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    let Some(grade) = current.grade.as_ref() else {
+    if current.grade.is_none() {
         return String::new();
-    };
-    // Two-speed advance (DESIGN.md): a correct verdict carries the
-    // auto-advance affordance for the enhancement script — the page holds
-    // long enough to read the verdict and horizon, then moves on; tapping
-    // anywhere advances sooner. A miss holds for study. Continue is the
-    // JS-off path and the visible affordance in both cases.
-    let auto = if format!("{:?}", grade.verdict) == "Correct" {
-        r#" data-auto-advance="2000""#
-    } else {
-        ""
-    };
+    }
+    // Operator ruling (memory-engine-081, live dogfood): a graded page never
+    // advances on its own. The learner reviews the verdict, answer key, and
+    // dossier until they explicitly advance — Continue (or Enter while it is
+    // focused) is the only way forward, correct or not. This reverses the
+    // two-speed auto-advance shipped in memory-engine-078.
     format!(
-        r#"<form class="me-next" action="/app/next" method="post"{auto}>{csrf}<button class="ae-button" type="submit">Continue {ICON_ARROW}</button></form>"#,
+        r#"<form class="me-next" action="/app/next" method="post">{csrf}<button class="ae-button" type="submit">Continue {ICON_ARROW}</button></form>"#,
         csrf = hidden_csrf_input(account),
     )
 }
@@ -656,14 +712,54 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
     // interaction law): Reference/Skip/Snooze/Bridge/Delete and the capture
     // punch-out live one tap deeper behind a single More disclosure, so
     // nothing competes with the answer. Delete stays last and visually set
-    // apart so it isn't a stray tap.
+    // apart so it isn't a stray tap. Every action carries a leading icon and
+    // a tooltip truthful to what the route actually does (memory-engine-081:
+    // Skip and Snooze were indistinguishable) — Skip is a short in-session
+    // deferral (`DEFAULT_SKIP_DEFER_MS`, 15 minutes) and Snooze defers until
+    // tomorrow (`DEFAULT_SNOOZE_DEFER_MS`, 24 hours); see
+    // `memory_engine_study::skip_current`/`snooze_current`.
     format!(
-        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/">+ Capture more</a></div></details>"#,
-        reference = render_review_action(account, current, "/app/reference", "Reference"),
-        skip = render_review_action(account, current, "/app/skip", "Skip"),
-        snooze = render_review_action(account, current, "/app/snooze", "Snooze"),
-        bridge = render_review_action(account, current, "/app/bridge", "Bridge"),
-        delete = render_review_action(account, current, "/app/delete", "Delete"),
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
+        reference = render_review_action(
+            account,
+            current,
+            "/app/reference",
+            "Reference",
+            ICON_REFERENCE,
+            "Show background reading for this card.",
+        ),
+        skip = render_review_action(
+            account,
+            current,
+            "/app/skip",
+            "Skip",
+            ICON_SKIP,
+            "Show later this session.",
+        ),
+        snooze = render_review_action(
+            account,
+            current,
+            "/app/snooze",
+            "Snooze",
+            ICON_SNOOZE,
+            "Hide until tomorrow.",
+        ),
+        bridge = render_review_action(
+            account,
+            current,
+            "/app/bridge",
+            "Bridge",
+            ICON_BRIDGE,
+            "Generate easier warm-up cards, then revisit this one later.",
+        ),
+        delete = render_review_action(
+            account,
+            current,
+            "/app/delete",
+            "Delete",
+            ICON_TRASH,
+            "Remove this card from review for good.",
+        ),
     )
 }
 
@@ -672,11 +768,14 @@ fn render_review_action(
     current: &BetaStudyCurrent,
     action: &str,
     label: &str,
+    icon: &str,
+    title: &str,
 ) -> String {
     format!(
-        r#"<form action="{action}" method="post">{csrf}<input type="hidden" name="reviewUnitId" value="{id}"><button class="ae-button-quiet ae-button-compact" type="submit">{label}</button></form>"#,
+        r#"<form action="{action}" method="post">{csrf}<input type="hidden" name="reviewUnitId" value="{id}"><button class="ae-button-quiet ae-button-compact" type="submit" title="{title}">{icon}{label}</button></form>"#,
         csrf = hidden_csrf_input(account),
         id = escape_html(&current.review_unit_id.to_string()),
+        title = escape_html(title),
     )
 }
 
@@ -754,6 +853,14 @@ const ICON_ERR: &str = r#"<svg class="ae-icon ae-err" viewBox="0 0 24 24" aria-h
 const ICON_REVEALED: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_INFO: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>"#;
 const ICON_ARROW: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>"#;
-const ICON_CLOCK: &str = r#"<svg class="ae-icon ae-dim" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"#;
 const ICON_UP: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>"#;
 const ICON_DOWN: &str = r#"<svg class="ae-icon ae-warn" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7 17 17"/><path d="M17 7v10H7"/></svg>"#;
+
+// More-sheet action icons (memory-engine-081): each escape hatch carries a
+// leading Lucide-style glyph (`.ae-icon`: 24x24 viewBox, 1.5px stroke).
+const ICON_REFERENCE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v14"/><path d="M3 18V6a1 1 0 0 1 1-1h5a3 3 0 0 1 3 3 3 3 0 0 1 3-3h5a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-6a2 2 0 0 0-2 2 2 2 0 0 0-2-2H4a1 1 0 0 1-1-1z"/></svg>"#;
+const ICON_SKIP: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 5 9 7-9 7z"/><path d="M19 5v14"/></svg>"#;
+const ICON_SNOOZE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"#;
+const ICON_BRIDGE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18"/><path d="M6 19v-6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v6"/><path d="M9 11V6"/><path d="M15 11V6"/></svg>"#;
+const ICON_TRASH: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M18 7l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>"#;
+const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>"#;
