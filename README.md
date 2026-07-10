@@ -58,7 +58,8 @@ The Rust migration is complete for the main runtime:
 
 The current production dogfood surface is `memory-engine-api`, a Rust binary on
 DigitalOcean App Platform backed by Neon Postgres. The former Fly deployment in
-`ord` is a temporary standby pending explicit decommission. Agent-facing
+`ord` is stopped and retained only as a manual rollback target pending explicit
+decommission; CI must not deploy or probe it. Agent-facing
 deployment, environment, auth, storage, and smoke-test details live in
 [docs/runbook.md](./docs/runbook.md).
 
