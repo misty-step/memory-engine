@@ -829,13 +829,21 @@ async fn archive_app_source(
     let result = state.archive_app_source(&account, &form.source_id);
 
     match result {
-        Ok(view) => Html(render_account_page(
-            &state,
-            &account,
-            Some(&view),
-            Some("Source removed."),
-        ))
-        .into_response(),
+        Ok((view, archived_count)) => {
+            // memory-engine-088: the operator dogfood found "Source removed."
+            // gave no sense of scope for an action that silently retires
+            // every card generated from the source, across every generation
+            // run. Name the actual count instead.
+            let cards = if archived_count == 1 { "card" } else { "cards" };
+            let notice = format!("Source removed. {archived_count} {cards} retired.");
+            Html(render_account_page(
+                &state,
+                &account,
+                Some(&view),
+                Some(&notice),
+            ))
+            .into_response()
+        }
         Err(error) => Html(render_account_page(
             &state,
             &account,
