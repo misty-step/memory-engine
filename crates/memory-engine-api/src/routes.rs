@@ -855,7 +855,7 @@ async fn retry_app_job(
             Err(error) => return error.into_response(),
         };
     let notice = if state.retry_generation_job(&account, &form.job_id) {
-        "Retrying — generating again in the background."
+        "Retrying. Generating again in the background."
     } else {
         "That job can't be retried."
     };

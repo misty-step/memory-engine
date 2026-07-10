@@ -40,8 +40,18 @@
     if (typeof next.requestSubmit === "function") next.requestSubmit();
     else next.submit();
   }
+  // A native Continue tap must also arm the flag, so the timer can never
+  // fire a second POST after the learner already advanced.
+  next.addEventListener("submit", function () {
+    advanced = true;
+  });
+  // Only a correct verdict is frictionless: the timer advances, and a tap or
+  // Enter anywhere outside a control advances sooner. A miss holds for study
+  // until the learner deliberately taps Continue — an incidental tap while
+  // reading the revealed answer must never advance it.
   var hold = parseInt(next.getAttribute("data-auto-advance") || "", 10);
-  if (hold > 0) setTimeout(advance, hold);
+  if (!(hold > 0)) return;
+  setTimeout(advance, hold);
   document.addEventListener("click", function (event) {
     if (event.target.closest("a, button, input, textarea, select, summary, details, form")) return;
     advance();

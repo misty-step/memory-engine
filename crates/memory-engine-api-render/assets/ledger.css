@@ -30,7 +30,7 @@
   --lg-accent-ink: #8e3b1b;
   --lg-pine: #2f6146;
   --lg-clay: #a6382c;
-  --lg-ochre: #9a6a16;
+  --lg-ochre: #7d5410; /* 5.98:1 on paper: verdict text must hold AA */
   --lg-slate: #4a5560;
   --lg-on-accent: #ffffff;
   --lg-on-ink: #f6f2ea;
@@ -60,6 +60,7 @@
     --lg-clay: #d2604f;
     --lg-ochre: #c79433;
     --lg-slate: #97a3ae;
+    --lg-on-accent: #15130d; /* 6.27:1 on the dark accent: white sat at 2.96 */
     --lg-on-ink: #15130d;
   }
 }

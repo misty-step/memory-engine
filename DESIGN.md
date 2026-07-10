@@ -73,7 +73,8 @@ instantly.
   anywhere advances immediately. Without JavaScript a Continue button is
   visible and everything still works.
 - Graded Close / Try again / Revealed: **no auto-advance** — the learner is
-  studying the miss. Tap anywhere (or Continue) advances.
+  studying the miss. Only a deliberate Continue tap advances; incidental taps
+  while reading the revealed answer must never advance the card.
 - Pre-grade shows **no card meta**: no stage, no last-seen, no success rate,
   no health. Just kicker, prompt, the answer mechanism, and the hatch row.
 - Escape hatches: only **Reveal answer** stays on the card, beside one `···`
