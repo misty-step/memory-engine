@@ -107,12 +107,16 @@ printf '%s\n' "$generate_status" \
 
 ## Deploy and rollback
 
-DigitalOcean App Platform is git-integrated on `master`: every push builds
-and deploys automatically (`doctl apps list-deployments memory-engine-api`
-to watch). The legacy Fly `deploy.yml` workflow still runs in parallel
-(gated on the `ci` workflow, deploys the same SHA, fails on a post-deploy
-smoke regression) and keeps the standby Fly app current until it is
-decommissioned — do not remove it without an explicit decommission ticket.
+DigitalOcean App Platform is git-integrated on `master`, but the app spec
+does NOT set `deploy_on_push`, so **merging to master does not deploy** —
+verified 2026-07-09 when two shipped merges sat undeployed until a manual
+trigger. Until ticket 075 wires an automatic gated deploy, every ship must
+end with the manual deploy below plus the Deployed smoke, and "shipped"
+claims must name the ACTIVE deployment id. The legacy Fly `deploy.yml`
+workflow still runs in parallel (gated on the `ci` workflow, deploys the
+same SHA, fails on a post-deploy smoke regression) and keeps the standby
+Fly app current until it is decommissioned — do not remove it without an
+explicit decommission ticket.
 
 Manual DO deploy / rollback:
 
