@@ -40,6 +40,42 @@
   });
 })();
 
+// Instant acknowledgment for every form action (memory-engine-086).
+//
+// The server round trip can be slow (memory-engine-085 owns the real fix);
+// until then a press must never look inert. This script marks the pressed
+// control, dims the MCQ siblings so the tapped choice reads as chosen, shows
+// a thin in-flight bar, and swallows duplicate submits while one navigation
+// is in flight. Progressive enhancement only: forms still post normally and
+// JS-off behavior is unchanged. Controls are never disabled before the post
+// (disabling the submitter would strip its name=value pair — the MCQ answer —
+// from the form data); duplicate suppression uses the busy flag instead.
+(function () {
+  "use strict";
+  var busy = false;
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.classList.contains("me-capture-form")) return; // owns its own pending state
+    if (busy) {
+      event.preventDefault();
+      return;
+    }
+    busy = true;
+    document.documentElement.setAttribute("data-busy", "");
+    var control =
+      event.submitter || form.querySelector('button[type="submit"], button:not([type])');
+    if (!control) return;
+    control.setAttribute("data-pressed", "");
+    if (control.classList.contains("me-choice")) {
+      var choices = form.querySelectorAll(".me-choice");
+      for (var i = 0; i < choices.length; i++) {
+        if (choices[i] !== control) choices[i].setAttribute("data-dim", "");
+      }
+    }
+  });
+})();
+
 // Progressive enhancement for the generation activity log.
 //
 // The server renders the authoritative list of jobs on every full page load,

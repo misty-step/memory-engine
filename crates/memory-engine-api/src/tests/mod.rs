@@ -5348,3 +5348,47 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         );
     }
 }
+
+#[tokio::test]
+async fn served_assets_carry_the_instant_acknowledgment_enhancement() {
+    // memory-engine-086: the review actions acknowledge a press before the
+    // server responds. The behavior itself is client-side; this tripwire
+    // pins that the served assets actually carry the enhancement hooks so a
+    // refactor cannot silently drop them.
+    let app = router(ApiState::default());
+
+    let js = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/app.js")
+                .body(Body::empty())
+                .expect("js request"),
+        )
+        .await
+        .expect("js response");
+    assert_eq!(js.status(), StatusCode::OK);
+    let js = response_text(js).await;
+    for hook in ["data-busy", "data-pressed", "data-dim", "event.submitter"] {
+        assert!(js.contains(hook), "app.js must carry {hook}");
+    }
+    assert!(
+        !js.contains("control.disabled = true"),
+        "the submitter must never be disabled pre-post (it would strip the MCQ answer value)"
+    );
+
+    let css = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/ledger.css")
+                .body(Body::empty())
+                .expect("css request"),
+        )
+        .await
+        .expect("css response");
+    let css = response_text(css).await;
+    for hook in ["data-pressed", "data-dim", "html[data-busy]"] {
+        assert!(css.contains(hook), "ledger.css must style {hook}");
+    }
+}
