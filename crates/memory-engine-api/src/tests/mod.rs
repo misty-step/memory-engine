@@ -4967,11 +4967,12 @@ async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
 }
 
 #[tokio::test]
-async fn graded_review_shows_meta_ledger_and_two_speed_advance() {
-    // Ledger interaction law (DESIGN.md): after grading the card shows its
-    // dossier (stage, last seen, success rate, next horizon) and a Continue
-    // control. A correct answer carries the auto-advance affordance for the
-    // enhancement script; a miss holds for study and must not auto-advance.
+async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
+    // Ledger interaction law (DESIGN.md), operator ruling from live dogfood
+    // use (memory-engine-081): after grading the card shows its dossier
+    // (stage, last seen, success rate, next horizon) and holds indefinitely
+    // — correct or not, only an explicit Continue tap ever advances it. This
+    // reverses the two-speed auto-advance shipped in memory-engine-078.
     let state = ApiState::default();
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
@@ -5012,12 +5013,12 @@ async fn graded_review_shows_meta_ledger_and_two_speed_advance() {
     }
     assert!(graded.contains("you'll see this again"));
     assert!(
-        graded.contains("data-auto-advance"),
-        "a correct verdict must carry the auto-advance affordance: {graded}"
+        !graded.contains("data-auto-advance"),
+        "a correct verdict must never auto-advance: {graded}"
     );
     assert!(
         graded.contains(">Continue"),
-        "the JS-off fallback control must be visible: {graded}"
+        "Continue must be the visible, only way to advance: {graded}"
     );
 
     // Wrong MCQ answer: dossier still shows, but no auto-advance — the
@@ -5158,4 +5159,192 @@ async fn generate_route_coalesces_a_duplicate_request_onto_the_in_flight_job() {
         1,
         "only one job must ever have existed for this source: {workspace}"
     );
+}
+
+#[tokio::test]
+async fn activity_retry_control_only_renders_for_failed_jobs() {
+    // Operator dogfood finding (memory-engine-081): an unstyled Retry button
+    // rendered next to a RUNNING job. Retry only ever makes sense once a job
+    // has actually failed.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let queued = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    let queued = response_text(queued).await;
+    assert!(queued.contains(r#"data-status="queued""#));
+    assert!(
+        !queued.contains("me-job-retry-btn"),
+        "a queued job must not offer Retry: {queued}"
+    );
+
+    // Archive the source so generation fails for a real reason, then confirm
+    // the now-failed row does carry a styled Retry control.
+    app.clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/archive",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("archive");
+    state.run_pending_jobs_blocking();
+    let failed_html = workspace_html(&app, &cookie).await;
+    assert!(failed_html.contains(r#"data-status="failed""#));
+    assert!(
+        failed_html.contains("me-job-retry-btn"),
+        "a failed job must offer a styled Retry control: {failed_html}"
+    );
+}
+
+#[tokio::test]
+async fn activity_glyphs_render_a_single_clean_mark_with_no_icon_overlap() {
+    // Operator dogfood finding (memory-engine-081): the success glyph was a
+    // solid pine dot with an awkwardly overlapping checkmark icon. Every job
+    // glyph is a single flat status dot driven by CSS off `data-status` — no
+    // icon layered inside it.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    assert_activity_succeeded_html(&generated, 2);
+    assert!(
+        generated.contains(r#"<span class="g-succeeded"></span>"#),
+        "the succeeded glyph must be a single bare dot: {generated}"
+    );
+    assert!(
+        !generated.contains(r#"class="g-succeeded"><svg"#),
+        "no icon may render inside the succeeded glyph: {generated}"
+    );
+}
+
+#[tokio::test]
+async fn capture_form_progressive_enhancement_shows_a_pending_state() {
+    // Ruling (memory-engine-081): Create must show an immediate in-page
+    // pending state — the submit button disables and its label swaps to a
+    // working state — via progressive enhancement. JS-off keeps the plain
+    // form post: the server always renders the button enabled with its real
+    // label, so the enhancement is additive only.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, _csrf_token, _source_id) = start_app_session_for_csrf(&app).await;
+
+    let workspace = workspace_html(&app, &cookie).await;
+    assert!(
+        workspace.contains(r#"<form class="me-capture-form" action="/app/capture" method="post">"#),
+        "the capture form needs a stable selector for the pending-state enhancement: {workspace}"
+    );
+    assert!(workspace.contains(">Create"));
+
+    let script = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/app.js")
+                .body(Body::empty())
+                .expect("app.js request"),
+        )
+        .await
+        .expect("app.js response");
+    let script = response_text(script).await;
+    assert!(
+        script.contains("me-capture-form"),
+        "app.js must target the capture form: {script}"
+    );
+    assert!(
+        script.contains("Creating\u{2026}"),
+        "app.js must swap the button label to a pending state: {script}"
+    );
+    assert!(
+        script.contains(".disabled = true"),
+        "app.js must disable the submit button during the pending state: {script}"
+    );
+}
+
+#[tokio::test]
+async fn saved_material_hides_generate_once_a_job_is_in_flight_or_done() {
+    // Operator dogfood finding (memory-engine-081): tapping "Create review"
+    // while a job for the same source was already running caused a
+    // duplicate generation run. Saved material never offers to generate
+    // again once a job for that source is queued, running, or already
+    // succeeded, and the action explains itself.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let fresh = workspace_html(&app, &cookie).await;
+    assert!(
+        fresh.contains("Generate cards"),
+        "a source with no job yet must offer to generate: {fresh}"
+    );
+    assert!(
+        !fresh.contains("Create review"),
+        "the action must be relabeled to explain itself: {fresh}"
+    );
+
+    let queued = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    let queued = response_text(queued).await;
+    assert!(queued.contains(r#"data-status="queued""#));
+    assert!(
+        !queued.contains("Generate cards"),
+        "a source with a job already queued must not offer to generate again: {queued}"
+    );
+
+    state.run_pending_jobs_blocking();
+    let succeeded = workspace_html(&app, &cookie).await;
+    assert!(succeeded.contains(r#"data-status="succeeded""#));
+    assert!(
+        !succeeded.contains("Generate cards"),
+        "a source that already succeeded must not offer to generate again: {succeeded}"
+    );
+    assert!(succeeded.contains("Remove"));
+}
+
+#[tokio::test]
+async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
+    // Operator dogfood finding (memory-engine-081): More-sheet actions were
+    // unclear without tooltips, and Skip vs Snooze read as interchangeable.
+    // Tooltips must be truthful to the actual route semantics: Skip
+    // (`DEFAULT_SKIP_DEFER_MS`) is a short in-session deferral, Snooze
+    // (`DEFAULT_SNOOZE_DEFER_MS`) defers until tomorrow.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+
+    let tooltips = [
+        "Show background reading for this card.",
+        "Show later this session.",
+        "Hide until tomorrow.",
+        "Generate easier warm-up cards, then revisit this one later.",
+        "Remove this card from review for good.",
+        "Capture new material without leaving review.",
+    ];
+    for tooltip in tooltips {
+        let marker = format!(r#"title="{tooltip}"><svg class="ae-icon""#);
+        assert!(
+            page.contains(&marker),
+            "expected a truthful tooltip with a leading icon ({tooltip}): {page}"
+        );
+    }
 }

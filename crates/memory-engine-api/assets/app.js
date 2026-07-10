@@ -21,44 +21,22 @@
   });
 })();
 
-// Two-speed graded advance (DESIGN.md, interaction law).
+// Progressive enhancement for Create: an immediate in-page pending state.
 //
-// The graded page always renders a working Continue form, so with JavaScript
-// off the learner taps Continue and nothing is lost. This script adds the
-// frictionless path: a correct verdict (the form carries data-auto-advance)
-// moves on after a short readable hold, and on any graded page a tap or
-// Enter anywhere outside a control advances immediately. A miss never
-// auto-advances — the learner is studying it.
+// The server posts the plain form either way, so with JavaScript off (or if
+// this script fails) capture still works exactly as before. This script only
+// gives the tap instant feedback: disable the submit button and swap its
+// label to a working state, so a slow network never looks inert and a
+// second tap can never fire a duplicate capture.
 (function () {
   "use strict";
-  var next = document.querySelector("form.me-next");
-  if (!next) return;
-  var advanced = false;
-  function advance() {
-    if (advanced) return;
-    advanced = true;
-    if (typeof next.requestSubmit === "function") next.requestSubmit();
-    else next.submit();
-  }
-  // A native Continue tap must also arm the flag, so the timer can never
-  // fire a second POST after the learner already advanced.
-  next.addEventListener("submit", function () {
-    advanced = true;
-  });
-  // Only a correct verdict is frictionless: the timer advances, and a tap or
-  // Enter anywhere outside a control advances sooner. A miss holds for study
-  // until the learner deliberately taps Continue — an incidental tap while
-  // reading the revealed answer must never advance it.
-  var hold = parseInt(next.getAttribute("data-auto-advance") || "", 10);
-  if (!(hold > 0)) return;
-  setTimeout(advance, hold);
-  document.addEventListener("click", function (event) {
-    if (event.target.closest("a, button, input, textarea, select, summary, details, form")) return;
-    advance();
-  });
-  document.addEventListener("keydown", function (event) {
-    if (event.key !== "Enter" || event.target.closest("a, button, input, textarea, select, summary")) return;
-    advance();
+  var form = document.querySelector("form.me-capture-form");
+  if (!form) return;
+  form.addEventListener("submit", function () {
+    var button = form.querySelector('button[type="submit"]');
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    button.textContent = "Creating…";
   });
 })();
 

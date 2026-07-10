@@ -158,6 +158,7 @@ footer.ae-bar { border-top: 1px solid var(--lg-line); margin-top: auto; justify-
   transition: transform var(--lg-quick) var(--lg-ease);
 }
 .ae-button:active { transform: translateY(1px); }
+.ae-button:disabled { opacity: 0.6; cursor: default; }
 .ae-button .ae-icon { color: currentColor; }
 .ae-button-quiet {
   display: inline-flex;
@@ -294,13 +295,34 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-row-actions { display: flex; gap: 8px; }
 .me-live-hint { font: 500 11px/1.4 var(--lg-mono); color: var(--lg-ink-2); }
 
-/* job status glyphs: the generating pulse is the app's only loop */
+/* job status glyphs: the generating pulse is the app's only loop. Each is a
+   single flat dot — no icon glyph layered on top, so nothing overlaps it. */
 .me-job-glyphs { display: grid; place-items: center; width: 12px; }
 .me-job-glyphs > span { display: none; width: 8px; height: 8px; border-radius: 50%; }
 .me-job[data-status='queued'] .g-queued { display: block; background: var(--lg-line); }
 .me-job[data-status='running'] .g-running { display: block; }
 .me-job[data-status='succeeded'] .g-succeeded { display: block; background: var(--lg-pine); }
 .me-job[data-status='failed'] .g-failed { display: block; background: var(--lg-clay); }
+
+/* Retry: only ever rendered for a failed job (see render_job_row); a quiet
+   outline button, not a bare unstyled <button>. */
+.me-job-retry { margin-left: auto; }
+.me-job-retry-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--lg-line);
+  border-radius: var(--lg-r);
+  background: transparent;
+  color: var(--lg-ink-2);
+  font: 600 12px/1 var(--lg-sans);
+  cursor: pointer;
+  transition: border-color var(--lg-quick) var(--lg-ease), transform var(--lg-quick) var(--lg-ease);
+}
+.me-job-retry-btn:hover { border-color: var(--lg-ink-2); }
+.me-job-retry-btn:active { transform: translateY(1px); }
 .me-spinner {
   display: block;
   width: 8px;

@@ -57,29 +57,32 @@ Registers (exactly these; no ad-hoc sizes):
 
 Space scale: 4 / 8 / 12 / 20 / 32. Radius: `--lg-r: 7px` (controls, cards),
 `--lg-r-lg: 12px` (hero panels). Motion: `--lg-ease: cubic-bezier(.16,1,.3,1)`,
-tap settle 190ms (1px translateY on `:active`), verdict hold ~2s before
-auto-advance on Correct. Motion is feedback only; the sole looping element is
-the generating pulse on an in-flight job, and it stops when the job resolves.
-`prefers-reduced-motion` removes translates and the pulse; state color applies
-instantly.
+tap settle 190ms (1px translateY on `:active`). Motion is feedback only; the
+sole looping element is the generating pulse on an in-flight job, and it
+stops when the job resolves. `prefers-reduced-motion` removes translates and
+the pulse; state color applies instantly.
 
 ## Interaction law (every click fights for its life)
 
 - MCQ: **one tap answers.** The choice buttons are the submit; there is no
   separate confirm.
 - Free response: type, then one submit.
-- Graded Correct: verdict prints in place (correct row tinted pine, horizon on
-  the row), meta ledger below; the page **auto-advances after ~2s**; tapping
-  anywhere advances immediately. Without JavaScript a Continue button is
-  visible and everything still works.
-- Graded Close / Try again / Revealed: **no auto-advance** — the learner is
-  studying the miss. Only a deliberate Continue tap advances; incidental taps
-  while reading the revealed answer must never advance the card.
+- Graded Correct and Graded Close / Try again / Revealed: **no auto-advance,
+  ever.** Verdict prints in place (correct row tinted pine, horizon on the
+  row), meta ledger below, and the page holds indefinitely: the learner
+  reviews the verdict, answer key, and dossier for as long as they want. Only
+  a deliberate Continue tap (or Enter while it is focused) advances the card
+  — incidental taps while reading must never advance it. Operator ruling
+  from live dogfood use (memory-engine-081) reverses the two-speed advance
+  shipped in memory-engine-078: it is dead law, correct or not.
 - Pre-grade shows **no card meta**: no stage, no last-seen, no success rate,
   no health. Just kicker, prompt, the answer mechanism, and the hatch row.
 - Escape hatches: only **Reveal answer** stays on the card, beside one `···`
   (More) disclosure holding Reference, Skip, Snooze, Bridge, Delete, and the
-  Capture punch-out. Six permanent buttons under a card is a defect.
+  Capture punch-out. Six permanent buttons under a card is a defect. Every
+  action in the disclosure carries a leading icon and a tooltip truthful to
+  what the route actually does (Skip defers within the session; Snooze
+  defers until tomorrow — they must never read as interchangeable).
 - The workspace's first element is the due hero: count + one Start review tap.
 
 ## Post-grade meta ledger
@@ -113,8 +116,8 @@ learner's honest dossier on the card; it never appears pre-grade.
 
 ## Anti-patterns (reject on sight)
 
-Left-border accent stripes on cards. Pre-grade meta of any kind. A separate
-Next tap after a correct MCQ when JS is available. Gradient text, glass,
+Left-border accent stripes on cards. Pre-grade meta of any kind. Any form of
+auto-advance on a graded page, correct or not. Gradient text, glass,
 blobs, purple-on-black. Ambient motion. Em-dashes in UI copy. New raw hex
 values outside the `ledger.css` token block. Fabricated numbers (counts,
 times, rates come from real state — the honest-effort invariant,
@@ -126,6 +129,6 @@ memory-engine-074).
   present, register scale exact, verdict tint classes, hatch collapse,
   pre-grade/post-grade meta split, no raw hex outside tokens in `render.rs`.
 - Behavior tests in `memory-engine-api` assert the interaction law at the
-  route boundary (one-tap MCQ, meta split, Continue fallback).
+  route boundary (one-tap MCQ, meta split, Continue as the only advance).
 - The live phone walk (390×844) is the overflow gate: no horizontal scroll on
   cover, workspace, review, graded, and sheet-open states.
