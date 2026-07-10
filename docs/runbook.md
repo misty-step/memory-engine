@@ -5,8 +5,8 @@ Everything here is CLI/API-driven; no dashboards required. The app is
 2026-07-08; Postgres is Neon, unchanged by the cutover), serving both the
 JSON API and the server-rendered study UI from one Rust binary at
 `https://memory-engine-api-i2xcr.ondigitalocean.app`. The Fly app
-(`memory-engine-api.fly.dev`, org `misty-step`, region `ord`) is left
-running pending decommission; do not point new consumers at it.
+(`memory-engine-api.fly.dev`, org `misty-step`, region `ord`) is a stopped,
+manual rollback target pending deletion; no CI or consumer may start it.
 
 ## Agent surface summary
 
@@ -14,26 +14,23 @@ running pending decommission; do not point new consumers at it.
 - Primary platform: DigitalOcean App Platform (id
   `5ab05b73-9265-43c9-a01c-fef53f5f46a4`), URL
   `https://memory-engine-api-i2xcr.ondigitalocean.app`.
-- Standby platform: Fly Machines, org `misty-step`, primary region `ord`,
-  URL `https://memory-engine-api.fly.dev` — still deployed by CI on every
-  push (see Deployed smoke below) and kept warm pending decommission, but
-  no longer where consumers should point.
+- Rollback platform: Fly Machines, org `misty-step`, primary region `ord`,
+  URL `https://memory-engine-api.fly.dev` — stopped and intentionally stale.
+  Start or deploy it only during an explicit rollback.
 - Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
 - Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
 - Auth contract: allowlist plus magic links; production account creation and
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
   `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path.
-- Smoke contract: deploys run health, home-page, and anonymous mutation
-  boundary checks from `.github/workflows/deploy.yml`; agents can repeat the
-  exact commands below.
+- Smoke contract: every DigitalOcean deployment runs the health, home-page,
+  and anonymous mutation boundary checks below before it can be called live.
 
 ## Deployed smoke
 
-These commands exercise the DigitalOcean primary. The post-deploy smoke in
-`.github/workflows/deploy.yml` currently runs the same checks against the Fly
-standby; ticket 075 owns gating the primary before that difference can be
-removed safely.
+These commands exercise the DigitalOcean primary. The retired Fly deployment
+workflow must not be restored: it silently reactivated and smoked the old
+provider after every green `master` push.
 
 ```sh
 base="https://memory-engine-api-i2xcr.ondigitalocean.app"
@@ -49,8 +46,8 @@ status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
 ```
 
-To compare the temporary standby, rerun the same block with
-`base="https://memory-engine-api.fly.dev"`.
+Only during an explicit rollback, start the Fly machine and rerun the same
+block with `base="https://memory-engine-api.fly.dev"`.
 
 ## Production generation latency
 
@@ -112,11 +109,9 @@ does NOT set `deploy_on_push`, so **merging to master does not deploy** —
 verified 2026-07-09 when two shipped merges sat undeployed until a manual
 trigger. Until ticket 075 wires an automatic gated deploy, every ship must
 end with the manual deploy below plus the Deployed smoke, and "shipped"
-claims must name the ACTIVE deployment id. The legacy Fly `deploy.yml`
-workflow still runs in parallel (gated on the `ci` workflow, deploys the
-same SHA, fails on a post-deploy smoke regression) and keeps the standby
-Fly app current until it is decommissioned — do not remove it without an
-explicit decommission ticket.
+claims must name the ACTIVE deployment id. Card
+`memory-engine-fly-ci-cutover` removed the legacy Fly deployment workflow
+after it was proven to reactivate the old provider on every green push.
 
 Manual DO deploy / rollback:
 
@@ -125,7 +120,7 @@ doctl apps create-deployment 5ab05b73-9265-43c9-a01c-fef53f5f46a4   # redeploy c
 doctl apps list-deployments 5ab05b73-9265-43c9-a01c-fef53f5f46a4    # find a prior deployment id to roll back to
 ```
 
-Manual Fly deploy (standby app, emergency only):
+Manual Fly deploy (rollback only):
 
 ```sh
 flyctl deploy --remote-only --app memory-engine-api
@@ -137,8 +132,7 @@ flyctl deploy --remote-only --app memory-engine-api
 curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status":"ok",...}
 doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
 
-# Fly standby (not primary traffic):
-curl -s https://memory-engine-api.fly.dev/healthz   # {"status":"ok",...}
+# Fly rollback target (normally stopped; probing it can auto-start it):
 flyctl status --app memory-engine-api
 flyctl logs --app memory-engine-api
 ```
@@ -156,7 +150,8 @@ losing Canary never affects requests.
 
 ## Secrets
 
-Set via `flyctl secrets set --app memory-engine-api NAME=value`. Current set:
+The DigitalOcean app owns the live values below. Fly retains a rollback copy
+until provider deletion; do not rotate only one provider during the soak.
 
 | Secret | Purpose |
 | --- | --- |

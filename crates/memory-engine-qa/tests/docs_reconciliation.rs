@@ -12,6 +12,30 @@ fn read_repo_file(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
 }
 
+fn github_workflows() -> Vec<(String, String)> {
+    let directory = repo_root().join(".github/workflows");
+    fs::read_dir(directory)
+        .expect("read GitHub workflows")
+        .map(|entry| entry.expect("read workflow entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("yml" | "yaml")
+            )
+        })
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("workflow filename")
+                .to_string_lossy()
+                .into_owned();
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            (name, text)
+        })
+        .collect()
+}
+
 fn assert_contains_all(relative: &str, text: &str, expected: &[&str]) {
     for needle in expected {
         assert!(text.contains(needle), "{relative} is missing `{needle}`");
@@ -116,7 +140,7 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
         &[
             "App: `memory-engine-api`",
             "Primary platform: DigitalOcean App Platform",
-            "Standby platform: Fly Machines",
+            "Rollback platform: Fly Machines",
             "MEMORY_ENGINE_POSTGRES_URL",
             "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
             "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS",
@@ -128,5 +152,22 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
             "curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w \"%{http_code}\" -X POST \"$base/app/generate\"",
             "case \"$status\" in 4??)",
         ],
+    );
+
+    assert!(
+        !repo_root().join(".github/workflows/deploy.yml").exists(),
+        "the retired Fly deploy workflow must not be restored after the DigitalOcean cutover"
+    );
+    for (workflow, text) in github_workflows() {
+        for retired_surface in ["flyctl", "FLY_API_TOKEN", "memory-engine-api.fly.dev"] {
+            assert!(
+                !text.contains(retired_surface),
+                ".github/workflows/{workflow} restores retired Fly surface `{retired_surface}`"
+            );
+        }
+    }
+    assert!(
+        !runbook.contains("still deployed by CI on every push"),
+        "the runbook must not advertise Fly as a live deployment target"
     );
 }
