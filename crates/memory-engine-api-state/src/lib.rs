@@ -37,7 +37,7 @@ mod jobs;
 mod registry;
 mod storage;
 
-pub use jobs::{GenerationJob, JobBroadcast, JobQueue, JobStatus};
+pub use jobs::{EnqueueOutcome, GenerationJob, JobBroadcast, JobQueue, JobStatus};
 pub use storage::StudyStorage;
 
 use storage::StudyStorageConfig;
@@ -567,22 +567,31 @@ impl ApiState {
         )
     }
 
-    /// Enqueue a background generation job.
+    /// Enqueue a background generation job, coalescing onto an existing
+    /// queued/running job for the same account+source (082) instead of
+    /// starting a duplicate.
     #[must_use]
-    pub fn enqueue_generation_job(&self, account: &AppAccount, source: &SourceRecord) -> String {
+    pub fn enqueue_generation_job(
+        &self,
+        account: &AppAccount,
+        source: &SourceRecord,
+    ) -> EnqueueOutcome {
         self.jobs
-            .enqueue(account.account_id(), &source.source_id, &source.title)
+            .enqueue_or_coalesce(account.account_id(), &source.source_id, &source.title)
     }
 
-    /// Enqueue a background generation job by source id and title.
+    /// Enqueue a background generation job by source id and title, coalescing
+    /// onto an existing queued/running job for the same account+source (082)
+    /// instead of starting a duplicate.
     #[must_use]
     pub fn enqueue_generation_job_by_source(
         &self,
         account: &AppAccount,
         source_id: &str,
         title: &str,
-    ) -> String {
-        self.jobs.enqueue(account.account_id(), source_id, title)
+    ) -> EnqueueOutcome {
+        self.jobs
+            .enqueue_or_coalesce(account.account_id(), source_id, title)
     }
 
     /// Retry a background generation job.

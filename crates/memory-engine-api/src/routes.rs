@@ -26,8 +26,8 @@ use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateProjectDeckRequest,
-    CreateSourceRequest, HealthResponse, InvalidateProjectDeckRequest, ProjectDeckRecord,
-    SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    CreateSourceRequest, EnqueueOutcome, HealthResponse, InvalidateProjectDeckRequest,
+    ProjectDeckRecord, SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -732,9 +732,16 @@ async fn capture_app_source(
     let request = capture_request(form.title, form.body, form.capture);
     let notice = match state.save_app_source(&account, &request) {
         Ok(source) => {
-            let _ =
-                state.enqueue_generation_job_by_source(&account, &source.source_id, &request.title);
-            "Generating your cards. They'll appear below as they're ready."
+            match state.enqueue_generation_job_by_source(
+                &account,
+                &source.source_id,
+                &request.title,
+            ) {
+                EnqueueOutcome::Started(_) => {
+                    "Generating your cards. They'll appear below as they're ready."
+                }
+                EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
+            }
         }
         Err(error) => {
             return Html(render_account_page(
@@ -801,15 +808,12 @@ async fn generate_app_source(
                 .map(|source| source.title)
         })
         .unwrap_or_else(|| "New material".to_owned());
-    let _ = state.enqueue_generation_job_by_source(&account, &form.source_id, &title);
+    let notice = match state.enqueue_generation_job_by_source(&account, &form.source_id, &title) {
+        EnqueueOutcome::Started(_) => "Generating. Watch the activity log.",
+        EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
+    };
 
-    Html(render_account_page(
-        &state,
-        &account,
-        None,
-        Some("Generating. Watch the activity log."),
-    ))
-    .into_response()
+    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
 }
 
 async fn archive_app_source(

@@ -5093,3 +5093,69 @@ async fn every_page_serves_the_ledger_design_system() {
         "the vendored aesthetic kit is superseded on this surface: {home}"
     );
 }
+
+#[tokio::test]
+async fn generate_route_coalesces_a_duplicate_request_onto_the_in_flight_job() {
+    // 082 dogfood repro: pressing "Create review" on a saved source while
+    // that source's generation job is already queued/running enqueued a
+    // second job (two activity rows, doubled card counts). A repeat request
+    // must coalesce onto the existing job instead of duplicating it.
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let first = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("first generate");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_text(first).await;
+    assert!(first.contains("Generating. Watch the activity log."));
+    assert_eq!(
+        first.matches("data-job-id=\"").count(),
+        1,
+        "exactly one job after the first request: {first}"
+    );
+
+    // The job is still queued — nothing has drained it yet — so a second
+    // press of "Create review" for the same source must coalesce, not
+    // duplicate, and must surface the already-working notice.
+    let second = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("second generate");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = response_text(second).await;
+    assert!(
+        second.contains("Already generating this source."),
+        "a repeat request while the job is in flight must surface the coalesce notice: {second}"
+    );
+    assert_eq!(
+        second.matches("data-job-id=\"").count(),
+        1,
+        "the repeat request must not enqueue a second job: {second}"
+    );
+
+    // Draining the queue must produce cards for exactly one job's worth of
+    // work, not double the count from a duplicate job.
+    state.run_pending_jobs_blocking();
+    let workspace = workspace_html(&app, &cookie).await;
+    assert_activity_succeeded_html(&workspace, 2);
+    assert_eq!(
+        workspace.matches("data-job-id=\"").count(),
+        1,
+        "only one job must ever have existed for this source: {workspace}"
+    );
+}

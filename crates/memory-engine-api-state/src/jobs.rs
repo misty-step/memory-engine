@@ -162,6 +162,28 @@ impl From<PersistedJob> for GenerationJob {
     }
 }
 
+/// Outcome of [`JobQueue::enqueue_or_coalesce`]: whether a new job was
+/// started or an already in-flight (queued/running) job for the same
+/// account+source was reused. Route handlers use this to pick the
+/// learner-facing notice — coalescing must never silently duplicate a job or
+/// its resulting cards (082).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnqueueOutcome {
+    Started(String),
+    AlreadyInFlight(String),
+}
+
+impl EnqueueOutcome {
+    /// The job id either way — the caller renders the same activity-log row
+    /// whether this call started the job or found it already running.
+    #[must_use]
+    pub fn job_id(&self) -> &str {
+        match self {
+            Self::Started(id) | Self::AlreadyInFlight(id) => id,
+        }
+    }
+}
+
 /// An async queue of generation jobs plus the in-process worker that drains it.
 ///
 /// Cheaply cloneable (`Arc` inside) so it can live in `ApiState`, be handed to
@@ -243,14 +265,77 @@ impl JobQueue {
 
     /// Enqueue generation for an already-saved source. Returns the job id; the
     /// caller renders immediately while the worker runs in the background.
+    ///
+    /// Always starts a new job, even if one is already in flight for the same
+    /// account+source — callers that must not duplicate a running job (any
+    /// learner-triggered "generate" request) should call
+    /// [`JobQueue::enqueue_or_coalesce`] instead.
     // Callers fire-and-forget (the id is incidental), so the return is routinely
     // discarded; `must_use` would only force noisy `let _ =` at every site.
     #[allow(clippy::must_use_candidate)]
     pub fn enqueue(&self, account_id: &str, source_id: &str, title: &str) -> String {
+        let job = self.new_job(account_id, source_id, title);
+        let snapshot = job.clone();
+        // Commit to the Vec first, then broadcast — so an SSE subscriber that
+        // reacts to the event can always find the job via `jobs_for`/`job`. This
+        // matches the commit-then-broadcast order of the other mutators.
+        {
+            let mut jobs = self.lock_jobs();
+            jobs.push(job);
+            enforce_terminal_retention(&mut jobs, account_id);
+        }
+        self.start(&snapshot);
+        snapshot.id
+    }
+
+    /// Enqueue generation for an already-saved source, coalescing onto an
+    /// existing in-flight (queued/running) job for the same account+source
+    /// instead of starting a second one. A repeat "Create review" press while
+    /// generation is still running must not enqueue a duplicate job (082) —
+    /// the check-and-insert happens under a single lock acquisition so two
+    /// racing requests can't both observe "no active job" and both enqueue.
+    #[must_use]
+    pub fn enqueue_or_coalesce(
+        &self,
+        account_id: &str,
+        source_id: &str,
+        title: &str,
+    ) -> EnqueueOutcome {
+        let candidate = self.new_job(account_id, source_id, title);
+        let outcome = {
+            let mut jobs = self.lock_jobs();
+            let active = jobs
+                .iter()
+                .find(|job| {
+                    job.account_id == account_id
+                        && job.source_id == source_id
+                        && !job.status.is_terminal()
+                })
+                .map(|job| job.id.clone());
+            if let Some(id) = active {
+                Err(id)
+            } else {
+                let snapshot = candidate.clone();
+                jobs.push(candidate);
+                enforce_terminal_retention(&mut jobs, account_id);
+                Ok(snapshot)
+            }
+        };
+        match outcome {
+            Ok(snapshot) => {
+                self.start(&snapshot);
+                EnqueueOutcome::Started(snapshot.id)
+            }
+            Err(id) => EnqueueOutcome::AlreadyInFlight(id),
+        }
+    }
+
+    /// Build a fresh queued job. Shared by `enqueue` and `enqueue_or_coalesce`
+    /// so the two entry points can never drift on the job's initial shape.
+    fn new_job(&self, account_id: &str, source_id: &str, title: &str) -> GenerationJob {
         let now = self.inner.registry.now();
-        let id = format!("job-{:032x}", rand::random::<u128>());
-        let job = GenerationJob {
-            id: id.clone(),
+        GenerationJob {
+            id: format!("job-{:032x}", rand::random::<u128>()),
             account_id: account_id.to_owned(),
             source_id: source_id.to_owned(),
             title: title.to_owned(),
@@ -260,22 +345,17 @@ impl JobQueue {
             error: None,
             created_at: now,
             updated_at: now,
-        };
-        // Commit to the Vec first, then broadcast — so an SSE subscriber that
-        // reacts to the event can always find the job via `jobs_for`/`job`. This
-        // matches the commit-then-broadcast order of the other mutators.
-        let snapshot = job.clone();
-        {
-            let mut jobs = self.lock_jobs();
-            jobs.push(job);
-            enforce_terminal_retention(&mut jobs, account_id);
         }
-        self.broadcast(&snapshot);
+    }
+
+    /// Broadcast, persist, and wake the worker for a freshly pushed job.
+    /// Shared tail of `enqueue` and `enqueue_or_coalesce`'s "started" path.
+    fn start(&self, job: &GenerationJob) {
+        self.broadcast(job);
         self.persist();
         // Send never fails while the queue is alive (the receiver lives in the
         // worker); if the worker was never started the job simply stays queued.
-        let _ = self.inner.tx.send(id.clone());
-        id
+        let _ = self.inner.tx.send(job.id.clone());
     }
 
     /// Re-queue a failed job (the learner pressed Retry). Scoped to the owning
