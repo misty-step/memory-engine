@@ -131,7 +131,7 @@ fn readme_quickstart_points_to_current_rust_and_deployed_surface() {
 }
 
 #[test]
-fn runbook_contains_reproducible_deployed_smoke_commands() {
+fn runbook_contains_reproducible_digitalocean_smoke_commands() {
     let runbook = read_repo_file("docs/runbook.md");
 
     assert_contains_all(
@@ -139,14 +139,13 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
         &runbook,
         &[
             "App: `memory-engine-api`",
-            "Primary platform: DigitalOcean App Platform",
-            "Rollback platform: Fly Machines",
+            "Platform: DigitalOcean App Platform",
             "MEMORY_ENGINE_POSTGRES_URL",
             "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
             "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS",
+            "do-connecting-ip",
             "## Deployed smoke",
             "base=\"https://memory-engine-api-i2xcr.ondigitalocean.app\"",
-            "base=\"https://memory-engine-api.fly.dev\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w \"%{http_code}\" \"$base/healthz\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-home -w \"%{http_code}\" \"$base/\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w \"%{http_code}\" -X POST \"$base/app/generate\"",
@@ -156,7 +155,11 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
 
     assert!(
         !repo_root().join(".github/workflows/deploy.yml").exists(),
-        "the retired Fly deploy workflow must not be restored after the DigitalOcean cutover"
+        "the retired provider deploy workflow must not be restored after the DigitalOcean cutover"
+    );
+    assert!(
+        !repo_root().join("fly.toml").exists(),
+        "the retired provider manifest must not remain a runnable rollback path"
     );
     for (workflow, text) in github_workflows() {
         for retired_surface in ["flyctl", "FLY_API_TOKEN", "memory-engine-api.fly.dev"] {
@@ -168,6 +171,39 @@ fn runbook_contains_reproducible_deployed_smoke_commands() {
     }
     assert!(
         !runbook.contains("still deployed by CI on every push"),
-        "the runbook must not advertise Fly as a live deployment target"
+        "the runbook must not advertise the retired provider as a live deployment target"
     );
+}
+
+#[test]
+fn current_runtime_contract_has_no_retired_provider_recreation_path() {
+    for relative in [
+        "AGENTS.md",
+        "README.md",
+        "VISION.md",
+        "docs/runbook.md",
+        ".agents/skills/memory-engine-qa/SKILL.md",
+        "docs/api/openapi.v1.json",
+        "bin/send-magic-link",
+        "crates/memory-engine-api-state/src/lib.rs",
+        "crates/memory-engine-api/src/tests/mod.rs",
+        "crates/memory-engine-contract/src/main.rs",
+    ] {
+        let text = read_repo_file(relative).to_ascii_lowercase();
+        for retired_surface in [
+            "memory-engine-api.fly.dev",
+            "flyctl",
+            "fly.toml",
+            "fly-client-ip",
+            "fly machines",
+            "temporary fly standby",
+            "rollback platform: fly",
+            "canary-obs",
+        ] {
+            assert!(
+                !text.contains(retired_surface),
+                "{relative} retains active retired-provider surface `{retired_surface}`"
+            );
+        }
+    }
 }

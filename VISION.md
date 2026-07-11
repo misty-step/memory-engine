@@ -101,9 +101,8 @@ by hand.
 2. Model learning material and quiz material as distinct but connected objects.
 3. Use AI to turn arbitrary learner input into atomic concepts, explanations,
    quizzes, and adaptive follow-up material.
-4. Keep the current DigitalOcean-hosted `memory-engine-api` as the primary
-   living proof surface while the full-stack-vs-service boundary remains open;
-   the Fly deployment is a temporary standby, not a second product target.
+4. Keep the DigitalOcean-hosted `memory-engine-api` as the sole production
+   living proof surface while the full-stack-vs-service boundary remains open.
 5. Push performance and data-shape decisions early enough that large concept
    graphs remain plausible.
 6. Keep `bun run ci` as the canonical gate and add ticket-specific QA, evals, or

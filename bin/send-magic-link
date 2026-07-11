@@ -21,8 +21,9 @@ sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
 # Sender. Defaults to onboarding@resend.dev, which Resend delivers only to the
 # account owner (the solo-dogfood allowlist) and which Gmail spam-folders for
 # want of domain reputation. After verifying a domain in Resend, set
-# MEMORY_ENGINE_MAIL_FROM (a fly secret) to a sender on that domain — no edit or
-# redeploy of this script. See docs/runbook.md, "Deliverability". Use a plain
+# MEMORY_ENGINE_MAIL_FROM (an encrypted App Platform variable) to a sender on
+# that domain — no edit or redeploy of this script. See docs/runbook.md,
+# "Deliverability". Use a plain
 # display name with no literal double-quote — the value is interpolated into the
 # JSON body unescaped (trusted operator config, like the rest of this script).
 from="${MEMORY_ENGINE_MAIL_FROM:-Memory Engine <onboarding@resend.dev>}"

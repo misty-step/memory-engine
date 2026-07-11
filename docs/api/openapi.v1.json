@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://memory-engine-api.fly.dev"
+      "url": "https://memory-engine-api-i2xcr.ondigitalocean.app"
     }
   ],
   "security": [

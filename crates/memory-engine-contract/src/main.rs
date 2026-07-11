@@ -665,8 +665,11 @@ mod tests {
     #[test]
     fn endpoint_trims_duplicate_slashes() {
         assert_eq!(
-            endpoint("https://memory-engine-api.fly.dev/", "/v1/openapi.json"),
-            "https://memory-engine-api.fly.dev/v1/openapi.json"
+            endpoint(
+                "https://memory-engine-api-i2xcr.ondigitalocean.app/",
+                "/v1/openapi.json"
+            ),
+            "https://memory-engine-api-i2xcr.ondigitalocean.app/v1/openapi.json"
         );
     }
 

@@ -1,5 +1,9 @@
 # QA: magic-link deliverability (ticket 056)
 
+> Historical receipt from 2026-06-21. Provider-specific configuration and the
+> open remainder below were superseded by the DigitalOcean cutover; use
+> `docs/runbook.md` for current secret and deployment operations.
+
 ## What shipped (agent-doable increment)
 
 - `bin/send-magic-link` reads `MEMORY_ENGINE_MAIL_FROM` (default
@@ -26,7 +30,7 @@ Both: `to` = the allowlist address, subject = "Your Memory Engine sign-in link",
 the full `https://…/app/login/verify?token=…` URL present in the plain-text body.
 The script exits 0 on a 200 from Resend.
 
-## Operator-gated remainder (oracle items still open)
+## Historical operator-gated remainder (superseded)
 
 These need decisions/access only the operator has; exact commands are in the
 runbook's Deliverability section:
