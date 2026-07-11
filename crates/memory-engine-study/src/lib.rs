@@ -6,11 +6,13 @@
 //! crates without moving filesystem, HTTP, or UI concerns into the pure core.
 
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     path::PathBuf,
+    rc::Rc,
 };
 
 use memory_engine_core::{
@@ -451,6 +453,7 @@ impl BetaStudyStore for BetaPersistenceStore {
 pub struct BetaStudySession<S = BetaPersistenceStore> {
     store: S,
     now: fn() -> i64,
+    cached_snapshot: RefCell<Option<Rc<BetaStoreSnapshot>>>,
     current: Option<GeneratedPromptDraft>,
     status: BetaStudyStatus,
     expected_answer: Option<String>,
@@ -467,7 +470,8 @@ impl BetaStudySession<BetaPersistenceStore> {
     /// Returns [`BetaStudyError`] when the beta store cannot be opened.
     pub fn open(options: BetaStudyOptions) -> Result<Self, BetaStudyError> {
         let store = BetaPersistenceStore::open(options.path).map_err(BetaStudyError::Store)?;
-        let status = if store.snapshot().source_documents.is_empty() {
+        let snapshot = store.snapshot();
+        let status = if snapshot.source_documents.is_empty() {
             BetaStudyStatus::Empty
         } else {
             BetaStudyStatus::Drafting
@@ -476,6 +480,7 @@ impl BetaStudySession<BetaPersistenceStore> {
         Ok(Self {
             store,
             now: options.now,
+            cached_snapshot: RefCell::new(Some(Rc::new(snapshot))),
             current: None,
             status,
             expected_answer: None,
@@ -492,14 +497,16 @@ where
 {
     #[must_use]
     pub fn from_store(store: S, now: fn() -> i64) -> Self {
-        let status = match store.snapshot() {
-            Ok(snapshot) if !has_active_sources(&snapshot) => BetaStudyStatus::Empty,
+        let snapshot = store.snapshot();
+        let status = match &snapshot {
+            Ok(snapshot) if !has_active_sources(snapshot) => BetaStudyStatus::Empty,
             Ok(_) | Err(_) => BetaStudyStatus::Drafting,
         };
 
         Self {
             store,
             now,
+            cached_snapshot: RefCell::new(snapshot.ok().map(Rc::new)),
             current: None,
             status,
             expected_answer: None,
@@ -532,6 +539,7 @@ where
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let body = input.body.trim().to_owned();
         let title = normalize_capture_title(&input.title, &body);
+        self.invalidate_snapshot();
         self.store
             .save_source_document(SourceDocument {
                 id: input.id,
@@ -566,7 +574,7 @@ where
         &mut self,
         source_document_id: &str,
     ) -> Result<(BetaStudyView, usize), BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let archived_at = (self.now)();
         let related_review_unit_ids = snapshot
             .generated_prompt_drafts
@@ -575,6 +583,7 @@ where
             .map(|draft| draft.review_unit_id.clone())
             .collect::<Vec<_>>();
 
+        self.invalidate_snapshot();
         self.store
             .archive_source_document(source_document_id, archived_at)
             .map_err(BetaStudyError::Store)?;
@@ -605,7 +614,7 @@ where
             self.schedule_change = None;
         }
 
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         self.status = if has_active_sources(&snapshot) {
             BetaStudyStatus::Drafting
         } else {
@@ -629,7 +638,7 @@ where
         source_document_id: &str,
         invalidated_at: i64,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let related_review_unit_ids = snapshot
             .generated_prompt_drafts
             .iter()
@@ -637,6 +646,7 @@ where
             .map(|draft| draft.review_unit_id.clone())
             .collect::<Vec<_>>();
 
+        self.invalidate_snapshot();
         self.store
             .archive_source_document(source_document_id, invalidated_at)
             .map_err(BetaStudyError::Store)?;
@@ -671,7 +681,7 @@ where
             self.schedule_change = None;
         }
         self.select_next()?;
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         if self.current.is_none() && !has_active_sources(&snapshot) {
             self.status = BetaStudyStatus::Empty;
         }
@@ -688,8 +698,9 @@ where
         &mut self,
         source_document_ids: Option<Vec<String>>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let request = self.generation_request(&snapshot, source_document_ids);
+        self.invalidate_snapshot();
         run_beta_generation(&mut self.store, request)?;
         self.status = BetaStudyStatus::Drafting;
         self.view()
@@ -709,8 +720,9 @@ where
         source_document_ids: Option<Vec<String>>,
         provider: &dyn DraftProvider,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let request = self.generation_request(&snapshot, source_document_ids);
+        self.invalidate_snapshot();
         run_beta_generation_with_provider(&mut self.store, provider, request)?;
         self.status = BetaStudyStatus::Drafting;
         self.view()
@@ -753,6 +765,7 @@ where
         &mut self,
         draft_id: &str,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.invalidate_snapshot();
         self.store
             .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
             .map_err(BetaStudyError::Store)?;
@@ -789,7 +802,7 @@ where
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         if let Some(text) = reference_text(&snapshot, active) {
             self.reference_text = Some(text);
             return self.view();
@@ -818,6 +831,7 @@ where
                     failure.to_string(),
                 ))
             })?;
+        self.invalidate_snapshot();
         let note = self
             .store
             .save_concept_reference_note(ConceptReferenceNote {
@@ -847,6 +861,7 @@ where
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.invalidate_snapshot();
         self.store
             .update_review_unit_prompt_text(
                 &active.review_unit_id,
@@ -875,6 +890,7 @@ where
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.invalidate_snapshot();
         self.store
             .archive_review_unit(&active.review_unit_id, (self.now)())
             .map_err(BetaStudyError::Store)?;
@@ -895,6 +911,7 @@ where
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        self.invalidate_snapshot();
         self.store
             .snooze_review_unit_until(&active.review_unit_id, snoozed_until)
             .map_err(BetaStudyError::Store)?;
@@ -959,13 +976,14 @@ where
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?
             .clone();
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let now = (self.now)();
         let bridge_due = snapshot
             .review_units
             .iter()
             .find(|unit| unit.review_unit_id == active.review_unit_id)
             .map_or(now - 60_000, |unit| unit.queue.due.saturating_sub(1_000));
+        self.invalidate_snapshot();
         let bridge = run_bridge_generation_with_provider(
             &mut self.store,
             provider,
@@ -1052,6 +1070,7 @@ where
             .store
             .read_schedule_state(&active.review_unit_id)
             .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
+        self.invalidate_snapshot();
         let review = {
             let mut service =
                 MemoryService::with_clock(&mut self.store, mastered_after_three_reviews, self.now);
@@ -1101,7 +1120,7 @@ where
     ///
     /// Returns [`BetaStudyError`] when schedule or queue reads fail.
     pub fn view(&self) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let mut queue = self
             .store
             .list_queue_candidates()
@@ -1237,7 +1256,7 @@ where
                 options: NextQueueOptions::default(),
             })?
         };
-        let snapshot = self.store.snapshot().map_err(BetaStudyError::Store)?;
+        let snapshot = self.snapshot()?;
         let active_source_ids = active_source_ids(&snapshot);
         let now = (self.now)();
         self.current = select_due_variant(
@@ -1295,7 +1314,7 @@ where
         let Some(active) = self.current.as_ref() else {
             return;
         };
-        let Ok(snapshot) = self.store.snapshot() else {
+        let Ok(snapshot) = self.snapshot() else {
             self.current = None;
             return;
         };
@@ -1306,6 +1325,21 @@ where
             .find(|unit| unit.review_unit_id == active.review_unit_id)
             .and_then(|unit| approved_draft_from_unit(&snapshot.generated_prompt_drafts, unit))
             .filter(|draft| draft_has_active_source(draft, &active_source_ids));
+    }
+    fn snapshot(
+        &self,
+    ) -> Result<Rc<BetaStoreSnapshot>, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        if let Some(snapshot) = self.cached_snapshot.borrow().as_ref().cloned() {
+            return Ok(snapshot);
+        }
+
+        let snapshot = Rc::new(self.store.snapshot().map_err(BetaStudyError::Store)?);
+        *self.cached_snapshot.borrow_mut() = Some(Rc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    fn invalidate_snapshot(&self) {
+        *self.cached_snapshot.borrow_mut() = None;
     }
 }
 

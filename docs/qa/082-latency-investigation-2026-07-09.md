@@ -173,43 +173,69 @@ per-call connection), not network/TLS/region.** Region and instance size are
 real but secondary; even a same-machine Postgres in §2 reproduced the
 "laggy" feel.
 
-## 4. Fix landed in this PR vs. shaped follow-up
+## 4. Follow-up 085 — review-loop latency fix (2026-07-11)
 
-No latency fix is landed in this PR. The smallest, safest candidate (drop
-the redundant `list_app_sources` fetch in `render_account_page` when
-rendering an active review card) lives in `crates/memory-engine-api-
-render/src/render.rs`, which this ticket explicitly scopes to another lane
-("Do NOT touch ... render.rs"). The dominant fix — collapsing
-`BetaStudySession`'s repeated `snapshot()` calls into one fetch per session
-— touches a shared, heavily-used abstraction (`memory-engine-study`, used by
-both the file store and the Postgres store) across ~10 call sites and
-changes a correctness-sensitive invariant (whether a later call in the same
-session sees writes made by an earlier call in that session); landing it
-without a dedicated red/green cycle proving cache-invalidation correctness
-would be exactly the kind of rushed fix Part 1 of this ticket exists to
-prevent. Recommended follow-up tickets, in priority order:
+The shaped follow-up is implemented in this branch:
 
-1. **Cache one account snapshot per `BetaStudySession` and invalidate it
-   only on writes the session itself makes**, instead of re-fetching on
-   every read. This is the ~70→~10-round-trip win; needs its own TDD pass
-   with tests that specifically assert staleness cannot leak across a
-   session's own writes (the file store's "snapshot is free" assumption
-   made this invisible for years — a regression test against the Postgres
-   adapter, not just the file adapter, should gate it).
-2. **Drop the render-layer `list_app_sources` fetch when a review card is
-   active** (owned by the render.rs lane) — small, safe, and independently
-   shippable; five hot routes (`next`, `submit`, `reveal`, `skip`, `snooze`,
-   `bridge`) skip one full snapshot fetch each.
-3. **Skip the per-request `ensure_account` write** once the in-process
-   account cache (`AccountRegistry`'s `data.accounts`) has confirmed the
-   account exists, instead of re-issuing an `INSERT ... ON CONFLICT DO
-   NOTHING` on every authenticated request. Smaller win, needs the cache
-   threaded into `with_postgres_account` (currently a free function keyed
-   only on `database_url`/`account_id`).
-4. **Introduce a Postgres connection pool** (e.g. `deadpool-postgres` or
-   `bb8`) so hot requests reuse a warm connection instead of paying
-   connect+TLS setup per storage call — currently masked by #1's bigger
-   cost, but becomes the next bottleneck once #1 lands.
+1. `crates/memory-engine-study/src/lib.rs` caches one account snapshot behind
+   the `BetaStudySession` boundary. The cache is scoped to one request/session,
+   never shared across requests, and is invalidated **before every session-owned
+   write** so partial failures cannot leave stale reads. `Rc` handles avoid
+   cloning the snapshot on cache hits.
+2. `crates/memory-engine-api-render/src/render.rs` skips the redundant
+   `list_app_sources` account snapshot when an active review card is already
+   supplied. Workspace renders still load sources.
+3. `crates/memory-engine-study/tests/snapshot_cache.rs` adds a counting-store
+   regression suite covering constructor/start reuse, post-grade refresh,
+   idempotent duplicate submit, and source write/read freshness.
+4. `crates/memory-engine-api/src/tests/mod.rs` adds an ignored, real-Postgres
+   latency receipt test that times exactly one `/app/next` and one `/app/submit`
+   request and asserts that submit renders graded feedback.
+
+Red/green proof:
+
+```text
+cargo test -p memory-engine-study --test snapshot_cache -- --nocapture  # 2 passed
+cargo test -p memory-engine-study                                      # 21 passed
+cargo test -p memory-engine-api                                         # 73 passed
+cargo test -p memory-engine-api postgres_backend_routes_drive_source_to_review \
+  -- --nocapture                                                        # 1 passed
+```
+
+The isolated Postgres receipt used `postgres:17-alpine` with
+`log_statement=all`, `MEMORY_ENGINE_POSTGRES_TEST_URL`, and the exact command:
+
+```text
+cargo test -p memory-engine-api postgres_review_actions_emit_latency_receipt \
+  -- --ignored --nocapture
+```
+
+The receipt was run twice against the same database container and fixture: once
+from a clean `HEAD` worktree (pre-fix), then from this branch. The test's route
+setup, source text, answer, and timing code were unchanged; only the cache and
+render changes differed. The Postgres log was grouped by the two route request
+connections, not inferred from elapsed time.
+
+| Route | clean HEAD time / SQL | 085 time / SQL |
+|---|---:|---:|
+| `/app/next` | 0.160 s / 38 | 0.060 s / 20 |
+| `/app/submit` | 0.157 s / 60 | 0.084 s / 42 |
+
+Both runs returned HTTP 200; the 085 submit body also contained the rendered
+`me-verdict` feedback marker. This apples-to-apples receipt is distinct from the
+older 082 manual route run in §2, whose 48/70 statement counts were collected
+with a different setup. Production credentials were not available in this
+session, so this is local Postgres proof, not a production latency claim.
+
+The cache removes repeated full snapshots; the render change removes another
+full snapshot from active-review responses. The remaining queries are
+queue/schedule reads, the atomic grade transaction, and the per-request account
+existence write.
+
+The next production-specific levers remain separate: skip the redundant
+`ensure_account` write after the registry has established account existence,
+and pool/reuse Postgres connections. They are intentionally not folded into
+this correctness-sensitive cache change.
 
 ## 5. Did the double-generation bug actually duplicate cards in production, and what cleanup does the operator need?
 

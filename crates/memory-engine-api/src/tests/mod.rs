@@ -2,6 +2,7 @@ use std::{
     fs,
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use axum::{
@@ -2584,6 +2585,57 @@ async fn postgres_backend_routes_drive_source_to_review() {
         review_unit_id,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual Postgres latency receipt"]
+async fn postgres_review_actions_emit_latency_receipt() {
+    let Some(database) = PostgresTestDatabase::new("latency_receipt") else {
+        return;
+    };
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    ));
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let next_started = Instant::now();
+    let page = next_review_html(&app, &cookie, &csrf_token, "latency next").await;
+    println!(
+        "latency /app/next = {:.3}s",
+        next_started.elapsed().as_secs_f64()
+    );
+
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let idempotency_key = html_value(&page, "idempotencyKey");
+    let submit_started = Instant::now();
+    let submitted = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("answer", management_answer_for_prompt(&page)),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", &idempotency_key),
+            ],
+        ))
+        .await
+        .expect("submit review");
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let submitted = response_text(submitted).await;
+    assert!(
+        submitted.contains("me-verdict"),
+        "latency receipt submit must render graded feedback: {submitted}"
+    );
+    println!(
+        "latency /app/submit = {:.3}s",
+        submit_started.elapsed().as_secs_f64()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
