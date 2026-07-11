@@ -246,8 +246,8 @@ curl -s https://api.resend.com/emails/<email-id> -H "Authorization: Bearer $RESE
 
 `POST /app/account` is abuse-limited in the API boundary before any magic link
 is sent. The fixed window is 5 attempts per 15 minutes per normalized email and
-per client IP (`x-real-ip`, then the first `x-forwarded-for` value). Rejected
-requests return `429` with the generic
+per client IP (`do-connecting-ip`, then `x-real-ip`, then the first
+`x-forwarded-for` value). Rejected requests return `429` with the generic
 message "Too many sign-in attempts. Try again later."; they do not write an
 outbox row or reveal whether an email is allowlisted.
 

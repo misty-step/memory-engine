@@ -1196,7 +1196,7 @@ fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
 
 #[must_use]
 pub fn client_rate_limit_key(headers: &HeaderMap) -> String {
-    ["x-real-ip", "x-forwarded-for"]
+    ["do-connecting-ip", "x-real-ip", "x-forwarded-for"]
         .into_iter()
         .find_map(|header| {
             headers
@@ -1645,4 +1645,22 @@ fn require_current_review_postgres(
     }
 
     Err(ApiFailure::not_found("Review unit not found."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_rate_limit_key_prefers_digitalocean_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("do-connecting-ip", HeaderValue::from_static("203.0.113.10"));
+        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.1"));
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.2, 10.0.0.3"),
+        );
+
+        assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
+    }
 }

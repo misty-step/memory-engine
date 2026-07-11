@@ -143,6 +143,7 @@ fn runbook_contains_reproducible_digitalocean_smoke_commands() {
             "MEMORY_ENGINE_POSTGRES_URL",
             "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
             "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS",
+            "do-connecting-ip",
             "## Deployed smoke",
             "base=\"https://memory-engine-api-i2xcr.ondigitalocean.app\"",
             "curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w \"%{http_code}\" \"$base/healthz\"",
