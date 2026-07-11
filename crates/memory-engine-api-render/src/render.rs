@@ -39,8 +39,18 @@ pub fn render_account_page(
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
 ) -> String {
-    let sources = state.list_app_sources(account).unwrap_or_default();
-    let jobs = state.jobs_for_app_account(account);
+    render_account_page_with_source_loader(state, account, view, notice, || {
+        state.list_app_sources(account).unwrap_or_default()
+    })
+}
+
+fn render_account_page_with_source_loader(
+    state: &ApiState,
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+    load_sources: impl FnOnce() -> Vec<SourceRecord>,
+) -> String {
     // When the caller doesn't supply a view (capture, generate, retry-refresh,
     // GET home), fetch the live study view so the due count and "Start review"
     // CTA reflect committed state instead of rendering an empty placeholder that
@@ -52,6 +62,15 @@ pub fn render_account_page(
         None
     };
     let view = view.or(fetched.as_ref());
+    // Active review responses render only the supplied card. Loading the full
+    // source list here repeats a complete account snapshot on every hot-path
+    // action while `render_signed_in` never reads it in the review branch.
+    let sources = if view.is_some_and(|view| view.current.is_some()) {
+        Vec::new()
+    } else {
+        load_sources()
+    };
+    let jobs = state.jobs_for_app_account(account);
     render_app_shell(Some(account), &sources, view, &jobs, notice)
 }
 
@@ -868,3 +887,76 @@ const ICON_SNOOZE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidde
 const ICON_BRIDGE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18"/><path d="M6 19v-6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v6"/><path d="M9 11V6"/><path d="M15 11V6"/></svg>"#;
 const ICON_TRASH: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M18 7l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>"#;
 const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>"#;
+
+#[cfg(test)]
+mod source_loading_tests {
+    use std::cell::Cell;
+
+    use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+
+    use super::render_account_page_with_source_loader;
+
+    fn source_body() -> String {
+        [
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for A?",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn active_review_skips_source_loader_and_workspace_loads_it() {
+        let state = ApiState::default();
+        let created = state
+            .create_account("render-loader-active@example.com")
+            .unwrap();
+        let account = state.create_browser_session(&created).unwrap();
+        let source = state
+            .save_app_source(
+                &account,
+                &CreateSourceRequest {
+                    title: "NATO practice notes".to_owned(),
+                    body: source_body(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            state.enqueue_generation_job_by_source(&account, &source.source_id, &source.title),
+            EnqueueOutcome::Started(_)
+        ));
+        state.run_pending_jobs_blocking();
+        let active_view = state.next_app_review(&account).unwrap();
+
+        let active_loads = Cell::new(0);
+        render_account_page_with_source_loader(&state, &account, Some(&active_view), None, || {
+            active_loads.set(active_loads.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(active_loads.get(), 0);
+
+        let workspace_state = ApiState::default();
+        let workspace_created = workspace_state
+            .create_account("render-loader-workspace@example.com")
+            .unwrap();
+        let workspace_account = workspace_state
+            .create_browser_session(&workspace_created)
+            .unwrap();
+        let workspace_loads = Cell::new(0);
+        render_account_page_with_source_loader(
+            &workspace_state,
+            &workspace_account,
+            None,
+            None,
+            || {
+                workspace_loads.set(workspace_loads.get() + 1);
+                Vec::new()
+            },
+        );
+        assert_eq!(workspace_loads.get(), 1);
+    }
+}
