@@ -97,7 +97,11 @@ first exposure — correct / total). A day only counts as "completed" if the
 loop actually reached `dueCount == 0`; hitting the `--max-cards` safety cap
 or an aborted stdin does not log a session line, by design.
 
-## Self-run transcript
+## Self-run transcript (historical, 2026-07-04)
+
+The transcript below preserves the endpoint used during that dated run. It is
+evidence, not a current invocation; the CLI default and `docs/runbook.md` point
+to the DigitalOcean runtime.
 
 Two runs were exercised for this ticket:
 

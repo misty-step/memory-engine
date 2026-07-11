@@ -47,7 +47,7 @@ cargo run -p memory-engine-api
 # → "Memory Engine API listening on http://127.0.0.1:18080"
 ```
 
-- Port: default is `8080` (matches `fly.toml`); use `18080` locally to avoid clashing.
+- Port: the production binary defaults to `8080`; use `18080` locally to avoid clashing.
 - Auth/seed: `MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true` surfaces the magic link
   on the "check your email" page so you can sign in without a mailer; or read the
   link from the outbox file `.tmp/api-dev/outbox.tsv`. Only the allowlisted email works.
@@ -90,10 +90,9 @@ cargo run -p memory-engine-qa -- --full     # handoff sweep; ends with bun run c
 
 ## Production smoke (optional)
 
-Live at `https://memory-engine-api-i2xcr.ondigitalocean.app` (DigitalOcean App
-Platform; standby copy still running at `memory-engine-api.fly.dev`, Fly
-`misty-step`/`ord`, pending decommission). Mirror the deploy smoke
-(health/home/anon boundary) per `docs/runbook.md`; e.g.
+Live at `https://memory-engine-api-i2xcr.ondigitalocean.app` on DigitalOcean
+App Platform. Mirror the deploy smoke (health/home/anonymous mutation boundary)
+per `docs/runbook.md`; e.g.
 `curl -fsS https://memory-engine-api-i2xcr.ondigitalocean.app/healthz` →
 `{"status":"ok",...}`.
 
@@ -101,7 +100,7 @@ Platform; standby copy still running at `memory-engine-api.fly.dev`, Fly
 
 - **API won't boot** without a store (`MEMORY_ENGINE_POSTGRES_URL` OR the file-store trio)
   AND `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` + a mailer/outbox — it `exit(1)`s. #1 local trap.
-- **File store is local/dev only** — Fly machines have no volume; never use it in prod.
+- **File store is local/dev only** — production requires Neon Postgres; never use the file store in prod.
 - **Generation falls back silently** without `OPENROUTER_API_KEY` — a "green" generate
   that never touched the model. `bun run ci` fixtures replay canned output.
 - `.env` holds live secrets (RESEND, OPENROUTER). Source via env refs; never print or commit.
@@ -113,4 +112,4 @@ Platform; standby copy still running at `memory-engine-api.fly.dev`, Fly
 Return: **verdict** (PASS / FAIL / UNVERIFIED) · exact commands run · surfaces
 exercised (machinery vs live API/UI vs generation brain) · artifacts inspected ·
 what was NOT covered (e.g. "fixtures only — no live generation") and whether a
-post-ship signal (Fly smoke, Canary) exists.
+post-ship signal (DigitalOcean smoke, Canary) exists.

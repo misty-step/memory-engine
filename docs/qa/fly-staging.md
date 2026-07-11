@@ -1,30 +1,16 @@
-# Fly Staging Scaffold
+# Archived Fly staging receipt — 2026-06-06
 
-## Scope
+> Historical evidence only. This file preserves the commands and observations
+> from the 2026-06-06 staging exercise; they are not current operating
+> instructions and must not be replayed. The root provider manifest has been
+> removed. Use `docs/runbook.md` for the sole DigitalOcean production runtime.
 
-This scaffold is for an operator-only staging smoke of `memory-engine-api`.
-The runtime is now wired for managed Postgres through `MEMORY_ENGINE_POSTGRES_URL`;
-the file store remains a local fallback only when explicitly opted in.
+## Historical scope
 
-## Config
+This receipt records the operator-only staging smoke that originally proved the
+managed-Postgres boundary. The file store described below was local-only.
 
-- `Dockerfile` builds `memory-engine-api`.
-- `fly.toml` exposes HTTP on internal port `8080`.
-- `HOST=0.0.0.0` is required so Fly Proxy can reach the service.
-- `min_machines_running = 1` keeps one Machine warm for production smoke and
-  avoids documenting a zero-capacity production default.
-- `MEMORY_ENGINE_POSTGRES_URL` must be set as a Fly secret for staging or
-  production storage, for example:
-
-```sh
-fly secrets set MEMORY_ENGINE_POSTGRES_URL=postgres://...
-```
-
-- `MEMORY_ENGINE_API_STORE_DIR=/path/to/accounts` is accepted only as a local
-  file-backed fallback when `MEMORY_ENGINE_POSTGRES_URL` is absent and
-  `MEMORY_ENGINE_ENABLE_FILE_STORE=true`.
-
-## Current Smoke Path
+## Smoke path exercised in 2026-06-06
 
 1. `GET /healthz`
 2. `GET /` at a 390 x 844 mobile viewport
@@ -97,7 +83,7 @@ The test creates an isolated schema, starts the API with
 `/generate`, `/approve`, `/reveal`, and `/submit`, then recreates API state and
 verifies source persistence after restart through the same Postgres schema.
 
-## Fly Staging Receipt
+## Archived staging receipt
 
 2026-06-06 deployed `memory-engine-api` to Fly app
 `https://memory-engine-api.fly.dev/` with Fly Managed Postgres cluster
@@ -209,7 +195,7 @@ original session token again. Both `attemptCount` and `duplicateAttemptCount`
 were `1`, with
 `duplicateLastOutcome: "correct"`.
 
-## Remaining Production Gaps
+## Gaps recorded in the 2026-06-06 snapshot
 
 - External auth is still a narrow app-owned session boundary, not a full
   passwordless/OAuth provider; the server-rendered no-JavaScript forms carry

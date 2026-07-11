@@ -1,22 +1,17 @@
 # Production runbook — memory-engine-api
 
 Everything here is CLI/API-driven; no dashboards required. The app is
-`memory-engine-api` on DigitalOcean App Platform (cut over from Fly
-2026-07-08; Postgres is Neon, unchanged by the cutover), serving both the
-JSON API and the server-rendered study UI from one Rust binary at
-`https://memory-engine-api-i2xcr.ondigitalocean.app`. The Fly app
-(`memory-engine-api.fly.dev`, org `misty-step`, region `ord`) is a stopped,
-manual rollback target pending deletion; no CI or consumer may start it.
+`memory-engine-api` on DigitalOcean App Platform, with Postgres on Neon,
+serving both the JSON API and the server-rendered study UI from one Rust binary
+at `https://memory-engine-api-i2xcr.ondigitalocean.app`. DigitalOcean is the
+only current application runtime; rollback stays within DigitalOcean plus git.
 
 ## Agent surface summary
 
 - App: `memory-engine-api`.
-- Primary platform: DigitalOcean App Platform (id
+- Platform: DigitalOcean App Platform (id
   `5ab05b73-9265-43c9-a01c-fef53f5f46a4`), URL
   `https://memory-engine-api-i2xcr.ondigitalocean.app`.
-- Rollback platform: Fly Machines, org `misty-step`, primary region `ord`,
-  URL `https://memory-engine-api.fly.dev` — stopped and intentionally stale.
-  Start or deploy it only during an explicit rollback.
 - Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
 - Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
@@ -28,9 +23,9 @@ manual rollback target pending deletion; no CI or consumer may start it.
 
 ## Deployed smoke
 
-These commands exercise the DigitalOcean primary. The retired Fly deployment
-workflow must not be restored: it silently reactivated and smoked the old
-provider after every green `master` push.
+These commands exercise the sole production runtime. The retired provider
+workflow must not be restored: it previously reactivated an obsolete runtime
+after every green `master` push.
 
 ```sh
 base="https://memory-engine-api-i2xcr.ondigitalocean.app"
@@ -45,9 +40,6 @@ test "$status" = "200"
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_code}" -X POST "$base/app/generate")
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
 ```
-
-Only during an explicit rollback, start the Fly machine and rerun the same
-block with `base="https://memory-engine-api.fly.dev"`.
 
 ## Production generation latency
 
@@ -109,21 +101,31 @@ does NOT set `deploy_on_push`, so **merging to master does not deploy** —
 verified 2026-07-09 when two shipped merges sat undeployed until a manual
 trigger. Until ticket 075 wires an automatic gated deploy, every ship must
 end with the manual deploy below plus the Deployed smoke, and "shipped"
-claims must name the ACTIVE deployment id. Card
-`memory-engine-fly-ci-cutover` removed the legacy Fly deployment workflow
-after it was proven to reactivate the old provider on every green push.
+claims must name the ACTIVE deployment id. The 2026-07-08 cutover removed the
+legacy provider workflow after it was proven to reactivate the old runtime on
+every green push.
 
-Manual DO deploy / rollback:
+Manual deploy:
 
 ```sh
-doctl apps create-deployment 5ab05b73-9265-43c9-a01c-fef53f5f46a4   # redeploy current spec
-doctl apps list-deployments 5ab05b73-9265-43c9-a01c-fef53f5f46a4    # find a prior deployment id to roll back to
+app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
+doctl apps create-deployment "$app_id" --wait
+doctl apps list-deployments "$app_id" --format ID,Phase,Created,Updated
 ```
 
-Manual Fly deploy (rollback only):
+Code rollback is a normal git revert followed by a new DigitalOcean deployment;
+do not revive a second provider. For an app-spec rollback, retrieve the known
+good deployment's spec, validate it, update the same app, and rerun the smoke:
 
 ```sh
-flyctl deploy --remote-only --app memory-engine-api
+app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
+known_good_deployment="${KNOWN_GOOD_DEPLOYMENT_ID:?set deployment id}"
+umask 077
+doctl apps spec get "$app_id" --deployment "$known_good_deployment" \
+  > /tmp/memory-engine-known-good.yaml
+doctl apps spec validate /tmp/memory-engine-known-good.yaml
+doctl apps update "$app_id" --spec /tmp/memory-engine-known-good.yaml --wait
+rm -f /tmp/memory-engine-known-good.yaml
 ```
 
 ## Health
@@ -131,13 +133,9 @@ flyctl deploy --remote-only --app memory-engine-api
 ```sh
 curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status":"ok",...}
 doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
-
-# Fly rollback target (normally stopped; probing it can auto-start it):
-flyctl status --app memory-engine-api
-flyctl logs --app memory-engine-api
 ```
 
-Errors land in Canary (`canary-obs` on Fly). Query it directly:
+Errors land in Canary. Query it directly:
 
 ```sh
 curl -s "$CANARY_ENDPOINT/api/v1/status" -H "Authorization: Bearer $CANARY_API_KEY"
@@ -150,8 +148,8 @@ losing Canary never affects requests.
 
 ## Secrets
 
-The DigitalOcean app owns the live values below. Fly retains a rollback copy
-until provider deletion; do not rotate only one provider during the soak.
+The DigitalOcean app owns the only live values below. Keep every secret typed as
+an encrypted App Platform variable and never copy its value into this repo.
 
 | Secret | Purpose |
 | --- | --- |
@@ -169,8 +167,7 @@ until provider deletion; do not rotate only one provider during the soak.
 
 1. `MEMORY_ENGINE_POSTGRES_URL` set → Postgres (production).
 2. Else `MEMORY_ENGINE_ENABLE_FILE_STORE=true` + `MEMORY_ENGINE_API_STORE_DIR`
-   → file store (local/dev only; Fly machines have no volume, so file-store
-   data dies on machine recycle — never use it in production).
+   → file store (local/dev only; it is not durable production storage).
 3. Else: refuses to boot.
 
 Migrations run once per process at first database use, not per request.
@@ -187,28 +184,21 @@ neonctl branches create --project-id twilight-brook-49749008 --name migration-te
 ```
 
 Use a branch to rehearse risky migrations against real data, then delete it.
-The earlier Fly Managed Postgres cluster `memory-engine-api-pg` is superseded
-by Neon and awaits operator decommission.
 
 ## Login (magic links over email)
 
 Auth is allowlist + magic link, delivered by `bin/send-magic-link` (baked
 into the image at `/usr/local/bin/send-magic-link`), which sends through
 Resend from `onboarding@resend.dev` — deliverable only to the Resend account
-owner's address, which matches the solo-dogfood allowlist. Activate with:
+owner's address, which matches the solo-dogfood allowlist. Activate it by
+setting `RESEND_API_KEY` and
+`MEMORY_ENGINE_AUTH_MAILER_COMMAND=/usr/local/bin/send-magic-link` as encrypted
+variables in the DigitalOcean app spec, updating the app, and rerunning the
+deployed smoke. Do not put the key in a shell command or checked-in spec.
 
-```sh
-flyctl secrets set --app memory-engine-api \
-  RESEND_API_KEY=<key> \
-  MEMORY_ENGINE_AUTH_MAILER_COMMAND=/usr/local/bin/send-magic-link
-```
-
-While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in
-the outbox file on the machine:
-
-```sh
-flyctl ssh console --app memory-engine-api -C "tail -1 <outbox-path>"
-```
+While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in an
+instance-local outbox. That path is a temporary solo-dogfood fallback, not a
+durable delivery channel.
 
 A failed send surfaces as a 500 and therefore lands in Canary. The sender
 address is the `MEMORY_ENGINE_MAIL_FROM` secret (default
@@ -238,10 +228,10 @@ verified domain. Resend verification is fully API-driven (no dashboard):
    dig +short TXT mail.<domain>                          # SPF (v=spf1 … include:amazonses.com)
    dig +short TXT _dmarc.mail.<domain>                   # DMARC (v=DMARC1; p=none …)
    ```
-5. **Switch the sender** (no redeploy of the script):
-   ```sh
-   flyctl secrets set --app memory-engine-api MEMORY_ENGINE_MAIL_FROM="Memory Engine <noreply@mail.<domain>>"
-   ```
+5. **Switch the sender** by updating the encrypted
+   `MEMORY_ENGINE_MAIL_FROM=Memory Engine <noreply@mail.<domain>>` App Platform
+   variable; no script edit is required. Deploy the updated app spec and rerun
+   the smoke.
 6. **Confirm inbox placement** — trigger a fresh magic link to an allowlist
    address; verify it lands in the Gmail inbox, not spam. *Operator-confirmed.*
 
@@ -256,8 +246,8 @@ curl -s https://api.resend.com/emails/<email-id> -H "Authorization: Bearer $RESE
 
 `POST /app/account` is abuse-limited in the API boundary before any magic link
 is sent. The fixed window is 5 attempts per 15 minutes per normalized email and
-per client IP (`fly-client-ip`, then `x-real-ip`, then the first
-`x-forwarded-for` value). Rejected requests return `429` with the generic
+per client IP (`x-real-ip`, then the first `x-forwarded-for` value). Rejected
+requests return `429` with the generic
 message "Too many sign-in attempts. Try again later."; they do not write an
 outbox row or reveal whether an email is allowlisted.
 

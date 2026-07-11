@@ -38,8 +38,8 @@ promotion.
   consumer-facing Rust facade and module exports.
 - `docs/qa/system.md`, `docs/dogfood/`, and `docs/beta/` record executable QA
   and dogfood evidence.
-- `docs/runbook.md` documents the DigitalOcean primary, temporary Fly standby,
-  and production smoke contract for agents.
+- `docs/runbook.md` documents the sole DigitalOcean production runtime and its
+  production smoke contract for agents.
 - Authority order overall: tests > type system > code > docs > lore.
 
 ## Gate Contract

@@ -1196,7 +1196,7 @@ fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
 
 #[must_use]
 pub fn client_rate_limit_key(headers: &HeaderMap) -> String {
-    ["fly-client-ip", "x-real-ip", "x-forwarded-for"]
+    ["x-real-ip", "x-forwarded-for"]
         .into_iter()
         .find_map(|header| {
             headers

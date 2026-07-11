@@ -1,5 +1,9 @@
 # Context Packet: Production Mobile Study App
 
+> Historical context packet (2026-06-06). Its provider choice and deployment
+> commands were superseded by the 2026-07-08 DigitalOcean cutover. Preserve it
+> as shaping evidence; use `docs/runbook.md` for current operations.
+
 ## PRD Summary
 
 - User: motivated learner using a phone to turn trusted source material into
