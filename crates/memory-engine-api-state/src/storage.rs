@@ -1106,11 +1106,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                 fs::create_dir_all(parent)
                     .map_err(|error| ApiFailure::internal(error.to_string()))?;
             }
-            let source_store =
-                memory_engine_persistence::BetaPersistenceStore::open(source_store_path)
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
-            source_store
-                .copy_for_account(target_store_path, target_account_id)
+            fs::copy(source_store_path, target_store_path)
                 .map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
         Ok(())

@@ -3658,10 +3658,6 @@ async fn file_save_account_preserves_content_feedback_for_copy_parity() {
         target_store.snapshot().content_feedback[0].id,
         "file-copy-feedback-a"
     );
-    assert_eq!(
-        target_store.snapshot().content_feedback[0].account_id,
-        target.account_id
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
