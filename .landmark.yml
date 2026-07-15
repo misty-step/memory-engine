@@ -1,0 +1,14 @@
+product:
+  name: Memory Engine
+  description: Rust learning engine and mobile study application.
+audience: developer
+voice: Clear, concrete, and specific to shipped behavior.
+changelog:
+  source: auto
+release:
+  profile: synthesis-only
+model:
+  policy: balanced
+budget:
+  max_input_tokens: 12000
+  max_output_tokens: 1200

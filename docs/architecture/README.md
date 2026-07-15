@@ -8,6 +8,11 @@ It is intentionally static and diffable:
 - `memory-engine.map.json` is the canonical graph model.
 - `workbench.html` is a dependency-free local viewer for that model.
 
+The map is also the current project-map authority for fleet onboarding. Landmark
+owns release intelligence and reads `.landmark.yml`; it does not replace this
+architecture map or generate it. The onboarding decisions and external-boundary
+limits are recorded in [`../fleet-onboarding.md`](../fleet-onboarding.md).
+
 ## Update Workflow
 
 1. Edit `docs/architecture/memory-engine.map.json` directly.
