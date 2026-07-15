@@ -36,8 +36,8 @@ const HONEST_TIMING_SCRIPT: &str = r#"<script>
   "use strict";
   var timingInput = document.querySelector('input[name="responseTimeMs"]');
   if (!timingInput) return;
-  var monotonic = window.performance && typeof performance.now === "function";
-  var now = function () { return monotonic ? performance.now() : Date.now(); };
+  var monotonic = window.performance && typeof window.performance.now === "function";
+  var now = function () { return monotonic ? window.performance.now() : Date.now(); };
   var shownAt = now();
   document.addEventListener("submit", function (event) {
     var form = event.target;
@@ -1183,7 +1183,12 @@ mod tests {
             .expect("review html");
         assert!(html.contains(r#"name="responseTimeMs" value=""#));
         assert!(!html.contains(r#"name="responseTimeMs" value="2400"#));
-        assert!(html.contains("performance.now"));
+        assert!(
+            html.contains(r#"window.performance && typeof window.performance.now === "function""#)
+        );
+        assert!(html.contains("monotonic ? window.performance.now() : Date.now()"));
+        assert!(!html.contains("typeof performance.now"));
+        assert!(!html.contains("? performance.now()"));
         assert!(html.contains("Date.now"));
         assert!(html.contains("Math.max(1, Math.round(elapsed))"));
     }
