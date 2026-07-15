@@ -540,9 +540,20 @@ pub fn serve(config: &WebShellConfig) -> Result<(), WebShellError> {
     let mut session = WebShellSession::try_new()?;
     let _ = session.start()?;
 
-    for stream in listener.incoming() {
+    serve_connections(&listener, &mut session, None)
+}
+
+fn serve_connections(
+    listener: &TcpListener,
+    session: &mut WebShellSession,
+    max_connections: Option<usize>,
+) -> Result<(), WebShellError> {
+    for (handled, stream) in listener.incoming().enumerate() {
         let mut stream = stream?;
-        handle_stream(&mut session, &mut stream)?;
+        handle_stream(session, &mut stream)?;
+        if max_connections.is_some_and(|max| handled + 1 >= max) {
+            break;
+        }
     }
 
     Ok(())
@@ -723,11 +734,22 @@ fn handle_stream(
     session: &mut WebShellSession,
     stream: &mut TcpStream,
 ) -> Result<(), WebShellError> {
-    let request = HttpRequest::read_from(stream)?;
+    let request = match HttpRequest::read_from(stream) {
+        Ok(request) => request,
+        Err(error) if is_ignorable_client_error(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let response = route(session, &request);
     response.write_to(stream)?;
 
     Ok(())
+}
+
+fn is_ignorable_client_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn view_response(result: Result<WebShellView, WebShellError>) -> HttpResponse {
@@ -1075,10 +1097,17 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        thread,
+    };
+
     use serde_json::{json, Value};
 
     use super::{
-        looks_like_json, route, run_web_shell_flow, HttpRequest, WebShellSession, WebShellStatus,
+        looks_like_json, route, run_web_shell_flow, serve_connections, HttpRequest,
+        WebShellSession, WebShellStatus,
     };
 
     #[test]
@@ -1278,6 +1307,42 @@ mod tests {
         assert_eq!(answered.status, 200);
         let answered = String::from_utf8(answered.body).expect("answered html");
         assert!(answered.contains("Correct rating 3"));
+    }
+
+    #[test]
+    fn ignores_an_incomplete_connection_before_serving_a_following_browser_form() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut shell = WebShellSession::new();
+            shell.start().expect("start");
+            serve_connections(&listener, &mut shell, Some(2)).expect("serve connections");
+        });
+
+        let mut incomplete = TcpStream::connect(address).expect("incomplete connection");
+        incomplete
+            .write_all(b"POST /answer HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("write incomplete headers");
+        incomplete
+            .shutdown(Shutdown::Write)
+            .expect("close incomplete connection");
+        drop(incomplete);
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(
+                b"POST /reveal HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n",
+            )
+            .expect("write browser form");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish browser form");
+        let mut response = String::new();
+        valid.read_to_string(&mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("I believe in one God"));
+        server.join().expect("server completes");
     }
 
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {

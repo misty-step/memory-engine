@@ -97,9 +97,20 @@ pub fn serve(config: BetaAppConfig) -> Result<(), BetaAppError> {
     let mut session = BetaStudySession::open(config.study)?;
     let _ = session.start()?;
 
-    for stream in listener.incoming() {
+    serve_connections(&listener, &mut session, None)
+}
+
+fn serve_connections(
+    listener: &TcpListener,
+    session: &mut BetaStudySession,
+    max_connections: Option<usize>,
+) -> Result<(), BetaAppError> {
+    for (handled, stream) in listener.incoming().enumerate() {
         let mut stream = stream?;
-        handle_stream(&mut session, &mut stream)?;
+        handle_stream(session, &mut stream)?;
+        if max_connections.is_some_and(|max| handled + 1 >= max) {
+            break;
+        }
     }
 
     Ok(())
@@ -109,11 +120,22 @@ fn handle_stream(
     session: &mut BetaStudySession,
     stream: &mut TcpStream,
 ) -> Result<(), BetaAppError> {
-    let request = HttpRequest::read_from(stream)?;
+    let request = match HttpRequest::read_from(stream) {
+        Ok(request) => request,
+        Err(error) if is_ignorable_client_error(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let response = route(session, &request);
     response.write_to(stream)?;
 
     Ok(())
+}
+
+fn is_ignorable_client_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse {
@@ -833,12 +855,19 @@ fn reason_phrase(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        path::PathBuf,
+        thread,
+    };
 
     use serde_json::{json, Value};
 
     use super::{
-        looks_like_json, render_page, route, BetaStudyOptions, BetaStudySession, HttpRequest,
+        looks_like_json, render_page, route, serve_connections, BetaStudyOptions, BetaStudySession,
+        HttpRequest,
     };
 
     const NOW: i64 = 1_779_984_000_000;
@@ -1225,6 +1254,49 @@ mod tests {
         assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
         assert_eq!(answered["current"]["grade"]["rating"], json!(3));
         assert_eq!(answered["summary"]["attemptCount"], json!(1));
+    }
+
+    #[test]
+    fn ignores_an_incomplete_connection_before_serving_a_following_browser_form() {
+        let directory = TempDirectory::new("disconnect");
+        let study_path = directory.path().join("study.json");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut session =
+                BetaStudySession::open(BetaStudyOptions::new(study_path).with_clock(now))
+                    .expect("open");
+            session.start().expect("start");
+            serve_connections(&listener, &mut session, Some(2)).expect("serve connections");
+        });
+
+        let mut incomplete = TcpStream::connect(address).expect("incomplete connection");
+        incomplete
+            .write_all(b"POST /source HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("write incomplete headers");
+        incomplete
+            .shutdown(Shutdown::Write)
+            .expect("close incomplete connection");
+        drop(incomplete);
+
+        let body = b"capture=hello";
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        write!(
+            valid,
+            "POST /source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .expect("write browser form headers");
+        valid.write_all(body).expect("write browser form body");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish browser form");
+        let mut response = String::new();
+        valid.read_to_string(&mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("Sources</dt><dd>1</dd>"));
+        server.join().expect("server completes");
     }
 
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {
