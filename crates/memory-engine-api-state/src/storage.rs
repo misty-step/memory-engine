@@ -169,9 +169,15 @@ impl StudyStorage {
         email: &str,
         enabled: bool,
         last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
     ) -> Result<(), ApiFailure> {
-        self.inner
-            .save_return_notification_preference(account_id, email, enabled, last_sent_at_ms)
+        self.inner.save_return_notification_preference(
+            account_id,
+            email,
+            enabled,
+            last_sent_at_ms,
+            unsubscribe_nonce,
+        )
     }
 
     pub(crate) fn load_return_notification_preference(
@@ -179,6 +185,23 @@ impl StudyStorage {
         account_id: &str,
     ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
         self.inner.load_return_notification_preference(account_id)
+    }
+
+    pub(crate) fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.disable_return_notification(
+            account_id,
+            email,
+            current_nonce,
+            next_nonce,
+            updated_at_ms,
+        )
     }
 
     pub(crate) fn claim_return_notification(
@@ -464,11 +487,20 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         email: &str,
         enabled: bool,
         last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
     ) -> Result<(), ApiFailure>;
     fn load_return_notification_preference(
         &self,
         account_id: &str,
     ) -> Result<Option<ReturnNotificationPreference>, ApiFailure>;
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure>;
     fn claim_return_notification(
         &self,
         request: &ReturnNotificationClaimRequest,
@@ -754,6 +786,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         email: &str,
         enabled: bool,
         last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
     ) -> Result<(), ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
@@ -765,6 +798,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             email: email.to_owned(),
             enabled,
             last_sent_at_ms,
+            unsubscribe_nonce: unsubscribe_nonce.to_owned(),
             claim_id: None,
             claim_expires_at_ms: None,
             pending_delivery_key: None,
@@ -788,6 +822,44 @@ impl StudyStorageAdapter for FileStudyStorage {
         };
         serde_json::from_slice(&bytes)
             .map(Some)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        _updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(false);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if !preference.enabled
+            || preference.email != email
+            || preference.unsubscribe_nonce != current_nonce
+        {
+            return Ok(false);
+        }
+        preference.enabled = false;
+        next_nonce.clone_into(&mut preference.unsubscribe_nonce);
+        preference.claim_id = None;
+        preference.claim_expires_at_ms = None;
+        preference.pending_delivery_key = None;
+        preference.pending_due_count = None;
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes)
+            .map(|()| true)
             .map_err(|error| ApiFailure::internal(error.to_string()))
     }
 
@@ -823,11 +895,17 @@ impl StudyStorageAdapter for FileStudyStorage {
             .pending_delivery_key
             .clone()
             .unwrap_or_else(|| request.delivery_key.clone());
+        let unsubscribe_nonce = if preference.unsubscribe_nonce.is_empty() {
+            request.unsubscribe_nonce.clone()
+        } else {
+            preference.unsubscribe_nonce.clone()
+        };
         let due_count = preference.pending_due_count.unwrap_or(request.due_count);
         preference.claim_id = Some(request.claim_id.clone());
         preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
         preference.pending_delivery_key = Some(delivery_key.clone());
         preference.pending_due_count = Some(due_count);
+        preference.unsubscribe_nonce.clone_from(&unsubscribe_nonce);
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -835,6 +913,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             email: preference.email,
             due_count,
             delivery_key,
+            unsubscribe_nonce,
             claim_id: request.claim_id.clone(),
         }))
     }
@@ -1285,6 +1364,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         email: &str,
         enabled: bool,
         last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
     ) -> Result<(), ApiFailure> {
         with_postgres_store(&self.database_url, |store| {
             store
@@ -1294,6 +1374,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     enabled,
                     last_sent_at_ms,
                     self.now_ms(),
+                    unsubscribe_nonce,
                 )
                 .map_err(postgres_failure)
         })
@@ -1311,12 +1392,34 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         email: preference.email,
                         enabled: preference.enabled,
                         last_sent_at_ms: preference.last_sent_at_ms,
+                        unsubscribe_nonce: preference.unsubscribe_nonce,
                         claim_id: None,
                         claim_expires_at_ms: None,
                         pending_delivery_key: None,
                         pending_due_count: None,
                     })
                 })
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .disable_return_notification(
+                    account_id,
+                    email,
+                    current_nonce,
+                    next_nonce,
+                    updated_at_ms,
+                )
                 .map_err(postgres_failure)
         })
     }
@@ -1337,6 +1440,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 claim_id: request.claim_id.clone(),
                 delivery_key: request.delivery_key.clone(),
                 claim_expires_at_ms: request.claim_expires_at_ms,
+                unsubscribe_nonce: request.unsubscribe_nonce.clone(),
             };
             store
                 .claim_return_notification(&request)
@@ -1345,6 +1449,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         email: claim.email,
                         due_count: usize::try_from(claim.due_count).unwrap_or(usize::MAX),
                         delivery_key: claim.delivery_key,
+                        unsubscribe_nonce: claim.unsubscribe_nonce,
                         claim_id: claim.claim_id,
                     })
                 })
@@ -1729,5 +1834,73 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
             Ok(StudyViewResponse::from_view(view))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    fn test_now() -> i64 {
+        1_700_000_000_000
+    }
+
+    #[test]
+    fn file_unsubscribe_race_cannot_leave_stale_token_disabled_after_reenable() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-race-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-a",
+                "a@example.com",
+                true,
+                None,
+                "nonce-before",
+            )
+            .expect("initial preference");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let stale_storage = storage.clone();
+        let stale_barrier = Arc::clone(&barrier);
+        let stale = thread::spawn(move || {
+            stale_barrier.wait();
+            stale_storage.disable_return_notification(
+                "account-a",
+                "a@example.com",
+                "nonce-before",
+                "nonce-stale",
+                test_now(),
+            )
+        });
+        let reenable_storage = storage.clone();
+        let reenable_barrier = Arc::clone(&barrier);
+        let reenable = thread::spawn(move || {
+            reenable_barrier.wait();
+            reenable_storage.save_return_notification_preference(
+                "account-a",
+                "a@example.com",
+                true,
+                None,
+                "nonce-reenabled",
+            )
+        });
+
+        let stale_result = stale.join().expect("stale worker");
+        reenable.join().expect("reenable worker").expect("reenable");
+        let preference = storage
+            .load_return_notification_preference("account-a")
+            .expect("load preference")
+            .expect("preference");
+        assert!(preference.enabled, "stale result: {stale_result:?}");
+        assert_eq!(preference.unsubscribe_nonce, "nonce-reenabled");
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -1558,6 +1558,85 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
     );
     let after_disable = fs::read_to_string(&outbox_path).expect("outbox after disable");
     assert_eq!(after_disable, after_enable);
+
+    let re_enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("re-enable return channel");
+    assert_eq!(re_enabled.status(), StatusCode::OK);
+    let after_reenable = fs::read_to_string(&outbox_path).expect("outbox after re-enable");
+    let current_unsubscribe_link = after_reenable
+        .lines()
+        .rfind(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("current signed unsubscribe link")
+        .to_owned();
+    assert_ne!(current_unsubscribe_link, unsubscribe_link);
+
+    let stale_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&unsubscribe_link)
+                .body(Body::empty())
+                .expect("stale unsubscribe GET"),
+        )
+        .await
+        .expect("stale unsubscribe GET response");
+    assert_eq!(stale_get.status(), StatusCode::FORBIDDEN);
+    let stale_post = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[(
+                "unsubscribeToken",
+                unsubscribe_link
+                    .split("token=")
+                    .nth(1)
+                    .expect("stale token"),
+            )],
+        ))
+        .await
+        .expect("stale unsubscribe POST response");
+    assert_eq!(stale_post.status(), StatusCode::FORBIDDEN);
+
+    let current_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&current_unsubscribe_link)
+                .body(Body::empty())
+                .expect("current unsubscribe GET"),
+        )
+        .await
+        .expect("current unsubscribe GET response");
+    assert_eq!(current_get.status(), StatusCode::OK);
+    let current_post = app
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[(
+                "unsubscribeToken",
+                current_unsubscribe_link
+                    .split("token=")
+                    .nth(1)
+                    .expect("current token"),
+            )],
+        ))
+        .await
+        .expect("current unsubscribe POST response");
+    assert_eq!(current_post.status(), StatusCode::OK);
 }
 
 #[test]
@@ -1599,6 +1678,73 @@ fn return_notification_email_must_belong_to_authenticated_account() {
     state
         .set_return_notification(&session_b, Some("account-b@example.com"), true)
         .expect("account B's own allowlisted email");
+}
+
+#[tokio::test]
+async fn postgres_return_notification_nonce_invalidates_replayed_tokens() {
+    let Some(database) = PostgresTestDatabase::new("return_unsubscribe_nonce") else {
+        eprintln!(
+            "skipping live Postgres unsubscribe nonce test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+        );
+        return;
+    };
+    let outbox_path = temp_store_root("postgres-return-unsubscribe-nonce").join("outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(&database.scoped_url).with_auth_config(
+            AuthConfig::allow_emails(["postgres@example.com".to_owned()])
+                .with_unsubscribe_secret("test-unsubscribe-secret")
+                .with_link_outbox(&outbox_path),
+        ),
+    );
+    let created = state
+        .create_account("postgres@example.com")
+        .expect("Postgres account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("Postgres browser session");
+    state
+        .set_return_notification(&account, Some("postgres@example.com"), true)
+        .expect("enable Postgres reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 2, true)
+        .expect("send initial Postgres reminder"));
+    let first_token = fs::read_to_string(&outbox_path)
+        .expect("initial Postgres reminder outbox")
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .and_then(|link| link.split("token=").nth(1))
+        .expect("initial Postgres unsubscribe token")
+        .to_owned();
+
+    state
+        .disable_return_notification(&first_token)
+        .expect("disable Postgres reminders");
+    state
+        .set_return_notification(&account, Some("postgres@example.com"), true)
+        .expect("re-enable Postgres reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 2, true)
+        .expect("send current Postgres reminder"));
+    let current_token = fs::read_to_string(&outbox_path)
+        .expect("current Postgres reminder outbox")
+        .lines()
+        .rfind(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .and_then(|link| link.split("token=").nth(1))
+        .expect("current Postgres unsubscribe token")
+        .to_owned();
+    assert_ne!(first_token, current_token);
+    assert!(state
+        .validate_return_notification_token(&first_token)
+        .is_err());
+    assert!(state.disable_return_notification(&first_token).is_err());
+    assert!(state
+        .validate_return_notification_token(&current_token)
+        .is_ok());
+    state
+        .disable_return_notification(&current_token)
+        .expect("current Postgres unsubscribe token");
 }
 
 #[tokio::test]

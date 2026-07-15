@@ -235,6 +235,16 @@ plain-text message. The email GET only renders a confirmation; its POST carries
 the scoped token and performs the mutation without requiring a browser session.
 Disable is persisted and never sends mail.
 
+Each unsubscribe link is a seven-day HMAC token bound to the account, normalized
+email, and a persisted unsubscribe nonce. The GET remains read-only; the POST
+atomically compares the current nonce and rotates it while disabling the
+preference, so a replayed or concurrent stale bearer cannot win against an
+authenticated re-enable. The nonce column is an additive migration with an
+empty default for existing Postgres rows, and legacy file JSON defaults the
+same way. Legacy v1 links are intentionally rejected because they cannot carry
+the nonce; the next authenticated enable or reminder delivery backfills the
+nonce and issues only v2 links.
+
 The command boundary receives these variables for a due-count message:
 `MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL`,
 `MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT`, and

@@ -209,6 +209,14 @@ impl AccountRegistry {
                 ));
             }
         }
+        let unsubscribe_nonce = existing
+            .as_ref()
+            .filter(|preference| {
+                preference.enabled == enabled && !preference.unsubscribe_nonce.is_empty()
+            })
+            .map_or_else(new_unsubscribe_nonce, |preference| {
+                preference.unsubscribe_nonce.clone()
+            });
         let last_sent_at_ms = if enabled {
             None
         } else {
@@ -219,6 +227,7 @@ impl AccountRegistry {
             &email,
             enabled,
             last_sent_at_ms,
+            &unsubscribe_nonce,
         )?;
         let mut data = self.lock_data();
         data.accounts
@@ -252,6 +261,7 @@ impl AccountRegistry {
             claim_id,
             delivery_key,
             claim_expires_at_ms: now.saturating_add(RETURN_NOTIFICATION_CLAIM_TTL_MS),
+            unsubscribe_nonce: new_unsubscribe_nonce(),
         };
         let Some(claim) = storage.claim_return_notification(&claim_request)? else {
             return Ok(false);
@@ -260,6 +270,7 @@ impl AccountRegistry {
             &auth_config.unsubscribe_secret,
             account_id,
             &claim.email,
+            &claim.unsubscribe_nonce,
             now.saturating_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS),
         );
         let unsubscribe_link = format!("/app/return-notifications?token={token}");
@@ -281,12 +292,12 @@ impl AccountRegistry {
     }
 
     pub(crate) fn validate_return_notification_token(&self, token: &str) -> Result<(), ApiFailure> {
-        let (account_id, email) = self.verify_unsubscribe_token(token)?;
+        let (account_id, email, unsubscribe_nonce) = self.verify_unsubscribe_token(token)?;
         let preference = self
             .storage()
             .load_return_notification_preference(&account_id)?
             .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is no longer valid."))?;
-        if preference.email != email {
+        if preference.email != email || preference.unsubscribe_nonce != unsubscribe_nonce {
             return Err(ApiFailure::forbidden(
                 "That unsubscribe link is not for this reminder account.",
             ));
@@ -295,25 +306,27 @@ impl AccountRegistry {
     }
 
     pub(crate) fn disable_return_notification(&self, token: &str) -> Result<(), ApiFailure> {
-        let (account_id, email) = self.verify_unsubscribe_token(token)?;
-        let storage = self.storage();
-        let preference = storage
-            .load_return_notification_preference(&account_id)?
-            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is no longer valid."))?;
-        if preference.email != email {
-            return Err(ApiFailure::forbidden(
-                "That unsubscribe link is not for this reminder account.",
-            ));
-        }
-        storage.save_return_notification_preference(
+        let (account_id, email, unsubscribe_nonce) = self.verify_unsubscribe_token(token)?;
+        let changed = self.storage().disable_return_notification(
             &account_id,
             &email,
-            false,
-            preference.last_sent_at_ms,
-        )
+            &unsubscribe_nonce,
+            &new_unsubscribe_nonce(),
+            self.now(),
+        )?;
+        if changed {
+            Ok(())
+        } else {
+            Err(ApiFailure::forbidden(
+                "That unsubscribe link is not for this reminder account.",
+            ))
+        }
     }
 
-    fn verify_unsubscribe_token(&self, token: &str) -> Result<(String, String), ApiFailure> {
+    fn verify_unsubscribe_token(
+        &self,
+        token: &str,
+    ) -> Result<(String, String, String), ApiFailure> {
         let (payload_hex, signature_hex) = token
             .trim()
             .split_once('.')
@@ -335,7 +348,7 @@ impl AccountRegistry {
         mac.verify_slice(&signature)
             .map_err(|_| ApiFailure::forbidden("That unsubscribe link is invalid or expired."))?;
         let mut fields = payload.split(|byte| *byte == b'\n');
-        if fields.next() != Some(b"v1") {
+        if fields.next() != Some(b"v2") {
             return Err(ApiFailure::forbidden(
                 "That unsubscribe link is invalid or expired.",
             ));
@@ -348,6 +361,10 @@ impl AccountRegistry {
             .next()
             .and_then(|value| String::from_utf8(value.to_owned()).ok())
             .filter(|value| !value.is_empty());
+        let unsubscribe_nonce = fields
+            .next()
+            .and_then(|value| String::from_utf8(value.to_owned()).ok())
+            .filter(|value| !value.is_empty());
         let expires_at_ms = fields
             .next()
             .and_then(|value| String::from_utf8(value.to_owned()).ok())
@@ -357,8 +374,8 @@ impl AccountRegistry {
                 "That unsubscribe link is invalid or expired.",
             ));
         }
-        let (Some(account_id), Some(email), Some(expires_at_ms)) =
-            (account_id, email, expires_at_ms)
+        let (Some(account_id), Some(email), Some(unsubscribe_nonce), Some(expires_at_ms)) =
+            (account_id, email, unsubscribe_nonce, expires_at_ms)
         else {
             return Err(ApiFailure::forbidden(
                 "That unsubscribe link is invalid or expired.",
@@ -369,7 +386,7 @@ impl AccountRegistry {
                 "That unsubscribe link is invalid or expired.",
             ));
         }
-        Ok((account_id, email))
+        Ok((account_id, email, unsubscribe_nonce))
     }
 
     fn record_app_account_request(
@@ -991,9 +1008,10 @@ fn signed_unsubscribe_token(
     secret: &str,
     account_id: &str,
     email: &str,
+    unsubscribe_nonce: &str,
     expires_at_ms: i64,
 ) -> String {
-    let payload = format!("v1\n{account_id}\n{email}\n{expires_at_ms}");
+    let payload = format!("v2\n{account_id}\n{email}\n{unsubscribe_nonce}\n{expires_at_ms}");
     let Ok(mut mac) = crate::UnsubscribeHmac::new_from_slice(secret.as_bytes()) else {
         return String::new();
     };
@@ -1003,6 +1021,10 @@ fn signed_unsubscribe_token(
         encode_hex(payload.as_bytes()),
         encode_hex(&mac.finalize().into_bytes())
     )
+}
+
+fn new_unsubscribe_nonce() -> String {
+    format!("unsubscribe_nonce_{:032x}", rand::random::<u128>())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

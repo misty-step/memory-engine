@@ -731,6 +731,8 @@ pub struct ReturnNotificationPreference {
     pub enabled: bool,
     pub last_sent_at_ms: Option<i64>,
     #[serde(default)]
+    pub unsubscribe_nonce: String,
+    #[serde(default)]
     pub claim_id: Option<String>,
     #[serde(default)]
     pub claim_expires_at_ms: Option<i64>,
@@ -745,6 +747,7 @@ pub(crate) struct ReturnNotificationClaim {
     pub email: String,
     pub due_count: usize,
     pub delivery_key: String,
+    pub unsubscribe_nonce: String,
     pub claim_id: String,
 }
 
@@ -758,6 +761,7 @@ pub(crate) struct ReturnNotificationClaimRequest {
     pub claim_id: String,
     pub delivery_key: String,
     pub claim_expires_at_ms: i64,
+    pub unsubscribe_nonce: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -25,6 +25,12 @@ Viewport: Chrome headless, 390 × 844, light mode
   `MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY`, sent that value as
   Resend's `Idempotency-Key` header, and reused the identical header on retry;
   magic-link mode remained successful without the header.
+- Unsubscribe links are v2 HMAC bearers bound to a persisted nonce. File
+  storage and the live-Postgres contract both cover stale-token races with
+  concurrent re-enable/rotation; replay after re-enable is forbidden while
+  the current token remains usable. The additive nonce migration defaults
+  legacy rows/files to empty and backfills them on the next enable or delivery;
+  legacy v1 links are intentionally rejected.
 
 ## Retained phone proof
 
