@@ -794,16 +794,67 @@ impl StudyStorageAdapter for FileStudyStorage {
         let _lock =
             FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
+        let existing = match fs::read(&path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<ReturnNotificationPreference>(&bytes)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ApiFailure::internal(error.to_string())),
+        };
+        let preserve_pending = existing.as_ref().is_some_and(|preference| {
+            preference.enabled
+                && enabled
+                && preference.email == email
+                && preference.pending_delivery_key.is_some()
+        });
         let preference = ReturnNotificationPreference {
             email: email.to_owned(),
             enabled,
             last_sent_at_ms,
-            unsubscribe_nonce: unsubscribe_nonce.to_owned(),
-            claim_id: None,
-            claim_expires_at_ms: None,
-            pending_delivery_key: None,
-            pending_due_count: None,
-            pending_unsubscribe_expires_at_ms: None,
+            unsubscribe_nonce: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .map(|preference| preference.unsubscribe_nonce.clone())
+                })
+                .flatten()
+                .unwrap_or_else(|| unsubscribe_nonce.to_owned()),
+            claim_id: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.claim_id.clone())
+                })
+                .flatten(),
+            claim_expires_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.claim_expires_at_ms)
+                })
+                .flatten(),
+            pending_delivery_key: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_delivery_key.clone())
+                })
+                .flatten(),
+            pending_due_count: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_due_count)
+                })
+                .flatten(),
+            pending_unsubscribe_expires_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_unsubscribe_expires_at_ms)
+                })
+                .flatten(),
         };
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1912,6 +1963,96 @@ mod tests {
             .expect("preference");
         assert!(preference.enabled, "stale result: {stale_result:?}");
         assert_eq!(preference.unsubscribe_nonce, "nonce-reenabled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_same_enabled_email_preserves_retry_envelope_but_policy_changes_clear_it() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-save-policy-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                true,
+                None,
+                "nonce-same",
+            )
+            .expect("initial preference");
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-policy".to_owned(),
+                now_ms: test_now(),
+                due_count: 2,
+                force_confirmation: true,
+                interval_ms: 86_400_000,
+                claim_id: "claim-policy".to_owned(),
+                delivery_key: "envelope-policy".to_owned(),
+                claim_expires_at_ms: test_now() + 100,
+                unsubscribe_nonce: "nonce-request".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("claim policy envelope")
+            .expect("claim available");
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                true,
+                None,
+                "nonce-new",
+            )
+            .expect("same enabled save");
+        let preserved = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-policy".to_owned(),
+                now_ms: test_now() + 200,
+                due_count: 1,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-policy-retry".to_owned(),
+                delivery_key: "envelope-new".to_owned(),
+                claim_expires_at_ms: test_now() + 300,
+                unsubscribe_nonce: "nonce-request-2".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_200,
+            })
+            .expect("retry claim")
+            .expect("retry available");
+        assert_eq!(preserved.delivery_key, first.delivery_key);
+        assert_eq!(preserved.unsubscribe_nonce, first.unsubscribe_nonce);
+        assert_eq!(
+            preserved.unsubscribe_expires_at_ms,
+            first.unsubscribe_expires_at_ms
+        );
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                false,
+                None,
+                "nonce-disabled",
+            )
+            .expect("disable");
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "changed@example.com",
+                true,
+                None,
+                "nonce-changed",
+            )
+            .expect("email change and re-enable");
+        let changed = storage
+            .load_return_notification_preference("account-policy")
+            .expect("load changed")
+            .expect("changed preference");
+        assert!(changed.claim_id.is_none());
+        assert!(changed.pending_delivery_key.is_none());
+        assert!(changed.pending_unsubscribe_expires_at_ms.is_none());
         let _ = fs::remove_dir_all(root);
     }
 

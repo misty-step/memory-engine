@@ -629,12 +629,54 @@ impl PostgresStudyStore {
              SET email_normalized = EXCLUDED.email_normalized,
                  enabled = EXCLUDED.enabled,
                  last_sent_at_ms = EXCLUDED.last_sent_at_ms,
-                 unsubscribe_nonce = EXCLUDED.unsubscribe_nonce,
-                 claim_id = NULL,
-                 claim_expires_at_ms = NULL,
-                 pending_delivery_key = NULL,
-                 pending_due_count = NULL,
-                 pending_unsubscribe_expires_at_ms = NULL,
+                 unsubscribe_nonce = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.unsubscribe_nonce
+                     ELSE EXCLUDED.unsubscribe_nonce
+                 END,
+                 claim_id = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.claim_id
+                     ELSE NULL
+                 END,
+                 claim_expires_at_ms = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.claim_expires_at_ms
+                     ELSE NULL
+                 END,
+                 pending_delivery_key = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_delivery_key
+                     ELSE NULL
+                 END,
+                 pending_due_count = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_due_count
+                     ELSE NULL
+                 END,
+                 pending_unsubscribe_expires_at_ms = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_unsubscribe_expires_at_ms
+                     ELSE NULL
+                 END,
                  updated_at_ms = EXCLUDED.updated_at_ms",
             &[
                 &account_id,
@@ -2204,6 +2246,14 @@ mod tests {
                     unsubscribe_expires_at_ms: NOW + 604_800_000,
                 })?
                 .expect("first retry claim");
+            retry.save_return_notification_preference(
+                "acct-claim-retry",
+                "retry@example.com",
+                true,
+                None,
+                NOW + 1,
+                "retry-nonce-request-rotated",
+            )?;
             let second = retry
                 .claim_return_notification(&super::ReturnNotificationClaimRequest {
                     account_id: "acct-claim-retry".to_owned(),
@@ -2219,6 +2269,7 @@ mod tests {
                 })?
                 .expect("stale retry claim");
             assert_eq!(second.delivery_key, first.delivery_key);
+            assert_eq!(second.unsubscribe_nonce, first.unsubscribe_nonce);
             assert_eq!(
                 second.unsubscribe_expires_at_ms,
                 first.unsubscribe_expires_at_ms

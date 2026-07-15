@@ -212,7 +212,9 @@ impl AccountRegistry {
         let unsubscribe_nonce = existing
             .as_ref()
             .filter(|preference| {
-                preference.enabled == enabled && !preference.unsubscribe_nonce.is_empty()
+                preference.enabled == enabled
+                    && preference.email == email
+                    && !preference.unsubscribe_nonce.is_empty()
             })
             .map_or_else(new_unsubscribe_nonce, |preference| {
                 preference.unsubscribe_nonce.clone()
@@ -250,7 +252,10 @@ impl AccountRegistry {
             data.auth_config.clone()
         };
         let claim_id = format!("return_claim_{:032x}", rand::random::<u128>());
-        let delivery_key = format!("return-notification:{account_id}:{now}");
+        let delivery_key = format!(
+            "return-notification:{account_id}:{:032x}",
+            rand::random::<u128>()
+        );
         let storage = self.storage();
         let claim_request = ReturnNotificationClaimRequest {
             account_id: account_id.to_owned(),

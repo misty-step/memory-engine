@@ -286,6 +286,136 @@ async fn home_get_does_not_send_or_mutate_return_notification_state() {
 }
 
 #[tokio::test]
+async fn return_notification_enable_route_retries_the_same_provider_envelope_after_restart() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-route-retry");
+    fs::create_dir_all(&store_root).expect("retry store root");
+    let mailer_command = retry_provider_script(&store_root);
+    let auth_config = || {
+        AuthConfig::default()
+            .with_unsubscribe_secret("claim-secret")
+            .with_mailer_command(&mailer_command)
+    };
+    let first_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let first_app = router(first_state);
+    let (cookie, csrf_token, _) = start_app_session_for_csrf(&first_app).await;
+    let saved = first_app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("email", "retry@example.com")],
+        ))
+        .await
+        .expect("save account");
+    let cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let csrf_token = html_value(&saved, "csrfToken");
+    let first_attempt = post_return_notification_enable(&first_app, &cookie, &csrf_token).await;
+    assert!(first_attempt.contains("return notification mailer command exited"));
+    let first_payload =
+        fs::read_to_string(store_root.join("retry-provider.tsv")).expect("failed payload");
+    assert_eq!(first_payload.lines().count(), 1);
+    let failed_preference: Value =
+        serde_json::from_str(&read_return_notification_preference(&store_root))
+            .expect("failed preference");
+    assert!(failed_preference["pendingDeliveryKey"].is_string());
+    assert!(failed_preference["pendingUnsubscribeExpiresAtMs"].is_number());
+    assert!(failed_preference["claimId"].is_null());
+
+    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    let recovery_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let recovery_app = router(recovery_state);
+    let second_attempt = post_return_notification_enable(&recovery_app, &cookie, &csrf_token).await;
+    assert!(second_attempt.contains("Due-count reminders are on"));
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        payloads[0], payloads[1],
+        "route retry payload must be identical"
+    );
+    assert_eq!(payloads[0].split('\t').count(), 4);
+    assert_eq!(
+        payloads[0].split('\t').nth(3),
+        payloads[1].split('\t').nth(3),
+        "route retry must preserve the idempotency key"
+    );
+    let completed_preference: Value =
+        serde_json::from_str(&read_return_notification_preference(&store_root))
+            .expect("completed preference");
+    for field in [
+        "claimId",
+        "pendingDeliveryKey",
+        "pendingDueCount",
+        "pendingUnsubscribeExpiresAtMs",
+    ] {
+        assert!(
+            completed_preference[field].is_null(),
+            "{field} must clear on success"
+        );
+    }
+}
+
+#[test]
+fn return_notification_new_envelopes_at_one_clock_tick_have_distinct_keys() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-random-envelope");
+    fs::create_dir_all(&store_root).expect("envelope store root");
+    let mailer_command = retry_provider_script(&store_root);
+    fs::write(store_root.join("retry-provider.failed"), "").expect("successful provider marker");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::default()
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(mailer_command),
+            ),
+    );
+    let account = state.create_account("random@example.com").expect("account");
+    let account = state.create_browser_session(&account).expect("session");
+    state
+        .set_return_notification(&account, Some("random@example.com"), true)
+        .expect("enable");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 1, true)
+        .expect("first envelope"));
+    state
+        .set_return_notification(&account, None, false)
+        .expect("disable");
+    state
+        .set_return_notification(&account, Some("random@example.com"), true)
+        .expect("re-enable");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 1, true)
+        .expect("second envelope"));
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_ne!(
+        payloads[0].split('\t').nth(3),
+        payloads[1].split('\t').nth(3),
+        "new envelopes at one clock tick must not collide"
+    );
+}
+
+#[tokio::test]
 async fn mcq_review_is_click_to_answer_and_grades_case_insensitively() {
     // The NATO letter-A card is multiple choice (answer ALFA, distractors
     // BRAVO/CHARLIE). It must render as clickable options that submit the
@@ -4728,6 +4858,29 @@ fn form_request_with_cookie(
         .header("cookie", cookie)
         .body(Body::from(form_body(fields)))
         .expect("request")
+}
+
+async fn post_return_notification_enable(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            cookie,
+            &[
+                ("csrfToken", csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "retry@example.com"),
+            ],
+        ))
+        .await
+        .expect("return notification enable");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
 }
 
 fn session_cookie(response: &axum::response::Response) -> String {
