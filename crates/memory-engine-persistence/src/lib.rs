@@ -846,6 +846,15 @@ impl BetaPersistenceStore {
             return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
         }
 
+        if let Some(existing) = self
+            .data
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == draft.review_unit_id)
+        {
+            return Ok(existing.clone());
+        }
+
         let review_unit = BetaReviewUnitRecord {
             review_unit_id: draft.review_unit_id.clone(),
             prompt_id: draft.prompt_id.clone(),
@@ -859,7 +868,7 @@ impl BetaPersistenceStore {
             created_at: draft.created_at,
         };
         let mut next = self.data.clone();
-        upsert_review_unit(&mut next.review_units, review_unit.clone());
+        next.review_units.push(review_unit.clone());
         apply_schedule_record(
             &mut next,
             &draft.review_unit_id,
@@ -1033,7 +1042,7 @@ impl BetaPersistenceStore {
         Ok(updated)
     }
 
-    /// Save or replace a beta review unit.
+    /// Create a beta review unit, or return the existing persisted unit untouched.
     ///
     /// # Errors
     ///
@@ -1042,6 +1051,14 @@ impl BetaPersistenceStore {
         &mut self,
         review_unit: BetaReviewUnitRecord,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        if let Some(existing) = self
+            .data
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == review_unit.review_unit_id)
+        {
+            return Ok(existing.clone());
+        }
         assert_review_unit_contract(&self.data, &review_unit)?;
         let mut next = self.data.clone();
         upsert_review_unit(&mut next.review_units, review_unit.clone());
@@ -1814,17 +1831,6 @@ fn upsert_by_id<T: HasId>(items: &mut Vec<T>, item: T) {
     if let Some(index) = items
         .iter()
         .position(|candidate| candidate.id() == item.id())
-    {
-        items[index] = item;
-    } else {
-        items.push(item);
-    }
-}
-
-fn upsert_review_unit(items: &mut Vec<BetaReviewUnitRecord>, item: BetaReviewUnitRecord) {
-    if let Some(index) = items
-        .iter()
-        .position(|candidate| candidate.review_unit_id == item.review_unit_id)
     {
         items[index] = item;
     } else {

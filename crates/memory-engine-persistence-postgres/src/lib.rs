@@ -882,6 +882,28 @@ pub struct AccountStudyStore<'a> {
 }
 
 impl AccountStudyStore<'_> {
+    /// Serialize every per-account study mutation across Postgres connections.
+    ///
+    /// The concept selector takes this same key before reading review units,
+    /// schedules, sources, drafts, and attempts. Any writer that can change
+    /// that selector must use this helper so those reads observe a committed
+    /// serial position, including across API replicas.
+    fn with_account_transaction<R>(
+        &mut self,
+        operation: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<R, PostgresStoreError>,
+    ) -> Result<R, PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&account_id],
+        )?;
+        let result = operation(&mut transaction)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Read all scoped study state in the beta-store snapshot shape.
     ///
     /// This is the bridge surface the HTTP study session needs before the API can
@@ -978,7 +1000,10 @@ impl AccountStudyStore<'_> {
         Ok(row.is_some())
     }
 
-    /// Save or replace a review unit for the scoped account.
+    /// Create a review unit for the scoped account, or leave an existing unit
+    /// untouched. Review-unit records contain server-owned mutable queue,
+    /// prompt, archive, and snooze state; a caller can hold a stale snapshot,
+    /// so conflict replacement is deliberately not part of this API.
     ///
     /// # Errors
     ///
@@ -988,24 +1013,23 @@ impl AccountStudyStore<'_> {
         review_unit: &BetaReviewUnitRecord,
     ) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(review_unit)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_review_units
-                (account_id, review_unit_id, record, created_at_ms, archived_at_ms)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (account_id, review_unit_id) DO UPDATE
-             SET record = EXCLUDED.record,
-                 created_at_ms = EXCLUDED.created_at_ms,
-                 archived_at_ms = EXCLUDED.archived_at_ms",
-            &[
-                &self.scope.account_id,
-                &review_unit.review_unit_id.as_str(),
-                &value,
-                &review_unit.created_at,
-                &review_unit.archived_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_review_units
+                    (account_id, review_unit_id, record, created_at_ms, archived_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (account_id, review_unit_id) DO NOTHING",
+                &[
+                    &account_id,
+                    &review_unit.review_unit_id.as_str(),
+                    &value,
+                    &review_unit.created_at,
+                    &review_unit.archived_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Promote an accepted generated draft into a review unit.
@@ -1022,46 +1046,94 @@ impl AccountStudyStore<'_> {
         let ApproveGeneratedPromptDraftOptions {
             initial_schedule_state,
         } = options;
-        let snapshot = self.snapshot()?;
-        let draft = snapshot
-            .generated_prompt_drafts
-            .iter()
-            .find(|draft| draft.id == draft_id)
-            .cloned()
-            .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))?;
-        if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
-            return Err(PostgresStoreError::RejectedGeneratedPromptDraft);
-        }
-        if draft
-            .generation_run_id
-            .as_ref()
-            .is_none_or(|run_id| !snapshot.generation_runs.iter().any(|run| &run.id == run_id))
-        {
-            return Err(PostgresStoreError::MissingGenerationRunForAcceptedDraft);
-        }
+        let account_id = self.scope.account_id.clone();
+        let draft_id = draft_id.to_owned();
+        self.with_account_transaction(|transaction| {
+            let draft: GeneratedPromptDraft = transaction
+                .query_opt(
+                    "SELECT draft FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1 AND draft_id = $2
+                     FOR UPDATE",
+                    &[&account_id, &draft_id],
+                )?
+                .map(|row| {
+                    let value: serde_json::Value = row.get(0);
+                    serde_json::from_value(value)
+                })
+                .transpose()?
+                .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.clone()))?;
+            if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
+                return Err(PostgresStoreError::RejectedGeneratedPromptDraft);
+            }
+            let generation_run_exists = draft
+                .generation_run_id
+                .as_ref()
+                .map(|run_id| {
+                    transaction
+                        .query_opt(
+                            "SELECT 1 FROM memory_engine_generation_runs
+                             WHERE account_id = $1 AND generation_run_id = $2",
+                            &[&account_id, run_id],
+                        )
+                        .map(|row| row.is_some())
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !generation_run_exists {
+                return Err(PostgresStoreError::MissingGenerationRunForAcceptedDraft);
+            }
 
-        let review_unit = BetaReviewUnitRecord {
-            review_unit_id: draft.review_unit_id.clone(),
-            prompt_id: draft.prompt_id.clone(),
-            prompt: draft.prompt.clone(),
-            queue: draft.queue.clone(),
-            reference_span_ids: draft.reference_span_ids.clone(),
-            concept_reference_note_key: draft.concept_reference_note_key.clone(),
-            generated_prompt_draft_id: Some(draft.id.clone()),
-            archived_at: None,
-            snoozed_until: None,
-            created_at: draft.created_at,
-        };
-        self.save_review_unit(&review_unit)?;
-        if let Some(schedule_state) = initial_schedule_state.as_ref() {
-            self.set_schedule_state(
-                &review_unit.review_unit_id,
-                Some(schedule_state),
-                draft.created_at,
+            let review_unit = BetaReviewUnitRecord {
+                review_unit_id: draft.review_unit_id.clone(),
+                prompt_id: draft.prompt_id.clone(),
+                prompt: draft.prompt.clone(),
+                queue: draft.queue.clone(),
+                reference_span_ids: draft.reference_span_ids.clone(),
+                concept_reference_note_key: draft.concept_reference_note_key.clone(),
+                generated_prompt_draft_id: Some(draft.id.clone()),
+                archived_at: None,
+                snoozed_until: None,
+                created_at: draft.created_at,
+            };
+            let value = serde_json::to_value(&review_unit)?;
+            let inserted = transaction.execute(
+                "INSERT INTO memory_engine_review_units
+                    (account_id, review_unit_id, record, created_at_ms, archived_at_ms)
+                 VALUES ($1, $2, $3, $4, NULL)
+                 ON CONFLICT (account_id, review_unit_id) DO NOTHING",
+                &[
+                    &account_id,
+                    &review_unit.review_unit_id.as_str(),
+                    &value,
+                    &review_unit.created_at,
+                ],
             )?;
-        }
-
-        Ok(review_unit)
+            if inserted == 0 {
+                return review_unit_from_transaction(
+                    transaction,
+                    &account_id,
+                    &review_unit.review_unit_id,
+                );
+            }
+            if let Some(schedule_state) = initial_schedule_state.as_ref() {
+                let schedule_value = serde_json::to_value(schedule_state)?;
+                transaction.execute(
+                    "INSERT INTO memory_engine_schedules
+                        (account_id, review_unit_id, state, updated_at_ms)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (account_id, review_unit_id) DO UPDATE
+                     SET state = EXCLUDED.state,
+                         updated_at_ms = EXCLUDED.updated_at_ms",
+                    &[
+                        &account_id,
+                        &review_unit.review_unit_id.as_str(),
+                        &schedule_value,
+                        &draft.created_at,
+                    ],
+                )?;
+            }
+            Ok(review_unit)
+        })
     }
 
     /// Replace review prompt text while preserving the same review unit.
@@ -1075,12 +1147,62 @@ impl AccountStudyStore<'_> {
         prompt_text: &str,
         expected_answer: &str,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let mut review_unit = self.review_unit(review_unit_id)?;
-        replace_prompt_text(&mut review_unit.prompt, prompt_text);
-        replace_prompt_answer(&mut review_unit.prompt, expected_answer);
-        self.save_review_unit(&review_unit)?;
-
-        Ok(review_unit)
+        assert_non_blank(prompt_text, "Review unit prompt")?;
+        assert_non_blank(expected_answer, "Review unit expected answer")?;
+        let account_id = self.scope.account_id.clone();
+        let review_unit_id = review_unit_id.clone();
+        let prompt_text = prompt_text.to_owned();
+        let expected_answer = expected_answer.to_owned();
+        self.with_account_transaction(|transaction| {
+            let mut review_unit =
+                review_unit_from_transaction(transaction, &account_id, &review_unit_id)?;
+            reject_archived(&review_unit)?;
+            replace_prompt_text(&mut review_unit.prompt, &prompt_text);
+            replace_prompt_answer(&mut review_unit.prompt, &expected_answer);
+            let prompt = serde_json::to_value(&review_unit.prompt)?;
+            if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
+                let mut draft: GeneratedPromptDraft = transaction
+                    .query_opt(
+                        "SELECT draft FROM memory_engine_generated_prompt_drafts
+                         WHERE account_id = $1 AND draft_id = $2
+                         FOR UPDATE",
+                        &[&account_id, draft_id],
+                    )?
+                    .map(|row| {
+                        let value: serde_json::Value = row.get(0);
+                        serde_json::from_value(value)
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.clone())
+                    })?;
+                replace_prompt_text(&mut draft.prompt, &prompt_text);
+                replace_prompt_answer(&mut draft.prompt, &expected_answer);
+                if !draft
+                    .critique_notes
+                    .iter()
+                    .any(|note| note == "Learner edited approved wording.")
+                {
+                    draft
+                        .critique_notes
+                        .push("Learner edited approved wording.".to_owned());
+                }
+                let draft_value = serde_json::to_value(draft)?;
+                transaction.execute(
+                    "UPDATE memory_engine_generated_prompt_drafts
+                     SET draft = $3
+                     WHERE account_id = $1 AND draft_id = $2",
+                    &[&account_id, draft_id, &draft_value],
+                )?;
+            }
+            transaction.execute(
+                "UPDATE memory_engine_review_units
+                 SET record = jsonb_set(record, '{prompt}', $3, true)
+                 WHERE account_id = $1 AND review_unit_id = $2",
+                &[&account_id, &review_unit_id.as_str(), &prompt],
+            )?;
+            Ok(review_unit)
+        })
     }
 
     /// Hide a review unit from future queue selection.
@@ -1093,11 +1215,21 @@ impl AccountStudyStore<'_> {
         review_unit_id: &ReviewUnitId,
         archived_at: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let mut review_unit = self.review_unit(review_unit_id)?;
-        review_unit.archived_at = Some(archived_at);
-        self.save_review_unit(&review_unit)?;
-
-        Ok(review_unit)
+        let account_id = self.scope.account_id.clone();
+        let review_unit_id = review_unit_id.clone();
+        self.with_account_transaction(|transaction| {
+            let mut review_unit =
+                review_unit_from_transaction(transaction, &account_id, &review_unit_id)?;
+            review_unit.archived_at = Some(archived_at);
+            transaction.execute(
+                "UPDATE memory_engine_review_units
+                 SET record = jsonb_set(record, '{archivedAt}', to_jsonb($3::BIGINT), true),
+                     archived_at_ms = $3
+                 WHERE account_id = $1 AND review_unit_id = $2",
+                &[&account_id, &review_unit_id.as_str(), &archived_at],
+            )?;
+            Ok(review_unit)
+        })
     }
 
     /// Move a review unit's beta queue availability without changing schedule history.
@@ -1110,11 +1242,21 @@ impl AccountStudyStore<'_> {
         review_unit_id: &ReviewUnitId,
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let mut review_unit = self.review_unit(review_unit_id)?;
-        review_unit.snoozed_until = Some(snoozed_until);
-        self.save_review_unit(&review_unit)?;
-
-        Ok(review_unit)
+        let account_id = self.scope.account_id.clone();
+        let review_unit_id = review_unit_id.clone();
+        self.with_account_transaction(|transaction| {
+            let mut review_unit =
+                review_unit_from_transaction(transaction, &account_id, &review_unit_id)?;
+            reject_archived(&review_unit)?;
+            review_unit.snoozed_until = Some(snoozed_until);
+            transaction.execute(
+                "UPDATE memory_engine_review_units
+                 SET record = jsonb_set(record, '{snoozedUntil}', to_jsonb($3::BIGINT), true)
+                 WHERE account_id = $1 AND review_unit_id = $2",
+                &[&account_id, &review_unit_id.as_str(), &snoozed_until],
+            )?;
+            Ok(review_unit)
+        })
     }
 
     /// Move every non-archived review unit under one persisted concept key
@@ -1132,32 +1274,30 @@ impl AccountStudyStore<'_> {
         concept_key: &str,
         snoozed_until: i64,
     ) -> Result<Vec<BetaReviewUnitRecord>, PostgresStoreError> {
-        let mut client = self.client.borrow_mut();
-        let mut transaction = client.transaction()?;
-        let rows = transaction.query(
-            "UPDATE memory_engine_review_units
-             SET record = jsonb_set(
-                 record,
-                 '{snoozedUntil}',
-                 to_jsonb($3::BIGINT),
-                 true
-             )
-             WHERE account_id = $1
-               AND archived_at_ms IS NULL
-               AND record->'queue'->>'conceptKey' = $2
-             RETURNING record",
-            &[&self.scope.account_id, &concept_key, &snoozed_until],
-        )?;
-        let snoozed = rows
-            .into_iter()
-            .map(|row| {
-                let value: serde_json::Value = row.get(0);
-                Ok(serde_json::from_value(value)?)
-            })
-            .collect::<Result<Vec<BetaReviewUnitRecord>, PostgresStoreError>>()?;
-        transaction.commit()?;
-
-        Ok(snoozed)
+        let account_id = self.scope.account_id.clone();
+        let concept_key = concept_key.to_owned();
+        self.with_account_transaction(|transaction| {
+            let rows = transaction.query(
+                "UPDATE memory_engine_review_units
+                 SET record = jsonb_set(
+                     record,
+                     '{snoozedUntil}',
+                     to_jsonb($3::BIGINT),
+                     true
+                 )
+                 WHERE account_id = $1
+                   AND archived_at_ms IS NULL
+                   AND record->'queue'->>'conceptKey' = $2
+                 RETURNING record",
+                &[&account_id, &concept_key, &snoozed_until],
+            )?;
+            rows.into_iter()
+                .map(|row| {
+                    let value: serde_json::Value = row.get(0);
+                    Ok(serde_json::from_value(value)?)
+                })
+                .collect::<Result<Vec<BetaReviewUnitRecord>, PostgresStoreError>>()
+        })
     }
 
     /// Resolve and snooze the requested current review unit's whole concept
@@ -1179,6 +1319,13 @@ impl AccountStudyStore<'_> {
     ) -> Result<Vec<BetaReviewUnitRecord>, PostgresStoreError> {
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&self.scope.account_id],
+        )?;
+        // All Postgres study writers use with_account_transaction with this
+        // exact account key. The selector's source, draft, and attempt reads
+        // therefore have the same serial order as their competing writes.
         // Lock the complete active candidate set before resolving current.
         // Every competing review mutation updates one of these rows, so a
         // replica cannot change archive/current state between this read and
@@ -1205,15 +1352,6 @@ impl AccountStudyStore<'_> {
                 review_unit_id,
             )));
         };
-        let concept_key = requested
-            .queue
-            .concept_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_owned)
-            .ok_or(PostgresStoreError::NoConceptKey)?;
-
         let schedule_rows = transaction.query(
             "SELECT schedules.review_unit_id, schedules.state
              FROM memory_engine_schedules AS schedules
@@ -1246,6 +1384,14 @@ impl AccountStudyStore<'_> {
                 review_unit_id,
             )));
         }
+
+        let concept_key = requested
+            .queue
+            .concept_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or(PostgresStoreError::NoConceptKey)?;
 
         let rows = transaction.query(
             "UPDATE memory_engine_review_units
@@ -1283,11 +1429,22 @@ impl AccountStudyStore<'_> {
         review_unit_id: &ReviewUnitId,
         lifecycle: ReviewUnitLifecycle,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let mut review_unit = self.review_unit(review_unit_id)?;
-        review_unit.queue.lifecycle = lifecycle;
-        self.save_review_unit(&review_unit)?;
-
-        Ok(review_unit)
+        let account_id = self.scope.account_id.clone();
+        let review_unit_id = review_unit_id.clone();
+        self.with_account_transaction(|transaction| {
+            let mut review_unit =
+                review_unit_from_transaction(transaction, &account_id, &review_unit_id)?;
+            reject_archived(&review_unit)?;
+            review_unit.queue.lifecycle = lifecycle;
+            let queue = serde_json::to_value(&review_unit.queue)?;
+            transaction.execute(
+                "UPDATE memory_engine_review_units
+                 SET record = jsonb_set(record, '{queue}', $3, true)
+                 WHERE account_id = $1 AND review_unit_id = $2",
+                &[&account_id, &review_unit_id.as_str(), &queue],
+            )?;
+            Ok(review_unit)
+        })
     }
 
     /// Save or replace source material for the scoped account.
@@ -1300,22 +1457,19 @@ impl AccountStudyStore<'_> {
         document: &SourceDocument,
     ) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(document)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_source_documents
-                (account_id, source_document_id, document, created_at_ms)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account_id, source_document_id) DO UPDATE
-             SET document = EXCLUDED.document,
-                 created_at_ms = EXCLUDED.created_at_ms",
-            &[
-                &self.scope.account_id,
-                &document.id,
-                &value,
-                &document.created_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_source_documents
+                    (account_id, source_document_id, document, created_at_ms)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (account_id, source_document_id) DO UPDATE
+                 SET document = EXCLUDED.document,
+                     created_at_ms = EXCLUDED.created_at_ms",
+                &[&account_id, &document.id, &value, &document.created_at],
+            )?;
+            Ok(())
+        })
     }
 
     /// Save or replace a generated concept-level reference note for the scoped account.
@@ -1328,22 +1482,19 @@ impl AccountStudyStore<'_> {
         note: &ConceptReferenceNote,
     ) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(note)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_concept_reference_notes
-                (account_id, concept_key, note, updated_at_ms)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account_id, concept_key) DO UPDATE
-             SET note = EXCLUDED.note,
-                 updated_at_ms = EXCLUDED.updated_at_ms",
-            &[
-                &self.scope.account_id,
-                &note.concept_key,
-                &value,
-                &note.updated_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_concept_reference_notes
+                    (account_id, concept_key, note, updated_at_ms)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (account_id, concept_key) DO UPDATE
+                 SET note = EXCLUDED.note,
+                     updated_at_ms = EXCLUDED.updated_at_ms",
+                &[&account_id, &note.concept_key, &value, &note.updated_at],
+            )?;
+            Ok(())
+        })
     }
 
     /// Hide source material from learner-facing flows while preserving receipts.
@@ -1356,11 +1507,21 @@ impl AccountStudyStore<'_> {
         source_document_id: &str,
         archived_at: i64,
     ) -> Result<SourceDocument, PostgresStoreError> {
-        let mut document = self.source_document(source_document_id)?;
-        document.archived_at = Some(archived_at);
-        self.save_source_document(&document)?;
-
-        Ok(document)
+        let account_id = self.scope.account_id.clone();
+        let source_document_id = source_document_id.to_owned();
+        self.with_account_transaction(|transaction| {
+            let mut document =
+                source_document_from_transaction(transaction, &account_id, &source_document_id)?;
+            document.archived_at = Some(archived_at);
+            let value = serde_json::to_value(&document)?;
+            transaction.execute(
+                "UPDATE memory_engine_source_documents
+                 SET document = $3
+                 WHERE account_id = $1 AND source_document_id = $2",
+                &[&account_id, &source_document_id, &value],
+            )?;
+            Ok(document)
+        })
     }
 
     /// Save or replace a source reference span for the scoped account.
@@ -1373,24 +1534,26 @@ impl AccountStudyStore<'_> {
         reference: &ReferenceSpan,
     ) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(reference)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_reference_spans
-                (account_id, reference_span_id, source_document_id, span, created_at_ms)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (account_id, reference_span_id) DO UPDATE
-             SET source_document_id = EXCLUDED.source_document_id,
-                 span = EXCLUDED.span,
-                 created_at_ms = EXCLUDED.created_at_ms",
-            &[
-                &self.scope.account_id,
-                &reference.id,
-                &reference.source_document_id,
-                &value,
-                &reference.created_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_reference_spans
+                    (account_id, reference_span_id, source_document_id, span, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (account_id, reference_span_id) DO UPDATE
+                 SET source_document_id = EXCLUDED.source_document_id,
+                     span = EXCLUDED.span,
+                     created_at_ms = EXCLUDED.created_at_ms",
+                &[
+                    &account_id,
+                    &reference.id,
+                    &reference.source_document_id,
+                    &value,
+                    &reference.created_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Save or replace a generation run receipt for the scoped account.
@@ -1400,17 +1563,19 @@ impl AccountStudyStore<'_> {
     /// Returns [`PostgresStoreError`] when serialization or persistence fails.
     pub fn save_generation_run(&mut self, run: &GenerationRun) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(run)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_generation_runs
-                (account_id, generation_run_id, run, started_at_ms)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account_id, generation_run_id) DO UPDATE
-             SET run = EXCLUDED.run,
-                 started_at_ms = EXCLUDED.started_at_ms",
-            &[&self.scope.account_id, &run.id, &value, &run.started_at],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_generation_runs
+                    (account_id, generation_run_id, run, started_at_ms)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (account_id, generation_run_id) DO UPDATE
+                 SET run = EXCLUDED.run,
+                     started_at_ms = EXCLUDED.started_at_ms",
+                &[&account_id, &run.id, &value, &run.started_at],
+            )?;
+            Ok(())
+        })
     }
 
     /// Save or replace a generated prompt draft for the scoped account.
@@ -1423,24 +1588,26 @@ impl AccountStudyStore<'_> {
         draft: &GeneratedPromptDraft,
     ) -> Result<(), PostgresStoreError> {
         let value = serde_json::to_value(draft)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_generated_prompt_drafts
-                (account_id, draft_id, review_unit_id, draft, created_at_ms)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (account_id, draft_id) DO UPDATE
-             SET review_unit_id = EXCLUDED.review_unit_id,
-                 draft = EXCLUDED.draft,
-                 created_at_ms = EXCLUDED.created_at_ms",
-            &[
-                &self.scope.account_id,
-                &draft.id,
-                &draft.review_unit_id.as_str(),
-                &value,
-                &draft.created_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_generated_prompt_drafts
+                    (account_id, draft_id, review_unit_id, draft, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (account_id, draft_id) DO UPDATE
+                 SET review_unit_id = EXCLUDED.review_unit_id,
+                     draft = EXCLUDED.draft,
+                     created_at_ms = EXCLUDED.created_at_ms",
+                &[
+                    &account_id,
+                    &draft.id,
+                    &draft.review_unit_id.as_str(),
+                    &value,
+                    &draft.created_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Append one account-scoped learner content judgment. Replaying the same
@@ -1572,69 +1739,35 @@ impl AccountStudyStore<'_> {
         schedule_state: Option<&ScheduleState>,
         updated_at_ms: i64,
     ) -> Result<(), PostgresStoreError> {
-        self.assert_known_review_unit(review_unit_id)?;
-        if let Some(schedule_state) = schedule_state {
-            let value = serde_json::to_value(schedule_state)?;
-            self.client.borrow_mut().execute(
-                "INSERT INTO memory_engine_schedules
-                    (account_id, review_unit_id, state, updated_at_ms)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (account_id, review_unit_id) DO UPDATE
-                 SET state = EXCLUDED.state,
-                     updated_at_ms = EXCLUDED.updated_at_ms",
-                &[
-                    &self.scope.account_id,
-                    &review_unit_id.as_str(),
-                    &value,
-                    &updated_at_ms,
-                ],
-            )?;
-        } else {
-            self.client.borrow_mut().execute(
-                "DELETE FROM memory_engine_schedules
-                 WHERE account_id = $1 AND review_unit_id = $2",
-                &[&self.scope.account_id, &review_unit_id.as_str()],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn assert_known_review_unit(
-        &mut self,
-        review_unit_id: &ReviewUnitId,
-    ) -> Result<(), PostgresStoreError> {
-        let known = self.client.borrow_mut().query_opt(
-            "SELECT 1 FROM memory_engine_review_units
-             WHERE account_id = $1 AND review_unit_id = $2",
-            &[&self.scope.account_id, &review_unit_id.as_str()],
-        )?;
-        if known.is_some() {
+        let account_id = self.scope.account_id.clone();
+        let review_unit_id = review_unit_id.clone();
+        let schedule_value = schedule_state.map(serde_json::to_value).transpose()?;
+        self.with_account_transaction(|transaction| {
+            assert_known_review_unit_in_transaction(transaction, &account_id, &review_unit_id)?;
+            if let Some(value) = schedule_value {
+                transaction.execute(
+                    "INSERT INTO memory_engine_schedules
+                        (account_id, review_unit_id, state, updated_at_ms)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (account_id, review_unit_id) DO UPDATE
+                     SET state = EXCLUDED.state,
+                         updated_at_ms = EXCLUDED.updated_at_ms",
+                    &[
+                        &account_id,
+                        &review_unit_id.as_str(),
+                        &value,
+                        &updated_at_ms,
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM memory_engine_schedules
+                     WHERE account_id = $1 AND review_unit_id = $2",
+                    &[&account_id, &review_unit_id.as_str()],
+                )?;
+            }
             Ok(())
-        } else {
-            Err(PostgresStoreError::UnknownReviewUnit(
-                review_unit_id.clone(),
-            ))
-        }
-    }
-
-    fn review_unit(
-        &self,
-        review_unit_id: &ReviewUnitId,
-    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT record FROM memory_engine_review_units
-             WHERE account_id = $1 AND review_unit_id = $2",
-            &[&self.scope.account_id, &review_unit_id.as_str()],
-        )?;
-        let Some(row) = row else {
-            return Err(PostgresStoreError::UnknownReviewUnit(
-                review_unit_id.clone(),
-            ));
-        };
-        let value: serde_json::Value = row.get(0);
-
-        Ok(serde_json::from_value(value)?)
+        })
     }
 
     fn source_documents(&self) -> Result<Vec<SourceDocument>, PostgresStoreError> {
@@ -1645,25 +1778,6 @@ impl AccountStudyStore<'_> {
              ORDER BY created_at_ms, source_document_id",
             &self.scope.account_id,
         )
-    }
-
-    fn source_document(
-        &self,
-        source_document_id: &str,
-    ) -> Result<SourceDocument, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT document FROM memory_engine_source_documents
-             WHERE account_id = $1 AND source_document_id = $2",
-            &[&self.scope.account_id, &source_document_id],
-        )?;
-        let Some(row) = row else {
-            return Err(PostgresStoreError::UnknownSourceDocument(
-                source_document_id.to_owned(),
-            ));
-        };
-        let value: serde_json::Value = row.get(0);
-
-        Ok(serde_json::from_value(value)?)
     }
 
     fn reference_spans(&self) -> Result<Vec<ReferenceSpan>, PostgresStoreError> {
@@ -1910,6 +2024,62 @@ impl BetaStudyStore for AccountStudyStore<'_> {
     }
 }
 
+fn assert_known_review_unit_in_transaction(
+    transaction: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    review_unit_id: &ReviewUnitId,
+) -> Result<(), PostgresStoreError> {
+    let known = transaction.query_opt(
+        "SELECT 1 FROM memory_engine_review_units
+         WHERE account_id = $1 AND review_unit_id = $2",
+        &[&account_id, &review_unit_id.as_str()],
+    )?;
+    known
+        .is_some()
+        .then_some(())
+        .ok_or_else(|| PostgresStoreError::UnknownReviewUnit(review_unit_id.clone()))
+}
+
+fn review_unit_from_transaction(
+    transaction: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    review_unit_id: &ReviewUnitId,
+) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+    let row = transaction.query_opt(
+        "SELECT record FROM memory_engine_review_units
+         WHERE account_id = $1 AND review_unit_id = $2
+         FOR UPDATE",
+        &[&account_id, &review_unit_id.as_str()],
+    )?;
+    let Some(row) = row else {
+        return Err(PostgresStoreError::UnknownReviewUnit(
+            review_unit_id.clone(),
+        ));
+    };
+    let value: serde_json::Value = row.get(0);
+    Ok(serde_json::from_value(value)?)
+}
+
+fn source_document_from_transaction(
+    transaction: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    source_document_id: &str,
+) -> Result<SourceDocument, PostgresStoreError> {
+    let row = transaction.query_opt(
+        "SELECT document FROM memory_engine_source_documents
+         WHERE account_id = $1 AND source_document_id = $2
+         FOR UPDATE",
+        &[&account_id, &source_document_id],
+    )?;
+    let Some(row) = row else {
+        return Err(PostgresStoreError::UnknownSourceDocument(
+            source_document_id.to_owned(),
+        ));
+    };
+    let value: serde_json::Value = row.get(0);
+    Ok(serde_json::from_value(value)?)
+}
+
 fn current_review_unit_matches(
     transaction: &mut postgres::Transaction<'_>,
     account_id: &str,
@@ -2018,23 +2188,29 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
     type Error = PostgresStoreError;
 
     fn record_attempt(&mut self, attempt: ServiceAttemptRecord) -> Result<(), Self::Error> {
-        self.assert_known_review_unit(&attempt.review_unit_id)?;
         let value = serde_json::to_value(&attempt)?;
-        self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_attempts
-                (account_id, review_unit_id, prompt_id, idempotency_key, attempt, occurred_at_ms)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-            &[
-                &self.scope.account_id,
-                &attempt.review_unit_id.as_str(),
-                &attempt.prompt_id,
-                &attempt.idempotency_key,
-                &value,
-                &attempt.occurred_at,
-            ],
-        )?;
-
-        Ok(())
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            assert_known_review_unit_in_transaction(
+                transaction,
+                &account_id,
+                &attempt.review_unit_id,
+            )?;
+            transaction.execute(
+                "INSERT INTO memory_engine_attempts
+                    (account_id, review_unit_id, prompt_id, idempotency_key, attempt, occurred_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &account_id,
+                    &attempt.review_unit_id.as_str(),
+                    &attempt.prompt_id,
+                    &attempt.idempotency_key,
+                    &value,
+                    &attempt.occurred_at,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn read_schedule_state(
@@ -2071,6 +2247,10 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&self.scope.account_id],
+        )?;
         let review_unit = transaction.query_opt(
             "SELECT 1 FROM memory_engine_review_units
              WHERE account_id = $1 AND review_unit_id = $2
@@ -2187,9 +2367,11 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 #[derive(Debug)]
 pub enum PostgresStoreError {
     BlankAccountId,
+    Blank { label: &'static str },
     NoConceptKey,
     UnknownSourceDocument(String),
     UnknownReviewUnit(ReviewUnitId),
+    ReviewUnitArchived(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
     RejectedGeneratedPromptDraft,
     MissingGenerationRunForAcceptedDraft,
@@ -2215,9 +2397,11 @@ impl fmt::Display for PostgresStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BlankAccountId => formatter.write_str("Account id must not be blank"),
+            Self::Blank { label } => write!(formatter, "{label} must not be blank"),
             Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
+            Self::ReviewUnitArchived(id) => write!(formatter, "Review unit is archived: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
                 write!(formatter, "Unknown generated prompt draft: {id}")
             }
@@ -2274,9 +2458,11 @@ impl Error for PostgresStoreError {
             Self::Postgres(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::BlankAccountId
+            | Self::Blank { .. }
             | Self::NoConceptKey
             | Self::UnknownSourceDocument(_)
             | Self::UnknownReviewUnit(_)
+            | Self::ReviewUnitArchived(_)
             | Self::UnknownGeneratedPromptDraft(_)
             | Self::RejectedGeneratedPromptDraft
             | Self::MissingGenerationRunForAcceptedDraft
@@ -2317,10 +2503,10 @@ impl From<memory_engine_study::BetaStudyError<PostgresStoreError>> for PostgresS
             memory_engine_study::BetaStudyError::Service(error) => {
                 Self::StudySession(error.to_string())
             }
-            memory_engine_study::BetaStudyError::NoActiveReviewUnit
-            | memory_engine_study::BetaStudyError::NoConceptKey => {
+            memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
                 Self::StudySession(error.to_string())
             }
+            memory_engine_study::BetaStudyError::NoConceptKey => Self::NoConceptKey,
         }
     }
 }
@@ -2345,6 +2531,21 @@ fn idempotency_receipt_key(idempotency_key: &str) -> String {
     format!("idempotency:{idempotency_key}")
 }
 
+fn assert_non_blank(value: &str, label: &'static str) -> Result<(), PostgresStoreError> {
+    if value.trim().is_empty() {
+        return Err(PostgresStoreError::Blank { label });
+    }
+    Ok(())
+}
+
+fn reject_archived(review_unit: &BetaReviewUnitRecord) -> Result<(), PostgresStoreError> {
+    review_unit
+        .archived_at
+        .is_none()
+        .then_some(())
+        .ok_or_else(|| PostgresStoreError::ReviewUnitArchived(review_unit.review_unit_id.clone()))
+}
+
 fn replace_prompt_text(prompt: &mut Prompt, text: &str) {
     match prompt {
         Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => {
@@ -2358,8 +2559,15 @@ fn replace_prompt_text(prompt: &mut Prompt, text: &str) {
 
 fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) {
     match prompt {
-        Prompt::Mcq { correct_choice, .. } => {
+        Prompt::Mcq {
+            choices,
+            correct_choice,
+            ..
+        } => {
             answer.clone_into(correct_choice);
+            if !choices.iter().any(|choice| choice == answer) {
+                choices.push(answer.to_owned());
+            }
         }
         Prompt::Boolean { correct_answer, .. } => {
             *correct_answer = matches!(
@@ -2388,6 +2596,7 @@ fn _receipt_type_anchor(_: &AppliedReviewReceipt) {}
 
 #[cfg(test)]
 mod tests {
+    use super::{replace_prompt_answer, replace_prompt_text};
     use memory_engine_core::{
         ExactPrompt, ExactPromptKind, Prompt, ReviewUnitId, ReviewUnitLifecycle, ScheduleState,
         ScheduleStatus,
@@ -3100,7 +3309,7 @@ mod tests {
             Some("run-live-a"),
         );
         let run = generation_run("run-live-a", &[&source.id], &[&draft.id]);
-        let review_unit = review_unit(&draft);
+        let base_review_unit = review_unit(&draft);
         let prior_schedule = schedule_state(1, ScheduleStatus::Review, NOW - 86_400_000);
         let next_schedule = schedule_state(2, ScheduleStatus::Review, NOW);
         let attempt = service_attempt(&review_unit_id, "idempotent-live-a", NOW);
@@ -3112,7 +3321,7 @@ mod tests {
             account_a.save_reference_span(&reference)?;
             account_a.save_generation_run(&run)?;
             account_a.save_generated_prompt_draft(&draft)?;
-            account_a.save_review_unit(&review_unit)?;
+            account_a.save_review_unit(&base_review_unit)?;
             account_a.set_schedule_state(&review_unit_id, Some(&prior_schedule), NOW)?;
 
             assert_eq!(
@@ -3143,7 +3352,7 @@ mod tests {
             assert_eq!(snapshot.reference_spans, vec![reference.clone()]);
             assert_eq!(snapshot.generation_runs, vec![run.clone()]);
             assert_eq!(snapshot.generated_prompt_drafts, vec![draft.clone()]);
-            assert_eq!(snapshot.review_units, vec![review_unit.clone()]);
+            assert_eq!(snapshot.review_units, vec![base_review_unit.clone()]);
             assert_eq!(snapshot.schedules.len(), 1);
             assert_eq!(snapshot.schedules[0].review_unit_id, review_unit_id);
             assert_eq!(snapshot.schedules[0].state, next_schedule.clone());
@@ -3182,6 +3391,84 @@ mod tests {
             assert_eq!(account_b.snapshot()?, BetaStoreSnapshot::default());
         }
 
+        run_postgres_prompt_edit_contract(store)?;
+
+        Ok(())
+    }
+
+    fn run_postgres_prompt_edit_contract(
+        store: &mut PostgresStudyStore,
+    ) -> Result<(), PostgresStoreError> {
+        let review_unit_id = ReviewUnitId::new("unit-live-prompt");
+        let source = source_document("source-live-prompt");
+        let reference = reference_span("reference-live-prompt", &source.id);
+        let mut draft = accepted_draft(
+            "draft-live-prompt",
+            &review_unit_id,
+            &[&source.id],
+            &[&reference.id],
+            Some("run-live-prompt"),
+        );
+        draft.prompt = Prompt::Mcq {
+            review_unit_id: review_unit_id.clone(),
+            prompt: "Original prompt".to_owned(),
+            choices: vec!["Original answer".to_owned(), "Distractor".to_owned()],
+            correct_choice: "Original answer".to_owned(),
+        };
+        let run = generation_run("run-live-prompt", &[&source.id], &[&draft.id]);
+        let mut account = store.for_account(AccountScope::new("acct_live_prompt")?);
+        account.ensure_account(NOW)?;
+        account.save_source_document(&source)?;
+        account.save_reference_span(&reference)?;
+        account.save_generation_run(&run)?;
+        account.save_generated_prompt_draft(&draft)?;
+        account.save_review_unit(&review_unit(&draft))?;
+
+        let updated = account.update_review_unit_prompt_text(
+            &review_unit_id,
+            "Edited prompt",
+            "Edited answer",
+        )?;
+        assert_eq!(updated.prompt, {
+            let mut expected = draft.prompt.clone();
+            replace_prompt_text(&mut expected, "Edited prompt");
+            replace_prompt_answer(&mut expected, "Edited answer");
+            expected
+        });
+        match &updated.prompt {
+            Prompt::Mcq {
+                choices,
+                correct_choice,
+                ..
+            } => {
+                assert_eq!(correct_choice, "Edited answer");
+                assert!(choices.iter().any(|choice| choice == "Edited answer"));
+            }
+            prompt => panic!("expected edited MCQ prompt, got {prompt:?}"),
+        }
+        let snapshot = account.snapshot()?;
+        let edited_prompt = match &snapshot.generated_prompt_drafts[0].prompt {
+            Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt.as_str(),
+            Prompt::Exact(prompt) => prompt.prompt.as_str(),
+        };
+        assert_eq!(edited_prompt, "Edited prompt");
+        assert!(snapshot.generated_prompt_drafts[0]
+            .critique_notes
+            .iter()
+            .any(|note| note == "Learner edited approved wording."));
+        account.archive_review_unit(&review_unit_id, NOW + 1_000)?;
+        assert!(matches!(
+            account.update_review_unit_prompt_text(
+                &review_unit_id,
+                "Rejected prompt",
+                "Rejected answer"
+            ),
+            Err(PostgresStoreError::ReviewUnitArchived(id)) if id == review_unit_id
+        ));
+        assert!(matches!(
+            account.snooze_review_unit_until(&review_unit_id, NOW + 2_000),
+            Err(PostgresStoreError::ReviewUnitArchived(id)) if id == review_unit_id
+        ));
         Ok(())
     }
 
@@ -3272,8 +3559,8 @@ mod tests {
         account.ensure_account(NOW)?;
 
         for (review_unit_id, concept_key) in [
-            ("concept-snooze-live-a", "shared-live-concept"),
-            ("concept-snooze-live-b", "shared-live-concept"),
+            ("concept-snooze-live-a", "  shared-live-concept  "),
+            ("concept-snooze-live-b", "  shared-live-concept  "),
             ("concept-snooze-live-other", "other-live-concept"),
         ] {
             let review_unit_id = ReviewUnitId::new(review_unit_id);
@@ -3287,9 +3574,27 @@ mod tests {
             )?;
         }
 
+        let blank_id = ReviewUnitId::new("concept-snooze-live-blank");
+        let mut blank = review_unit_for_concept(&blank_id, "");
+        blank.queue.due = NOW + 60_000;
+        account.save_review_unit(&blank)?;
+        let mut blank_schedule = schedule_state(2, ScheduleStatus::Review, NOW);
+        blank_schedule.due = NOW + 60_000;
+        account.set_schedule_state(&blank_id, Some(&blank_schedule), NOW)?;
+        let before_blank_rejection = account.snapshot()?;
+        assert!(matches!(
+            account.snooze_current_review_unit_concept_until(
+                blank_id.as_str(),
+                NOW,
+                NOW + 86_400_000,
+            ),
+            Err(PostgresStoreError::UnknownReviewUnit(id)) if id == blank_id
+        ));
+        assert_eq!(account.snapshot()?, before_blank_rejection);
+
         let before = account.snapshot()?;
         let snoozed = account
-            .snooze_review_units_for_concept_until("shared-live-concept", NOW + 86_400_000)?;
+            .snooze_review_units_for_concept_until("  shared-live-concept  ", NOW + 86_400_000)?;
         assert_eq!(snoozed.len(), 2);
         assert!(snoozed
             .iter()
@@ -3310,7 +3615,7 @@ mod tests {
             after
                 .review_units
                 .iter()
-                .filter(|unit| unit.queue.concept_key.as_deref() == Some("shared-live-concept"))
+                .filter(|unit| unit.queue.concept_key.as_deref() == Some("  shared-live-concept  "))
                 .filter_map(|unit| unit.snoozed_until)
                 .collect::<Vec<_>>(),
             vec![NOW + 86_400_000; 2]

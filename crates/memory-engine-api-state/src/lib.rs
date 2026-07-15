@@ -8,16 +8,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    fs::{self, OpenOptions},
+    fs,
     io::Write as _,
     path::{Path as FsPath, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, MutexGuard,
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, MutexGuard},
 };
+
+#[cfg(unix)]
+use std::{fs::OpenOptions, os::fd::AsRawFd};
 
 use axum::{
     http::{
@@ -1276,11 +1274,6 @@ impl ApiFailure {
     }
 
     #[must_use]
-    pub fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    #[must_use]
     pub fn is_magic_link_recovery(&self) -> bool {
         self.status == StatusCode::FORBIDDEN && self.message == "Magic link is invalid or expired."
     }
@@ -1635,93 +1628,49 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 struct FileAccountLock {
-    path: PathBuf,
-    stop_heartbeat: Arc<AtomicBool>,
-    heartbeat: Option<JoinHandle<()>>,
+    _file: fs::File,
 }
 
-impl Drop for FileAccountLock {
-    fn drop(&mut self) {
-        self.stop_heartbeat.store(true, Ordering::Release);
-        if let Some(heartbeat) = self.heartbeat.take() {
-            let _ = heartbeat.join();
-        }
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
+#[cfg(unix)]
 fn acquire_file_account_lock(store_path: &FsPath) -> Result<FileAccountLock, ApiFailure> {
-    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-    const STALE_AFTER: Duration = Duration::from_secs(30);
     let lock_path = store_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
     }
-    let deadline = Instant::now() + ACQUIRE_TIMEOUT;
-
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let owner = format!("pid={}\n", std::process::id());
-                file.write_all(owner.as_bytes())
-                    .and_then(|()| file.sync_all())
-                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
-                let stop_heartbeat = Arc::new(AtomicBool::new(false));
-                let heartbeat_stop = Arc::clone(&stop_heartbeat);
-                let heartbeat_path = lock_path.clone();
-                let heartbeat = std::thread::spawn(move || {
-                    while !heartbeat_stop.load(Ordering::Acquire) {
-                        for _ in 0..20 {
-                            if heartbeat_stop.load(Ordering::Acquire) {
-                                return;
-                            }
-                            std::thread::sleep(Duration::from_millis(250));
-                        }
-                        let Ok(mut file) = OpenOptions::new().write(true).open(&heartbeat_path)
-                        else {
-                            return;
-                        };
-                        if file
-                            .set_len(0)
-                            .and_then(|()| file.write_all(owner.as_bytes()))
-                            .and_then(|()| file.sync_all())
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                });
-                return Ok(FileAccountLock {
-                    path: lock_path,
-                    stop_heartbeat,
-                    heartbeat: Some(heartbeat),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock_path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age >= STALE_AFTER);
-                if stale {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
-                }
-                if Instant::now() >= deadline {
-                    return Err(ApiFailure::conflict(
-                        "The account study store is busy; try again shortly.",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(ApiFailure::internal(error.to_string())),
-        }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+    // The descriptor owns the lock. It is never reclaimed from metadata and
+    // the lockfile is never deleted, so a delayed/drop path cannot affect a
+    // replacement owner. Contention is deliberately a prompt 409: callers
+    // are async route workers and must not sleep on a Tokio worker.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(FileAccountLock { _file: file });
     }
+    let error = std::io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+    {
+        return Err(ApiFailure::conflict(
+            "The account study store is busy; try again shortly.",
+        ));
+    }
+    Err(ApiFailure::internal(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn acquire_file_account_lock(_store_path: &FsPath) -> Result<(), ApiFailure> {
+    Err(ApiFailure::internal(
+        "File account locking is unsupported on this platform.",
+    ))
 }
 
 pub(crate) fn with_file_account_lock<R>(
@@ -2035,6 +1984,23 @@ fn require_current_review_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_file_store_owners_cannot_steal_a_live_descriptor_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-file-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store_path = root.join("study.json");
+        let first = acquire_file_account_lock(&store_path).expect("first descriptor lock");
+        let second = acquire_file_account_lock(&store_path);
+        assert!(matches!(second, Err(error) if error.status() == StatusCode::CONFLICT));
+        drop(first);
+        let replacement = acquire_file_account_lock(&store_path).expect("released lock");
+        drop(replacement);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn client_rate_limit_key_prefers_digitalocean_client_ip() {

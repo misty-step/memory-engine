@@ -318,6 +318,44 @@ fn concept_snooze_commit_failure_preserves_every_member_and_history() {
 }
 
 #[test]
+fn concept_snooze_preserves_nonblank_whitespace_key_exactly() {
+    let directory = TempDirectory::new("concept-snooze-whitespace-key");
+    let path = directory.path().join("store.json");
+    let persisted_key = "  shared-concept  ";
+    let matching_id = review_unit_id("concept-snooze-whitespace-match");
+    let other_id = review_unit_id("concept-snooze-whitespace-other");
+    let mut matching_queue = queue_candidate(&matching_id, NOW - 60_000);
+    matching_queue.concept_key = Some(persisted_key.to_owned());
+    let mut other_queue = queue_candidate(&other_id, NOW - 60_000);
+    other_queue.concept_key = Some("shared-concept".to_owned());
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_review_unit(review_unit(
+            &matching_id,
+            "whitespace-prompt",
+            short_answer_prompt(&matching_id, "What?"),
+            matching_queue,
+        ))
+        .expect("matching unit");
+    store
+        .save_review_unit(review_unit(
+            &other_id,
+            "other-prompt",
+            short_answer_prompt(&other_id, "What else?"),
+            other_queue,
+        ))
+        .expect("other unit");
+
+    let snoozed = store
+        .snooze_review_units_for_concept_until(persisted_key, NOW + 86_400_000)
+        .expect("exact persisted key snooze");
+    assert_eq!(snoozed.len(), 1);
+    assert_eq!(snoozed[0].review_unit_id, matching_id);
+    assert_eq!(snoozed[0].queue.concept_key.as_deref(), Some(persisted_key));
+    assert_eq!(store.snapshot().review_units[1].snoozed_until, None);
+}
+
+#[test]
 fn reloads_queue_projection_with_schedule_due_and_progression_metadata() {
     let directory = TempDirectory::new("queue-projection");
     let path = directory.path().join("store.json");
@@ -877,6 +915,136 @@ fn feedback(
         occurred_at,
         supersedes_id: supersedes_id.map(str::to_owned),
     }
+}
+
+#[test]
+fn stale_review_unit_save_preserves_newer_prompt_lifecycle_and_snooze() {
+    let directory = TempDirectory::new("stale-review-unit-save");
+    let path = directory.path().join("store.json");
+    let unit_id = review_unit_id("stale-review-unit");
+    let original = review_unit(
+        &unit_id,
+        "stale-review-prompt",
+        short_answer_prompt(&unit_id, "Original prompt"),
+        queue_candidate(&unit_id, NOW - 60_000),
+    );
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_review_unit(original.clone())
+        .expect("save original review unit");
+
+    let newer_prompt = store
+        .update_review_unit_prompt_text(&unit_id, "Newer prompt", "Newer answer")
+        .expect("newer prompt");
+    let newer_lifecycle = store
+        .set_review_unit_lifecycle(
+            &unit_id,
+            ReviewUnitLifecycle::ttl_expires_at(NOW + 86_400_000),
+        )
+        .expect("newer lifecycle");
+    let newer_snooze = store
+        .snooze_review_unit_until(&unit_id, NOW + 20_000)
+        .expect("newer snooze");
+
+    let mut stale = original;
+    stale.snoozed_until = Some(NOW + 10_000);
+    store
+        .save_review_unit(stale)
+        .expect("stale save is an idempotent no-op");
+
+    let persisted = store
+        .snapshot()
+        .review_units
+        .into_iter()
+        .find(|unit| unit.review_unit_id == unit_id)
+        .expect("persisted review unit");
+    assert_eq!(persisted.prompt, newer_prompt.prompt);
+    assert_eq!(persisted.queue.lifecycle, newer_lifecycle.queue.lifecycle);
+    assert_eq!(persisted.snoozed_until, newer_snooze.snoozed_until);
+}
+
+#[test]
+fn mcq_prompt_edit_keeps_new_answer_in_choices() {
+    let directory = TempDirectory::new("mcq-prompt-edit");
+    let path = directory.path().join("store.json");
+    let unit_id = review_unit_id("mcq-prompt-edit");
+    let prompt = Prompt::Mcq {
+        review_unit_id: unit_id.clone(),
+        prompt: "Original prompt".to_owned(),
+        choices: vec!["Original answer".to_owned(), "Distractor".to_owned()],
+        correct_choice: "Original answer".to_owned(),
+    };
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_review_unit(review_unit(
+            &unit_id,
+            "mcq-prompt-edit",
+            prompt,
+            queue_candidate(&unit_id, NOW - 60_000),
+        ))
+        .expect("save MCQ review unit");
+
+    let updated = store
+        .update_review_unit_prompt_text(&unit_id, "Edited prompt", "Edited answer")
+        .expect("edit MCQ prompt");
+    match updated.prompt {
+        Prompt::Mcq {
+            choices,
+            correct_choice,
+            ..
+        } => {
+            assert_eq!(correct_choice, "Edited answer");
+            assert!(choices.iter().any(|choice| choice == "Edited answer"));
+        }
+        prompt => panic!("expected edited MCQ prompt, got {prompt:?}"),
+    }
+}
+
+#[test]
+fn repeated_draft_approval_returns_existing_record_without_rewriting_schedule() {
+    let directory = TempDirectory::new("repeat-approval");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let unit_id = draft.review_unit_id.clone();
+    let newer_prompt = store
+        .update_review_unit_prompt_text(&unit_id, "Newer prompt", "Newer answer")
+        .expect("newer prompt");
+    let newer_lifecycle = store
+        .set_review_unit_lifecycle(
+            &unit_id,
+            ReviewUnitLifecycle::ttl_expires_at(NOW + 86_400_000),
+        )
+        .expect("newer lifecycle");
+    let newer_snooze = store
+        .snooze_review_unit_until(&unit_id, NOW + 20_000)
+        .expect("newer snooze");
+    let newer_schedule = schedule_state(7, ScheduleStatus::Review);
+    store
+        .set_schedule_state(&unit_id, Some(newer_schedule.clone()))
+        .expect("newer schedule");
+
+    let reapproved = store
+        .approve_generated_prompt_draft(
+            &draft.id,
+            ApproveGeneratedPromptDraftOptions {
+                initial_schedule_state: Some(schedule_state(1, ScheduleStatus::New)),
+            },
+        )
+        .expect("repeat approval");
+    assert_eq!(reapproved.prompt, newer_prompt.prompt);
+    assert_eq!(reapproved.queue.lifecycle, newer_lifecycle.queue.lifecycle);
+    assert_eq!(reapproved.snoozed_until, newer_snooze.snoozed_until);
+
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot
+            .schedules
+            .iter()
+            .find(|schedule| schedule.review_unit_id == unit_id)
+            .expect("persisted schedule")
+            .state,
+        newer_schedule
+    );
 }
 
 fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {

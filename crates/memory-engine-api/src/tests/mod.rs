@@ -4930,7 +4930,7 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_two_connections_lock_different_candidate_before_concept_snooze() {
+async fn postgres_two_connections_archive_requested_before_concept_snooze() {
     let Some(database) = PostgresTestDatabase::new("stale_concept_two_connections") else {
         return;
     };
@@ -4951,23 +4951,16 @@ async fn postgres_two_connections_lock_different_candidate_before_concept_snooze
     }
     let stale_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
-    let other_id = before
-        .review_units
-        .iter()
-        .find(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-b"))
-        .expect("different candidate")
-        .review_unit_id
-        .to_string();
     let (first_ready_tx, first_ready_rx) = mpsc::channel();
     let (release_first_tx, release_first_rx) = mpsc::channel();
     let first_url = database.scoped_url.clone();
     let first_account_id = account.account_id.clone();
-    let first_other_id = other_id.clone();
+    let first_stale_id = stale_id.clone();
     let first = thread::spawn(move || {
         hold_postgres_account_lock_and_archive(
             &first_url,
             &first_account_id,
-            &first_other_id,
+            &first_stale_id,
             &first_ready_tx,
             &release_first_rx,
         );
@@ -4989,10 +4982,11 @@ async fn postgres_two_connections_lock_different_candidate_before_concept_snooze
             memory_engine_persistence_postgres::AccountScope::new(account_id)
                 .expect("second account scope"),
         );
+        let now = live_now_ms();
         account_store.snooze_current_review_unit_concept_until(
             &stale_id_for_second,
-            DEFAULT_BETA_STUDY_NOW,
-            DEFAULT_BETA_STUDY_NOW + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+            now,
+            now + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
         )
     });
     tokio::task::block_in_place(|| {
@@ -5005,7 +4999,14 @@ async fn postgres_two_connections_lock_different_candidate_before_concept_snooze
         .expect("release first archive transaction");
     first.join().expect("join first transaction");
     let second_result = second.join().expect("join second transaction");
-    assert!(second_result.is_err(), "the requested id became stale");
+    assert!(
+        matches!(
+            &second_result,
+            Err(memory_engine_persistence_postgres::PostgresStoreError::UnknownReviewUnit(id))
+                if id.as_str() == stale_id
+        ),
+        "the requested id did not become stale: requested={stale_id}, result={second_result:?}"
+    );
 
     let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
     assert_eq!(after.attempts, before.attempts);
@@ -5018,10 +5019,87 @@ async fn postgres_two_connections_lock_different_candidate_before_concept_snooze
     assert!(after
         .review_units
         .iter()
-        .find(|unit| unit.review_unit_id.as_str() == other_id)
+        .find(|unit| unit.review_unit_id.as_str() == stale_id)
         .expect("archived unit after two-connection race")
         .archived_at
         .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
+    let Some(database) = PostgresTestDatabase::new("stale_full_record_save") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-full-record@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let requested_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+
+    let (stale_ready_tx, stale_ready_rx) = mpsc::channel::<()>();
+    let (allow_stale_save_tx, allow_stale_save_rx) = mpsc::channel();
+    let stale_url = database.scoped_url.clone();
+    let stale_account_id = account.account_id.clone();
+    let stale_account_id_for_thread = stale_account_id.clone();
+    let requested_id_for_stale = requested_id.clone();
+    let stale_writer = spawn_stale_postgres_record_writer(
+        stale_url,
+        stale_account_id,
+        stale_account_id_for_thread,
+        requested_id_for_stale,
+        stale_ready_tx,
+        allow_stale_save_rx,
+    );
+    tokio::task::block_in_place(|| {
+        stale_ready_rx
+            .recv()
+            .expect("receive stale record before concept commit");
+    });
+
+    let (latest_prompt, latest_lifecycle) = update_and_snooze_postgres_review_unit(
+        &database.scoped_url,
+        &account.account_id,
+        &requested_id,
+    );
+
+    allow_stale_save_tx
+        .send(())
+        .expect("allow stale full-record save");
+    stale_writer
+        .join()
+        .expect("stale writer did not panic")
+        .expect("stale full-record save");
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_some()));
+    let persisted_requested = after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == requested_id)
+        .expect("persisted requested record");
+    assert_eq!(persisted_requested.prompt, latest_prompt.prompt);
+    assert_eq!(
+        persisted_requested.queue.lifecycle,
+        latest_lifecycle.queue.lifecycle
+    );
 }
 
 #[tokio::test]
@@ -5221,6 +5299,14 @@ async fn v1_openapi_artifact_matches_registered_routes() {
         .iter()
         .map(|operation| (operation.method.to_owned(), operation.path.to_owned()))
         .collect::<std::collections::BTreeSet<_>>();
+    let concept_responses = &contract["paths"]
+        ["/v1/accounts/{account_id}/review/{review_unit_id}/snooze-concept"]["post"]["responses"];
+    for status in ["200", "400", "403", "404", "409"] {
+        assert!(
+            concept_responses[status].is_object(),
+            "concept snooze OpenAPI response {status} missing"
+        );
+    }
 
     assert_eq!(actual, expected);
     assert_schema_requires(
@@ -6347,6 +6433,97 @@ fn temp_store_root(name: &str) -> std::path::PathBuf {
     root
 }
 
+fn live_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn spawn_stale_postgres_record_writer(
+    database_url: String,
+    read_account_id: String,
+    save_account_id: String,
+    requested_id: String,
+    ready: mpsc::Sender<()>,
+    allow_save: mpsc::Receiver<()>,
+) -> thread::JoinHandle<Result<(), String>> {
+    thread::spawn(move || {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database_url)
+                .expect("connect stale writer");
+        let mut stale_record = store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(read_account_id)
+                    .expect("stale writer account scope"),
+            )
+            .snapshot()
+            .expect("read stale writer snapshot")
+            .review_units
+            .into_iter()
+            .find(|unit| unit.review_unit_id.as_str() == requested_id)
+            .expect("stale requested record");
+        stale_record.snoozed_until = Some(live_now_ms());
+        ready.send(()).expect("signal stale read");
+        allow_save
+            .recv()
+            .expect("wait for concept commit before stale save");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(save_account_id)
+                    .expect("stale save account scope"),
+            )
+            .save_review_unit(&stale_record)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn update_and_snooze_postgres_review_unit(
+    database_url: &str,
+    account_id: &str,
+    requested_id: &str,
+) -> (
+    memory_engine_persistence::BetaReviewUnitRecord,
+    memory_engine_persistence::BetaReviewUnitRecord,
+) {
+    tokio::task::block_in_place(|| {
+        let mut latest_store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect mutable writer");
+        let mut latest_account = latest_store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                .expect("mutable account scope"),
+        );
+        let requested_review_unit = memory_engine_core::ReviewUnitId::new(requested_id);
+        let latest_prompt = latest_account
+            .update_review_unit_prompt_text(&requested_review_unit, "Newer prompt wins", "ALFA")
+            .expect("newer prompt update");
+        let latest_lifecycle = latest_account
+            .set_review_unit_lifecycle(
+                &requested_review_unit,
+                memory_engine_core::ReviewUnitLifecycle::ttl_expires_at(live_now_ms() + 86_400_000),
+            )
+            .expect("newer lifecycle update");
+        let mut concept_store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect concept writer");
+        let now = live_now_ms();
+        concept_store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                    .expect("concept account scope"),
+            )
+            .snooze_current_review_unit_concept_until(
+                requested_id,
+                now,
+                now + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+            )
+            .expect("concept writer commit");
+        (latest_prompt, latest_lifecycle)
+    })
+}
+
 fn hold_postgres_account_lock_and_archive(
     database_url: &str,
     account_id: &str,
@@ -6357,6 +6534,12 @@ fn hold_postgres_account_lock_and_archive(
     let mut client = memory_engine_persistence_postgres::connect_client(database_url)
         .expect("connect first concurrency client");
     let mut transaction = client.transaction().expect("begin first transaction");
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&account_id],
+        )
+        .expect("lock account for first concurrency client");
     transaction
         .execute(
             "UPDATE memory_engine_review_units

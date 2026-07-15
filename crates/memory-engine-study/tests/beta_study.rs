@@ -754,6 +754,17 @@ fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
         .expect("current")
         .review_unit_id
         .clone();
+    let persisted: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read study snapshot"))
+            .expect("decode study snapshot");
+    let concept_member_ids = persisted["reviewUnits"]
+        .as_array()
+        .expect("review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .map(|unit| ReviewUnitId::new(unit["reviewUnitId"].as_str().expect("unit id")))
+        .collect::<Vec<_>>();
+    assert_eq!(concept_member_ids.len(), 2);
     let reviewed = study.submit_answer("ALFA", 1_800).expect("review");
     let reviewed_schedule = reviewed
         .current
@@ -781,7 +792,7 @@ fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
         snoozed
             .queue
             .iter()
-            .filter(|row| row.review_unit_id.as_str().contains("nato-letter-a"))
+            .filter(|row| concept_member_ids.contains(&row.review_unit_id))
             .map(|row| row.due)
             .collect::<Vec<_>>(),
         [horizon, horizon]
@@ -789,7 +800,7 @@ fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
     assert!(snoozed
         .queue
         .iter()
-        .any(|row| { row.review_unit_id.as_str().contains("nato-letter-b") && row.due < horizon }));
+        .any(|row| !concept_member_ids.contains(&row.review_unit_id) && row.due < horizon));
 
     let mut resumed = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_snooze))
         .expect("resume");
@@ -798,7 +809,7 @@ fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
     assert!(resumed
         .queue
         .iter()
-        .filter(|row| row.review_unit_id.as_str().contains("nato-letter-a"))
+        .filter(|row| concept_member_ids.contains(&row.review_unit_id))
         .all(|row| row.due <= after_snooze()));
 }
 
