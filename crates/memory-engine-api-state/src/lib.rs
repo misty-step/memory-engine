@@ -758,6 +758,29 @@ impl ApiState {
         )
     }
 
+    /// Edit a browser-authenticated review without changing its schedule or
+    /// attempt history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when review lookup, validation, or persistence
+    /// rejects the edit.
+    pub fn edit_app_review(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.edit_review(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+            prompt,
+            expected_answer,
+        )
+    }
+
     /// Snooze a review.
     ///
     /// # Errors
@@ -1680,6 +1703,8 @@ fn normalize_required_text(text: &str, label: &'static str) -> Result<String, Ap
             "Source title" => "Source title must not be blank.",
             "Source body" => "Source body must not be blank.",
             "Review answer" => "Review answer must not be blank.",
+            "Review unit prompt" => "Review unit prompt must not be blank.",
+            "Review unit expected answer" => "Review unit expected answer must not be blank.",
             "Idempotency key" => "Idempotency key must not be blank.",
             _ => "Value must not be blank.",
         }));

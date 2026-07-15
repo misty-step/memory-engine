@@ -23,7 +23,7 @@ use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_app_shell, render_auth_recovery,
-    render_login_requested, render_return_notification_confirmation,
+    render_edit_review_html, render_login_requested, render_return_notification_confirmation,
     render_return_notification_disabled, LEDGER_CSS,
 };
 use memory_engine_api_state::{
@@ -270,6 +270,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/skip", post(skip_app_review))
         .route("/app/snooze", post(snooze_app_review))
         .route("/app/snooze-concept", post(snooze_concept_app_review))
+        .route("/app/edit", post(edit_app_review))
+        .route("/app/edit/save", post(save_app_review))
         .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
@@ -703,6 +705,15 @@ struct AppJobActionForm {
 struct AppReviewActionForm {
     csrf_token: Option<String>,
     review_unit_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppReviewEditForm {
+    csrf_token: Option<String>,
+    review_unit_id: String,
+    prompt: String,
+    expected_answer: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1271,6 +1282,60 @@ async fn delete_app_review(
     let result = state.delete_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn edit_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let view = match state.next_app_review(&account) {
+        Ok(view) => view,
+        Err(error) => return error.into_response(),
+    };
+    let Some(current) = view.current.as_ref() else {
+        return ApiFailure::not_found("Review unit not found.").into_response();
+    };
+    if current.review_unit_id.to_string() != form.review_unit_id {
+        return ApiFailure::not_found("Review unit not found.").into_response();
+    }
+
+    Html(render_edit_review_html(&state, &account, &view, None)).into_response()
+}
+
+async fn save_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewEditForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.edit_app_review(
+        &account,
+        &form.review_unit_id,
+        &form.prompt,
+        &form.expected_answer,
+    );
+
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn snooze_app_review(

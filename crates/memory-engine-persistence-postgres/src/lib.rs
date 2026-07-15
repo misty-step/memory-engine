@@ -3728,16 +3728,45 @@ mod tests {
             assert_eq!(approved.status, BetaStudyStatus::Answering);
             assert_eq!(approved.summary.approved_review_unit_count, 1);
 
+            let schedule_before_edit = approved
+                .current
+                .as_ref()
+                .and_then(|current| current.review_state.clone());
+            let edited =
+                study.edit_current_prompt("Edited NATO composition prompt", "EDITED CAT")?;
+            assert_eq!(edited.status, BetaStudyStatus::Answering);
+            assert_eq!(
+                edited
+                    .current
+                    .as_ref()
+                    .map(|current| current.prompt.as_str()),
+                Some("Edited NATO composition prompt")
+            );
+            assert_eq!(
+                edited
+                    .current
+                    .as_ref()
+                    .map(|current| current.revision_expected_answer.as_str()),
+                Some("EDITED CAT")
+            );
+            assert_eq!(
+                edited
+                    .current
+                    .as_ref()
+                    .and_then(|current| current.review_state.clone()),
+                schedule_before_edit
+            );
+
             let revealed = study.reveal()?;
             assert_eq!(
                 revealed
                     .current
                     .as_ref()
                     .and_then(|current| current.expected_answer.as_deref()),
-                Some("CHARLIE ALFA TANGO")
+                Some("EDITED CAT")
             );
 
-            let reviewed = study.submit_answer("CHARLIE ALFA TANGO", 4_200)?;
+            let reviewed = study.submit_answer("EDITED CAT", 4_200)?;
             assert_eq!(reviewed.status, BetaStudyStatus::Graded);
             assert_eq!(reviewed.summary.attempt_count, 1);
             assert_eq!(
@@ -3757,6 +3786,27 @@ mod tests {
             assert_eq!(snapshot.reference_spans.len(), 2);
             assert_eq!(snapshot.generation_runs.len(), 1);
             assert_eq!(snapshot.generated_prompt_drafts.len(), 2);
+            let edited_draft = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .find(|draft| {
+                    draft
+                        .review_unit_id
+                        .as_str()
+                        .ends_with("nato-cat-composition")
+                })
+                .expect("edited draft");
+            let edited_prompt = serde_json::to_string(&edited_draft.prompt)?;
+            assert!(edited_prompt.contains("Edited NATO composition prompt"));
+            assert!(edited_prompt.contains("EDITED CAT"));
+            assert!(edited_draft
+                .critique_notes
+                .iter()
+                .any(|note| note == "Learner edited approved wording."));
+            assert_eq!(
+                edited_draft.validation.status,
+                GeneratedPromptValidationStatus::Accepted
+            );
             assert_eq!(snapshot.review_units.len(), 1);
             assert_eq!(snapshot.attempts.len(), 1);
             assert_eq!(snapshot.applied_reviews.len(), 1);

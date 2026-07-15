@@ -443,6 +443,23 @@ impl StudyStorage {
             .delete_review(account_id, store_path, review_unit_id)
     }
 
+    pub(crate) fn edit_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner.edit_review(
+            account_id,
+            store_path,
+            review_unit_id,
+            prompt,
+            expected_answer,
+        )
+    }
+
     pub(crate) fn bridge_review(
         &self,
         account_id: &str,
@@ -650,6 +667,14 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn edit_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn bridge_review(
         &self,
@@ -1477,6 +1502,23 @@ impl StudyStorageAdapter for FileStudyStorage {
         })
     }
 
+    fn edit_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = study
+            .edit_current_prompt(prompt, expected_answer)
+            .map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
     fn bridge_review(
         &self,
         _account_id: &str,
@@ -2143,6 +2185,24 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
             let view = study.archive_current().map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn edit_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = study
+                .edit_current_prompt(prompt, expected_answer)
+                .map_err(study_failure)?;
 
             Ok(StudyViewResponse::from_view(view))
         })
