@@ -2,7 +2,7 @@
 
 Date: 2026-07-15  
 Branch: `cx/097-scheduled-reminders`  
-Implementation commit: `b400ac47c429b48267f7c41289cc6c23d0bd6c20`  
+Implementation commit: `e8a7e521c720906c6d61010eae8f12e638db8a21`  
 Base: `85db8aff01446dc6ab2a627376623848e3ea2b1e`  
 Draft PR: [#57](https://github.com/misty-step/memory-engine/pull/57)
 
@@ -46,6 +46,12 @@ start or mutate a send. `GET /healthz` returns `status: "ok"`,
   anchoring, health failure semantics, graceful scheduler shutdown, blocked
   sender versus responsive health, descriptor-lock owner safety, and
   lease-expiry file-outbox deduplication.
+- Same-load branch/base A/B for the one observed route-retry failure:
+  `e8a7e52` branch `cargo test -p memory-engine-api --lib` — 96 passed, 1
+  ignored; clean base `85db8aff` with the identical command — 86 passed, 1
+  ignored. Neither reproduced the failure, so no branch-specific delta was
+  observed under this oracle; the exact initial failure remains retained in
+  the run log and was not treated as acceptance by a lucky rerun.
 
 ## Residuals
 
