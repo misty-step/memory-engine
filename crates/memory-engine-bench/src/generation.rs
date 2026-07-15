@@ -1946,6 +1946,7 @@ mod tests {
             intent_labels,
             [
                 "concept_understanding",
+                "fact_recall",
                 "enumerable_set",
                 "procedure_process",
                 "verbatim_memorization",
