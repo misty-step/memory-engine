@@ -2432,12 +2432,15 @@ mod tests {
                 .into_iter()
                 .map(|handle| handle.join().expect("stale worker"))
                 .collect::<Vec<_>>();
-            assert!(stale_results.iter().all(|result| matches!(
-                result,
-                Err(ContentFeedbackError::Store(
-                    super::PostgresStoreError::FeedbackSupersedesStale { .. }
-                ))
-            )));
+            assert!(
+                stale_results.iter().all(|result| matches!(
+                    result,
+                    Err(ContentFeedbackError::Store(
+                        super::PostgresStoreError::FeedbackSupersedesStale { .. }
+                    ))
+                )),
+                "stale concurrent results: {stale_results:?}"
+            );
             Ok(())
         })();
         admin
