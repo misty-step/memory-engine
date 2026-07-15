@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use memory_engine_persistence::SourcePermission;
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
 };
@@ -363,6 +364,14 @@ impl StudyStorage {
         self.inner.save_source(account_id, store_path, source)
     }
 
+    pub(crate) fn list_sources(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+    ) -> Result<Vec<SourceRecord>, ApiFailure> {
+        self.list_sources_with_timings(account_id, store_path, None)
+    }
+
     pub(crate) fn list_sources_with_timings(
         &self,
         account_id: &str,
@@ -371,6 +380,17 @@ impl StudyStorage {
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
         self.inner
             .list_sources_with_timings(account_id, store_path, timings)
+    }
+
+    pub(crate) fn update_source_permission(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .update_source_permission(account_id, store_path, source_id, permission)
     }
 
     pub(crate) fn generate_source(
@@ -702,6 +722,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         let _ = timings;
         self.list_sources(account_id, store_path)
     }
+    fn update_source_permission(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure>;
     fn generate_source(
         &self,
         account_id: &str,
@@ -851,8 +878,9 @@ impl FileStudyStorage {
             return Err(ApiFailure::not_found("Source not found."));
         }
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = crate::run_source_generation_with_provider(&mut study, source_id, provider)
-            .map_err(study_failure)?;
+        let view =
+            crate::run_source_generation_with_provider(&mut study, source_id, Some(provider))
+                .map_err(study_failure)?;
         Ok(StudyViewResponse::from_view(view))
     }
 
@@ -1447,6 +1475,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                     body: source.body.clone(),
                     project_key: source.project_key.clone(),
                     ttl_expires_at: source.ttl_expires_at,
+                    permission: source.permission.clone(),
                 })
                 .map_err(study_failure)?;
             Ok(())
@@ -1459,6 +1488,20 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
         persisted_sources(store_path)
+    }
+
+    fn update_source_permission(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        study
+            .update_source_permission(source_id, permission)
+            .map(drop)
+            .map_err(study_failure)
     }
 
     fn generate_source(
@@ -2147,6 +2190,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     body: source.body.clone(),
                     project_key: source.project_key.clone(),
                     ttl_expires_at: source.ttl_expires_at,
+                    permission: source.permission.clone(),
                 })
                 .map(drop)
                 .map_err(study_failure)
@@ -2183,12 +2227,28 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         source_id: source.id,
                         title: source.title,
                         body: source.body.unwrap_or_default(),
+                        permission: source.permission,
                         project_key: source.project_key,
                         ttl_expires_at: source.ttl_expires_at,
                     })
                     .collect())
             },
         )
+    }
+
+    fn update_source_permission(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            study
+                .update_source_permission(source_id, permission)
+                .map(drop)
+                .map_err(study_failure)
+        })
     }
 
     fn generate_source(
@@ -2847,6 +2907,7 @@ mod tests {
                     body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("save source");
@@ -2896,6 +2957,7 @@ mod tests {
                     body: "Concept: Unrelated\nActivity: quiz\nStage: recognition-1\nQuestion: What is unrelated?\nAnswer: UNRELATED".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("foreground source mutation must commit while provider is running");
@@ -2950,6 +3012,7 @@ mod tests {
                     body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("save source");

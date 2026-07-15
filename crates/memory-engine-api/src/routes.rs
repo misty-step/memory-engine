@@ -40,8 +40,9 @@ use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
     CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
     InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
-    ScheduledReturnNotificationReport, SourceList, SourceRecord, StudyViewResponse,
-    SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings, SubmitViewport,
+    ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
+    StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
+    SubmitViewport,
 };
 
 #[cfg(test)]
@@ -201,7 +202,10 @@ impl V1Route {
                 router.route(V1_SERVICE_SESSIONS_PATH, post(issue_service_session))
             }
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
-            Self::Source => router.route(V1_SOURCE_PATH, delete(archive_source)),
+            Self::Source => router.route(
+                V1_SOURCE_PATH,
+                delete(archive_source).patch(update_source_permission),
+            ),
             Self::ProjectDecks => router.route(V1_PROJECT_DECKS_PATH, post(create_project_deck)),
             Self::ProjectDeckInvalidate => router.route(
                 V1_PROJECT_DECK_INVALIDATE_PATH,
@@ -252,10 +256,16 @@ impl V1Route {
                     path: V1_SOURCES_PATH,
                 },
             ],
-            Self::Source => &[V1ContractOperation {
-                method: "DELETE",
-                path: V1_SOURCE_PATH,
-            }],
+            Self::Source => &[
+                V1ContractOperation {
+                    method: "DELETE",
+                    path: V1_SOURCE_PATH,
+                },
+                V1ContractOperation {
+                    method: "PATCH",
+                    path: V1_SOURCE_PATH,
+                },
+            ],
             Self::ProjectDecks => &[V1ContractOperation {
                 method: "POST",
                 path: V1_PROJECT_DECKS_PATH,
@@ -368,6 +378,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
         .route("/app/capture", post(capture_app_source))
+        .route("/app/source/permission", post(update_app_source_permission))
         .route("/app/source/archive", post(archive_app_source))
         .route("/app/generate", post(generate_app_source))
         .route("/app/jobs/events", get(app_jobs_events))
@@ -703,6 +714,24 @@ async fn archive_source(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSourcePermissionRequest {
+    permission: SourcePermission,
+}
+
+async fn update_source_permission(
+    State(state): State<ApiState>,
+    Path((account_id, source_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSourcePermissionRequest>,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.update_source_permission(&account_id, session_token, &source_id, request.permission)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn approve_draft(
     State(state): State<ApiState>,
     Path((account_id, draft_id)): Path<(String, String)>,
@@ -861,6 +890,7 @@ struct AppStartForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -870,6 +900,7 @@ struct AppSourceForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -890,6 +921,14 @@ struct AppAccountActionForm {
 struct AppSourceActionForm {
     csrf_token: Option<String>,
     source_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppSourcePermissionForm {
+    csrf_token: Option<String>,
+    source_id: String,
+    permission: SourcePermission,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1175,7 +1214,7 @@ async fn start_app_study(
     };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture),
+        &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
     html_with_browser_session(
@@ -1196,7 +1235,7 @@ async fn create_app_source(
         };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture),
+        &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
     Html(render_save_result_html(
@@ -1221,7 +1260,7 @@ async fn capture_app_source(
             Ok(account) => account,
             Err(error) => return app_failure_response(error),
         };
-    let request = capture_request(form.title, form.body, form.capture);
+    let request = capture_request(form.title, form.body, form.capture, form.permission);
     let notice = match state.save_app_source(&account, &request) {
         Ok(source) => {
             match state.enqueue_generation_job_by_source(
@@ -1270,13 +1309,18 @@ fn capture_request(
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 ) -> CreateSourceRequest {
     let body = capture.or(body).unwrap_or_default();
     let title = title
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| infer_capture_title(&body));
 
-    CreateSourceRequest { title, body }
+    CreateSourceRequest {
+        title,
+        body,
+        permission: permission.unwrap_or_default(),
+    }
 }
 
 /// Re-generate from an already-saved source — enqueues a background job, same
@@ -1338,6 +1382,34 @@ async fn archive_app_source(
             ))
             .into_response()
         }
+        Err(error) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some(&error.message),
+        ))
+        .into_response(),
+    }
+}
+
+async fn update_app_source_permission(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppSourcePermissionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    match state.update_app_source_permission(&account, &form.source_id, form.permission) {
+        Ok(()) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some("Source permission updated."),
+        ))
+        .into_response(),
         Err(error) => Html(render_account_page(
             &state,
             &account,

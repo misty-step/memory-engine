@@ -1460,6 +1460,7 @@ mod tests {
                     title: "Idempotent source".to_owned(),
                     body: "Concept: Stable generation\nQuestion: What stays stable?\nAnswer: The job identity."
                         .to_owned(),
+                    permission: crate::SourcePermission::ModelEligible,
                 },
             )
             .expect("source");
@@ -1523,6 +1524,7 @@ mod tests {
                         title: "Fence source".to_owned(),
                         body: "Concept: Fence\nQuestion: What keeps stale work out?\nAnswer: The durable attempt ledger."
                             .to_owned(),
+                        permission: crate::SourcePermission::ModelEligible,
                     },
                 )
                 .map_err(|error| error.message.clone())?;
@@ -1673,6 +1675,7 @@ mod tests {
                         title: "Expiry source".to_owned(),
                         body: "Concept: Expiry\nQuestion: What keeps stale work out?\nAnswer: The durable attempt ledger."
                             .to_owned(),
+                        permission: crate::SourcePermission::ModelEligible,
                     },
                 )
                 .map_err(|error| error.message.clone())?;

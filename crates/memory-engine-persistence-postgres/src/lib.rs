@@ -24,6 +24,7 @@ use memory_engine_persistence::{
     parse_strict_boolean_answer, AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions,
     BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
     GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
+    SourcePermission,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -2798,6 +2799,40 @@ impl AccountStudyStore<'_> {
         })
     }
 
+    /// Update a source permission within this account. Archived sources are
+    /// retained for provenance but are not editable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the source is unknown, archived, or
+    /// persistence fails.
+    pub fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: memory_engine_persistence::SourcePermission,
+    ) -> Result<SourceDocument, PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        let source_document_id = source_document_id.to_owned();
+        self.with_account_transaction(|transaction| {
+            let mut document =
+                source_document_from_transaction(transaction, &account_id, &source_document_id)?;
+            if document.archived_at.is_some() {
+                return Err(PostgresStoreError::SourceDocumentArchived(
+                    source_document_id.to_owned(),
+                ));
+            }
+            document.permission = permission;
+            let value = serde_json::to_value(&document)?;
+            transaction.execute(
+                "UPDATE memory_engine_source_documents
+                 SET document = $3
+                 WHERE account_id = $1 AND source_document_id = $2",
+                &[&account_id, &source_document_id, &value],
+            )?;
+            Ok(document)
+        })
+    }
+
     /// Save or replace a source reference span for the scoped account.
     ///
     /// # Errors
@@ -3204,6 +3239,14 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         AccountStudyStore::archive_source_document(self, source_document_id, archived_at)
     }
 
+    fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::update_source_document_permission(self, source_document_id, permission)
+    }
+
     fn approve_generated_prompt_draft(
         &mut self,
         draft_id: &str,
@@ -3600,6 +3643,7 @@ pub enum PostgresStoreError {
     InvalidBooleanAnswer,
     NoConceptKey,
     UnknownSourceDocument(String),
+    SourceDocumentArchived(String),
     UnknownReviewUnit(ReviewUnitId),
     ReviewUnitArchived(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
@@ -3633,6 +3677,9 @@ impl fmt::Display for PostgresStoreError {
             }
             Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::SourceDocumentArchived(id) => {
+                write!(formatter, "Source document is archived: {id}")
+            }
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::ReviewUnitArchived(id) => write!(formatter, "Review unit is archived: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
@@ -3695,6 +3742,7 @@ impl Error for PostgresStoreError {
             | Self::InvalidBooleanAnswer
             | Self::NoConceptKey
             | Self::UnknownSourceDocument(_)
+            | Self::SourceDocumentArchived(_)
             | Self::UnknownReviewUnit(_)
             | Self::ReviewUnitArchived(_)
             | Self::UnknownGeneratedPromptDraft(_)
@@ -3737,7 +3785,8 @@ impl From<memory_engine_study::BetaStudyError<PostgresStoreError>> for PostgresS
             memory_engine_study::BetaStudyError::Service(error) => {
                 Self::StudySession(error.to_string())
             }
-            memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
+            memory_engine_study::BetaStudyError::UnknownReferenceSpan(_)
+            | memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
                 Self::StudySession(error.to_string())
             }
             memory_engine_study::BetaStudyError::NoConceptKey => Self::NoConceptKey,
@@ -3951,7 +4000,7 @@ mod tests {
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
         GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage,
         PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-        SourcePermission,
+        SourcePermission, SourcePermissionReceipt,
     };
     use memory_engine_service::{
         record_content_feedback, ContentFeedbackError, ContentFeedbackVerdict,
@@ -4996,6 +5045,80 @@ mod tests {
     }
 
     #[test]
+    fn live_postgres_reads_legacy_source_without_permission_as_model_eligible() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_legacy_source_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = super::connect_client(&database_url).expect("admin connection");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut store = super::PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+            let scope = super::AccountScope::new("acct-legacy")?;
+            {
+                let mut account = store.for_account(scope.clone());
+                account.ensure_account(NOW)?;
+            }
+            let legacy = serde_json::json!({
+                "id": "legacy-source",
+                "kind": "text",
+                "title": "Legacy source",
+                "body": "old notes",
+                "uri": null,
+                "freshness": NOW,
+                "createdAt": NOW
+            });
+            store.client.borrow_mut().execute(
+                "INSERT INTO memory_engine_source_documents
+                    (account_id, source_document_id, document, created_at_ms)
+                 VALUES ($1, $2, $3, $4)",
+                &[&"acct-legacy", &"legacy-source", &legacy, &NOW],
+            )?;
+            let account = store.for_account(scope.clone());
+            let source = account.snapshot()?.source_documents[0].clone();
+            assert_eq!(source.permission, SourcePermission::ModelEligible);
+            drop(account);
+            let mut account = store.for_account(scope.clone());
+            let updated = account
+                .update_source_document_permission("legacy-source", SourcePermission::LocalOnly)?;
+            assert_eq!(updated.permission, SourcePermission::LocalOnly);
+            account.archive_source_document("legacy-source", NOW)?;
+            assert!(matches!(
+                account.update_source_document_permission(
+                    "legacy-source",
+                    SourcePermission::ModelEligible
+                ),
+                Err(super::PostgresStoreError::SourceDocumentArchived(id)) if id == "legacy-source"
+            ));
+            drop(account);
+            let other_scope = super::AccountScope::new("acct-other")?;
+            let mut other = store.for_account(other_scope);
+            other.ensure_account(NOW)?;
+            assert!(matches!(
+                other.update_source_document_permission(
+                    "legacy-source",
+                    SourcePermission::ModelEligible
+                ),
+                Err(super::PostgresStoreError::UnknownSourceDocument(id)) if id == "legacy-source"
+            ));
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("legacy source read");
+    }
+
+    #[test]
     fn live_postgres_return_notification_claim_is_atomic_and_fenced() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
@@ -5881,6 +6004,7 @@ mod tests {
             .join("\n"),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         }
     }
 
@@ -5914,6 +6038,15 @@ mod tests {
             completed_at: Some(NOW),
             validation_failures: Vec::new(),
             usage: None,
+            source_permissions: source_document_ids
+                .iter()
+                .map(|source_document_id| SourcePermissionReceipt {
+                    source_document_id: (*source_document_id).to_owned(),
+                    permission: SourcePermission::ModelEligible,
+                    consented: true,
+                })
+                .collect(),
+            prompt_version: "prompt-v1".to_owned(),
         }
     }
 

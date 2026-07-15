@@ -24,7 +24,7 @@ use memory_engine_generation::{
     ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
-    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
+    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument, SourcePermission,
 };
 use serde::Deserialize;
 
@@ -334,6 +334,7 @@ impl DraftProvider for OpenRouterProvider {
     }
 
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        ensure_model_eligible(source)?;
         let response = self.complete_structured(
             &build_prompt(self.config.prompt, self.config.max_drafts, source),
             "quiz_drafts",
@@ -352,6 +353,7 @@ impl DraftProvider for OpenRouterProvider {
         source: &SourceDocument,
         rejections: &[DraftRejection],
     ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        ensure_model_eligible(source)?;
         if rejections.is_empty() {
             return Ok(None);
         }
@@ -373,6 +375,26 @@ impl DraftProvider for OpenRouterProvider {
             self.config.max_drafts,
         )
         .map(Some)
+    }
+}
+
+fn ensure_model_eligible(source: &SourceDocument) -> Result<(), ProviderFailure> {
+    if source.archived_at.is_some() {
+        Err(ProviderFailure::archived_source(source.id.clone()))
+    } else if source.permission == SourcePermission::LocalOnly {
+        Err(ProviderFailure::local_only_source(source.id.clone()))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_authorized_request(
+    authorization: &memory_engine_generation::SourceAuthorizationContext,
+) -> Result<(), ProviderFailure> {
+    if let Some(source_id) = authorization.local_only_source_id() {
+        Err(ProviderFailure::local_only_source(source_id.to_owned()))
+    } else {
+        Ok(())
     }
 }
 
@@ -418,6 +440,7 @@ impl ReferenceNoteProvider for OpenRouterProvider {
         &self,
         request: &ReferenceNoteRequest,
     ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        ensure_authorized_request(request.authorization())?;
         let response = self.complete_structured(
             &build_reference_note_prompt(request),
             "reference_note",
@@ -438,6 +461,7 @@ impl BridgeMaterialProvider for OpenRouterProvider {
         &self,
         request: &BridgeMaterialRequest,
     ) -> Result<BridgeMaterial, ProviderFailure> {
+        ensure_authorized_request(request.authorization())?;
         let response = self.complete_structured(
             &build_bridge_prompt(request),
             "bridge_material",

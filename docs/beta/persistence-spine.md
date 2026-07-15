@@ -99,9 +99,10 @@ fixtures only. Source documents carry a permission label:
 - `local-only`: do not send to hosted model providers;
 - `model-eligible`: may be used by a product-level generation workflow.
 
-This label is recorded but not enforced by the kernel. Enforcement belongs to
-future beta generation and provider-adapter code outside
-`crates/memory-engine-core`.
+The pure kernel does not own transport policy, but the current beta generation
+runner, study reference path, bridge path, forwarding fallback, and external
+provider adapters enforce this label before any model transmission. Permission
+updates are scoped to the owning account and active (non-archived) source.
 
 ## Extraction Criteria
 

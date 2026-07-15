@@ -171,6 +171,35 @@
             "$ref": "#/components/responses/Error"
           }
         }
+      },
+      "patch": {
+        "summary": "Update active source permission",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/SourceId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSourcePermissionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Source permission updated"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     },
     "/v1/accounts/{account_id}/project-decks": {
@@ -780,6 +809,15 @@
           },
           "body": {
             "type": "string"
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "local-only",
+              "model-eligible"
+            ],
+            "default": "model-eligible",
+            "description": "Whether captured source bytes may be sent to a model provider."
           }
         }
       },
@@ -802,6 +840,22 @@
           },
           "ttlExpiresAt": {
             "type": "integer"
+          }
+        }
+      },
+      "UpdateSourcePermissionRequest": {
+        "type": "object",
+        "required": [
+          "permission"
+        ],
+        "properties": {
+          "permission": {
+            "type": "string",
+            "enum": [
+              "local-only",
+              "model-eligible"
+            ],
+            "description": "Whether captured source bytes may be sent to a model provider."
           }
         }
       },
@@ -835,7 +889,8 @@
         "required": [
           "sourceId",
           "title",
-          "body"
+          "body",
+          "permission"
         ],
         "properties": {
           "sourceId": {
@@ -846,6 +901,13 @@
           },
           "body": {
             "type": "string"
+          },
+          "permission": {
+            "type": "string",
+            "enum": [
+              "local-only",
+              "model-eligible"
+            ]
           },
           "projectKey": {
             "type": "string"

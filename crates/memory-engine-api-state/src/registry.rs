@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
-use memory_engine_persistence::GeneratedPromptValidationStatus;
+use memory_engine_persistence::{GeneratedPromptValidationStatus, SourcePermission};
 use memory_engine_service::RecordContentFeedbackCommand;
 
 use crate::storage::GenerationCommitFence;
@@ -612,6 +612,7 @@ impl AccountRegistry {
             source_id: source_id_for(account_id, &title, &body),
             title,
             body,
+            permission: request.permission.clone(),
             project_key: None,
             ttl_expires_at: None,
         };
@@ -654,6 +655,7 @@ impl AccountRegistry {
             source_id: project_deck_id_for(account_id, &project_key, &title, &body),
             title,
             body,
+            permission: SourcePermission::ModelEligible,
             project_key: Some(project_key.clone()),
             ttl_expires_at: request.ttl_expires_at,
         };
@@ -726,6 +728,25 @@ impl AccountRegistry {
             self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?;
         self.storage()
             .list_sources_with_timings(account_id, &account.store_path, timings)
+    }
+
+    pub(crate) fn update_source_permission(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let storage = self.storage();
+        if !storage
+            .list_sources(account_id, &account.store_path)?
+            .iter()
+            .any(|source| source.source_id == source_id)
+        {
+            return Err(ApiFailure::not_found("Source not found."));
+        }
+        storage.update_source_permission(account_id, &account.store_path, source_id, permission)
     }
 
     /// Runs an API registry operation.

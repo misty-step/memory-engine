@@ -37,11 +37,12 @@ pub enum SourceDocumentKind {
     VideoTranscript,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SourcePermission {
     #[serde(rename = "local-only")]
     LocalOnly,
     #[serde(rename = "model-eligible")]
+    #[default]
     ModelEligible,
 }
 
@@ -55,6 +56,7 @@ pub struct SourceDocument {
     pub project_key: Option<String>,
     pub body: Option<String>,
     pub uri: Option<String>,
+    #[serde(default)]
     pub permission: SourcePermission,
     pub freshness: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +147,20 @@ pub struct GenerationRun {
     pub validation_failures: Vec<String>,
     #[serde(default)]
     pub usage: Option<GenerationRunUsage>,
+    /// Permission and consent recorded for every source sent to a provider.
+    #[serde(default)]
+    pub source_permissions: Vec<SourcePermissionReceipt>,
+    /// Version of the prompt contract used for the provider request.
+    #[serde(default)]
+    pub prompt_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePermissionReceipt {
+    pub source_document_id: String,
+    pub permission: SourcePermission,
+    pub consented: bool,
 }
 
 /// Token and cost accounting for one generation run, summed across sources.
@@ -365,6 +381,7 @@ pub enum BetaStoreError {
     },
     InvalidBooleanAnswer,
     UnknownSourceDocument(String),
+    SourceDocumentArchived(String),
     UnknownReferenceSpan(String),
     UnknownConceptReferenceNote(String),
     UnknownReviewUnit(ReviewUnitId),
@@ -409,6 +426,9 @@ impl fmt::Display for BetaStoreError {
                 formatter.write_str("Boolean answers must be true or false")
             }
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::SourceDocumentArchived(id) => {
+                write!(formatter, "Source document is archived: {id}")
+            }
             Self::UnknownReferenceSpan(id) => write!(formatter, "Unknown reference span: {id}"),
             Self::UnknownConceptReferenceNote(id) => {
                 write!(formatter, "Unknown concept reference note: {id}")
@@ -498,6 +518,7 @@ impl PartialEq for BetaStoreError {
             (Self::UnsupportedVersion(left), Self::UnsupportedVersion(right)) => left == right,
             (Self::Blank { label: left }, Self::Blank { label: right }) => left == right,
             (Self::UnknownSourceDocument(left), Self::UnknownSourceDocument(right))
+            | (Self::SourceDocumentArchived(left), Self::SourceDocumentArchived(right))
             | (Self::UnknownReferenceSpan(left), Self::UnknownReferenceSpan(right))
             | (Self::UnknownConceptReferenceNote(left), Self::UnknownConceptReferenceNote(right))
             | (Self::UnknownGeneratedPromptDraft(left), Self::UnknownGeneratedPromptDraft(right))
@@ -675,6 +696,36 @@ impl BetaPersistenceStore {
                     BetaStoreError::UnknownSourceDocument(source_document_id.to_owned())
                 })?;
             source.archived_at = Some(archived_at);
+            Ok(source.clone())
+        })
+    }
+
+    /// Update a source permission while preserving its body and provenance.
+    /// Archived sources cannot be edited.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the source is unknown, archived, or
+    /// the updated snapshot cannot be committed.
+    pub fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<SourceDocument, BetaStoreError> {
+        self.transact(|snapshot| {
+            let source = snapshot
+                .source_documents
+                .iter_mut()
+                .find(|source| source.id == source_document_id)
+                .ok_or_else(|| {
+                    BetaStoreError::UnknownSourceDocument(source_document_id.to_owned())
+                })?;
+            if source.archived_at.is_some() {
+                return Err(BetaStoreError::SourceDocumentArchived(
+                    source_document_id.to_owned(),
+                ));
+            }
+            source.permission = permission;
             Ok(source.clone())
         })
     }

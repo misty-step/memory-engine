@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memory_engine_api_render::{render_account_page, render_content_feedback_result_html};
-use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome, StudyViewResponse};
+use memory_engine_api_state::{
+    ApiState, CreateSourceRequest, EnqueueOutcome, SourcePermission, StudyViewResponse,
+};
 use memory_engine_study::BetaStudySummary;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -39,6 +41,7 @@ fn active_review_render_skips_workspace_material() {
             &CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: nato_source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");
@@ -76,6 +79,7 @@ fn workspace_render_keeps_saved_material_without_active_review() {
             &CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: nato_source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");
@@ -116,4 +120,28 @@ fn completed_feedback_action_requires_an_explicit_workspace_exit() {
     assert!(html.contains(r#"href="/">Back to workspace</a>"#));
     assert!(!html.contains("What do you want to remember?"));
     assert!(!html.contains("Return gently"));
+}
+
+#[test]
+fn workspace_discloses_local_only_source_permission() {
+    let state = ApiState::default();
+    let created = state
+        .create_account(&unique_email("local-only"))
+        .expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    state
+        .save_app_source(
+            &account,
+            &CreateSourceRequest {
+                title: "Private notes".to_owned(),
+                body: "Never send this text to a model.".to_owned(),
+                permission: SourcePermission::LocalOnly,
+            },
+        )
+        .expect("source");
+
+    let html = render_account_page(&state, &account, None, None);
+    assert!(html.contains("Local only · never sent to a model"));
 }

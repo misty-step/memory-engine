@@ -17,6 +17,7 @@ use tower::ServiceExt;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use memory_engine_persistence::SourcePermission;
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
 use super::{
@@ -239,6 +240,69 @@ async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
 }
 
 #[tokio::test]
+async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_bytes() {
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let captured = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/capture",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("capture", "private learner notes"),
+                ("permission", "local-only"),
+            ],
+        ))
+        .await
+        .expect("local-only capture");
+    assert_eq!(captured.status(), StatusCode::OK);
+    let captured = response_text(captured).await;
+    assert!(captured.contains("Local only · never sent to a model"));
+
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/permission",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("sourceId", &source_id),
+                ("permission", "local-only"),
+            ],
+        ))
+        .await
+        .expect("edit permission");
+    assert_eq!(edited.status(), StatusCode::OK);
+    assert!(response_text(edited)
+        .await
+        .contains("Source permission updated."));
+
+    let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    assert!(workspace.contains("Due now"));
+    assert!(workspace.contains("Start review"));
+
+    let invalid = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/permission",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("sourceId", &source_id),
+                ("permission", "invalid"),
+            ],
+        ))
+        .await
+        .expect("invalid permission");
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn signed_in_home_surfaces_review_cta_after_generation() {
     // Regression: a learner who generated cards could see "scheduled for
     // review" in the activity log but had no way to start reviewing. Two gaps
@@ -410,6 +474,7 @@ fn scheduled_return_notification_sends_live_due_count_without_request_traffic() 
             &CreateSourceRequest {
                 title: "Scheduled reminder source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("save source");
@@ -544,6 +609,7 @@ fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
                 &CreateSourceRequest {
                     title: "Quota source".to_owned(),
                     body: source_body(),
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("quota source");
@@ -621,6 +687,7 @@ fn concurrent_scheduler_instances_share_one_durable_file_claim() {
             &CreateSourceRequest {
                 title: "Concurrent scheduler source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("source");
@@ -3324,6 +3391,7 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
             &CreateSourceRequest {
                 title: "Postgres scheduled source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("Postgres source");
@@ -6497,6 +6565,83 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
 }
 
 #[tokio::test]
+async fn v1_source_permission_round_trips_through_http_and_file_store() {
+    let app = router(ApiState::default());
+    let account = create_account_v1(&app, "privacy@example.com").await;
+    let response = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+            &json!({
+                "title": "Private notes",
+                "body": "Do not send this outside the local study store.",
+                "permission": "local-only"
+            }),
+        ))
+        .await
+        .expect("create local-only source");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let source = response_json(response).await;
+    assert_eq!(source["permission"], json!("local-only"));
+
+    let listed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("list local-only source");
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(listed).await["sources"][0]["permission"],
+        json!("local-only")
+    );
+
+    let source_id = source["sourceId"].as_str().expect("source id");
+    let updated = app
+        .clone()
+        .oneshot(v1_json_request(
+            "PATCH",
+            &format!("/v1/accounts/{}/sources/{source_id}", account.account_id),
+            &account.session_token,
+            &json!({"permission": "model-eligible"}),
+        ))
+        .await
+        .expect("update source permission");
+    assert_eq!(updated.status(), StatusCode::NO_CONTENT);
+
+    let listed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("list updated source");
+    assert_eq!(
+        response_json(listed).await["sources"][0]["permission"],
+        json!("model-eligible")
+    );
+
+    archive_source_v1(&app, &account, source_id).await;
+    let archived_update = app
+        .oneshot(v1_json_request(
+            "PATCH",
+            &format!("/v1/accounts/{}/sources/{source_id}", account.account_id),
+            &account.session_token,
+            &json!({"permission": "local-only"}),
+        ))
+        .await
+        .expect("archived update");
+    assert_eq!(archived_update.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn v1_project_deck_ttl_and_event_invalidation_stop_scheduling() {
     let store_root = temp_store_root("volatile-project-deck");
     let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
@@ -8406,6 +8551,7 @@ async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::A
             &CreateSourceRequest {
                 title: "Postgres recovery source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("Postgres recovery source");
@@ -9107,6 +9253,7 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
             &super::CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");

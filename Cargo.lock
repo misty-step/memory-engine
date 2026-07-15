@@ -962,6 +962,7 @@ dependencies = [
  "memory-engine-core",
  "memory-engine-persistence",
  "memory-engine-service",
+ "serde_json",
 ]
 
 [[package]]

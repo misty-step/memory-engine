@@ -11,6 +11,7 @@ memory-engine-persistence = { path = "../memory-engine-persistence" }
 
 [dev-dependencies]
 memory-engine-service = { path = "../memory-engine-service" }
+serde_json = "1.0.145"
 
 [lints]
 workspace = true
