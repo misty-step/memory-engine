@@ -19,9 +19,9 @@ use std::{
 use std::os::unix::net::UnixStream;
 
 use memory_engine_generation::{
-    enforce_content_policy, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, DraftRejection, LearningIntent, ProviderDrafts, ProviderFailure,
-    ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
+    BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
+    DraftRejection, LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
+    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument, SourcePermission,
@@ -422,16 +422,13 @@ fn parse_drafts_response(
         }
     }
 
-    Ok(enforce_content_policy(
-        source,
-        ProviderDrafts {
-            model,
-            learning_intent: Some(learning_intent),
-            candidates,
-            failures,
-            usage: response.usage,
-        },
-    ))
+    Ok(ProviderDrafts {
+        model,
+        learning_intent: Some(learning_intent),
+        candidates,
+        failures,
+        usage: response.usage,
+    })
 }
 
 impl ReferenceNoteProvider for OpenRouterProvider {

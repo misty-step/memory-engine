@@ -243,7 +243,7 @@ fn expands_a_bare_topic_into_standalone_cards_without_requiring_quotes() {
 }
 
 #[test]
-fn model_output_for_an_enumerable_source_is_replaced_by_complete_source_policy() {
+fn model_output_for_an_enumerable_source_remains_provider_owned_before_runner_policy() {
     let body = serde_json::json!({
         "choices": [{
             "message": {
@@ -280,25 +280,23 @@ fn model_output_for_an_enumerable_source_is_replaced_by_complete_source_policy()
         ))
         .expect("provider output");
 
-    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
-    assert_eq!(drafts.candidates.len(), 4);
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::FactRecall));
+    assert_eq!(drafts.candidates.len(), 1);
     assert_eq!(
         drafts
             .candidates
             .iter()
             .map(|candidate| candidate.answer.as_str())
             .collect::<Vec<_>>(),
-        ["Alfa", "Bravo", "Charlie", "Delta"]
+        ["Alfa"]
     );
-    assert!(drafts.candidates.iter().all(|candidate| {
-        candidate.distractors.is_empty()
-            && candidate.activity_stage == "production-recall"
-            && candidate.evidence.is_some()
-    }));
+    assert_eq!(drafts.candidates[0].distractors, ["Bravo", "Charlie"]);
+    assert_eq!(drafts.candidates[0].activity_stage, "recognition");
+    assert!(drafts.candidates[0].evidence.is_some());
 }
 
 #[test]
-fn model_output_for_a_sequential_source_preserves_every_verbatim_unit() {
+fn model_output_for_a_sequential_source_remains_provider_owned_before_runner_policy() {
     let body = serde_json::json!({
         "choices": [{
             "message": {
@@ -337,7 +335,7 @@ fn model_output_for_a_sequential_source_preserves_every_verbatim_unit() {
 
     assert_eq!(
         drafts.learning_intent,
-        Some(LearningIntent::VerbatimMemorization)
+        Some(LearningIntent::ConceptUnderstanding)
     );
     assert_eq!(
         drafts
@@ -345,13 +343,11 @@ fn model_output_for_a_sequential_source_preserves_every_verbatim_unit() {
             .iter()
             .map(|candidate| candidate.answer.as_str())
             .collect::<Vec<_>>(),
-        ["First oath line.", "Second oath line.", "Third oath line."]
+        ["A summary"]
     );
     assert!(drafts.candidates.iter().all(|candidate| {
-        candidate.activity_kind
-            == memory_engine_persistence::GeneratedLearningActivityKind::Exercise
-            && candidate.distractors.is_empty()
-            && candidate.worked_solution.is_some()
+        candidate.activity_kind == memory_engine_persistence::GeneratedLearningActivityKind::Quiz
+            && candidate.distractors == ["Another answer", "A third answer"]
     }));
 }
 

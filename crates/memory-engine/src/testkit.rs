@@ -98,7 +98,7 @@ pub fn grading_fixtures() -> Vec<GradingFixture> {
 #[must_use]
 pub fn recitation_fixtures() -> Vec<RecitationFixture> {
     vec![RecitationFixture {
-        name: "recitation grades long-form deterministic recall from the Ruminatio study oracle"
+        name: "recitation requires the exact long-form unit from the Ruminatio study oracle"
             .to_owned(),
         prompt: exact_prompt(
             ExactPromptKind::Recitation,
@@ -106,7 +106,7 @@ pub fn recitation_fixtures() -> Vec<RecitationFixture> {
             "Recite the prayer.",
             &["Glory be to the Father, and to the Son, and to the Holy Spirit."],
         ),
-        submitted: "Glory be to the Father and to the Son and to the Holy Spirit".to_owned(),
+        submitted: "Glory be to the Father, and to the Son, and to the Holy Spirit.".to_owned(),
         context: GradeContext {
             response_time_ms: 3_200,
             prior_reps: 1,
@@ -114,7 +114,7 @@ pub fn recitation_fixtures() -> Vec<RecitationFixture> {
         expected: deterministic_grade(
             Verdict::Correct,
             Rating::Good,
-            "Glory be to the Father and to the Son and to the Holy Spirit",
+            "Glory be to the Father, and to the Son, and to the Holy Spirit.",
             "Glory be to the Father, and to the Son, and to the Holy Spirit.",
             true,
         ),

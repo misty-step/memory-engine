@@ -456,7 +456,14 @@ pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassi
     let list_facts = count_fact_sentences(body);
     let enumerable = looks_enumerable(body, &lines);
     let process = looks_process(&normalized);
-    let ordered_process = looks_ordered_process(&normalized);
+    let explicit_verbatim = looks_explicit_verbatim(&normalized);
+    let ordered_process = looks_ordered_process(&normalized, &lines);
+    if explicit_verbatim {
+        return LearningIntentClassification {
+            intent: LearningIntent::VerbatimMemorization,
+            rationale: "source explicitly calls for exact sequential memorization".to_owned(),
+        };
+    }
     // A numbered procedure is both list-shaped and process-shaped. Let the
     // strong ordered-action signal win that overlap, while keeping ordinary
     // line-broken verse on the verbatim path and finite reference sets
@@ -627,16 +634,13 @@ impl DraftProvider for FakeModelProvider {
             LearningIntent::ProcedureProcess => procedure_candidates(source, &body),
         };
 
-        Ok(enforce_content_policy(
-            source,
-            ProviderDrafts {
-                model: DraftProvider::model(self),
-                learning_intent: Some(classification.intent),
-                candidates,
-                failures: Vec::new(),
-                usage: None,
-            },
-        ))
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: Some(classification.intent),
+            candidates,
+            failures: Vec::new(),
+            usage: None,
+        })
     }
 }
 
@@ -732,6 +736,17 @@ impl BridgeMaterialProvider for FakeModelProvider {
 }
 
 fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
+    looks_explicit_verbatim(normalized)
+        || (lines.len() >= 3
+            && lines.iter().all(|line| !line.contains(':'))
+            && lines
+                .iter()
+                .filter(|line| line.chars().count() <= 96)
+                .count()
+                >= 3)
+}
+
+fn looks_explicit_verbatim(normalized: &str) -> bool {
     normalized.contains("recite")
         || normalized.contains("memorize")
         || normalized.contains("verbatim")
@@ -741,12 +756,6 @@ fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
         || normalized.contains("excerpt")
         || normalized.contains("verse")
         || normalized.contains("quote")
-        || (lines.len() >= 3
-            && lines
-                .iter()
-                .filter(|line| line.chars().count() <= 96)
-                .count()
-                >= 3)
 }
 
 /// Apply deterministic content policy after a provider has classified a source.
@@ -763,11 +772,19 @@ pub fn enforce_content_policy(
     mut drafts: ProviderDrafts,
 ) -> ProviderDrafts {
     let classification = classify_learning_intent(source);
+    let body = source.body.as_deref().unwrap_or_default();
     match classification.intent {
         LearningIntent::EnumerableSet => {
             drafts.learning_intent = Some(classification.intent);
             drafts.candidates =
                 enumerable_candidates(source, source.body.as_deref().unwrap_or_default());
+            assert_exhaustive_indices(&drafts.candidates);
+        }
+        // The legacy 047/084 ordinal prose fixture remains fact-labelled for
+        // intent-shape parity, but its source-owned coverage oracle is still a
+        // finite ordinal set and must receive the complete enumerable drafts.
+        LearningIntent::FactRecall if ordinal_mapping_entries(body).len() >= 3 => {
+            drafts.candidates = enumerable_candidates(source, body);
             assert_exhaustive_indices(&drafts.candidates);
         }
         LearningIntent::VerbatimMemorization => {
@@ -795,6 +812,11 @@ fn looks_enumerable(body: &str, lines: &[String]) -> bool {
 }
 
 fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
+    let ordinal_mappings = ordinal_mapping_entries(body);
+    if ordinal_mappings.len() >= 3 {
+        return ordinal_mappings;
+    }
+
     let mappings = mapping_entries(body);
     if mappings.len() >= 3 {
         return mappings;
@@ -810,6 +832,51 @@ fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
             // production provenance floor. Cite the complete source list so
             // the draft remains grounded without weakening that trust gate.
             evidence: body.trim().to_owned(),
+        })
+        .collect()
+}
+
+fn ordinal_mapping_entries(body: &str) -> Vec<EnumerableEntry> {
+    numbered_segments(body)
+        .into_iter()
+        .filter_map(|segment| {
+            let (cue, rest) = segment.split_once(". ")?;
+            let (answer, _fact) = rest.split_once(" is ")?;
+            Some(EnumerableEntry {
+                cue: cue.trim().to_owned(),
+                answer: answer.trim().to_owned(),
+                evidence: segment,
+            })
+        })
+        .collect()
+}
+
+fn numbered_segments(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut starts = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        let is_boundary = position == 0 || bytes[position - 1].is_ascii_whitespace();
+        if is_boundary && bytes[position].is_ascii_digit() {
+            let mut end = position;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end + 1 < bytes.len() && bytes[end] == b'.' && bytes[end + 1].is_ascii_whitespace() {
+                starts.push(position);
+            }
+            position = end;
+        } else {
+            position += 1;
+        }
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(bytes.len());
+            body[*start..end].trim().to_owned()
         })
         .collect()
 }
@@ -921,7 +988,7 @@ fn looks_process(normalized: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
-fn looks_ordered_process(normalized: &str) -> bool {
+fn looks_ordered_process(normalized: &str, lines: &[String]) -> bool {
     [
         "step",
         "steps",
@@ -938,6 +1005,31 @@ fn looks_ordered_process(normalized: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+        || looks_like_imperative_sequence(lines)
+}
+
+fn looks_like_imperative_sequence(lines: &[String]) -> bool {
+    let entries = list_entries(lines);
+    entries.len() >= 3
+        && entries
+            .iter()
+            .all(|(answer, _)| starts_with_action_verb(answer))
+}
+
+fn starts_with_action_verb(answer: &str) -> bool {
+    let Some(first_word) = answer.split_whitespace().next() else {
+        return false;
+    };
+    let first_word = first_word.trim_matches(|character: char| !character.is_alphabetic());
+    [
+        "add", "bake", "boil", "bring", "chop", "choose", "clean", "click", "close", "combine",
+        "cook", "create", "cut", "discard", "feed", "fill", "fold", "gather", "heat", "insert",
+        "install", "knead", "let", "load", "make", "measure", "mix", "open", "place", "pour",
+        "preheat", "press", "remove", "repeat", "rinse", "run", "save", "select", "serve", "set",
+        "start", "stir", "stop", "take", "turn", "use", "whisk", "write",
+    ]
+    .iter()
+    .any(|verb| *verb == first_word.to_ascii_lowercase())
 }
 
 fn looks_concept(normalized: &str) -> bool {
@@ -1156,45 +1248,58 @@ fn grounded_fact_distractors(facts: &[(String, String, String)], answer: &str) -
 }
 
 fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let lines = non_empty_lines(body);
+    let ordered_entries = list_entries(&lines);
+    if ordered_entries.len() >= 3 {
+        let source_evidence = body.trim().to_owned();
+        return ordered_entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, (answer, _entry_evidence))| DraftCandidate {
+                index: position + 1,
+                concept: format!("{} procedure step {}", source.title, position + 1),
+                question: format!(
+                    "What is ordered action {} in the {} procedure?",
+                    position + 1,
+                    source.title
+                ),
+                answer,
+                evidence: Some(source_evidence.clone()),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "procedure-composition".to_owned(),
+                unsupported: false,
+            })
+            .collect();
+    }
+
     let sentences = split_sentences(body);
-    let evidence = sentences
-        .iter()
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(". ");
-    let evidence = if evidence.is_empty() {
-        body.trim().to_owned()
-    } else {
-        evidence
-    };
-    let mut candidates = vec![DraftCandidate {
-        index: 1,
-        concept: format!("{} procedure", source.title),
-        question: format!("Describe the process in \"{}\" in order.", source.title),
-        answer: evidence.clone(),
-        evidence: Some(evidence),
-        distractors: Vec::new(),
-        worked_solution: None,
-        activity_kind: GeneratedLearningActivityKind::Quiz,
-        activity_stage: "procedure-composition".to_owned(),
-        unsupported: false,
-    }];
-    if let Some(check_sentence) = sentences.get(2).or_else(|| sentences.get(1)) {
-        candidates.push(DraftCandidate {
-            index: 2,
-            concept: format!("{} procedure check", source.title),
-            question: format!("What condition or check matters in \"{}\"?", source.title),
-            answer: check_sentence.clone(),
-            evidence: Some(check_sentence.clone()),
+    let source_evidence = body.trim().to_owned();
+    sentences
+        .into_iter()
+        .enumerate()
+        .map(|(position, sentence)| DraftCandidate {
+            index: position + 1,
+            concept: format!("{} procedure step {}", source.title, position + 1),
+            question: if position == 0 {
+                format!("Describe the process in \"{}\" in order.", source.title)
+            } else {
+                format!("What further step matters in \"{}\"?", source.title)
+            },
+            answer: sentence,
+            evidence: Some(source_evidence.clone()),
             distractors: Vec::new(),
             worked_solution: None,
             activity_kind: GeneratedLearningActivityKind::Quiz,
-            activity_stage: "procedure-check".to_owned(),
+            activity_stage: if position == 0 {
+                "procedure-composition".to_owned()
+            } else {
+                "procedure-check".to_owned()
+            },
             unsupported: false,
-        });
-    }
-    candidates
+        })
+        .collect()
 }
 
 fn fact_question_answer(source: &SourceDocument, sentence: &str) -> (String, String) {

@@ -1,6 +1,6 @@
 use std::{cell::Cell, fs, path::PathBuf};
 
-use memory_engine_core::{ExactPromptKind, Prompt};
+use memory_engine_core::{ExactPromptKind, GradeContext, Grader, Prompt, Verdict};
 use memory_engine_generation::{
     classify_learning_intent, run_beta_generation_with_provider, BetaGenerationRequest,
     DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
@@ -347,6 +347,68 @@ fn numbered_procedures_keep_process_semantics_instead_of_set_cards() {
 }
 
 #[test]
+fn numbered_imperative_procedures_keep_process_semantics_without_metadata() {
+    let source = source_document(
+        "src-imperative-procedure",
+        "Fried eggs",
+        "1. Heat the pan\n2. Add the oil\n3. Cook the eggs",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("imperative procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage == "procedure-composition"));
+}
+
+#[test]
+fn explicit_poem_intent_outranks_generic_list_shape() {
+    let source = source_document(
+        "src-oath-list",
+        "Recite this oath",
+        "- We stand together.\n- We keep our word.\n- We serve with care.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::VerbatimMemorization
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("oath generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::VerbatimMemorization)
+    );
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "- We stand together.",
+            "- We keep our word.",
+            "- We serve with care."
+        ]
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_kind == GeneratedLearningActivityKind::Exercise));
+}
+
+#[test]
 fn finite_sets_with_weak_process_words_keep_enumerable_semantics() {
     let source = source_document(
         "src-planets",
@@ -459,6 +521,41 @@ fn verbatim_intent_persists_recitation_prompt_ladder() {
         "verbatim sources must not become MC trivia: {:?}",
         snapshot.generated_prompt_drafts
     );
+
+    let free_recall = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.activity_stage == "free-recall")
+        .expect("free-recall draft");
+    let exact_prompt = match &free_recall.prompt {
+        Prompt::Exact(prompt) => prompt,
+        other => panic!("unexpected verbatim prompt: {other:?}"),
+    };
+    let accepted_answer = exact_prompt.accepted_answers[0].clone();
+    let grader = Grader::new();
+    let context = GradeContext {
+        response_time_ms: 5_100,
+        prior_reps: 0,
+    };
+    assert_eq!(
+        grader
+            .grade(&free_recall.prompt, &accepted_answer, context)
+            .verdict,
+        Verdict::Correct
+    );
+    for (label, submission) in [
+        ("case", accepted_answer.to_lowercase()),
+        ("punctuation", format!("{accepted_answer}!")),
+        ("word", accepted_answer.replacen("thing", "things", 1)),
+    ] {
+        assert_ne!(
+            grader
+                .grade(&free_recall.prompt, &submission, context)
+                .verdict,
+            Verdict::Correct,
+            "{label} deviation must not be correct"
+        );
+    }
 }
 
 #[test]

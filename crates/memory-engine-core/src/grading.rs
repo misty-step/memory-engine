@@ -1,4 +1,6 @@
-use crate::{ExactPrompt, GradeContext, GradeResult, GraderKind, Prompt, Rating, Verdict};
+use crate::{
+    ExactPrompt, ExactPromptKind, GradeContext, GradeResult, GraderKind, Prompt, Rating, Verdict,
+};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 pub type RatingPolicy = fn(Verdict, GradeContext) -> Rating;
@@ -94,6 +96,66 @@ impl Grader {
     }
 
     fn grade_exact(
+        &self,
+        prompt: &ExactPrompt,
+        submitted_answer: &str,
+        context: GradeContext,
+    ) -> GradeResult {
+        match prompt.kind {
+            ExactPromptKind::Recitation => self.grade_recitation(prompt, submitted_answer, context),
+            ExactPromptKind::Cloze | ExactPromptKind::ShortAnswer => {
+                self.grade_normalized_exact(prompt, submitted_answer, context)
+            }
+        }
+    }
+
+    fn grade_recitation(
+        &self,
+        prompt: &ExactPrompt,
+        submitted_answer: &str,
+        context: GradeContext,
+    ) -> GradeResult {
+        let submitted = submitted_answer.trim();
+        let accepted = prompt
+            .accepted_answers
+            .iter()
+            .map(|answer| answer.trim())
+            .collect::<Vec<_>>();
+
+        if accepted.contains(&submitted) {
+            return deterministic_grade(
+                Verdict::Correct,
+                (self.rating_policy)(Verdict::Correct, context),
+                submitted_answer,
+                &expected_answer(prompt),
+                true,
+            );
+        }
+
+        let is_close = accepted.iter().any(|candidate| {
+            !candidate.is_empty()
+                && !submitted.eq_ignore_ascii_case(candidate)
+                && (strip_punctuation_preserving_case(submitted)
+                    == strip_punctuation_preserving_case(candidate)
+                    || levenshtein(submitted, candidate)
+                        <= near_miss_threshold(candidate.chars().count()))
+        });
+        let verdict = if is_close {
+            Verdict::Close
+        } else {
+            Verdict::Wrong
+        };
+
+        deterministic_grade(
+            verdict,
+            (self.rating_policy)(verdict, context),
+            submitted_answer,
+            &expected_answer(prompt),
+            false,
+        )
+    }
+
+    fn grade_normalized_exact(
         &self,
         prompt: &ExactPrompt,
         submitted_answer: &str,
@@ -218,6 +280,16 @@ fn base_normalize(value: &str) -> String {
     words.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn strip_punctuation_preserving_case(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric() || character.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn apply_equivalence_groups(value: &str, groups: &[Vec<String>]) -> String {
     let mut replacements = groups
         .iter()
@@ -324,6 +396,17 @@ mod tests {
         })
     }
 
+    fn recitation(accepted_answer: &str) -> Prompt {
+        Prompt::Exact(ExactPrompt {
+            kind: ExactPromptKind::Recitation,
+            review_unit_id: ReviewUnitId::new("recitation"),
+            prompt: "Recite the accepted unit exactly.".to_owned(),
+            accepted_answers: vec![accepted_answer.to_owned()],
+            equivalence_groups: vec![vec!["colour".to_owned(), "color".to_owned()]],
+            ignored_tokens: vec!["please".to_owned(), ".".to_owned()],
+        })
+    }
+
     #[test]
     fn default_rating_policy_matches_current_typescript_contract() {
         assert_eq!(
@@ -425,5 +508,31 @@ mod tests {
         let grade = Grader::new().grade(&prompt, "crédō", context(5_100, 0));
 
         assert_eq!(grade.verdict, Verdict::Correct);
+    }
+
+    #[test]
+    fn recitation_requires_the_exact_accepted_unit_and_has_explicit_near_misses() {
+        let prompt = recitation("The colour of sky.");
+
+        let exact = Grader::new().grade(&prompt, "The colour of sky.", context(5_100, 0));
+        assert_eq!(exact.verdict, Verdict::Correct);
+
+        let outer_whitespace =
+            Grader::new().grade(&prompt, "  The colour of sky.  ", context(5_100, 0));
+        assert_eq!(outer_whitespace.verdict, Verdict::Correct);
+
+        let case_variant = Grader::new().grade(&prompt, "the colour of sky.", context(5_100, 0));
+        assert_eq!(case_variant.verdict, Verdict::Wrong);
+
+        let punctuation_variant =
+            Grader::new().grade(&prompt, "The colour of sky", context(5_100, 0));
+        assert_eq!(punctuation_variant.verdict, Verdict::Close);
+
+        let word_near_miss = Grader::new().grade(&prompt, "The colour of say.", context(5_100, 0));
+        assert_eq!(word_near_miss.verdict, Verdict::Close);
+
+        let normalized_variant =
+            Grader::new().grade(&prompt, "Please the color of sky.", context(5_100, 0));
+        assert_eq!(normalized_variant.verdict, Verdict::Wrong);
     }
 }
