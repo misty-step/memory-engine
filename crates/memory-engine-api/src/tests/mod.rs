@@ -3594,14 +3594,16 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
     let target = state
         .save_account(&browser, "copy-target@example.com")
         .expect("copy account");
-    let mut store =
-        memory_engine_persistence_postgres::PostgresStudyStore::connect(&database.scoped_url)
-            .expect("verify copied account");
-    let account = store.for_account(
-        memory_engine_persistence_postgres::AccountScope::new(target.account_id.clone())
-            .expect("target scope"),
-    );
-    let snapshot = account.snapshot().expect("target snapshot");
+    let snapshot = tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database.scoped_url)
+                .expect("verify copied account");
+        let account = store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(target.account_id.clone())
+                .expect("target scope"),
+        );
+        account.snapshot().expect("target snapshot")
+    });
     assert_eq!(snapshot.content_feedback.len(), 1);
     assert_eq!(snapshot.content_feedback[0].id, "copy-feedback-a");
     assert_eq!(snapshot.content_feedback[0].account_id, target.account_id);
