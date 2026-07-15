@@ -581,6 +581,36 @@ impl BetaPersistenceStore {
         load_snapshot(&self.path).unwrap_or_else(|_| self.data.clone())
     }
 
+    /// Copy this account's durable snapshot for a new account scope.
+    ///
+    /// Content feedback carries its account scope because it is also exported
+    /// independently of the account snapshot. Rewrite that field while
+    /// preserving every other persisted record and use the same atomic file
+    /// ownership boundary as ordinary store writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the source cannot be read or the target
+    /// cannot be locked and written.
+    pub fn copy_for_account(
+        &self,
+        target_path: impl Into<PathBuf>,
+        target_account_id: &str,
+    ) -> Result<(), BetaStoreError> {
+        assert_non_blank(target_account_id, "Target account id")?;
+        let mut snapshot = self.snapshot();
+        for feedback in &mut snapshot.content_feedback {
+            target_account_id.clone_into(&mut feedback.account_id);
+        }
+
+        let target_path = target_path.into();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _lock = StoreFileLock::acquire(&target_path)?;
+        persist_snapshot(&target_path, &snapshot)
+    }
+
     pub fn fail_next_commit_for_test(&mut self) {
         self.fail_next_commit = true;
     }
