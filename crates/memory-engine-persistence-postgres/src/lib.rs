@@ -1117,6 +1117,49 @@ impl AccountStudyStore<'_> {
         Ok(review_unit)
     }
 
+    /// Move every non-archived review unit under one persisted concept key
+    /// forward in one account-scoped transaction.
+    ///
+    /// The JSON record is updated as a set, so membership is evaluated by the
+    /// persisted queue concept key and all matching rows commit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the transaction or record decoding
+    /// fails.
+    pub fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let rows = transaction.query(
+            "UPDATE memory_engine_review_units
+             SET record = jsonb_set(
+                 record,
+                 '{snoozedUntil}',
+                 to_jsonb($3::BIGINT),
+                 true
+             )
+             WHERE account_id = $1
+               AND archived_at_ms IS NULL
+               AND record->'queue'->>'conceptKey' = $2
+             RETURNING record",
+            &[&self.scope.account_id, &concept_key, &snoozed_until],
+        )?;
+        let snoozed = rows
+            .into_iter()
+            .map(|row| {
+                let value: serde_json::Value = row.get(0);
+                Ok(serde_json::from_value(value)?)
+            })
+            .collect::<Result<Vec<BetaReviewUnitRecord>, PostgresStoreError>>()?;
+        transaction.commit()?;
+
+        Ok(snoozed)
+    }
+
     /// Replace volatile lifecycle metadata without changing schedule history.
     ///
     /// # Errors
@@ -1735,6 +1778,14 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::snooze_review_unit_until(self, review_unit_id, snoozed_until)
+    }
+
+    fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::snooze_review_units_for_concept_until(self, concept_key, snoozed_until)
     }
 
     fn set_review_unit_lifecycle(
@@ -2768,6 +2819,7 @@ mod tests {
 
         run_low_level_postgres_store_contract(&mut store)?;
         run_postgres_study_session_contract(&mut store)?;
+        run_postgres_concept_snooze_contract(&mut store)?;
 
         Ok(())
     }
@@ -3011,6 +3063,60 @@ mod tests {
         Ok(())
     }
 
+    fn run_postgres_concept_snooze_contract(
+        store: &mut PostgresStudyStore,
+    ) -> Result<(), PostgresStoreError> {
+        let mut account = store.for_account(AccountScope::new("acct_live_concept_snooze")?);
+        account.ensure_account(NOW)?;
+
+        for (review_unit_id, concept_key) in [
+            ("concept-snooze-live-a", "shared-live-concept"),
+            ("concept-snooze-live-b", "shared-live-concept"),
+            ("concept-snooze-live-other", "other-live-concept"),
+        ] {
+            let review_unit_id = ReviewUnitId::new(review_unit_id);
+            let mut unit = review_unit_for_concept(&review_unit_id, concept_key);
+            unit.queue.due = NOW - 60_000;
+            account.save_review_unit(&unit)?;
+            account.set_schedule_state(
+                &review_unit_id,
+                Some(&schedule_state(2, ScheduleStatus::Review, NOW - 86_400_000)),
+                NOW,
+            )?;
+        }
+
+        let before = account.snapshot()?;
+        let snoozed = account
+            .snooze_review_units_for_concept_until("shared-live-concept", NOW + 86_400_000)?;
+        assert_eq!(snoozed.len(), 2);
+        assert!(snoozed
+            .iter()
+            .all(|unit| unit.snoozed_until == Some(NOW + 86_400_000)));
+
+        let after = account.snapshot()?;
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.schedules, before.schedules);
+        assert_eq!(
+            after
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == ReviewUnitId::new("concept-snooze-live-other"))
+                .and_then(|unit| unit.snoozed_until),
+            None
+        );
+        assert_eq!(
+            after
+                .review_units
+                .iter()
+                .filter(|unit| unit.queue.concept_key.as_deref() == Some("shared-live-concept"))
+                .filter_map(|unit| unit.snoozed_until)
+                .collect::<Vec<_>>(),
+            vec![NOW + 86_400_000; 2]
+        );
+
+        Ok(())
+    }
+
     fn source_document(id: &str) -> SourceDocument {
         SourceDocument {
             id: id.to_owned(),
@@ -3136,6 +3242,32 @@ mod tests {
             reference_span_ids: draft.reference_span_ids.clone(),
             concept_reference_note_key: None,
             generated_prompt_draft_id: Some(draft.id.clone()),
+            archived_at: None,
+            snoozed_until: None,
+            created_at: NOW,
+        }
+    }
+
+    fn review_unit_for_concept(
+        review_unit_id: &ReviewUnitId,
+        concept_key: &str,
+    ) -> BetaReviewUnitRecord {
+        BetaReviewUnitRecord {
+            review_unit_id: review_unit_id.clone(),
+            prompt_id: format!("prompt-{review_unit_id}"),
+            prompt: prompt(review_unit_id),
+            queue: PersistedQueueCandidate {
+                review_unit_id: review_unit_id.clone(),
+                due: NOW - 60_000,
+                lifecycle: ReviewUnitLifecycle::active(),
+                progression: None,
+                concept_key: Some(concept_key.to_owned()),
+                source_key: Some("live-concept-source".to_owned()),
+                domain_key: Some("live".to_owned()),
+            },
+            reference_span_ids: Vec::new(),
+            concept_reference_note_key: None,
+            generated_prompt_draft_id: None,
             archived_at: None,
             snoozed_until: None,
             created_at: NOW,

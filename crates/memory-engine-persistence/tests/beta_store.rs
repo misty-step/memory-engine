@@ -262,6 +262,62 @@ fn advisory_lock_handoff_ignores_the_orphaned_lock_file() {
 }
 
 #[test]
+fn concept_snooze_commit_failure_preserves_every_member_and_history() {
+    let directory = TempDirectory::new("concept-snooze-atomic");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let matching_ids = [
+        review_unit_id("concept-snooze-a"),
+        review_unit_id("concept-snooze-b"),
+    ];
+    let non_member_id = review_unit_id("concept-snooze-other");
+
+    for (index, review_unit_id) in matching_ids.iter().enumerate() {
+        let mut queue = queue_candidate(review_unit_id, NOW - 60_000);
+        queue.concept_key = Some("shared-concept".to_owned());
+        store
+            .save_review_unit(review_unit(
+                review_unit_id,
+                "concept-snooze-prompt",
+                short_answer_prompt(review_unit_id, "What is the answer?"),
+                queue,
+            ))
+            .expect("matching review unit");
+        store
+            .set_schedule_state(
+                review_unit_id,
+                Some(schedule_state(
+                    u32::try_from(index + 1).expect("reps"),
+                    ScheduleStatus::Review,
+                )),
+            )
+            .expect("matching schedule");
+    }
+    store
+        .save_review_unit(review_unit(
+            &non_member_id,
+            "concept-snooze-prompt",
+            short_answer_prompt(&non_member_id, "What is the answer?"),
+            queue_candidate(&non_member_id, NOW - 60_000),
+        ))
+        .expect("non-member review unit");
+
+    let before = store.snapshot();
+    store.fail_next_commit_for_test();
+    assert_eq!(
+        store
+            .snooze_review_units_for_concept_until("shared-concept", NOW + 86_400_000)
+            .expect_err("the injected commit must fail"),
+        BetaStoreError::InjectedCommitFailure
+    );
+    assert_eq!(
+        store.snapshot(),
+        before,
+        "a failed concept snooze must not leave any member partially updated"
+    );
+}
+
+#[test]
 fn reloads_queue_projection_with_schedule_due_and_progression_metadata() {
     let directory = TempDirectory::new("queue-projection");
     let path = directory.path().join("store.json");

@@ -973,6 +973,40 @@ impl BetaPersistenceStore {
         Ok(snoozed)
     }
 
+    /// Move every non-archived review unit under one persisted concept key
+    /// forward in one file-store commit.
+    ///
+    /// This does not mutate schedule or attempt history. The returned records
+    /// are the exact members changed by the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the single snapshot commit fails.
+    pub fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, BetaStoreError> {
+        let mut next = self.data.clone();
+        let snoozed = next
+            .review_units
+            .iter_mut()
+            .filter(|review_unit| review_unit.archived_at.is_none())
+            .filter(|review_unit| review_unit.queue.concept_key.as_deref() == Some(concept_key))
+            .map(|review_unit| {
+                review_unit.snoozed_until = Some(snoozed_until);
+                review_unit.clone()
+            })
+            .collect::<Vec<_>>();
+
+        if snoozed.is_empty() {
+            return Ok(snoozed);
+        }
+
+        self.commit(next)?;
+        Ok(snoozed)
+    }
+
     /// Replace an approved review unit's volatile lifecycle metadata.
     ///
     /// # Errors

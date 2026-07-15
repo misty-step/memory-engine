@@ -4502,6 +4502,46 @@ async fn v1_json_api_returns_post_answer_feedback_and_concept_progress() {
 }
 
 #[tokio::test]
+async fn v1_json_concept_snooze_is_authenticated_and_defers_every_member() {
+    let app = router(ApiState::default());
+    let account = create_account_v1(&app, "concept-snooze@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    assert_eq!(draft_ids.len(), 2);
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+
+    let review_unit_id = next_review_v1(&app, &account).await;
+    let snoozed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("snooze concept");
+    assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_json(snoozed).await;
+    assert_eq!(snoozed["current"], json!(null));
+    assert_eq!(snoozed["dueCount"], json!(0));
+
+    let after = next_review_v1_body(&app, &account).await;
+    assert_eq!(after["current"], json!(null));
+    assert_eq!(after["dueCount"], json!(0));
+}
+
+#[tokio::test]
 async fn v1_json_api_exposes_review_escape_hatches() {
     let app = router(ApiState::default());
     let account = create_account_v1(&app, "bridge@example.com").await;

@@ -383,26 +383,12 @@ pub trait BetaStudyStore:
     ///
     /// # Errors
     ///
-    /// Returns the store error when the snapshot or any unit write fails.
+    /// Returns the store error when the atomic concept operation fails.
     fn snooze_review_units_for_concept_until(
         &mut self,
         concept_key: &str,
         snoozed_until: i64,
-    ) -> Result<Vec<BetaReviewUnitRecord>, <Self as MemoryServiceStore>::Error> {
-        let review_unit_ids = self
-            .snapshot()?
-            .review_units
-            .into_iter()
-            .filter(|unit| unit.archived_at.is_none())
-            .filter(|unit| unit.queue.concept_key.as_deref() == Some(concept_key))
-            .map(|unit| unit.review_unit_id)
-            .collect::<Vec<_>>();
-
-        review_unit_ids
-            .into_iter()
-            .map(|review_unit_id| self.snooze_review_unit_until(&review_unit_id, snoozed_until))
-            .collect()
-    }
+    ) -> Result<Vec<BetaReviewUnitRecord>, <Self as MemoryServiceStore>::Error>;
 
     /// Replace volatile lifecycle metadata on a review unit.
     ///
@@ -469,6 +455,18 @@ impl BetaStudyStore for BetaPersistenceStore {
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         BetaPersistenceStore::snooze_review_unit_until(self, review_unit_id, snoozed_until)
+    }
+
+    fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::snooze_review_units_for_concept_until(
+            self,
+            concept_key,
+            snoozed_until,
+        )
     }
 
     fn set_review_unit_lifecycle(

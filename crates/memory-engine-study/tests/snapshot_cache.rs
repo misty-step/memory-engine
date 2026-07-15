@@ -151,6 +151,15 @@ impl memory_engine_study::BetaStudyStore for SnapshotCountingStore {
             .snooze_review_unit_until(review_unit_id, snoozed_until)
     }
 
+    fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, StoreError> {
+        self.inner
+            .snooze_review_units_for_concept_until(concept_key, snoozed_until)
+    }
+
     fn set_review_unit_lifecycle(
         &mut self,
         review_unit_id: &ReviewUnitId,
