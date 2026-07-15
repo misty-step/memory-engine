@@ -12,7 +12,7 @@ use crate::{
     source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
     AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
     CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
-    ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
+    ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
     ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
     SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
     AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
