@@ -28,13 +28,22 @@ reverse-direction fact cards from this source, not 47 ordinal-to-member cards.
 The eval instrument itself is green: it reports the failure without changing
 generator policy, and its focused tests pass.
 
-## Instrument green receipt
+## Instrument verification
 
 ```text
 cargo test -p memory-engine-bench generation:: -- --nocapture
-31 passed; 0 failed
+34 passed; 0 failed; 23 filtered out
+
+cargo test -p memory-engine-bench generation::enumerable -- --nocapture
+6 passed; 0 failed; 51 filtered out
+
+cargo test -p memory-engine-bench generation::tests::score_source_uses_production_gate_to_filter_duplicates_before_scoring -- --nocapture
+1 passed; 0 failed; 56 filtered out
 ```
 
-The scorer also has deterministic mutants for missing, duplicate, invented,
-misassigned, reversed, and order-corrupt output. Conceptual sources return
-non-applicable rather than failing an enumerable-set check.
+The focused scorer tests assert missing, duplicate, invented, ordinal
+misassignment, reversed, and order-corrupt output. The fully correct 47-card
+fixture passes even though Grover Cleveland and Donald J. Trump each occur at
+two ordinals. The renderer integration test asserts that conceptual sources
+without a content-fit score render `N/A` in each content-fit column. Conceptual
+sources remain non-applicable rather than failing an enumerable-set check.

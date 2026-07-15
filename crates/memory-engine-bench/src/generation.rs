@@ -1658,6 +1658,10 @@ mod tests {
             receipt.contains("| source | category | accepted | rejected | failures | runtime |")
         );
         assert!(receipt.contains("| letters | fixture | 1 | 0 | 1 | 50% |"));
+        assert!(
+            receipt.contains("| N/A | N/A | N/A | N/A |"),
+            "content-fit None must render explicitly as N/A: {receipt}"
+        );
     }
 
     #[test]

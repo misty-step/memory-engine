@@ -80,18 +80,35 @@ pub(super) fn score(
             .members
             .iter()
             .find(|member| member_name_in_text(member, &candidate.question));
-        let answer_member = expectation
-            .members
-            .iter()
-            .find(|member| member_name_in_text(member, &candidate.answer));
         let answer_ordinal = expectation
             .members
             .iter()
             .find(|member| ordinal_in_text(member.ordinal, &candidate.answer))
             .map(|member| member.ordinal);
+        // The question ordinal is the identity key. Looking up the answer name
+        // first misassigns repeated people such as Grover Cleveland (22/24)
+        // and Donald J. Trump (45/47) to their first occurrence.
+        let answer_member = question_ordinal
+            .and_then(|ordinal| {
+                expectation.members.iter().find(|member| {
+                    member.ordinal == ordinal && member_name_in_text(member, &candidate.answer)
+                })
+            })
+            .or_else(|| {
+                expectation
+                    .members
+                    .iter()
+                    .find(|member| member_name_in_text(member, &candidate.answer))
+            });
+        let answer_ordinal_matches_question =
+            answer_ordinal.is_none_or(|ordinal| question_ordinal == Some(ordinal));
 
-        match (question_ordinal, answer_member) {
-            (Some(ordinal), Some(member)) => {
+        match (
+            question_ordinal,
+            answer_member,
+            answer_ordinal_matches_question,
+        ) {
+            (Some(ordinal), Some(member), true) => {
                 observed_ordinals.push(ordinal);
                 if member.ordinal == ordinal {
                     exact_ordinals.push(ordinal);
@@ -104,7 +121,11 @@ pub(super) fn score(
                     duplicates.insert(ordinal);
                 }
             }
-            (None, _) if question_member.is_some() && answer_ordinal.is_some() => reversed += 1,
+            (Some(ordinal), Some(_), false) => {
+                observed_ordinals.push(ordinal);
+                misassigned += 1;
+            }
+            (None, _, _) if question_member.is_some() && answer_ordinal.is_some() => reversed += 1,
             _ => invented += 1,
         }
     }
@@ -270,6 +291,53 @@ mod tests {
         let score = score(Some(&expectation()), &candidates).expect("applicable");
 
         assert!(score.passes(), "{score:?}");
+    }
+
+    fn presidents_expectation() -> EnumerableSetExpectation {
+        super::super::load_corpus()
+            .expect("corpus")
+            .into_iter()
+            .find(|source| source.id == "us-presidents-ordinal")
+            .and_then(|source| source.expect.enumerable_set)
+            .expect("presidents enumerable expectation")
+    }
+
+    fn ordinal_candidate(ordinal: usize, answer: &str) -> DraftCandidate {
+        candidate(&format!("Who was president number {ordinal}?"), answer)
+    }
+
+    #[test]
+    fn fully_correct_47_card_set_passes_with_repeated_names() {
+        let expectation = presidents_expectation();
+        let candidates = expectation
+            .members
+            .iter()
+            .map(|member| ordinal_candidate(member.ordinal, &member.name))
+            .collect::<Vec<_>>();
+
+        let score = score(Some(&expectation), &candidates).expect("applicable");
+
+        assert_eq!(score.expected, 47);
+        assert_eq!(score.covered, 47);
+        assert_eq!(score.missing, 0);
+        assert_eq!(score.misassigned, 0);
+        assert!(score.passes(), "{score:?}");
+    }
+
+    #[test]
+    fn rejects_an_answer_with_a_repeated_name_but_wrong_ordinal() {
+        let expectation = presidents_expectation();
+        let mut candidates = expectation
+            .members
+            .iter()
+            .map(|member| ordinal_candidate(member.ordinal, &member.name))
+            .collect::<Vec<_>>();
+        candidates[23].answer = "Grover Cleveland was president number 22.".to_owned();
+
+        let score = score(Some(&expectation), &candidates).expect("applicable");
+
+        assert_eq!(score.misassigned, 1);
+        assert!(!score.passes(), "an ordinal-misassignment mutant must fail");
     }
 
     #[test]
