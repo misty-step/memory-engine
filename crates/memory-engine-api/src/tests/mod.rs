@@ -6852,6 +6852,7 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         "Show background reading for this card.",
         "Show later this session.",
         "Hide until tomorrow.",
+        "Hide every card for this concept until tomorrow.",
         "Generate easier warm-up cards, then revisit this one later.",
         "Remove this card from review for good.",
         "Capture new material without leaving review.",
@@ -6863,6 +6864,21 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
             "expected a truthful tooltip with a leading icon ({tooltip}): {page}"
         );
     }
+
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let concept_snoozed = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("snooze concept");
+    assert_eq!(concept_snoozed.status(), StatusCode::OK);
 }
 
 #[tokio::test]

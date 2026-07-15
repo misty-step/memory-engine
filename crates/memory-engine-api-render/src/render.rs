@@ -869,7 +869,7 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
     // tomorrow (`DEFAULT_SNOOZE_DEFER_MS`, 24 hours); see
     // `memory_engine_study::skip_current`/`snooze_current`.
     format!(
-        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
         reference = render_review_action(
             account,
             current,
@@ -894,6 +894,16 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
             ICON_SNOOZE,
             "Hide until tomorrow.",
         ),
+        concept_snooze = current.concept_key.as_ref().map_or_else(String::new, |_| {
+            render_review_action(
+                account,
+                current,
+                "/app/snooze-concept",
+                "Snooze concept",
+                ICON_SNOOZE,
+                "Hide every card for this concept until tomorrow.",
+            )
+        }),
         bridge = render_review_action(
             account,
             current,

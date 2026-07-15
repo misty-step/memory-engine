@@ -412,6 +412,16 @@ impl StudyStorage {
             .snooze_review(account_id, store_path, review_unit_id)
     }
 
+    pub(crate) fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .snooze_concept_review(account_id, store_path, review_unit_id)
+    }
+
     pub(crate) fn delete_review(
         &self,
         account_id: &str,
@@ -647,6 +657,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn snooze_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn snooze_concept_review(
         &self,
         account_id: &str,
         store_path: &FsPath,
@@ -1317,6 +1333,19 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(StudyViewResponse::from_view(view))
     }
 
+    fn snooze_concept_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        require_current_review(&mut study, review_unit_id)?;
+        let view = study.snooze_current_concept().map_err(study_failure)?;
+
+        Ok(StudyViewResponse::from_view(view))
+    }
+
     fn delete_review(
         &self,
         _account_id: &str,
@@ -1915,6 +1944,20 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
             let view = study.snooze_current().map_err(study_failure)?;
+
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            require_current_review_postgres(study, review_unit_id)?;
+            let view = study.snooze_current_concept().map_err(study_failure)?;
 
             Ok(StudyViewResponse::from_view(view))
         })

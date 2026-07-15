@@ -155,6 +155,7 @@ pub struct BetaStudyQueueRow {
 #[serde(rename_all = "camelCase")]
 pub struct BetaStudyCurrent {
     pub review_unit_id: ReviewUnitId,
+    pub concept_key: Option<String>,
     pub prompt_id: String,
     pub activity_kind: GeneratedLearningActivityKind,
     pub activity_stage: String,
@@ -252,6 +253,7 @@ pub enum BetaStudyError<E = BetaStoreError> {
     Generation(BetaGenerationError<E>),
     Service(ServiceError<E>),
     NoActiveReviewUnit,
+    NoConceptKey,
 }
 
 impl<E> fmt::Display for BetaStudyError<E>
@@ -266,6 +268,7 @@ where
             Self::NoActiveReviewUnit => {
                 formatter.write_str("Beta study session has no active review unit")
             }
+            Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
         }
     }
 }
@@ -279,7 +282,7 @@ where
             Self::Store(error) => Some(error),
             Self::Generation(error) => Some(error),
             Self::Service(error) => Some(error),
-            Self::NoActiveReviewUnit => None,
+            Self::NoActiveReviewUnit | Self::NoConceptKey => None,
         }
     }
 }
@@ -374,6 +377,32 @@ pub trait BetaStudyStore:
         review_unit_id: &ReviewUnitId,
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Move every non-archived review unit under one persisted concept key
+    /// forward without changing any schedule or attempt receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the snapshot or any unit write fails.
+    fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, <Self as MemoryServiceStore>::Error> {
+        let review_unit_ids = self
+            .snapshot()?
+            .review_units
+            .into_iter()
+            .filter(|unit| unit.archived_at.is_none())
+            .filter(|unit| unit.queue.concept_key.as_deref() == Some(concept_key))
+            .map(|unit| unit.review_unit_id)
+            .collect::<Vec<_>>();
+
+        review_unit_ids
+            .into_iter()
+            .map(|review_unit_id| self.snooze_review_unit_until(&review_unit_id, snoozed_until))
+            .collect()
+    }
 
     /// Replace volatile lifecycle metadata on a review unit.
     ///
@@ -918,6 +947,63 @@ where
             .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
+    }
+
+    /// Snooze every active review unit sharing the current unit's persisted
+    /// concept key, then select the next due candidate.
+    ///
+    /// Concept membership is deliberately limited to the existing queue key;
+    /// review-unit ids and labels are never guessed into a grouping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active, the active item has
+    /// no concept key, or persistence fails.
+    pub fn snooze_current_concept_until(
+        &mut self,
+        snoozed_until: i64,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let concept_key = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?
+            .queue
+            .concept_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or(BetaStudyError::NoConceptKey)?;
+        self.snooze_concept_until(&concept_key, snoozed_until)
+    }
+
+    /// Snooze all active review units under an existing concept key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when persistence fails.
+    pub fn snooze_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.invalidate_snapshot();
+        self.store
+            .snooze_review_units_for_concept_until(concept_key, snoozed_until)
+            .map_err(BetaStudyError::Store)?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Snooze the current concept for the default long interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when no item is active, the active item has
+    /// no concept key, or persistence fails.
+    pub fn snooze_current_concept(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.snooze_current_concept_until((self.now)() + DEFAULT_SNOOZE_DEFER_MS)
     }
 
     /// Skip the active review item briefly without grading it.
@@ -1541,6 +1627,7 @@ fn current_view(parts: CurrentViewParts<'_>) -> BetaStudyCurrent {
 
     BetaStudyCurrent {
         review_unit_id: draft.review_unit_id.clone(),
+        concept_key: draft.queue.concept_key.clone(),
         prompt_id: draft.prompt_id.clone(),
         activity_kind: draft.activity_kind.clone(),
         activity_stage: draft.activity_stage.clone(),

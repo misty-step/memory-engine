@@ -569,6 +569,39 @@ impl ApiState {
         )
     }
 
+    /// Snooze every review card under the active card's persisted concept key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, review lookup, or persistence fails.
+    pub fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .snooze_concept_review(account_id, session_token, review_unit_id)
+    }
+
+    /// Snooze every review card under the browser-authenticated card's
+    /// persisted concept key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when review lookup or persistence fails.
+    pub fn snooze_concept_app_review(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.snooze_concept_review(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+        )
+    }
+
     /// Generate bridge material for a review.
     ///
     /// # Errors

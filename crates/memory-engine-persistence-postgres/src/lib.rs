@@ -2064,7 +2064,8 @@ impl From<memory_engine_study::BetaStudyError<PostgresStoreError>> for PostgresS
             memory_engine_study::BetaStudyError::Service(error) => {
                 Self::StudySession(error.to_string())
             }
-            memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
+            memory_engine_study::BetaStudyError::NoActiveReviewUnit
+            | memory_engine_study::BetaStudyError::NoConceptKey => {
                 Self::StudySession(error.to_string())
             }
         }

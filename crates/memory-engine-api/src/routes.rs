@@ -58,6 +58,7 @@ enum V1Route {
     Reference,
     Skip,
     Snooze,
+    SnoozeConcept,
     Bridge,
     Submit,
 }
@@ -77,6 +78,8 @@ const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/
 const V1_REFERENCE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reference";
 const V1_SKIP_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/skip";
 const V1_SNOOZE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/snooze";
+const V1_SNOOZE_CONCEPT_PATH: &str =
+    "/v1/accounts/{account_id}/review/{review_unit_id}/snooze-concept";
 const V1_BRIDGE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/bridge";
 const V1_SUBMIT_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/submit";
 const V1_CONTENT_FEEDBACK_PATH: &str =
@@ -96,6 +99,7 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Reference,
     V1Route::Skip,
     V1Route::Snooze,
+    V1Route::SnoozeConcept,
     V1Route::Bridge,
     V1Route::Submit,
     V1Route::ContentFeedback,
@@ -120,6 +124,9 @@ impl V1Route {
             Self::Reference => router.route(V1_REFERENCE_PATH, post(reference_review)),
             Self::Skip => router.route(V1_SKIP_PATH, post(skip_review)),
             Self::Snooze => router.route(V1_SNOOZE_PATH, post(snooze_review)),
+            Self::SnoozeConcept => {
+                router.route(V1_SNOOZE_CONCEPT_PATH, post(snooze_concept_review))
+            }
             Self::Bridge => router.route(V1_BRIDGE_PATH, post(bridge_review)),
             Self::Submit => router.route(V1_SUBMIT_PATH, post(submit_review)),
             Self::ContentFeedback => router.route(V1_CONTENT_FEEDBACK_PATH, post(content_feedback)),
@@ -186,6 +193,10 @@ impl V1Route {
             Self::Snooze => &[V1ContractOperation {
                 method: "POST",
                 path: V1_SNOOZE_PATH,
+            }],
+            Self::SnoozeConcept => &[V1ContractOperation {
+                method: "POST",
+                path: V1_SNOOZE_CONCEPT_PATH,
             }],
             Self::Bridge => &[V1ContractOperation {
                 method: "POST",
@@ -254,6 +265,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/reference", post(reference_app_review))
         .route("/app/skip", post(skip_app_review))
         .route("/app/snooze", post(snooze_app_review))
+        .route("/app/snooze-concept", post(snooze_concept_app_review))
         .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
@@ -290,6 +302,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/snooze",
             post(snooze_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/snooze-concept",
+            post(snooze_concept_review),
         )
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/bridge",
@@ -537,6 +553,20 @@ async fn snooze_review(
     let session_token = read_session_token(&headers)?;
 
     Ok(Json(state.snooze_review(
+        &account_id,
+        session_token,
+        &review_unit_id,
+    )?))
+}
+
+async fn snooze_concept_review(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.snooze_concept_review(
         &account_id,
         session_token,
         &review_unit_id,
@@ -1209,6 +1239,21 @@ async fn snooze_app_review(
             Err(error) => return app_failure_response(error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
+
+    Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn snooze_concept_app_review(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReviewActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }

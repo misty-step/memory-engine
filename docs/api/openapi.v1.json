@@ -373,6 +373,31 @@
         }
       }
     },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/snooze-concept": {
+      "post": {
+        "summary": "Snooze every review under the current concept without grading it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with every card under the current concept deferred and the next due item selected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/review/{review_unit_id}/bridge": {
       "post": {
         "summary": "Generate easier bridge material for the current review",
@@ -843,6 +868,7 @@
         "type": "object",
         "required": [
           "reviewUnitId",
+          "conceptKey",
           "promptId",
           "activityKind",
           "activityStage",
@@ -861,6 +887,17 @@
         "properties": {
           "reviewUnitId": {
             "type": "string"
+          },
+          "conceptKey": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Existing persisted concept grouping key, when this card belongs to one."
           },
           "promptId": {
             "type": "string"

@@ -793,6 +793,22 @@ impl AccountRegistry {
             .snooze_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation for the active review's whole concept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
+    pub(crate) fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .snooze_concept_review(account_id, &account.store_path, review_unit_id)
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors
