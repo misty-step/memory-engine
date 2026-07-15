@@ -162,8 +162,8 @@ fn fake_model_provider_branches_draft_shapes_by_learning_intent() {
     );
     let fact = source_document(
         "src-fact",
-        "NATO letters",
-        "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+        "Cell facts",
+        "ATP means cellular energy. DNA means genetic material. RNA means messenger material.",
     );
     let process = source_document(
         "src-process",
@@ -239,6 +239,110 @@ fn fake_model_provider_branches_draft_shapes_by_learning_intent() {
         .candidates
         .iter()
         .any(|candidate| candidate.activity_stage.contains("composition")));
+}
+
+#[test]
+fn enumerable_sources_emit_every_mapping_in_the_non_derivable_direction() {
+    let source = source_document(
+        "src-enumerable",
+        "NATO phonetic alphabet",
+        "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+    );
+
+    let classification = classify_learning_intent(&source);
+    assert_eq!(classification.intent, LearningIntent::EnumerableSet);
+    assert_eq!(
+        LearningIntent::from_label("enumerable_set"),
+        Some(LearningIntent::EnumerableSet)
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("enumerable generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 4);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["Alfa", "Bravo", "Charlie", "Delta"]
+    );
+    assert!(drafts.candidates.iter().all(|candidate| {
+        candidate.distractors.is_empty()
+            && candidate.question.contains("letter")
+            && candidate.activity_stage == "production-recall"
+            && candidate.evidence.is_some()
+    }));
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("which letter")));
+}
+
+#[test]
+fn enumerable_numbered_lists_preserve_order_and_source_evidence() {
+    let source = source_document("src-list", "Ordered terms", "1. Alpha\n2. Beta\n3. Gamma");
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("numbered list generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+    assert_eq!(drafts.candidates[0].index, 1);
+    assert_eq!(drafts.candidates[2].index, 3);
+    assert_eq!(drafts.candidates[1].evidence.as_deref(), Some("2. Beta"));
+}
+
+#[test]
+fn sequential_sources_emit_one_verbatim_card_per_sentence() {
+    let source = source_document(
+        "src-sequence",
+        "A quoted oath excerpt",
+        "First faithful line. Second faithful line. Third faithful line.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::VerbatimMemorization
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("sequential generation");
+
+    assert_eq!(drafts.candidates.len(), 3);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "First faithful line.",
+            "Second faithful line.",
+            "Third faithful line."
+        ]
+    );
+    assert!(drafts.candidates.iter().all(|candidate| {
+        candidate.activity_kind == GeneratedLearningActivityKind::Exercise
+            && candidate.worked_solution.is_some()
+            && candidate.evidence.as_deref() == Some(candidate.answer.as_str())
+    }));
+    assert_eq!(drafts.candidates[0].activity_stage, "free-recall");
+    assert!(drafts.candidates[1..]
+        .iter()
+        .all(|candidate| candidate.activity_stage == "cued-recall"));
+    assert!(drafts.candidates[1]
+        .question
+        .contains("First faithful line."));
 }
 
 #[test]

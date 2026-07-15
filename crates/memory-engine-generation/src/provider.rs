@@ -405,6 +405,7 @@ pub trait BridgeMaterialProvider: ReferenceNoteProvider {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LearningIntent {
     VerbatimMemorization,
+    EnumerableSet,
     ConceptUnderstanding,
     FactRecall,
     ProcedureProcess,
@@ -415,6 +416,7 @@ impl LearningIntent {
     pub fn label(self) -> &'static str {
         match self {
             Self::VerbatimMemorization => "verbatim_memorization",
+            Self::EnumerableSet => "enumerable_set",
             Self::ConceptUnderstanding => "concept_understanding",
             Self::FactRecall => "fact_recall",
             Self::ProcedureProcess => "procedure_process",
@@ -425,6 +427,7 @@ impl LearningIntent {
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim() {
             "verbatim_memorization" => Some(Self::VerbatimMemorization),
+            "enumerable_set" => Some(Self::EnumerableSet),
             "concept_understanding" => Some(Self::ConceptUnderstanding),
             "fact_recall" => Some(Self::FactRecall),
             "procedure_process" => Some(Self::ProcedureProcess),
@@ -448,9 +451,16 @@ pub struct LearningIntentClassification {
 #[must_use]
 pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassification {
     let body = source.body.as_deref().unwrap_or_default();
-    let normalized = body.to_lowercase();
+    let normalized = format!("{} {}", source.title, body).to_lowercase();
     let lines = non_empty_lines(body);
     let list_facts = count_fact_sentences(body);
+    if looks_enumerable(body, &lines) {
+        return LearningIntentClassification {
+            intent: LearningIntent::EnumerableSet,
+            rationale: "source contains a finite set of independently recallable entries"
+                .to_owned(),
+        };
+    }
     if looks_verbatim(&normalized, &lines) {
         return LearningIntentClassification {
             intent: LearningIntent::VerbatimMemorization,
@@ -598,18 +608,22 @@ impl DraftProvider for FakeModelProvider {
         let classification = classify_learning_intent(source);
         let candidates = match classification.intent {
             LearningIntent::VerbatimMemorization => verbatim_candidates(source, &body),
+            LearningIntent::EnumerableSet => enumerable_candidates(source, &body),
             LearningIntent::ConceptUnderstanding => concept_candidates(source, &body),
             LearningIntent::FactRecall => fact_candidates(source, &body),
             LearningIntent::ProcedureProcess => procedure_candidates(source, &body),
         };
 
-        Ok(ProviderDrafts {
-            model: DraftProvider::model(self),
-            learning_intent: Some(classification.intent),
-            candidates,
-            failures: Vec::new(),
-            usage: None,
-        })
+        Ok(enforce_content_policy(
+            source,
+            ProviderDrafts {
+                model: DraftProvider::model(self),
+                learning_intent: Some(classification.intent),
+                candidates,
+                failures: Vec::new(),
+                usage: None,
+            },
+        ))
     }
 }
 
@@ -709,12 +723,166 @@ fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
         || normalized.contains("memorize")
         || normalized.contains("verbatim")
         || normalized.contains("poem")
+        || normalized.contains("oath")
+        || normalized.contains("creed")
+        || normalized.contains("excerpt")
+        || normalized.contains("verse")
+        || normalized.contains("quote")
         || (lines.len() >= 3
             && lines
                 .iter()
                 .filter(|line| line.chars().count() <= 96)
                 .count()
                 >= 3)
+}
+
+/// Apply deterministic content policy after a provider has classified a source.
+///
+/// Finite sets and sequential passages are safety-critical coverage cases: a
+/// model may omit entries or collapse a passage into a sampled quiz. The
+/// source itself is the authority for these two shapes, so replace only those
+/// candidates with exact, source-grounded drafts. Conceptual and ordinary fact
+/// generation remains provider-owned and therefore keeps its fewer-better
+/// behavior.
+#[must_use]
+pub fn enforce_content_policy(
+    source: &SourceDocument,
+    mut drafts: ProviderDrafts,
+) -> ProviderDrafts {
+    let classification = classify_learning_intent(source);
+    match classification.intent {
+        LearningIntent::EnumerableSet => {
+            drafts.learning_intent = Some(classification.intent);
+            drafts.candidates =
+                enumerable_candidates(source, source.body.as_deref().unwrap_or_default());
+            assert_exhaustive_indices(&drafts.candidates);
+        }
+        LearningIntent::VerbatimMemorization => {
+            drafts.learning_intent = Some(classification.intent);
+            drafts.candidates =
+                verbatim_candidates(source, source.body.as_deref().unwrap_or_default());
+            assert_exhaustive_indices(&drafts.candidates);
+        }
+        LearningIntent::ConceptUnderstanding
+        | LearningIntent::FactRecall
+        | LearningIntent::ProcedureProcess => {}
+    }
+    drafts
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnumerableEntry {
+    cue: String,
+    answer: String,
+    evidence: String,
+}
+
+fn looks_enumerable(body: &str, lines: &[String]) -> bool {
+    mapping_entries(body).len() >= 3 || list_entries(lines).len() >= 3
+}
+
+fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
+    let mappings = mapping_entries(body);
+    if mappings.len() >= 3 {
+        return mappings;
+    }
+
+    list_entries(&non_empty_lines(body))
+        .into_iter()
+        .enumerate()
+        .map(|(position, (answer, evidence))| EnumerableEntry {
+            cue: (position + 1).to_string(),
+            answer,
+            evidence,
+        })
+        .collect()
+}
+
+fn mapping_entries(body: &str) -> Vec<EnumerableEntry> {
+    body.split(['.', '?', '!', '\n'])
+        .filter_map(|raw| {
+            let evidence = raw.trim().to_owned();
+            let (cue, answer) = raw.split_once(" is ")?;
+            let cue = cue.trim();
+            let answer = answer.trim().trim_matches(|character: char| {
+                character == ':' || character == ';' || character == ','
+            });
+            if cue.chars().count() != 1 || answer.is_empty() {
+                return None;
+            }
+            Some(EnumerableEntry {
+                cue: cue.to_owned(),
+                answer: answer.to_owned(),
+                evidence,
+            })
+        })
+        .collect()
+}
+
+fn list_entries(lines: &[String]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(answer) = trimmed
+            .strip_prefix('-')
+            .or_else(|| trimmed.strip_prefix('*'))
+            .or_else(|| trimmed.strip_prefix('•'))
+            .map(str::trim)
+            .filter(|answer| !answer.is_empty())
+        {
+            entries.push((answer.to_owned(), trimmed.to_owned()));
+            continue;
+        }
+        let Some((prefix, answer)) = trimmed.split_once(['.', ')', ':']) else {
+            continue;
+        };
+        if prefix.trim().parse::<usize>().is_ok() && !answer.trim().is_empty() {
+            entries.push((answer.trim().to_owned(), trimmed.to_owned()));
+        }
+    }
+    entries
+}
+
+fn assert_exhaustive_indices(candidates: &[DraftCandidate]) {
+    for (position, candidate) in candidates.iter().enumerate() {
+        assert_eq!(
+            candidate.index,
+            position + 1,
+            "content-policy candidates must cover sequential indices [1..N]"
+        );
+    }
+}
+
+fn enumerable_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    enumerable_entries(body)
+        .into_iter()
+        .enumerate()
+        .map(|(position, entry)| {
+            let question = if entry.cue.chars().count() == 1 {
+                format!(
+                    "In {}, which word stands for the letter {}?",
+                    source.title, entry.cue
+                )
+            } else {
+                format!(
+                    "In {}, what is the entry for number {}?",
+                    source.title, entry.cue
+                )
+            };
+            DraftCandidate {
+                index: position + 1,
+                concept: format!("{}: {}", source.title, entry.cue),
+                question,
+                answer: entry.answer.clone(),
+                evidence: Some(entry.evidence),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "production-recall".to_owned(),
+                unsupported: false,
+            }
+        })
+        .collect()
 }
 
 fn looks_process(normalized: &str) -> bool {
@@ -773,52 +941,55 @@ fn count_fact_sentences(body: &str) -> usize {
 }
 
 fn verbatim_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let units = sequential_units(body);
+    units
+        .iter()
+        .enumerate()
+        .map(|(position, unit)| {
+            let (question, activity_stage) = if position == 0 {
+                (
+                    format!("Recite the opening line of {} exactly.", source.title),
+                    "free-recall",
+                )
+            } else {
+                (
+                    format!("Recite the next line after: {}", units[position - 1]),
+                    "cued-recall",
+                )
+            };
+            DraftCandidate {
+                index: position + 1,
+                concept: format!("{} line {}", source.title, position + 1),
+                question,
+                answer: unit.clone(),
+                evidence: Some(unit.clone()),
+                distractors: Vec::new(),
+                worked_solution: Some(format!("The exact source line is: {unit}")),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: activity_stage.to_owned(),
+                unsupported: false,
+            }
+        })
+        .collect()
+}
+
+fn sequential_units(body: &str) -> Vec<String> {
     let lines = non_empty_lines(body);
     if lines.len() >= 2 {
-        let cued_answer = lines[1].clone();
-        let cued_evidence = lines.iter().take(2).cloned().collect::<Vec<_>>().join("\n");
-        let free_answer = lines.iter().take(4).cloned().collect::<Vec<_>>().join("\n");
-        return vec![
-            DraftCandidate {
-                index: 1,
-                concept: format!("{} cued recitation", source.title),
-                question: format!("Recite the next line after: {}", lines[0]),
-                answer: cued_answer.clone(),
-                evidence: Some(cued_evidence),
-                distractors: Vec::new(),
-                worked_solution: Some(format!("The source line is: {cued_answer}")),
-                activity_kind: GeneratedLearningActivityKind::Exercise,
-                activity_stage: "cued-recall".to_owned(),
-                unsupported: false,
-            },
-            DraftCandidate {
-                index: 2,
-                concept: format!("{} free recitation", source.title),
-                question: format!("Recite the opening passage of {}.", source.title),
-                answer: free_answer.clone(),
-                evidence: Some(free_answer.clone()),
-                distractors: Vec::new(),
-                worked_solution: Some(format!("Compare your recitation against:\n{free_answer}")),
-                activity_kind: GeneratedLearningActivityKind::Exercise,
-                activity_stage: "free-recall".to_owned(),
-                unsupported: false,
-            },
-        ];
+        return lines;
     }
 
-    let sentence = split_sentences(body).into_iter().next().unwrap_or_default();
-    vec![DraftCandidate {
-        index: 1,
-        concept: format!("{} recitation", source.title),
-        question: format!("Recite {} exactly.", source.title),
-        answer: sentence.clone(),
-        evidence: Some(sentence.clone()),
-        distractors: Vec::new(),
-        worked_solution: Some(format!("Compare your answer against: {sentence}")),
-        activity_kind: GeneratedLearningActivityKind::Exercise,
-        activity_stage: "free-recall".to_owned(),
-        unsupported: false,
-    }]
+    let units = body
+        .split_inclusive(['.', '?', '!'])
+        .map(str::trim)
+        .filter(|unit| !unit.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if units.is_empty() && !body.trim().is_empty() {
+        vec![body.trim().to_owned()]
+    } else {
+        units
+    }
 }
 
 fn concept_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {

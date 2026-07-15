@@ -16,10 +16,10 @@ mod provider;
 use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
-    classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
-    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure,
-    ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    classify_learning_intent, enforce_content_policy, BridgeMaterial, BridgeMaterialProvider,
+    BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider,
+    FallbackProvider, LearningIntent, LearningIntentClassification, ProviderDrafts,
+    ProviderFailure, ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
     ReferenceNoteRequest, ReviewPerformanceContext, SourceAuthorizationContext,
     SourceAuthorizationError, StructuredBlockProvider,
 };

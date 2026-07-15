@@ -103,10 +103,13 @@ pass even when the source already produced other accepted drafts. Variant
 quality checks same-concept same-stage groups for meaningfully different
 question surfaces and rejects questions that leak the answer text.
 Intent shape match is the 051 capture-anything oracle: fixtures annotate
-verbatim memorization, concept understanding, fact recall, and
-procedure/process sources, and the provider must emit different activity
-kinds, stages, and distractor shapes rather than collapsing them into generic
-recognition quizzes. The receipt also runs the selected provider through a
+verbatim memorization, enumerable sets, concept understanding, fact recall, and
+procedure/process sources, and the provider must emit different activity kinds,
+stages, and distractor shapes rather than collapsing them into generic
+recognition quizzes. Enumerable and sequential sources additionally pass
+through deterministic source coverage policy so a model cannot omit a required
+mapping or recitation unit; conceptual prose keeps the fewer-better path. The
+receipt also runs the selected provider through a
 bridge-material fixture that must use the recent failed attempt context,
 produce lower-stage items, stay faithful to the parent concept, and avoid
 duplicates against the parent item. The receipt also reports tokens, dollars,
