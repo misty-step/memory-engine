@@ -150,9 +150,7 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
                 request,
                 session.submit_answer(
                     answer.answer,
-                    answer
-                        .response_time_ms
-                        .unwrap_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS),
+                    sanitize_json_response_time_ms(answer.response_time_ms.as_ref()),
                 ),
             ),
             Err(error) => HttpResponse::bad_request(&error),
@@ -356,7 +354,7 @@ struct SourcePayload {
 #[serde(rename_all = "camelCase")]
 struct AnswerPayload {
     answer: String,
-    response_time_ms: Option<u32>,
+    response_time_ms: Option<serde_json::Value>,
 }
 
 struct RevisionPayload {
@@ -424,17 +422,14 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
             .and_then(|value| value.trim().parse::<u32>().ok());
         return Ok(AnswerPayload {
             answer,
-            response_time_ms: Some(sanitize_response_time_ms(response_time_ms)),
+            response_time_ms: response_time_ms.map(serde_json::Value::from),
         });
     }
 
     let payload: AnswerPayload = serde_json::from_slice(body)
         .map_err(|error| format!("Request body must be an answer object: {error}"))?;
     require_non_blank(&payload.answer, "answer")?;
-    Ok(AnswerPayload {
-        response_time_ms: Some(sanitize_response_time_ms(payload.response_time_ms)),
-        ..payload
-    })
+    Ok(payload)
 }
 
 fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
@@ -442,6 +437,17 @@ fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
         .map_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS, |elapsed| {
             elapsed.min(MAX_PLAUSIBLE_RESPONSE_TIME_MS)
         })
+}
+
+fn sanitize_json_response_time_ms(raw: Option<&serde_json::Value>) -> u32 {
+    let elapsed = raw.and_then(|value| match value {
+        serde_json::Value::String(value) => value.trim().parse::<u32>().ok(),
+        serde_json::Value::Number(value) => {
+            value.as_u64().and_then(|value| u32::try_from(value).ok())
+        }
+        _ => None,
+    });
+    sanitize_response_time_ms(elapsed)
 }
 
 fn read_required_string(body: &[u8], key: &str) -> Result<String, String> {
@@ -911,6 +917,42 @@ mod tests {
         assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
         assert_eq!(answered["current"]["grade"]["rating"], json!(3));
         assert_eq!(answered["summary"]["attemptCount"], json!(1));
+    }
+
+    #[test]
+    fn json_answers_sanitize_malformed_and_out_of_range_response_times() {
+        for (index, response_time_ms) in [
+            json!("6500"),
+            json!("not-a-number"),
+            json!(-250),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TempDirectory::new(&format!("json-timing-{index}"));
+            let mut session = session(directory.path().join("study.json"));
+            seed_nato_source_and_generate(&mut session);
+            approve_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
+
+            let answered = route(
+                &mut session,
+                &request(
+                    "POST",
+                    "/answer",
+                    &json!({
+                        "answer": "ALFA",
+                        "responseTimeMs": response_time_ms,
+                    })
+                    .to_string(),
+                ),
+            );
+            assert_eq!(answered.status, 200, "timing case {index}");
+            let answered: Value = serde_json::from_slice(&answered.body).expect("answered");
+            assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
+            assert_eq!(answered["current"]["grade"]["rating"], json!(3));
+        }
     }
 
     #[test]

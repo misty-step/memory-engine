@@ -573,9 +573,7 @@ pub fn route(session: &mut WebShellSession, request: &HttpRequest) -> HttpRespon
                 request,
                 session.submit_answer(
                     answer.answer,
-                    answer
-                        .response_time_ms
-                        .unwrap_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS),
+                    sanitize_json_response_time_ms(answer.response_time_ms.as_ref()),
                 ),
             ),
             Err(error) => HttpResponse::bad_request(&error),
@@ -718,7 +716,7 @@ impl HttpResponse {
 #[serde(rename_all = "camelCase")]
 struct AnswerPayload {
     answer: String,
-    response_time_ms: Option<u32>,
+    response_time_ms: Option<serde_json::Value>,
 }
 
 fn handle_stream(
@@ -763,7 +761,7 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
             .and_then(|value| value.trim().parse::<u32>().ok());
         return Ok(AnswerPayload {
             answer,
-            response_time_ms: Some(sanitize_response_time_ms(response_time_ms)),
+            response_time_ms: response_time_ms.map(serde_json::Value::from),
         });
     }
 
@@ -772,10 +770,7 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
     if payload.answer.trim().is_empty() {
         return Err("answer must be a non-empty string".to_owned());
     }
-    Ok(AnswerPayload {
-        response_time_ms: Some(sanitize_response_time_ms(payload.response_time_ms)),
-        ..payload
-    })
+    Ok(payload)
 }
 
 fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
@@ -783,6 +778,17 @@ fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
         .map_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS, |elapsed| {
             elapsed.min(MAX_PLAUSIBLE_RESPONSE_TIME_MS)
         })
+}
+
+fn sanitize_json_response_time_ms(raw: Option<&serde_json::Value>) -> u32 {
+    let elapsed = raw.and_then(|value| match value {
+        serde_json::Value::String(value) => value.trim().parse::<u32>().ok(),
+        serde_json::Value::Number(value) => {
+            value.as_u64().and_then(|value| u32::try_from(value).ok())
+        }
+        _ => None,
+    });
+    sanitize_response_time_ms(elapsed)
 }
 
 fn looks_like_json(body: &[u8]) -> bool {
@@ -1213,6 +1219,40 @@ mod tests {
             reveal["current"]["expectedAnswer"],
             json!("I believe in one God")
         );
+    }
+
+    #[test]
+    fn json_answers_sanitize_malformed_and_out_of_range_response_times() {
+        for (index, response_time_ms) in [
+            json!("6500"),
+            json!("not-a-number"),
+            json!(-250),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut shell = WebShellSession::new();
+            shell.start().expect("start");
+
+            let answered = route(
+                &mut shell,
+                &request(
+                    "POST",
+                    "/answer",
+                    &json!({
+                        "answer": "I believe in one God",
+                        "responseTimeMs": response_time_ms,
+                    })
+                    .to_string(),
+                ),
+            );
+            assert_eq!(answered.status, 200, "timing case {index}");
+            let answered: Value = serde_json::from_slice(&answered.body).expect("answered");
+            assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
+            assert_eq!(answered["current"]["grade"]["rating"], json!(3));
+        }
     }
 
     #[test]
