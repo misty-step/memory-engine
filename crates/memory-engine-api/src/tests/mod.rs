@@ -1061,6 +1061,128 @@ async fn review_delete_removes_the_card_for_good() {
 }
 
 #[tokio::test]
+async fn review_edit_form_preserves_identity_queue_and_uses_edited_answer() {
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    assert_activity_succeeded_html(&generated, 2);
+
+    let original_prompt = "Spell CAT over the phone";
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, original_prompt).await;
+    assert!(
+        page.contains(">Edit</button>"),
+        "review must expose Edit: {page}"
+    );
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let due_before = page
+        .split_once(" due</span>")
+        .and_then(|(prefix, _)| prefix.rsplit_once('>'))
+        .map(|(_, due)| due.to_owned())
+        .expect("due count");
+
+    let edit = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/edit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("open edit form");
+    assert_eq!(edit.status(), StatusCode::OK);
+    let edit = response_text(edit).await;
+    assert!(edit.contains(r#"<form class="me-edit-form" action="/app/edit/save" method="post">"#));
+    assert!(edit.contains(r#"name="prompt""#));
+    assert!(edit.contains(r#"name="expectedAnswer""#));
+    assert!(edit.contains(original_prompt));
+
+    assert_blank_review_edit_rejected(&app, &cookie, &csrf_token, &review_unit_id).await;
+
+    let edited_prompt = "Spell CAT with the revised NATO wording";
+    let edited_answer = "REVISED CHARLIE ALFA TANGO";
+    let padded_prompt = format!("  {edited_prompt}  ");
+    let padded_answer = format!("  {edited_answer}  ");
+    let saved = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/edit/save",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("prompt", &padded_prompt),
+                ("expectedAnswer", &padded_answer),
+            ],
+        ))
+        .await
+        .expect("save edit");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = response_text(saved).await;
+    assert!(
+        saved.contains(edited_prompt),
+        "edited prompt must render: {saved}"
+    );
+    assert_eq!(html_value(&saved, "reviewUnitId"), review_unit_id);
+    assert!(saved.contains(&format!(">{due_before} due</span>")));
+
+    let submitted = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("answer", edited_answer),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", "review-edit-uses-new-answer"),
+            ],
+        ))
+        .await
+        .expect("submit edited card");
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let submitted = response_text(submitted).await;
+    assert!(
+        submitted.contains(r#"<span class="me-verdict">Correct</span>"#),
+        "grading must use edited answer: {submitted}"
+    );
+    assert!(submitted.contains(edited_prompt));
+}
+
+async fn assert_blank_review_edit_rejected(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+) {
+    let blank = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/edit/save",
+            cookie,
+            &[
+                ("csrfToken", csrf_token),
+                ("reviewUnitId", review_unit_id),
+                ("prompt", "   "),
+                ("expectedAnswer", "still an answer"),
+            ],
+        ))
+        .await
+        .expect("reject blank edit");
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    assert!(response_text(blank)
+        .await
+        .contains("Review unit prompt must not be blank"));
+}
+
+#[tokio::test]
 async fn mobile_form_flow_generates_reveals_and_submits_review() {
     let state = ApiState::default();
     let app = router(state.clone());
@@ -1807,6 +1929,26 @@ async fn assert_review_mutations_require_csrf(
         "/app/bridge",
         &[("reviewUnitId", review_unit_id)],
         "bridge without csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
+        "/app/edit",
+        &[("reviewUnitId", review_unit_id)],
+        "edit without csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
+        "/app/edit/save",
+        &[
+            ("reviewUnitId", review_unit_id),
+            ("prompt", "edited"),
+            ("expectedAnswer", "ALFA"),
+        ],
+        "edit save without csrf",
     )
     .await;
     assert_forbidden_form(

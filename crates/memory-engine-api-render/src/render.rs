@@ -44,6 +44,24 @@ pub fn render_account_page(
     })
 }
 
+#[must_use]
+pub fn render_edit_review_html(
+    state: &ApiState,
+    account: &AppAccount,
+    view: &StudyViewResponse,
+    notice: Option<&str>,
+) -> String {
+    let jobs = state.jobs_for_app_account(account);
+    document(&render_signed_in(
+        account,
+        &[],
+        Some(view),
+        &jobs,
+        notice,
+        true,
+    ))
+}
+
 fn render_account_page_with_source_loader(
     state: &ApiState,
     account: &AppAccount,
@@ -83,7 +101,7 @@ pub fn render_app_shell(
     notice: Option<&str>,
 ) -> String {
     let inner = match account {
-        Some(account) => render_signed_in(account, sources, view, jobs, notice),
+        Some(account) => render_signed_in(account, sources, view, jobs, notice, false),
         None => render_signed_out(notice),
     };
     document(&inner)
@@ -249,6 +267,7 @@ fn render_signed_in(
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
     notice: Option<&str>,
+    editing: bool,
 ) -> String {
     let due = view.map_or(0, |view| view.due_count);
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
@@ -258,7 +277,12 @@ fn render_signed_in(
         hidden_csrf_input(account)
     );
 
-    let body = if let Some(current) = view.and_then(|view| view.current.as_ref()) {
+    let body = if editing {
+        view.and_then(|view| view.current.as_ref()).map_or_else(
+            || render_workspace(account, sources, view, jobs),
+            |current| render_edit_review(account, current),
+        )
+    } else if let Some(current) = view.and_then(|view| view.current.as_ref()) {
         render_current_review(account, current)
     } else {
         render_workspace(account, sources, view, jobs)
@@ -266,6 +290,27 @@ fn render_signed_in(
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
 
     screen(&header_right, &view_inner, &footer)
+}
+
+fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
+    format!(
+        r#"<section class="ae-group me-edit">
+<p class="me-kicker">Edit card</p>
+<form class="me-edit-form" action="/app/edit/save" method="post">
+{csrf}
+<input type="hidden" name="reviewUnitId" value="{id}">
+<label class="ae-label" for="me-edit-prompt">Prompt</label>
+<textarea class="ae-input" id="me-edit-prompt" name="prompt" rows="4" required>{prompt}</textarea>
+<label class="ae-label" for="me-edit-answer">Answer</label>
+<input class="ae-input" id="me-edit-answer" name="expectedAnswer" value="{answer}" required autocomplete="off">
+<div class="me-actions"><button class="ae-button" type="submit">Save changes</button><a class="ae-button-quiet" href="/">Cancel</a></div>
+</form>
+</section>"#,
+        csrf = hidden_csrf_input(account),
+        id = escape_html(&current.review_unit_id.to_string()),
+        prompt = escape_html(&current.prompt),
+        answer = escape_html(&current.revision_expected_answer),
+    )
 }
 
 fn render_workspace(
@@ -869,7 +914,7 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
     // tomorrow (`DEFAULT_SNOOZE_DEFER_MS`, 24 hours); see
     // `memory_engine_study::skip_current`/`snooze_current`.
     format!(
-        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}{edit}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
         reference = render_review_action(
             account,
             current,
@@ -915,6 +960,14 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
             "Bridge",
             ICON_BRIDGE,
             "Generate easier warm-up cards, then revisit this one later.",
+        ),
+        edit = render_review_action(
+            account,
+            current,
+            "/app/edit",
+            "Edit",
+            ICON_EDIT,
+            "Correct the prompt or answer without changing review history.",
         ),
         delete = render_review_action(
             account,
@@ -1027,6 +1080,7 @@ const ICON_SKIP: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden=
 const ICON_SNOOZE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>"#;
 const ICON_BRIDGE: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 19h18"/><path d="M6 19v-6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v6"/><path d="M9 11V6"/><path d="M15 11V6"/></svg>"#;
 const ICON_TRASH: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M18 7l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>"#;
+const ICON_EDIT: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg>"#;
 const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>"#;
 
 #[cfg(test)]

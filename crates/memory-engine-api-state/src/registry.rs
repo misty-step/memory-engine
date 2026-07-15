@@ -885,6 +885,33 @@ impl AccountRegistry {
             .delete_review(account_id, &account.store_path, review_unit_id)
     }
 
+    /// Runs an API registry operation for an authenticated review edit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, review lookup, validation, or storage
+    /// rejects the edit.
+    pub(crate) fn edit_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let prompt = normalize_required_text(prompt, "Review unit prompt")?;
+        let expected_answer =
+            normalize_required_text(expected_answer, "Review unit expected answer")?;
+        self.storage().edit_review(
+            account_id,
+            &account.store_path,
+            review_unit_id,
+            &prompt,
+            &expected_answer,
+        )
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors
