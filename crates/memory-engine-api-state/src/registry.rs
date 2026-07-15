@@ -203,6 +203,11 @@ impl AccountRegistry {
                     "That reminder email is not allowed for this account.",
                 ));
             }
+            if account_id_for(&email) != account_id {
+                return Err(ApiFailure::forbidden(
+                    "That reminder email must belong to the authenticated account.",
+                ));
+            }
         }
         let last_sent_at_ms = if enabled {
             None

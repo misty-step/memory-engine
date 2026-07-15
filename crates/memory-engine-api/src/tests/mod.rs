@@ -1560,6 +1560,47 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
     assert_eq!(after_disable, after_enable);
 }
 
+#[test]
+fn return_notification_email_must_belong_to_authenticated_account() {
+    let store_root = temp_store_root("return-notification-account-scope");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails([
+                "account-a@example.com".to_owned(),
+                "account-b@example.com".to_owned(),
+            ])
+            .with_unsubscribe_secret("test-unsubscribe-secret"),
+        ),
+    );
+    let account_a = state
+        .create_account("account-a@example.com")
+        .expect("account A");
+    let account_b = state
+        .create_account("account-b@example.com")
+        .expect("account B");
+    let session_a = state
+        .create_browser_session(&account_a)
+        .expect("account A session");
+    let session_b = state
+        .create_browser_session(&account_b)
+        .expect("account B session");
+
+    assert_ne!(session_a.account_id(), session_b.account_id());
+    let error = state
+        .set_return_notification(&session_a, Some("account-b@example.com"), true)
+        .expect_err("account A must not configure account B's allowlisted email");
+    assert_eq!(
+        error.message,
+        "That reminder email must belong to the authenticated account."
+    );
+    state
+        .set_return_notification(&session_a, Some("account-a@example.com"), true)
+        .expect("account A's own allowlisted email");
+    state
+        .set_return_notification(&session_b, Some("account-b@example.com"), true)
+        .expect("account B's own allowlisted email");
+}
+
 #[tokio::test]
 async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
     EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
