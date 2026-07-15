@@ -12,10 +12,10 @@ use crate::{
     source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
     AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
     CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
-    ProjectDeckRecord, ReturnNotificationClaimRequest, SourceRecord, StudyStorage,
-    StudyViewResponse, SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
-    APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
+    ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
+    SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+    AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -248,6 +248,86 @@ impl AccountRegistry {
         force_confirmation: bool,
     ) -> Result<bool, ApiFailure> {
         self.require_account(account_id, session_token)?;
+        self.send_due_count_notification(account_id, due_count, force_confirmation)
+    }
+
+    pub(crate) fn run_scheduled_return_notifications(
+        &self,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let started_at_ms = self.now();
+        let storage = self.storage();
+        let mut account_ids = storage.enabled_return_notification_accounts(
+            config.batch_size.saturating_add(1),
+            started_at_ms,
+            RETURN_NOTIFICATION_INTERVAL_MS,
+        )?;
+        let truncated = account_ids.len() > config.batch_size;
+        account_ids.truncate(config.batch_size);
+        let mut report = ScheduledReturnNotificationReport {
+            started_at_ms,
+            ..ScheduledReturnNotificationReport::default()
+        };
+        report.examined = account_ids.len();
+        for account_id in account_ids {
+            let preference = match storage.load_return_notification_preference(&account_id) {
+                Ok(Some(preference)) => preference,
+                Ok(None) => {
+                    report.skipped = report.skipped.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!(
+                        "return notification scheduler preference failed account={account_id}: {error:?}"
+                    );
+                    continue;
+                }
+            };
+            let view = match storage
+                .study_view(&account_id, &storage.account_store_path(&account_id))
+            {
+                Ok(view) => view,
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!("return notification scheduler due-count failed account={account_id}: {error:?}");
+                    continue;
+                }
+            };
+            if view.due_count == 0 {
+                if preference.pending_delivery_key.is_none() {
+                    report.skipped = report.skipped.saturating_add(1);
+                    continue;
+                }
+            } else {
+                report.due = report.due.saturating_add(1);
+            }
+            match self.send_due_count_notification(&account_id, view.due_count, false) {
+                Ok(true) => report.sent = report.sent.saturating_add(1),
+                Ok(false) => report.skipped = report.skipped.saturating_add(1),
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!(
+                        "return notification scheduler send failed account={account_id}: {error:?}"
+                    );
+                }
+            }
+        }
+        report.truncated = truncated;
+        report.finished_at_ms = self.now();
+        eprintln!(
+            "return notification scheduler examined={} due={} sent={} skipped={} failed={} truncated={}",
+            report.examined, report.due, report.sent, report.skipped, report.failed, report.truncated
+        );
+        Ok(report)
+    }
+
+    fn send_due_count_notification(
+        &self,
+        account_id: &str,
+        due_count: usize,
+        force_confirmation: bool,
+    ) -> Result<bool, ApiFailure> {
         let now = self.now();
         let auth_config = {
             let data = self.lock_data();
@@ -288,7 +368,7 @@ impl AccountRegistry {
             &unsubscribe_link,
             &claim.delivery_key,
         ) {
-            storage.release_return_notification(account_id, &claim.claim_id)?;
+            storage.release_return_notification(account_id, &claim.claim_id, now)?;
             return Err(error);
         }
         if !storage.complete_return_notification(account_id, &claim.claim_id, now)? {

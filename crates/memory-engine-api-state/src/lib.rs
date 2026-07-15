@@ -11,7 +11,11 @@ use std::{
     fs,
     io::Write as _,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::Duration,
 };
 
 use axum::{
@@ -52,6 +56,27 @@ use storage::StudyStorageConfig;
 pub struct ApiState {
     accounts: AccountRegistry,
     jobs: JobQueue,
+    scheduler: Arc<SchedulerRuntime>,
+}
+
+struct SchedulerRuntime {
+    enabled: AtomicBool,
+    running: AtomicBool,
+    last_run_at_ms: AtomicI64,
+    last_success_at_ms: AtomicI64,
+    failure_count: AtomicU64,
+}
+
+impl Default for SchedulerRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            last_run_at_ms: AtomicI64::new(0),
+            last_success_at_ms: AtomicI64::new(0),
+            failure_count: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ApiState {
@@ -63,7 +88,11 @@ impl ApiState {
             Some(path) => JobQueue::with_persistence(accounts.clone(), path),
             None => JobQueue::new(accounts.clone()),
         };
-        Self { accounts, jobs }
+        Self {
+            accounts,
+            jobs,
+            scheduler: Arc::new(SchedulerRuntime::default()),
+        }
     }
 
     /// Start the background generation worker. Call once, from inside the Tokio
@@ -400,6 +429,127 @@ impl ApiState {
             due_count,
             force_confirmation,
         )
+    }
+
+    /// Run one bounded, request-independent reminder sweep. This is the
+    /// scheduler's explicit execution surface; it is safe to call from a
+    /// cron/manual trigger and uses the durable account claim before mail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when enumeration itself cannot be completed.
+    pub fn run_scheduled_return_notifications(
+        &self,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        self.run_scheduled_return_notifications_with_config(
+            ReturnNotificationSchedulerConfig::default(),
+        )
+    }
+
+    /// Run one scheduler sweep with an explicit bound. This is public for the
+    /// safe manual/backfill trigger and deterministic boundary tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when enumeration itself cannot be completed.
+    pub fn run_scheduled_return_notifications_with_config(
+        &self,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let result = self.accounts.run_scheduled_return_notifications(config);
+        match &result {
+            Ok(report) => {
+                self.scheduler
+                    .last_run_at_ms
+                    .store(report.finished_at_ms, Ordering::Relaxed);
+                self.scheduler
+                    .last_success_at_ms
+                    .store(report.finished_at_ms, Ordering::Relaxed);
+                self.scheduler
+                    .failure_count
+                    .fetch_add(report.failed as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.scheduler.failure_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    /// Start the production scheduled trigger. Multiple API instances are
+    /// safe because durable storage owns the per-account claim/fence.
+    pub fn start_return_notification_scheduler(&self) {
+        let interval_ms = scheduler_interval_ms();
+        let config = ReturnNotificationSchedulerConfig::from_env();
+        if !scheduler_enabled() {
+            return;
+        }
+        self.scheduler.enabled.store(true, Ordering::Relaxed);
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                state.scheduler.running.store(true, Ordering::Relaxed);
+                let run_state = state.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    run_state.run_scheduled_return_notifications_with_config(config)
+                })
+                .await;
+                state.scheduler.running.store(false, Ordering::Relaxed);
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("return notification scheduler enumeration failed: {error:?}");
+                    }
+                    Err(error) => {
+                        state
+                            .scheduler
+                            .failure_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("return notification scheduler worker failed: {error}");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+        });
+    }
+
+    /// Run the bounded scheduler through the operator-only manual token.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the manual trigger is not configured or the
+    /// supplied token does not match.
+    pub fn run_manual_return_notification_scheduler(
+        &self,
+        token: &str,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let configured = self
+            .accounts
+            .lock_data()
+            .auth_config
+            .scheduler_manual_token
+            .clone();
+        if configured.as_deref().is_none_or(|value| value != token) {
+            return Err(ApiFailure::forbidden(
+                "Scheduled reminder trigger is not authorized.",
+            ));
+        }
+        self.run_scheduled_return_notifications()
+    }
+
+    #[must_use]
+    pub fn scheduler_health(&self) -> SchedulerHealth {
+        SchedulerHealth {
+            enabled: self.scheduler.enabled.load(Ordering::Relaxed),
+            running: self.scheduler.running.load(Ordering::Relaxed),
+            last_run_at_ms: nonzero_timestamp(
+                self.scheduler.last_run_at_ms.load(Ordering::Relaxed),
+            ),
+            last_success_at_ms: nonzero_timestamp(
+                self.scheduler.last_success_at_ms.load(Ordering::Relaxed),
+            ),
+            failure_count: self.scheduler.failure_count.load(Ordering::Relaxed),
+        }
     }
 
     /// Validate an email unsubscribe link without changing preference state.
@@ -784,6 +934,7 @@ pub struct AuthConfig {
     expose_debug_links: bool,
     link_delivery: AuthLinkDelivery,
     unsubscribe_secret: String,
+    scheduler_manual_token: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -793,6 +944,7 @@ impl Default for AuthConfig {
             expose_debug_links: false,
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
+            scheduler_manual_token: None,
         }
     }
 }
@@ -815,6 +967,10 @@ pub struct ReturnNotificationPreference {
     pub pending_due_count: Option<usize>,
     #[serde(default)]
     pub pending_unsubscribe_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub retry_attempts: u32,
+    #[serde(default)]
+    pub next_retry_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,6 +995,71 @@ pub(crate) struct ReturnNotificationClaimRequest {
     pub claim_expires_at_ms: i64,
     pub unsubscribe_nonce: String,
     pub unsubscribe_expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledReturnNotificationReport {
+    pub examined: usize,
+    pub due: usize,
+    pub sent: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub truncated: bool,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationSchedulerConfig {
+    pub batch_size: usize,
+}
+
+impl Default for ReturnNotificationSchedulerConfig {
+    fn default() -> Self {
+        Self { batch_size: 100 }
+    }
+}
+
+impl ReturnNotificationSchedulerConfig {
+    #[must_use]
+    pub fn from_env() -> Self {
+        let batch_size = std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map_or(100, |value| value.min(1_000));
+        Self { batch_size }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerHealth {
+    pub enabled: bool,
+    pub running: bool,
+    pub last_run_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub failure_count: u64,
+}
+
+fn nonzero_timestamp(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+fn scheduler_enabled() -> bool {
+    std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED")
+        .map(|value| value.trim() != "false")
+        .unwrap_or(true)
+}
+
+fn scheduler_interval_ms() -> u64 {
+    std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map_or(900, |value| value.min(86_400))
+        .saturating_mul(1_000)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -889,6 +1110,12 @@ impl AuthConfig {
     #[must_use]
     pub fn with_unsubscribe_secret(mut self, secret: impl Into<String>) -> Self {
         self.unsubscribe_secret = secret.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_scheduler_manual_token(mut self, token: impl Into<String>) -> Self {
+        self.scheduler_manual_token = Some(token.into());
         self
     }
 
@@ -1147,6 +1374,7 @@ impl StudyViewResponse {
 pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
+    pub return_notification_scheduler: SchedulerHealth,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

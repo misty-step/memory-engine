@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
 use super::{
-    router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS,
+    router, routes, AccountRegistry, ApiState, AuthConfig, CreateSourceRequest,
+    ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
 use memory_engine_api_state::RETURN_NOTIFICATION_INTERVAL_MS;
@@ -40,6 +41,60 @@ async fn healthz_exposes_production_api_boundary() {
     let body = response_json(response).await;
     assert_eq!(body["status"], json!("ok"));
     assert_eq!(body["service"], json!("memory-engine-api"));
+}
+
+#[tokio::test]
+async fn manual_return_scheduler_requires_operator_token_and_reports_health() {
+    let state = ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::default().with_scheduler_manual_token("operator-scheduler-token"),
+    ));
+    let app = router(state);
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/scheduler/return-notifications")
+                .body(Body::empty())
+                .expect("manual scheduler request"),
+        )
+        .await
+        .expect("manual scheduler response");
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    let authorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/scheduler/return-notifications")
+                .header("x-scheduler-token", "operator-scheduler-token")
+                .body(Body::empty())
+                .expect("authorized scheduler request"),
+        )
+        .await
+        .expect("authorized scheduler response");
+    assert_eq!(authorized.status(), StatusCode::OK);
+    assert_eq!(response_json(authorized).await["examined"], json!(0));
+
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("health request"),
+        )
+        .await
+        .expect("health response");
+    let health = response_json(health).await;
+    assert_eq!(
+        health["returnNotificationScheduler"]["enabled"],
+        json!(false)
+    );
+    assert_eq!(
+        health["returnNotificationScheduler"]["failureCount"],
+        json!(0)
+    );
 }
 
 #[tokio::test]
@@ -284,9 +339,302 @@ async fn home_get_does_not_send_or_mutate_return_notification_state() {
     );
 }
 
+#[test]
+fn scheduled_return_notification_sends_live_due_count_without_request_traffic() {
+    SCHEDULED_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("scheduled-return-notification");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(scheduled_clock)
+            .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
+    );
+    let created = state
+        .create_account("scheduled@example.com")
+        .expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let source = state
+        .save_source(
+            account.account_id(),
+            account.session_token(),
+            &CreateSourceRequest {
+                title: "Scheduled reminder source".to_owned(),
+                body: source_body(),
+            },
+        )
+        .expect("save source");
+    let generated = state
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("generate source");
+    for draft in &generated.drafts {
+        state
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("approve generated draft");
+    }
+    let view = state
+        .study_view(account.account_id(), account.session_token())
+        .expect("study view");
+    assert!(view.due_count > 0);
+    state
+        .set_return_notification(&account, Some("scheduled@example.com"), true)
+        .expect("enable reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, view.due_count, true)
+        .expect("confirmation"));
+    let before_scheduler = fs::read_to_string(&outbox_path).expect("confirmation outbox");
+    SCHEDULED_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let report = state
+        .run_scheduled_return_notifications()
+        .expect("scheduled run");
+
+    assert_eq!(report.sent, 1);
+    let messages = fs::read_to_string(&outbox_path)
+        .expect("scheduled reminder outbox")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), before_scheduler.lines().count() + 1);
+    assert!(messages
+        .last()
+        .is_some_and(|message| message.contains("scheduled@example.com")
+            && message.contains(&format!("\t{}\t", view.due_count))));
+}
+
+#[test]
+fn scheduled_return_notification_retries_with_durable_backoff() {
+    RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("scheduled-return-retry-backoff");
+    fs::create_dir_all(&store_root).expect("retry store root");
+    let mailer_command = retry_provider_script(&store_root);
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(retry_clock)
+            .with_auth_config(
+                AuthConfig::default()
+                    .with_unsubscribe_secret("retry-backoff-secret")
+                    .with_mailer_command(&mailer_command),
+            ),
+    );
+    let created = state
+        .create_account("backoff@example.com")
+        .expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    state
+        .set_return_notification(&account, Some("backoff@example.com"), true)
+        .expect("enable reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 0, true)
+        .is_err());
+    let provider_log = store_root.join("retry-provider.tsv");
+    assert_eq!(
+        fs::read_to_string(&provider_log)
+            .expect("failed send")
+            .lines()
+            .count(),
+        1
+    );
+    let preference: Value = serde_json::from_str(&read_return_notification_preference(&store_root))
+        .expect("retry preference");
+    assert!(preference["nextRetryAtMs"]
+        .as_i64()
+        .is_some_and(|retry_at| { retry_at > RETRY_CLOCK.load(Ordering::SeqCst) }));
+
+    let immediate = state
+        .run_scheduled_return_notifications()
+        .expect("immediate scheduled run");
+    assert_eq!(immediate.sent, 0);
+    assert_eq!(
+        fs::read_to_string(&provider_log)
+            .expect("backoff log")
+            .lines()
+            .count(),
+        1
+    );
+
+    RETRY_CLOCK.fetch_add(60_001, Ordering::SeqCst);
+    let recovered = state
+        .run_scheduled_return_notifications()
+        .expect("backoff recovery run");
+    assert_eq!(recovered.sent, 1);
+    assert_eq!(
+        fs::read_to_string(&provider_log)
+            .expect("recovery log")
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
+    QUOTA_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("scheduled-return-quota");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(quota_clock)
+            .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
+    );
+    for email in ["quota-a@example.com", "quota-b@example.com"] {
+        let created = state.create_account(email).expect("quota account");
+        let account = state
+            .create_browser_session(&created)
+            .expect("quota session");
+        let source = state
+            .save_source(
+                account.account_id(),
+                account.session_token(),
+                &CreateSourceRequest {
+                    title: "Quota source".to_owned(),
+                    body: source_body(),
+                },
+            )
+            .expect("quota source");
+        let generated = state
+            .generate_source(
+                account.account_id(),
+                account.session_token(),
+                &source.source_id,
+            )
+            .expect("quota generation");
+        for draft in &generated.drafts {
+            state
+                .approve_draft(account.account_id(), account.session_token(), &draft.id)
+                .expect("quota approval");
+        }
+        state
+            .set_return_notification(&account, Some(email), true)
+            .expect("quota enable");
+        assert!(state
+            .maybe_send_due_count_notification(&account, 0, true)
+            .expect("quota confirmation"));
+    }
+    QUOTA_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let first = state
+        .run_scheduled_return_notifications_with_config(ReturnNotificationSchedulerConfig {
+            batch_size: 1,
+        })
+        .expect("first quota run");
+    assert_eq!(first.examined, 1);
+    assert_eq!(first.sent, 1);
+    assert!(first.truncated);
+
+    let second = state
+        .run_scheduled_return_notifications_with_config(ReturnNotificationSchedulerConfig {
+            batch_size: 1,
+        })
+        .expect("second quota run");
+    assert_eq!(second.examined, 1);
+    assert_eq!(
+        second.sent, 1,
+        "the first account must not starve the batch"
+    );
+    assert_eq!(
+        fs::read_to_string(&outbox_path)
+            .expect("quota outbox")
+            .lines()
+            .filter(|line| line.starts_with("due-count\t"))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn concurrent_scheduler_instances_share_one_durable_file_claim() {
+    CONCURRENT_SCHEDULER_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("concurrent-scheduled-return-notification");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let auth_config = || AuthConfig::default().with_link_outbox(&outbox_path);
+    let first = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(concurrent_scheduler_clock)
+            .with_auth_config(auth_config()),
+    );
+    let created = first
+        .create_account("concurrent-scheduled@example.com")
+        .expect("account");
+    let account = first
+        .create_browser_session(&created)
+        .expect("browser session");
+    let source = first
+        .save_source(
+            account.account_id(),
+            account.session_token(),
+            &CreateSourceRequest {
+                title: "Concurrent scheduler source".to_owned(),
+                body: source_body(),
+            },
+        )
+        .expect("source");
+    let generated = first
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("generation");
+    for draft in &generated.drafts {
+        first
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("approval");
+    }
+    let view = first
+        .study_view(account.account_id(), account.session_token())
+        .expect("study view");
+    first
+        .set_return_notification(&account, Some("concurrent-scheduled@example.com"), true)
+        .expect("enable");
+    assert!(first
+        .maybe_send_due_count_notification(&account, view.due_count, true)
+        .expect("confirmation"));
+    CONCURRENT_SCHEDULER_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let second = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(concurrent_scheduler_clock)
+            .with_auth_config(auth_config()),
+    );
+    let barrier = Arc::new(Barrier::new(2));
+    let workers = [first, second]
+        .into_iter()
+        .map(|state| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                state
+                    .run_scheduled_return_notifications()
+                    .expect("scheduler run")
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("scheduler worker"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().map(|report| report.sent).sum::<usize>(), 1);
+    assert_eq!(
+        fs::read_to_string(&outbox_path)
+            .expect("shared outbox")
+            .lines()
+            .filter(|line| line.starts_with("due-count\t"))
+            .count(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn return_notification_enable_route_retries_the_same_provider_envelope_after_restart() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    ROUTE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
     let store_root = temp_store_root("return-notification-route-retry");
     fs::create_dir_all(&store_root).expect("retry store root");
     let mailer_command = retry_provider_script(&store_root);
@@ -297,7 +645,7 @@ async fn return_notification_enable_route_retries_the_same_provider_envelope_aft
     };
     let first_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(route_retry_clock)
             .with_auth_config(auth_config()),
     );
     let first_app = router(first_state);
@@ -327,10 +675,10 @@ async fn return_notification_enable_route_retries_the_same_provider_envelope_aft
     assert!(failed_preference["pendingUnsubscribeExpiresAtMs"].is_number());
     assert!(failed_preference["claimId"].is_null());
 
-    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    ROUTE_RETRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
     let recovery_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(route_retry_clock)
             .with_auth_config(auth_config()),
     );
     let recovery_app = router(recovery_state);
@@ -2234,6 +2582,82 @@ async fn postgres_return_notification_nonce_invalidates_replayed_tokens() {
         .expect("current Postgres unsubscribe token");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduled_return_notification_runs_through_real_postgres() {
+    let Some(database) = PostgresTestDatabase::new("scheduled_return_notification") else {
+        eprintln!(
+            "skipping live Postgres scheduled reminder test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+        );
+        return;
+    };
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let outbox_path = temp_store_root("postgres-scheduled-return-notification").join("outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(&database.scoped_url)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["scheduled-postgres@example.com".to_owned()])
+                    .with_unsubscribe_secret("postgres-scheduler-secret")
+                    .with_link_outbox(&outbox_path),
+            ),
+    );
+    let created = state
+        .create_account("scheduled-postgres@example.com")
+        .expect("Postgres account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("Postgres browser session");
+    let source = state
+        .save_source(
+            account.account_id(),
+            account.session_token(),
+            &CreateSourceRequest {
+                title: "Postgres scheduled source".to_owned(),
+                body: source_body(),
+            },
+        )
+        .expect("Postgres source");
+    let generated = state
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("Postgres generation");
+    for draft in &generated.drafts {
+        state
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("Postgres approve");
+    }
+    let view = state
+        .study_view(account.account_id(), account.session_token())
+        .expect("Postgres study view");
+    assert!(view.due_count > 0);
+    state
+        .set_return_notification(&account, Some("scheduled-postgres@example.com"), true)
+        .expect("Postgres enable");
+    assert!(state
+        .maybe_send_due_count_notification(&account, view.due_count, true)
+        .expect("Postgres confirmation"));
+    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let report = state
+        .run_scheduled_return_notifications()
+        .expect("Postgres scheduled run");
+
+    assert_eq!(report.sent, 1);
+    let messages = fs::read_to_string(&outbox_path)
+        .expect("Postgres reminder outbox")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2);
+    assert!(messages
+        .last()
+        .is_some_and(|message| message.contains("scheduled-postgres@example.com")
+            && message.contains(&format!("\t{}\t", view.due_count))));
+}
+
 #[tokio::test]
 async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
     EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
@@ -2364,12 +2788,12 @@ fn file_return_notification_claim_allows_one_concurrent_sender() {
 
 #[test]
 fn file_return_notification_retry_reuses_the_failed_provider_payload() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    FILE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
     let store_root = temp_store_root("return-notification-retry");
     fs::create_dir_all(&store_root).expect("retry store root");
     let failing_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(file_retry_clock)
             .with_auth_config(
                 AuthConfig::allow_emails(["retry@example.com".to_owned()])
                     .with_unsubscribe_secret("claim-secret")
@@ -2404,14 +2828,14 @@ fn file_return_notification_retry_reuses_the_failed_provider_payload() {
     assert!(retry_path.contains("pendingDeliveryKey"));
     let recovery_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(file_retry_clock)
             .with_auth_config(
                 AuthConfig::allow_emails(["retry@example.com".to_owned()])
                     .with_unsubscribe_secret("claim-secret")
                     .with_mailer_command(retry_provider_script(&store_root)),
             ),
     );
-    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    FILE_RETRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
     assert!(recovery_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .expect("retry send"));
@@ -6787,9 +7211,39 @@ fn default_registry_clock_is_wall_time() {
 }
 
 static EXPIRY_CLOCK: AtomicI64 = AtomicI64::new(0);
+static SCHEDULED_CLOCK: AtomicI64 = AtomicI64::new(0);
+static RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
+static QUOTA_CLOCK: AtomicI64 = AtomicI64::new(0);
+static CONCURRENT_SCHEDULER_CLOCK: AtomicI64 = AtomicI64::new(0);
+static ROUTE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
+static FILE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn expiry_clock() -> i64 {
     EXPIRY_CLOCK.load(Ordering::SeqCst)
+}
+
+fn scheduled_clock() -> i64 {
+    SCHEDULED_CLOCK.load(Ordering::SeqCst)
+}
+
+fn retry_clock() -> i64 {
+    RETRY_CLOCK.load(Ordering::SeqCst)
+}
+
+fn quota_clock() -> i64 {
+    QUOTA_CLOCK.load(Ordering::SeqCst)
+}
+
+fn concurrent_scheduler_clock() -> i64 {
+    CONCURRENT_SCHEDULER_CLOCK.load(Ordering::SeqCst)
+}
+
+fn route_retry_clock() -> i64 {
+    ROUTE_RETRY_CLOCK.load(Ordering::SeqCst)
+}
+
+fn file_retry_clock() -> i64 {
+    FILE_RETRY_CLOCK.load(Ordering::SeqCst)
 }
 
 #[test]

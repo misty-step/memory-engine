@@ -59,6 +59,7 @@ async fn main() {
     // Start the background generation worker before serving so captures run
     // asynchronously instead of blocking the request thread.
     state.start_worker();
+    state.start_return_notification_scheduler();
 
     if let Err(error) = axum::serve(listener, router(state)).await {
         eprintln!("{error}");
@@ -88,6 +89,12 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
         return Err("MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET must not be empty".to_owned());
     }
     auth_config = auth_config.with_unsubscribe_secret(unsubscribe_secret);
+    if let Ok(token) = env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            auth_config = auth_config.with_scheduler_manual_token(token.to_owned());
+        }
+    }
     // Local/dev only: surface the magic link on the "check your email" page so
     // sign-in works without a real mailer. Never enable in production.
     if env::var("MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS").as_deref() == Ok("true") {

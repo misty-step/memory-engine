@@ -267,8 +267,20 @@ impl StudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
-        self.inner.release_return_notification(account_id, claim_id)
+        self.inner
+            .release_return_notification(account_id, claim_id, now_ms)
+    }
+
+    pub(crate) fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        self.inner
+            .enabled_return_notification_accounts(limit, now_ms, interval_ms)
     }
 
     pub(crate) fn record_rate_limit_attempts(
@@ -577,7 +589,14 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure>;
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure>;
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -954,6 +973,20 @@ impl StudyStorageAdapter for FileStudyStorage {
                         .and_then(|preference| preference.pending_unsubscribe_expires_at_ms)
                 })
                 .flatten(),
+            retry_attempts: if preserve_pending {
+                existing
+                    .as_ref()
+                    .map_or(0, |preference| preference.retry_attempts)
+            } else {
+                0
+            },
+            next_retry_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.next_retry_at_ms)
+                })
+                .flatten(),
         };
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1008,6 +1041,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
         preference.pending_unsubscribe_expires_at_ms = None;
+        preference.retry_attempts = 0;
+        preference.next_retry_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes)
@@ -1033,8 +1068,13 @@ impl StudyStorageAdapter for FileStudyStorage {
         let interval_elapsed = preference
             .last_sent_at_ms
             .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
-        let eligible = preference.pending_delivery_key.is_some()
-            || (interval_elapsed && (request.force_confirmation || request.due_count > 0));
+        let eligible = (preference.pending_delivery_key.is_some()
+            && preference
+                .next_retry_at_ms
+                .is_none_or(|retry_at| retry_at <= request.now_ms))
+            || (preference.pending_delivery_key.is_none()
+                && interval_elapsed
+                && (request.force_confirmation || request.due_count > 0));
         if !preference.enabled
             || !eligible
             || preference
@@ -1101,6 +1141,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
         preference.pending_unsubscribe_expires_at_ms = None;
+        preference.retry_attempts = 0;
+        preference.next_retry_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1111,6 +1153,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
@@ -1126,6 +1169,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         if preference.claim_id.as_deref() == Some(claim_id) {
             preference.claim_id = None;
             preference.claim_expires_at_ms = None;
+            let delay_ms = 60_000_i64.saturating_mul(
+                1_i64
+                    .checked_shl(preference.retry_attempts.min(8))
+                    .unwrap_or(256),
+            );
+            preference.retry_attempts = preference.retry_attempts.saturating_add(1);
+            preference.next_retry_at_ms =
+                Some(now_ms.saturating_add(delay_ms.min(6 * 60 * 60 * 1_000)));
             let bytes = serde_json::to_vec(&preference)
                 .map_err(|error| ApiFailure::internal(error.to_string()))?;
             write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1170,6 +1221,43 @@ impl StudyStorageAdapter for FileStudyStorage {
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
         Ok(account_session_path(&self.store_root, account_id).exists()
             || account_store_path(&self.store_root, account_id).exists())
+    }
+
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        let mut account_ids = fs::read_dir(&self.store_root)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_dir() {
+                    return None;
+                }
+                let account_id = entry.file_name().to_string_lossy().into_owned();
+                if account_id.starts_with('_') {
+                    return None;
+                }
+                let path = entry.path().join("return-notifications.json");
+                let preference = fs::read(path).ok().and_then(|bytes| {
+                    serde_json::from_slice::<ReturnNotificationPreference>(&bytes).ok()
+                })?;
+                let pending_ready = preference.pending_delivery_key.is_some()
+                    && preference
+                        .next_retry_at_ms
+                        .is_none_or(|retry_at_ms| retry_at_ms <= now_ms);
+                let cadence_ready = preference.last_sent_at_ms.is_none_or(|last_sent_at_ms| {
+                    last_sent_at_ms <= now_ms.saturating_sub(interval_ms)
+                });
+                (preference.enabled && (pending_ready || cadence_ready)).then_some(account_id)
+            })
+            .collect::<Vec<_>>();
+        account_ids.sort();
+        account_ids.truncate(limit);
+        Ok(account_ids)
     }
 
     fn copy_account(
@@ -1593,11 +1681,17 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         enabled: preference.enabled,
                         last_sent_at_ms: preference.last_sent_at_ms,
                         unsubscribe_nonce: preference.unsubscribe_nonce,
-                        claim_id: None,
-                        claim_expires_at_ms: None,
-                        pending_delivery_key: None,
-                        pending_due_count: None,
-                        pending_unsubscribe_expires_at_ms: None,
+                        claim_id: preference.claim_id,
+                        claim_expires_at_ms: preference.claim_expires_at_ms,
+                        pending_delivery_key: preference.pending_delivery_key,
+                        pending_due_count: preference
+                            .pending_due_count
+                            .and_then(|value| usize::try_from(value).ok()),
+                        pending_unsubscribe_expires_at_ms: preference
+                            .pending_unsubscribe_expires_at_ms,
+                        retry_attempts: u32::try_from(preference.retry_attempts)
+                            .map_or(u32::MAX, |value| value),
+                        next_retry_at_ms: preference.next_retry_at_ms,
                     })
                 })
                 .map_err(postgres_failure)
@@ -1677,10 +1771,33 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
         with_postgres_store(&self.database_url, |store| {
             store
-                .release_return_notification(account_id, claim_id)
+                .release_return_notification(account_id, claim_id, now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        let limit = i64::try_from(limit).map_err(|_| {
+            ApiFailure::internal("scheduler batch exceeds postgres range".to_owned())
+        })?;
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .enabled_return_notification_accounts(limit, now_ms, interval_ms)
+                .map(|accounts| {
+                    accounts
+                        .into_iter()
+                        .map(|account| account.account_id)
+                        .collect()
+                })
                 .map_err(postgres_failure)
         })
     }

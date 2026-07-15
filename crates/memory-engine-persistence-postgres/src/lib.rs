@@ -75,6 +75,8 @@ ALTER TABLE memory_engine_return_notification_preferences
     ADD COLUMN IF NOT EXISTS pending_delivery_key TEXT,
     ADD COLUMN IF NOT EXISTS pending_due_count BIGINT,
     ADD COLUMN IF NOT EXISTS pending_unsubscribe_expires_at_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS retry_attempts INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS next_retry_at_ms BIGINT,
     ADD COLUMN IF NOT EXISTS unsubscribe_nonce TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS memory_engine_source_documents (
@@ -194,13 +196,24 @@ UPDATE memory_engine_return_notification_preferences
      claim_expires_at_ms = $7::BIGINT,
      pending_delivery_key = COALESCE(pending_delivery_key, $8),
      pending_due_count = COALESCE(pending_due_count, $3::BIGINT),
-     pending_unsubscribe_expires_at_ms = COALESCE(pending_unsubscribe_expires_at_ms, $10::BIGINT),
+    pending_unsubscribe_expires_at_ms = COALESCE(pending_unsubscribe_expires_at_ms, $10::BIGINT),
+    retry_attempts = CASE
+        WHEN memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+        THEN memory_engine_return_notification_preferences.retry_attempts
+        ELSE 0
+    END,
+    next_retry_at_ms = CASE
+        WHEN memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+        THEN memory_engine_return_notification_preferences.next_retry_at_ms
+        ELSE NULL
+    END,
      unsubscribe_nonce = COALESCE(NULLIF(unsubscribe_nonce, ''), $9),
      updated_at_ms = $2::BIGINT
  WHERE account_id = $1
    AND enabled
-   AND (pending_delivery_key IS NOT NULL OR
-        (($4 OR $3::BIGINT > 0) AND
+   AND ((pending_delivery_key IS NOT NULL AND
+        (next_retry_at_ms IS NULL OR next_retry_at_ms <= $2::BIGINT)) OR
+        (pending_delivery_key IS NULL AND ($4 OR $3::BIGINT > 0) AND
         (last_sent_at_ms IS NULL OR last_sent_at_ms <= $5::BIGINT)))
    AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2::BIGINT)
  RETURNING email_normalized,
@@ -254,6 +267,18 @@ pub struct ReturnNotificationPreference {
     pub enabled: bool,
     pub last_sent_at_ms: Option<i64>,
     pub unsubscribe_nonce: String,
+    pub claim_id: Option<String>,
+    pub claim_expires_at_ms: Option<i64>,
+    pub pending_delivery_key: Option<String>,
+    pub pending_due_count: Option<i64>,
+    pub pending_unsubscribe_expires_at_ms: Option<i64>,
+    pub retry_attempts: i32,
+    pub next_retry_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnabledReturnNotificationAccount {
+    pub account_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -695,6 +720,22 @@ impl PostgresStudyStore {
                      THEN memory_engine_return_notification_preferences.pending_unsubscribe_expires_at_ms
                      ELSE NULL
                  END,
+                 retry_attempts = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.retry_attempts
+                     ELSE 0
+                 END,
+                 next_retry_at_ms = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.next_retry_at_ms
+                     ELSE NULL
+                 END,
                  updated_at_ms = EXCLUDED.updated_at_ms",
             &[
                 &account_id,
@@ -756,6 +797,39 @@ impl PostgresStudyStore {
         .transpose()
     }
 
+    /// Enumerate enabled reminder accounts in a deterministic bounded batch.
+    /// The scheduler still re-checks consent atomically when it claims each
+    /// account, so an unsubscribe racing this read cannot send mail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the query.
+    pub fn enabled_return_notification_accounts(
+        &mut self,
+        limit: i64,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<EnabledReturnNotificationAccount>, PostgresStoreError> {
+        let rows = self.client.borrow_mut().query(
+            "SELECT account_id
+             FROM memory_engine_return_notification_preferences
+             WHERE enabled
+               AND ((pending_delivery_key IS NOT NULL
+                     AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= $2::BIGINT))
+                    OR (last_sent_at_ms IS NULL
+                        OR last_sent_at_ms <= $2::BIGINT - $3::BIGINT))
+             ORDER BY account_id
+             LIMIT $1",
+            &[&limit, &now_ms, &interval_ms],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnabledReturnNotificationAccount {
+                account_id: row.get(0),
+            })
+            .collect())
+    }
+
     /// Finalize only the currently fenced claim. A stale worker cannot mark a
     /// newer claim sent.
     ///
@@ -776,6 +850,8 @@ impl PostgresStudyStore {
                  pending_delivery_key = NULL,
                  pending_due_count = NULL,
                  pending_unsubscribe_expires_at_ms = NULL,
+                 retry_attempts = 0,
+                 next_retry_at_ms = NULL,
                  updated_at_ms = $3
              WHERE account_id = $1 AND claim_id = $2",
             &[&account_id, &claim_id, &sent_at_ms],
@@ -792,12 +868,19 @@ impl PostgresStudyStore {
         &mut self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), PostgresStoreError> {
         self.client.borrow_mut().execute(
             "UPDATE memory_engine_return_notification_preferences
-             SET claim_id = NULL, claim_expires_at_ms = NULL
+             SET claim_id = NULL,
+                 claim_expires_at_ms = NULL,
+                 retry_attempts = retry_attempts + 1,
+                 next_retry_at_ms = $3::BIGINT + LEAST(
+                     21600000::BIGINT,
+                     60000::BIGINT * power(2::NUMERIC, LEAST(retry_attempts, 8))::BIGINT
+                 )
              WHERE account_id = $1 AND claim_id = $2",
-            &[&account_id, &claim_id],
+            &[&account_id, &claim_id, &now_ms],
         )?;
         Ok(())
     }
@@ -828,6 +911,8 @@ impl PostgresStudyStore {
                  pending_delivery_key = NULL,
                  pending_due_count = NULL,
                  pending_unsubscribe_expires_at_ms = NULL,
+                 retry_attempts = 0,
+                 next_retry_at_ms = NULL,
                  updated_at_ms = $5
              WHERE account_id = $1
                AND email_normalized = $2
@@ -854,7 +939,9 @@ impl PostgresStudyStore {
         account_id: &str,
     ) -> Result<Option<ReturnNotificationPreference>, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
-            "SELECT email_normalized, enabled, last_sent_at_ms, unsubscribe_nonce
+            "SELECT email_normalized, enabled, last_sent_at_ms, unsubscribe_nonce,
+                    claim_id, claim_expires_at_ms, pending_delivery_key, pending_due_count,
+                    pending_unsubscribe_expires_at_ms, retry_attempts, next_retry_at_ms
              FROM memory_engine_return_notification_preferences
              WHERE account_id = $1",
             &[&account_id],
@@ -864,6 +951,13 @@ impl PostgresStudyStore {
             enabled: row.get(1),
             last_sent_at_ms: row.get(2),
             unsubscribe_nonce: row.get(3),
+            claim_id: row.get(4),
+            claim_expires_at_ms: row.get(5),
+            pending_delivery_key: row.get(6),
+            pending_due_count: row.get(7),
+            pending_unsubscribe_expires_at_ms: row.get(8),
+            retry_attempts: row.get(9),
+            next_retry_at_ms: row.get(10),
         }))
     }
 
@@ -3093,18 +3187,19 @@ mod tests {
                 NOW + 1,
                 "retry-nonce-request-rotated",
             )?;
+            assert_retry_backoff_gate(&mut retry, "acct-claim-retry", &first.claim_id)?;
             let second = retry
                 .claim_return_notification(&super::ReturnNotificationClaimRequest {
                     account_id: "acct-claim-retry".to_owned(),
-                    now_ms: NOW + 200,
+                    now_ms: NOW + 60_003,
                     due_count: 1,
                     force_confirmation: false,
                     interval_ms: 86_400_000,
                     claim_id: "retry-stale-2".to_owned(),
                     delivery_key: "retry-delivery-2".to_owned(),
-                    claim_expires_at_ms: NOW + 300,
+                    claim_expires_at_ms: NOW + 60_303,
                     unsubscribe_nonce: "retry-nonce-request-2".to_owned(),
-                    unsubscribe_expires_at_ms: NOW + 604_800_200,
+                    unsubscribe_expires_at_ms: NOW + 604_860_003,
                 })?
                 .expect("stale retry claim");
             assert_eq!(second.delivery_key, first.delivery_key);
@@ -3116,12 +3211,12 @@ mod tests {
             assert!(!retry.complete_return_notification(
                 "acct-claim-retry",
                 &first.claim_id,
-                NOW + 201,
+                NOW + 60_004,
             )?);
             assert!(retry.complete_return_notification(
                 "acct-claim-retry",
                 &second.claim_id,
-                NOW + 202,
+                NOW + 60_005,
             )?);
             Ok(())
         })();
@@ -3129,6 +3224,29 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live Postgres return retry contract");
+    }
+
+    fn assert_retry_backoff_gate(
+        retry: &mut super::PostgresStudyStore,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), super::PostgresStoreError> {
+        retry.release_return_notification(account_id, claim_id, NOW + 2)?;
+        assert!(retry
+            .claim_return_notification(&super::ReturnNotificationClaimRequest {
+                account_id: account_id.to_owned(),
+                now_ms: NOW + 3,
+                due_count: 1,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "retry-too-soon".to_owned(),
+                delivery_key: "retry-delivery-too-soon".to_owned(),
+                claim_expires_at_ms: NOW + 303,
+                unsubscribe_nonce: "retry-nonce-too-soon".to_owned(),
+                unsubscribe_expires_at_ms: NOW + 604_800_003,
+            })?
+            .is_none());
+        Ok(())
     }
 
     #[test]

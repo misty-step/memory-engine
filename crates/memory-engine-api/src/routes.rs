@@ -32,7 +32,7 @@ use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
     CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
     InvalidateProjectDeckRequest, ProjectDeckRecord, SourceList, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest,
+    ScheduledReturnNotificationReport, SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -242,6 +242,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/icon-192.png", get(static_icon_192))
         .route("/icon-512.png", get(static_icon_512))
         .route("/apple-touch-icon.png", get(static_apple_touch_icon))
+        .route(
+            "/internal/scheduler/return-notifications",
+            post(run_return_notification_scheduler),
+        )
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
@@ -322,11 +326,23 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<HealthResponse> {
+async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "memory-engine-api",
+        return_notification_scheduler: state.scheduler_health(),
     })
+}
+
+async fn run_return_notification_scheduler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ScheduledReturnNotificationReport>, ApiFailure> {
+    let token = headers
+        .get("x-scheduler-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    Ok(Json(state.run_manual_return_notification_scheduler(token)?))
 }
 
 /// Serve the Ledger design system stylesheet (DESIGN.md). The render crate
