@@ -1260,6 +1260,251 @@ async fn auth_rejects_magic_link_replay() {
 }
 
 #[tokio::test]
+async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let app = router(ApiState::new(
+        AccountRegistry::default()
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
+            ),
+    ));
+    let requested = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    let verify_path = debug_sign_in_path(&response_text(requested).await);
+    EXPIRY_CLOCK.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(verify_path)
+                .body(Body::empty())
+                .expect("expired verify request"),
+        )
+        .await
+        .expect("expired verify response");
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Sign-in link expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(body.contains("Request a new link"));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
+async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
+    SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let app = router(ApiState::new(
+        AccountRegistry::default().with_clock(session_clock),
+    ));
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", "session expiry proof")],
+        ))
+        .await
+        .expect("start");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/next",
+            &cookie,
+            &[("csrfToken", &csrf_token)],
+        ))
+        .await
+        .expect("expired session response");
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Your session expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
+async fn installability_assets_are_valid_and_linked_from_the_shell() {
+    let app = router(ApiState::default());
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    let home = response_text(home).await;
+    assert!(home.contains(r#"rel="manifest" href="/manifest.webmanifest""#));
+    assert!(home.contains(r#"rel="icon" href="/favicon.svg""#));
+    assert!(home.contains(r#"rel="apple-touch-icon" href="/apple-touch-icon.svg""#));
+    assert!(home.contains(r#"name="theme-color""#));
+
+    let manifest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/manifest.webmanifest")
+                .body(Body::empty())
+                .expect("manifest request"),
+        )
+        .await
+        .expect("manifest response");
+    assert_eq!(manifest.status(), StatusCode::OK);
+    let manifest = response_json(manifest).await;
+    assert_eq!(manifest["name"], json!("Memory Engine"));
+    assert_eq!(manifest["display"], json!("standalone"));
+    assert_eq!(manifest["start_url"], json!("/"));
+    assert_eq!(manifest["icons"][0]["src"], json!("/favicon.svg"));
+
+    for path in ["/favicon.svg", "/apple-touch-icon.svg"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("icon request"),
+            )
+            .await
+            .expect("icon response");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/svg+xml")
+        );
+    }
+}
+
+#[tokio::test]
+async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
+    let store_root = temp_store_root("return-notifications");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails(["learner@example.com".to_owned()])
+                .with_link_outbox(&outbox_path),
+        ),
+    ));
+    let requested = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    let verify_path = fs::read_to_string(&outbox_path)
+        .expect("auth outbox")
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').nth(1))
+        .map(str::to_owned)
+        .expect("magic link");
+    drop(requested);
+    let verified = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&verify_path)
+                .body(Body::empty())
+                .expect("verify request"),
+        )
+        .await
+        .expect("verify");
+    let cookie = session_cookie(&verified);
+    let verified = response_text(verified).await;
+    let csrf_token = html_value(&verified, "csrfToken");
+
+    let enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("enable return channel");
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let enabled = response_text(enabled).await;
+    assert!(enabled.contains("Due-count reminders are on"));
+    let after_enable = fs::read_to_string(&outbox_path).expect("outbox after enable");
+    assert!(after_enable.contains("due-count\tlearner@example.com\t"));
+
+    let unsubscribed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/return-notifications")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("unsubscribe request"),
+        )
+        .await
+        .expect("unsubscribe response");
+    assert_eq!(unsubscribed.status(), StatusCode::OK);
+    assert!(response_text(unsubscribed)
+        .await
+        .contains("Due-count reminders are off"));
+
+    let disabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("enabled", "off")],
+        ))
+        .await
+        .expect("disable return channel");
+    assert_eq!(disabled.status(), StatusCode::OK);
+    assert!(response_text(disabled)
+        .await
+        .contains("Due-count reminders are off"));
+    let after_disable = fs::read_to_string(&outbox_path).expect("outbox after disable");
+    assert_eq!(after_disable, after_enable);
+}
+
+#[tokio::test]
 async fn auth_magic_link_writes_configured_outbox() {
     let store_root = temp_store_root("magic-link-outbox");
     let outbox_path = store_root.join("auth-outbox.tsv");

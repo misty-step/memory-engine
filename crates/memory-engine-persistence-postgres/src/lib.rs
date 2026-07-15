@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS memory_engine_auth_challenges (
     consumed_at_ms BIGINT
 );
 
+CREATE TABLE IF NOT EXISTS memory_engine_return_notification_preferences (
+    account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    email_normalized TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    last_sent_at_ms BIGINT,
+    updated_at_ms BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memory_engine_source_documents (
     account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
     source_document_id TEXT NOT NULL,
@@ -190,6 +198,13 @@ pub struct BrowserSession {
     pub session_token: String,
     pub csrf_token_hash: String,
     pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationPreference {
+    pub email: String,
+    pub enabled: bool,
+    pub last_sent_at_ms: Option<i64>,
 }
 
 /// TLS connector for Postgres, with Mozilla's compiled-in roots.
@@ -535,6 +550,61 @@ impl PostgresStudyStore {
         )?;
 
         Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Persist the learner's explicit due-count reminder choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the upsert.
+    pub fn save_return_notification_preference(
+        &mut self,
+        account_id: &str,
+        email_normalized: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        updated_at_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "INSERT INTO memory_engine_return_notification_preferences
+                (account_id, email_normalized, enabled, last_sent_at_ms, updated_at_ms)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (account_id) DO UPDATE
+             SET email_normalized = EXCLUDED.email_normalized,
+                 enabled = EXCLUDED.enabled,
+                 last_sent_at_ms = EXCLUDED.last_sent_at_ms,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &account_id,
+                &email_normalized,
+                &enabled,
+                &last_sent_at_ms,
+                &updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the learner's due-count reminder choice, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the query.
+    pub fn return_notification_preference(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT email_normalized, enabled, last_sent_at_ms
+             FROM memory_engine_return_notification_preferences
+             WHERE account_id = $1",
+            &[&account_id],
+        )?;
+        Ok(row.map(|row| ReturnNotificationPreference {
+            email: row.get(0),
+            enabled: row.get(1),
+            last_sent_at_ms: row.get(2),
+        }))
     }
 
     /// Scope all following operations to one already-authenticated account.

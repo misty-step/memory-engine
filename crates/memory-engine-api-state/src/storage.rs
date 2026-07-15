@@ -12,8 +12,8 @@ use crate::{
     persisted_sources, postgres_failure, rate_limit_path, require_current_review,
     require_current_review_postgres, run_bridge_generation, run_reference_generation,
     run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, SourceRecord,
-    StudyViewResponse,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -160,6 +160,24 @@ impl StudyStorage {
         now_ms: i64,
     ) -> Result<Option<String>, ApiFailure> {
         self.inner.consume_auth_challenge(challenge_hash, now_ms)
+    }
+
+    pub(crate) fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .save_return_notification_preference(account_id, email, enabled, last_sent_at_ms)
+    }
+
+    pub(crate) fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        self.inner.load_return_notification_preference(account_id)
     }
 
     pub(crate) fn record_rate_limit_attempts(
@@ -373,6 +391,17 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         challenge_hash: &str,
         now_ms: i64,
     ) -> Result<Option<String>, ApiFailure>;
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+    ) -> Result<(), ApiFailure>;
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure>;
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -635,6 +664,43 @@ impl StudyStorageAdapter for FileStudyStorage {
         .map_err(|error| ApiFailure::internal(error.to_string()))?;
 
         Ok(Some(email.to_owned()))
+    }
+
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+    ) -> Result<(), ApiFailure> {
+        let path = self
+            .store_root
+            .join(account_id)
+            .join("return-notifications.json");
+        let preference = ReturnNotificationPreference {
+            email: email.to_owned(),
+            enabled,
+            last_sent_at_ms,
+        };
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        let path = self
+            .store_root
+            .join(account_id)
+            .join("return-notifications.json");
+        let Ok(bytes) = fs::read(path) else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
     }
 
     fn record_rate_limit_attempts(
@@ -1016,6 +1082,44 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_store(&self.database_url, |store| {
             store
                 .consume_auth_challenge(challenge_hash, now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .save_return_notification_preference(
+                    account_id,
+                    email,
+                    enabled,
+                    last_sent_at_ms,
+                    self.now_ms(),
+                )
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .return_notification_preference(account_id)
+                .map(|preference| {
+                    preference.map(|preference| ReturnNotificationPreference {
+                        email: preference.email,
+                        enabled: preference.enabled,
+                        last_sent_at_ms: preference.last_sent_at_ms,
+                    })
+                })
                 .map_err(postgres_failure)
         })
     }

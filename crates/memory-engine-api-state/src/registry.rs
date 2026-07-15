@@ -12,6 +12,7 @@ use crate::{
     CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
     SourceRecord, StudyStorage, StudyViewResponse, SubmitReviewRequest,
     APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS,
+    RETURN_NOTIFICATION_INTERVAL_MS,
 };
 
 impl AccountRegistry {
@@ -165,6 +166,97 @@ impl AccountRegistry {
         let account = self.login_account(&email)?;
 
         self.create_browser_session(&account)
+    }
+
+    pub(crate) fn set_return_notification(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        email: Option<&str>,
+        enabled: bool,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let storage = self.storage();
+        let existing = storage.load_return_notification_preference(account_id)?;
+        let email = match (enabled, email, existing.as_ref()) {
+            (true, Some(email), _) => normalize_email(email).ok_or_else(|| {
+                ApiFailure::bad_request("Reminder email must contain one @ and a domain.")
+            })?,
+            (true, None, _) => {
+                return Err(ApiFailure::bad_request(
+                    "Reminder email must contain one @ and a domain.",
+                ));
+            }
+            (false, _, Some(existing)) => existing.email.clone(),
+            (false, _, None) => return Ok(()),
+        };
+        if enabled {
+            let allowed = {
+                let data = self.lock_data();
+                data.auth_config.email_allowed(&email)
+            };
+            if !allowed {
+                return Err(ApiFailure::forbidden(
+                    "That reminder email is not allowed for this account.",
+                ));
+            }
+        }
+        storage.save_return_notification_preference(
+            account_id,
+            &email,
+            enabled,
+            existing.and_then(|preference| preference.last_sent_at_ms),
+        )?;
+        let mut data = self.lock_data();
+        data.accounts
+            .entry(account_id.to_owned())
+            .or_insert(account);
+        Ok(())
+    }
+
+    pub(crate) fn maybe_send_due_count_notification(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        due_count: usize,
+        force_confirmation: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.require_account(account_id, session_token)?;
+        if due_count == 0 && !force_confirmation {
+            return Ok(false);
+        }
+        let storage = self.storage();
+        let Some(preference) = storage.load_return_notification_preference(account_id)? else {
+            return Ok(false);
+        };
+        if !preference.enabled {
+            return Ok(false);
+        }
+        let now = self.now();
+        if !force_confirmation
+            && preference
+                .last_sent_at_ms
+                .is_some_and(|sent| now.saturating_sub(sent) < RETURN_NOTIFICATION_INTERVAL_MS)
+        {
+            return Ok(false);
+        }
+        let unsubscribe_link = "/app/return-notifications";
+        let auth_config = {
+            let data = self.lock_data();
+            data.auth_config.clone()
+        };
+        auth_config.deliver_due_count_notification(
+            &preference.email,
+            due_count,
+            unsubscribe_link,
+        )?;
+        storage.save_return_notification_preference(
+            account_id,
+            &preference.email,
+            true,
+            Some(now),
+        )?;
+        Ok(true)
     }
 
     fn record_app_account_request(
@@ -806,6 +898,50 @@ impl AuthConfig {
                 } else {
                     Err(ApiFailure::internal(format!(
                         "auth mailer command exited with {status}"
+                    )))
+                }
+            }
+        }
+    }
+
+    fn deliver_due_count_notification(
+        &self,
+        email: &str,
+        due_count: usize,
+        unsubscribe_link: &str,
+    ) -> Result<(), ApiFailure> {
+        match &self.link_delivery {
+            AuthLinkDelivery::None => Ok(()),
+            AuthLinkDelivery::OutboxFile(path) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                }
+                let existing = fs::read_to_string(path).unwrap_or_default();
+                fs::write(
+                    path,
+                    format!("{existing}due-count\t{email}\t{due_count}\t{unsubscribe_link}\n"),
+                )
+                .map_err(|error| ApiFailure::internal(error.to_string()))
+            }
+            AuthLinkDelivery::Command(command) => {
+                let status = Command::new(command)
+                    .env("MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL", email)
+                    .env(
+                        "MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT",
+                        due_count.to_string(),
+                    )
+                    .env(
+                        "MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE",
+                        unsubscribe_link,
+                    )
+                    .status()
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(ApiFailure::internal(format!(
+                        "return notification mailer command exited with {status}"
                     )))
                 }
             }

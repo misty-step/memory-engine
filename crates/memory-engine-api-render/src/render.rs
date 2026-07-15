@@ -105,16 +105,45 @@ pub fn render_login_requested(debug_link: Option<&str>) -> String {
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
 
+#[must_use]
+pub fn render_auth_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Return to your workspace</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<section class="ae-group me-capture-hero">
+<form action="/app/account" method="post">
+<label class="ae-label" for="me-recovery-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button" type="submit">Request a new link</button></div>
+</form>
+</section>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
 fn document(inner: &str) -> String {
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f2ea">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>Memory Engine</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">
@@ -124,7 +153,7 @@ fn document(inner: &str) -> String {
 <body>
 {inner}
 </body>
-</html>"#
+</html>"##
     )
 }
 
@@ -168,12 +197,12 @@ fn render_signed_out(notice: Option<&str>) -> String {
 {notice}
 <p class="me-kicker">Spaced repetition, made effortless</p>
 <h1 class="me-display">Read it once.<br>Remember it for good.</h1>
-<p class="ae-lede ae-dim me-support">Capture anything worth remembering. Memory Engine brings it back, timed to how memory fades.</p>
+<p class="ae-lede ae-dim me-support">Capture anything worth remembering. We bring it back when it matters.</p>
 <section class="ae-group me-capture-hero">
 <form action="/app/account" method="post">
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email you a sign-in link.</span></div>
+<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
 </form>
 </section>
 </div>"#,
@@ -227,12 +256,33 @@ fn render_workspace(
         );
     }
     html.push_str(&render_capture(account));
+    html.push_str(&render_return_notifications(account));
     html.push_str(&render_jobs(account, jobs));
     html.push_str(&render_sources(account, sources, jobs));
     if let Some(view) = view {
         html.push_str(&render_concept_progress(&view.concept_progress));
     }
     html
+}
+
+fn render_return_notifications(account: &AppAccount) -> String {
+    format!(
+        r#"<section class="ae-group me-return-channel">
+<h2 class="ae-h">Return gently</h2>
+<p class="ae-lede">Opt in to one quiet email a day when reviews are waiting. No scores or promotional mail.</p>
+<form action="/app/return-notifications" method="post">
+{csrf}<label class="ae-label" for="me-reminder-email">Reminder email</label>
+<input class="ae-input" id="me-reminder-email" name="reminderEmail" type="email" autocomplete="email" required placeholder="you@example.com">
+<input type="hidden" name="enabled" value="on">
+<button class="ae-button" type="submit">Enable due-count reminders</button>
+</form>
+<form action="/app/return-notifications" method="post" class="me-return-off">
+{csrf}<input type="hidden" name="enabled" value="off">
+<button class="ae-button-quiet" type="submit">Turn off reminders</button>
+</form>
+</section>"#,
+        csrf = hidden_csrf_input(account),
+    )
 }
 
 fn render_notice(message: Option<&str>, jobs: &[GenerationJob]) -> String {

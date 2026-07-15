@@ -358,6 +358,44 @@ impl ApiState {
             .study_view(account.account_id(), account.session_token())
     }
 
+    /// Persist the learner's explicit due-count return-channel choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account preference cannot be stored.
+    pub fn set_return_notification(
+        &self,
+        account: &AppAccount,
+        email: Option<&str>,
+        enabled: bool,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.set_return_notification(
+            account.account_id(),
+            account.session_token(),
+            email,
+            enabled,
+        )
+    }
+
+    /// Send the due-count message when the deterministic daily policy allows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the configured mail boundary fails.
+    pub fn maybe_send_due_count_notification(
+        &self,
+        account: &AppAccount,
+        due_count: usize,
+        force_confirmation: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.accounts.maybe_send_due_count_notification(
+            account.account_id(),
+            account.session_token(),
+            due_count,
+            force_confirmation,
+        )
+    }
+
     /// Reveal a review answer.
     ///
     /// # Errors
@@ -647,6 +685,14 @@ pub struct AuthConfig {
     allowed_emails: Option<BTreeSet<String>>,
     expose_debug_links: bool,
     link_delivery: AuthLinkDelivery,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnNotificationPreference {
+    pub email: String,
+    pub enabled: bool,
+    pub last_sent_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1048,6 +1094,21 @@ impl ApiFailure {
             message,
         }
     }
+
+    #[must_use]
+    pub fn is_session_expired(&self) -> bool {
+        self.status == StatusCode::UNAUTHORIZED
+    }
+
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub fn is_magic_link_recovery(&self) -> bool {
+        self.status == StatusCode::FORBIDDEN && self.message == "Magic link is invalid or expired."
+    }
 }
 
 /// Process-wide Canary reporter, installed once by the binary entry point.
@@ -1312,6 +1373,9 @@ const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // switches routinely burn ten minutes. Found in dogfood: a link expired
 // before the operator could click it.
 pub const AUTH_CHALLENGE_TTL_MS: i64 = 30 * 60 * 1_000;
+/// At most one due-count reminder per account per day, apart from the
+/// one-time confirmation sent immediately after an explicit opt-in.
+pub const RETURN_NOTIFICATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 fn source_id_for(account_id: &str, title: &str, body: &str) -> String {
     let stable = [account_id, title, body]

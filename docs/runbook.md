@@ -39,6 +39,11 @@ test "$status" = "200"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_code}" -X POST "$base/app/generate")
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
+
+curl -fsS --max-time 15 "$base/manifest.webmanifest" | jq -e \
+  '.display == "standalone" and (.icons | length >= 2)' >/dev/null
+curl -fsS --max-time 15 "$base/favicon.svg" | grep -q '<svg'
+curl -fsS --max-time 15 "$base/apple-touch-icon.svg" | grep -q '<svg'
 ```
 
 ## Production generation latency
@@ -204,6 +209,26 @@ A failed send surfaces as a 500 and therefore lands in Canary. The sender
 address is the `MEMORY_ENGINE_MAIL_FROM` secret (default
 `Memory Engine <onboarding@resend.dev>`); switching it is a secret change, not
 a code edit — see Deliverability below.
+
+### Due-count return channel
+
+The signed-in workspace offers one explicit, optional return channel: “Enable
+due-count reminders.” It stores the normalized, allowlisted reminder address in
+the account store and sends one confirmation through the same
+`MEMORY_ENGINE_AUTH_MAILER_COMMAND` / `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH`
+boundary. Subsequent authenticated home renders may send a reminder only when
+reviews are due and the persisted last-send time is at least 24 hours old. The
+policy is deterministic, has no streaks or promotional content, and a learner
+can disable it from the workspace or the unsubscribe link in the plain-text
+message. Disable is persisted and never sends mail.
+
+The command boundary receives these variables for a due-count message:
+`MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL`,
+`MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT`, and
+`MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE`. The bundled sender supports
+both the magic-link and due-count envelopes. A file outbox line beginning with
+`due-count` is a local proof receipt; production proof still requires checking
+the provider send log and inbox placement.
 
 ### Deliverability (inbox, not spam)
 

@@ -11,11 +11,30 @@
 # RESEND_API_URL is overridable for tests only.
 set -eu
 : "${RESEND_API_KEY:?RESEND_API_KEY is required}"
-: "${MEMORY_ENGINE_AUTH_EMAIL:?MEMORY_ENGINE_AUTH_EMAIL is required}"
-: "${MEMORY_ENGINE_AUTH_LINK:?MEMORY_ENGINE_AUTH_LINK is required}"
 
 base="${MEMORY_ENGINE_PUBLIC_BASE_URL:-https://memory-engine-api-i2xcr.ondigitalocean.app}"
 api="${RESEND_API_URL:-https://api.resend.com}"
+
+if [ -n "${MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL:-}" ]; then
+    : "${MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT:?MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT is required}"
+    : "${MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE:?MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE is required}"
+    email="$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL"
+    due_count="$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT"
+    unsubscribe_url="${base}${MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE}"
+    subject="You have ${due_count} Memory Engine review"
+    [ "$due_count" = "1" ] || subject="You have ${due_count} Memory Engine reviews"
+    text="You have ${due_count} review(s) waiting in Memory Engine. Return when it suits you: ${base}/\n\nTo turn off these reminders, visit: ${unsubscribe_url}"
+    from="${MEMORY_ENGINE_MAIL_FROM:-Memory Engine <onboarding@resend.dev>}"
+    curl -sf --max-time 10 "$api/emails" \
+        -H "Authorization: Bearer $RESEND_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"from\":\"$from\",\"to\":[\"$email\"],\"subject\":\"$subject\",\"text\":\"$text\"}" \
+        > /dev/null
+    exit 0
+fi
+
+: "${MEMORY_ENGINE_AUTH_EMAIL:?MEMORY_ENGINE_AUTH_EMAIL is required}"
+: "${MEMORY_ENGINE_AUTH_LINK:?MEMORY_ENGINE_AUTH_LINK is required}"
 sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
 
 # Sender. Defaults to onboarding@resend.dev, which Resend delivers only to the
