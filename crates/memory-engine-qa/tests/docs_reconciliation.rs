@@ -369,6 +369,23 @@ fn trusted_live_generation_lane_is_default_branch_only_and_fail_closed() {
             && !upload.contains("target/generation-061-live/artifact.json"),
         "the upload step must never publish raw early-failure evidence"
     );
+    let staging = workflow
+        .split("- name: Stage only scanned live evidence")
+        .nth(1)
+        .and_then(|rest| rest.split("\n      - name:").next())
+        .expect("staging step exists");
+    assert!(
+        !staging.contains("transcript.txt")
+            && !staging.contains("artifact.json")
+            && !staging.contains("cerberus-receipt.json"),
+        "published evidence is only trusted schema-validated fields: the raw target transcript and harness bundles must never be staged"
+    );
+    assert!(
+        staging.contains("provider-attestation.json")
+            && staging.contains("runtime-cleanup.json")
+            && staging.contains("$RECEIPT_PATH"),
+        "staging must cover exactly the trusted attestation, cleanup proof, and validated receipt"
+    );
     assert!(
         !workflow.contains("find docs/evals -maxdepth 1") && !workflow.contains("! rg -n -F"),
         "staging and scans must be exact and explicit, never historical/globbed or inverted"
@@ -394,6 +411,44 @@ fn trusted_live_request_uses_a_nonempty_parent_to_exact_head_range() {
             && request.contains("--base \"$base_sha\"")
             && request.contains("--head \"$HEAD_SHA\""),
         "the exact current master commit must be evaluated against its parent, not an empty master-to-self range"
+    );
+    assert!(
+        request.contains("if git diff --quiet \"$base_sha\" \"$HEAD_SHA\"; then"),
+        "an empty tree diff (e.g. an empty commit on master) must be refused, not merely a parent != head SHA comparison"
+    );
+}
+
+#[test]
+fn trusted_live_lane_verifies_protected_master_gates_before_any_secret() {
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    let gates = workflow
+        .find("- name: Verify protected-master gates passed on the evaluated commit")
+        .expect("protected-master gate verification step exists");
+    let mint = workflow
+        .find("- name: Mint bounded key in short-lived process")
+        .expect("mint step exists");
+    assert!(
+        gates < mint,
+        "gate verification must run before the provisioning secret is exposed"
+    );
+    let section = workflow
+        .split("- name: Verify protected-master gates passed on the evaluated commit")
+        .nth(1)
+        .and_then(|rest| rest.split("\n      - name:").next())
+        .expect("gate verification step body");
+    assert_contains_all(
+        "protected-master gate verification",
+        section,
+        &[
+            "for gate in ci review; do",
+            "check-runs?check_name=",
+            "refusing to expose provider authority",
+            "sha256sum",
+        ],
+    );
+    assert!(
+        workflow.contains("permissions:\n  contents: read\n  checks: read\n\nconcurrency:"),
+        "the workflow may hold only read authority: repository contents and check runs"
     );
 }
 
@@ -444,6 +499,119 @@ fn trusted_staging_rejects_malicious_symlink_origins() {
     fs::remove_dir_all(root).expect("remove symlink staging fixture");
 }
 
+#[cfg(unix)]
+#[test]
+fn trusted_staging_is_descriptor_based_exclusive_and_mode_preserving() {
+    let staging = repo_root().join("scripts/generation-061-stage-evidence.sh");
+    let root = test_temp_dir("descriptor-stage");
+    let destination = root.join("safe");
+    let tool = root.join("tool.sh");
+    fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write executable evidence source");
+    let mut permissions = fs::metadata(&tool).expect("tool metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&tool, permissions).expect("make evidence source executable");
+
+    let first = std::process::Command::new("bash")
+        .arg(&staging)
+        .arg(&destination)
+        .arg(&tool)
+        .output()
+        .expect("run trusted staging helper");
+    assert!(
+        first.status.success(),
+        "staging a regular executable evidence file must succeed: {first:?}"
+    );
+    let staged_mode = fs::metadata(destination.join("tool.sh"))
+        .expect("staged file metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        staged_mode & 0o111,
+        0o111,
+        "descriptor staging must preserve executable modes"
+    );
+
+    // A destination name that already exists must fail via O_EXCL at the
+    // descriptor — there is no check-then-copy window to race.
+    let second = std::process::Command::new("bash")
+        .arg(&staging)
+        .arg(&destination)
+        .arg(&tool)
+        .output()
+        .expect("re-run trusted staging helper");
+    assert!(
+        !second.status.success(),
+        "staging over an existing destination name must fail closed: {second:?}"
+    );
+
+    // A symlink planted at the destination name must fail even though the
+    // source is honest.
+    let planted = root.join("planted");
+    let honest = root.join("honest.md");
+    fs::write(&honest, "honest evidence\n").expect("write honest evidence");
+    fs::create_dir_all(&planted).expect("create planted destination");
+    symlink(root.join("outside.md"), planted.join("honest.md"))
+        .expect("plant destination symlink");
+    let symlinked = std::process::Command::new("bash")
+        .arg(&staging)
+        .arg(&planted)
+        .arg(&honest)
+        .output()
+        .expect("run staging against planted destination symlink");
+    assert!(
+        !symlinked.status.success(),
+        "a symlink planted at the destination name must fail closed: {symlinked:?}"
+    );
+    assert!(
+        !root.join("outside.md").exists(),
+        "the planted symlink target must never be created or written"
+    );
+    fs::remove_dir_all(root).expect("remove descriptor staging fixture");
+}
+
+#[test]
+fn trusted_staging_and_scanning_are_descriptor_based_and_scan_the_safe_copy() {
+    let staging = read_repo_file("scripts/generation-061-stage-evidence.sh");
+    let scanner = read_repo_file("scripts/generation-061-scan-safe.sh");
+    let helper = read_repo_file("scripts/generation-061-copy-regular.py");
+    for (name, text) in [
+        ("scripts/generation-061-stage-evidence.sh", &staging),
+        ("scripts/generation-061-scan-safe.sh", &scanner),
+    ] {
+        assert_contains_all(
+            name,
+            text,
+            &["generation-061-copy-regular.py", "--max-bytes"],
+        );
+        assert!(
+            !text.contains("cp --no-dereference") && !text.contains("cp -- \"$path\""),
+            "{name} must not fall back to racy path-based cp"
+        );
+    }
+    assert_contains_all(
+        "scripts/generation-061-copy-regular.py",
+        &helper,
+        &[
+            "O_NOFOLLOW",
+            "O_EXCL",
+            "dir_fd",
+            "fstat",
+            "S_ISREG",
+            "fchmod",
+        ],
+    );
+    let copy_position = scanner
+        .find("generation-061-copy-regular.py")
+        .expect("scan-safe copies through the descriptor helper");
+    let scan_position = scanner
+        .find("$scanner\" -n --hidden -F")
+        .expect("scan-safe scans staged evidence");
+    assert!(
+        copy_position < scan_position && scanner.contains("$safe_dir/$name"),
+        "scan-safe must copy first and scan the immutable safe copy, not the racy source path"
+    );
+}
+
 #[test]
 fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
     let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
@@ -478,15 +646,19 @@ fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
     );
     assert!(
         comparison.contains("--mount") && comparison.contains("dst=/workspace,readonly"),
-        "the target worktree must be read-only inside the container"
+        "the target worktree must be read-only inside the build container"
     );
     assert!(
-        comparison.contains("--mount") && comparison.contains("dst=/output,rw"),
-        "only the bounded output directory may be writable"
+        comparison.contains("--tmpfs /output:rw,noexec,nosuid"),
+        "the only writable output surface must be a bounded noexec tmpfs"
     );
     assert!(
         workflow.contains("rust:1.88-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0"),
-        "the target runtime must use a pinned image"
+        "the build stage must use a pinned image"
+    );
+    assert!(
+        workflow.contains("debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"),
+        "the runtime stage must use a digest-pinned minimal image without Cargo or rustc"
     );
     assert!(
         workflow.contains("id: mint_key")
@@ -591,7 +763,7 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
     let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
     let comparison = read_repo_file("scripts/generation-061-live-comparison.sh");
     assert!(
-        workflow.contains("permissions:\n  contents: read\n\nconcurrency:"),
+        workflow.contains("permissions:\n  contents: read\n  checks: read\n\nconcurrency:"),
         "the workflow must have the exact top-level read-only permissions block"
     );
     assert!(
@@ -611,12 +783,14 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
     );
     assert!(
         comparison.contains("cache_root=\"$(cd -P -- \"$GENERATION_CACHE_DIR\" && pwd)\"")
-            && comparison.contains("output_dir=\"$cache_root/live-output\"")
-            && comparison.contains("rm -rf -- \"$output_dir\"")
-            && comparison.contains("--mount \"type=bind,src=$output_dir,dst=/output,rw\"")
+            && comparison.contains("--tmpfs /output:rw,noexec,nosuid")
             && comparison.contains("prepared_dir=\"$cache_root/prepared\"")
             && comparison.contains("GENERATION_RUNTIME_CLEANUP_EVIDENCE"),
-        "the benchmark output mount must be freshly recreated outside the target tree"
+        "benchmark output must live in a bounded noexec tmpfs, never a host bind mount"
+    );
+    assert!(
+        !comparison.contains("dst=/output"),
+        "no host directory may be bind-mounted at /output"
     );
 }
 
@@ -673,6 +847,28 @@ fn trusted_live_target_cannot_retain_provider_key_or_use_unrestricted_egress() {
             && !comparison.contains("dst=/cargo-target"),
         "target build/runtime canaries must not receive the provider key or persistent caches"
     );
+    let runtime = comparison
+        .split("--network none")
+        .nth(1)
+        .expect("network-none runtime invocation exists");
+    let runtime = runtime
+        .split("GENERATION_RUNTIME_IMAGE")
+        .next()
+        .expect("runtime invocation ends at its image");
+    assert!(
+        runtime.contains("dst=/workspace/crates/memory-engine-bench/corpus,readonly")
+            && runtime.contains("dst=/prepared/memory-engine-bench,readonly")
+            && runtime.contains("--tmpfs /output:rw,noexec,nosuid"),
+        "the runtime container may mount only the eval corpus data, the exact prepared binary, trusted helpers, and a bounded noexec output tmpfs"
+    );
+    assert!(
+        !runtime.contains("dst=/workspace,readonly") && !runtime.contains("cargo"),
+        "the runtime container must not see repository source or any Cargo surface"
+    );
+    assert!(
+        comparison.contains("prepared directory must contain exactly the digest-checked benchmark"),
+        "the prepared directory must be verified to hold exactly one regular executable"
+    );
     assert_contains_all(
         "scripts/generation-061-trusted-provider-proxy.py",
         &proxy,
@@ -710,12 +906,20 @@ fn trusted_live_target_cannot_retain_provider_key_or_use_unrestricted_egress() {
 
 const STALE_RECEIPT_DOCKER: &str = r#"#!/bin/bash
 set -euo pipefail
-if [[ "${1:-}" == container ]]; then exit 1; fi
+if [[ "${1:-}" == container ]]; then
+  case "${2:-}" in
+    inspect) echo "Error: No such container: ${*: -1}" >&2; exit 1 ;;
+    ls) exit 0 ;;
+    rm) exit 0 ;;
+  esac
+  exit 1
+fi
 [[ "${1:-}" == run ]]
 network=''
-output_mount=''
+output_dir=''
 target_mount=''
 prepared_mount=''
+prepared_binary=''
 helper_mount=''
 validator_mount=''
 env_file=''
@@ -723,13 +927,15 @@ while (($#)); do
   case "$1" in
     --network) network="$2"; shift 2 ;;
     --env-file) env_file="$2"; shift 2 ;;
+    --tmpfs)
+      case "$2" in
+        /output:*) output_dir="$(mktemp -d)" ;;
+      esac
+      shift 2
+      ;;
     --mount)
       mount="$2"
       case "$mount" in
-        *",dst=/output,rw")
-          output_mount="${mount#type=bind,src=}"
-          output_mount="${output_mount%,dst=/output,rw}"
-          ;;
         *",dst=/workspace,readonly")
           target_mount="${mount#type=bind,src=}"
           target_mount="${target_mount%,dst=/workspace,readonly}"
@@ -737,6 +943,10 @@ while (($#)); do
         *",dst=/prepared,rw")
           prepared_mount="${mount#type=bind,src=}"
           prepared_mount="${prepared_mount%,dst=/prepared,rw}"
+          ;;
+        *",dst=/prepared/memory-engine-bench,readonly")
+          prepared_binary="${mount#type=bind,src=}"
+          prepared_binary="${prepared_binary%,dst=/prepared/memory-engine-bench,readonly}"
           ;;
         *",dst=/trusted/generation-061-live-comparison.sh,readonly")
           helper_mount="${mount#type=bind,src=}"
@@ -771,18 +981,16 @@ exit 0
 EOF
   fi
   chmod 0555 "$prepared_mount/memory-engine-bench"
-  sha256sum "$prepared_mount/memory-engine-bench" > "$prepared_mount/memory-engine-bench.sha256"
   exit 0
 fi
-printf '%s' "$output_mount" > "$DOCKER_OUTPUT_MOUNT_LOG"
+printf '%s' "$output_dir" > "$DOCKER_OUTPUT_MOUNT_LOG"
 set -a
 . "$env_file"
 set +a
 GENERATION_LIVE_IN_CONTAINER=true \
-GENERATION_OUTPUT_DIR="$output_mount" \
+GENERATION_OUTPUT_DIR="$output_dir" \
 GENERATION_RECEIPT_VALIDATOR="$validator_mount" \
-GENERATION_PREPARED_BINARY="$prepared_mount/memory-engine-bench" \
-GENERATION_PREPARED_BINARY_SHA256="$(cut -d ' ' -f1 "$prepared_mount/memory-engine-bench.sha256")" \
+GENERATION_PREPARED_BINARY="$prepared_binary" \
 PATH="$FAKE_BIN:/usr/bin:/bin" \
 bash "$helper_mount"
 "#;
@@ -816,6 +1024,13 @@ fn prepare_stale_receipt_fixture() -> (
     let cache = fs::canonicalize(test_temp_dir("stale-live-cache")).expect("canonicalize cache");
     let fake_git_dir = root.join("git-common");
     fs::create_dir_all(root.join("docs/evals")).expect("create target eval directory");
+    fs::create_dir_all(root.join("crates/memory-engine-bench/corpus/generation"))
+        .expect("create target corpus directory");
+    fs::write(
+        root.join("crates/memory-engine-bench/corpus/generation/fixture.md"),
+        "fixture corpus source\n",
+    )
+    .expect("write fixture corpus source");
     fs::create_dir_all(&scripts).expect("create temporary scripts directory");
     fs::create_dir_all(&fake_bin).expect("create fake command directory");
     fs::create_dir_all(&fake_git_dir).expect("create fake shared git directory");
@@ -918,23 +1133,42 @@ fn prepare_forged_receipt_fixture() -> (
 
 const HONEST_BUILD_DOCKER: &str = r#"#!/bin/sh
 set -eu
+fixture_cache='__FIXTURE_CACHE__'
+if [ "${1:-}" = container ]; then
+  if [ -f "$fixture_cache/fixture-docker-broken-cleanup" ]; then
+    echo 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock' >&2
+    exit 1
+  fi
+  case "${2:-}" in
+    inspect) echo "Error: No such container" >&2; exit 1 ;;
+    ls) exit 0 ;;
+    rm) exit 0 ;;
+  esac
+  exit 1
+fi
 network=''
 env_file=''
-output_mount=''
+output_dir=''
 helper_mount=''
 validator_mount=''
 prepared_mount=''
+prepared_binary=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --network) network="$2"; shift 2 ;;
     --env-file) env_file="$2"; shift 2 ;;
+    --tmpfs)
+      case "$2" in
+        /output:*)
+          output_dir="$fixture_cache/fixture-output"
+          mkdir -p "$output_dir"
+          ;;
+      esac
+      shift 2
+      ;;
     --mount)
       mount="$2"
       case "$mount" in
-        *",dst=/output,rw")
-          output_mount="${mount#type=bind,src=}"
-          output_mount="${output_mount%,dst=/output,rw}"
-          ;;
         *",dst=/trusted/generation-061-live-comparison.sh,readonly")
           helper_mount="${mount#type=bind,src=}"
           helper_mount="${helper_mount%,dst=/trusted/generation-061-live-comparison.sh,readonly}"
@@ -943,9 +1177,9 @@ while [ "$#" -gt 0 ]; do
           validator_mount="${mount#type=bind,src=}"
           validator_mount="${validator_mount%,dst=/trusted/validate-receipt.sh,readonly}"
           ;;
-        *",dst=/prepared,readonly")
-          prepared_mount="${mount#type=bind,src=}"
-          prepared_mount="${prepared_mount%,dst=/prepared,readonly}"
+        *",dst=/prepared/memory-engine-bench,readonly")
+          prepared_binary="${mount#type=bind,src=}"
+          prepared_binary="${prepared_binary%,dst=/prepared/memory-engine-bench,readonly}"
           ;;
         *",dst=/prepared,rw")
           prepared_mount="${mount#type=bind,src=}"
@@ -957,9 +1191,7 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-if [ -n "$prepared_mount" ]; then
-  printf '%s\n' "$network" >> "$(dirname "$prepared_mount")/honest-build-network.log"
-fi
+printf '%s\n' "$network" >> "$fixture_cache/honest-build-network.log"
 if [ "$network" = bridge ]; then
   test -z "${GENERATION_PROVIDER_KEY:-}"
   mkdir -p "$prepared_mount"
@@ -993,7 +1225,9 @@ cat > "$out" <<'RECEIPT'
 RECEIPT
 EOF
   chmod 0555 "$prepared_mount/memory-engine-bench"
-  sha256sum "$prepared_mount/memory-engine-bench" > "$prepared_mount/memory-engine-bench.sha256"
+  if [ -f "$fixture_cache/fixture-extra-entry" ]; then
+    : > "$prepared_mount/fixture-extra"
+  fi
   exit 0
 fi
 test "$network" = none
@@ -1001,9 +1235,9 @@ test -s "$env_file"
 if grep -Eq 'GENERATION_PROVIDER_KEY|CARGO_HOME|CARGO_TARGET_DIR' "$env_file"; then
   exit 1
 fi
-test -n "$prepared_mount"
-test -x "$prepared_mount/memory-engine-bench"
-test -s "$prepared_mount/memory-engine-bench.sha256"
+test -n "$prepared_binary"
+test -x "$prepared_binary"
+test -n "$output_dir"
 exit 0
 "#;
 
@@ -1016,7 +1250,14 @@ import time
 from pathlib import Path
 
 socket_path = Path(sys.argv[sys.argv.index('--socket') + 1])
-socket_path.unlink(missing_ok=True)
+
+def remove_socket_path(path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+remove_socket_path(socket_path)
 server_socket = socket.socket(socket.AF_UNIX)
 server_socket.bind(str(socket_path))
 server_socket.listen(1)
@@ -1034,7 +1275,7 @@ def finish(_signum, _frame):
         'calls': calls,
     }) + '\n')
     server_socket.close()
-    socket_path.unlink(missing_ok=True)
+    remove_socket_path(socket_path)
     raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, finish)
@@ -1043,11 +1284,243 @@ while True:
 ";
 
 #[test]
-fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
-    let (root, scripts, fake_bin, original_cache, _target_receipt, stale) =
+fn honest_build_proxy_remains_python_37_compatible() {
+    assert!(
+        HONEST_BUILD_PROXY.contains("except FileNotFoundError:"),
+        "the honest-build proxy must clean up sockets without relying on Python 3.8+ missing_ok"
+    );
+    assert!(
+        !HONEST_BUILD_PROXY.contains("missing_ok=True"),
+        "the honest-build proxy must not require Path.unlink(missing_ok=True)"
+    );
+}
+
+#[cfg(unix)]
+fn spawn_real_trusted_proxy(
+    label: &str,
+    extra_args: &[&str],
+) -> (
+    std::process::Child,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use std::io::Write as _;
+    // Unix socket paths are limited to ~104 bytes on macOS; the default
+    // test temp dir under /var/folders is too long, so use a short root.
+    let root = std::path::PathBuf::from(format!("/tmp/me098-{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create short proxy fixture root");
+    let socket = root.join("provider.sock");
+    let attestation = root.join("provider-attestation.json");
+    // The declared interpreter is whatever `python3` resolves to on the host
+    // (3.7 on the oldest supported dev machine, newer on the hosted runner).
+    // Running the real proxy through it is the executable portability
+    // regression: any 3.8+-only API (Path.unlink(missing_ok=...),
+    // socket-timeout aliasing) crashes before the socket appears.
+    let mut child = std::process::Command::new("python3")
+        .arg(repo_root().join("scripts/generation-061-trusted-provider-proxy.py"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--attestation")
+        .arg(&attestation)
+        .args(["--target-sha", "fixture-head", "--token", "one-run-token"])
+        .args(["--provider-key-fd", "0"])
+        .args(extra_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn real trusted provider proxy");
+    child
+        .stdin
+        .take()
+        .expect("proxy stdin")
+        .write_all(b"sk-fixture-provider-key\n")
+        .expect("write fixture provider key");
+    for _ in 0..200 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        socket.exists(),
+        "the real proxy must start under the host python3 interpreter; it crashed before binding its socket"
+    );
+    (child, root, socket, attestation)
+}
+
+#[cfg(unix)]
+fn proxy_round_trip(socket: &std::path::Path, request: &str) -> String {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket).expect("connect trusted proxy socket");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    stream.write_all(b"\n").expect("terminate proxy request");
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("read proxy reply");
+    line
+}
+
+#[cfg(unix)]
+fn stop_real_trusted_proxy(mut child: std::process::Child) -> String {
+    use std::io::Read as _;
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("signal trusted proxy");
+    // Bounded shutdown is acceptance: SIGTERM must yield a clean exit within
+    // ten seconds. An unbounded wait would hang the suite instead of failing
+    // when signal/socket-loop cleanup regresses.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll trusted proxy") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the trusted proxy did not shut down within ten seconds of SIGTERM");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).expect("read proxy stderr");
+    }
+    assert!(
+        status.success(),
+        "the trusted proxy must exit cleanly on SIGTERM: {status:?}; stderr={stderr}"
+    );
+    stderr
+}
+
+#[cfg(unix)]
+fn allowlisted_proxy_payload() -> String {
+    r#"{"model":"google/gemini-3.5-flash","messages":[{"role":"user","content":"fixture prompt"}],"response_format":{"type":"json_schema","json_schema":{"name":"fixture","strict":true,"schema":{"type":"object"}}},"provider":{"require_parameters":true,"allow_fallbacks":true},"usage":{"include":true}}"#
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn real_trusted_proxy_runs_on_host_python3_and_fails_closed() {
+    let (child, root, socket, attestation) =
+        spawn_real_trusted_proxy("real-proxy-fail-closed", &[]);
+
+    let unauthorized = proxy_round_trip(
+        &socket,
+        r#"{"token":"forged","payload":{"model":"google/gemini-3.5-flash","messages":[]}}"#,
+    );
+    assert!(
+        unauthorized.contains("\"status\":401"),
+        "a forged capability token must be rejected without any upstream call: {unauthorized}"
+    );
+
+    let wrong_model = proxy_round_trip(
+        &socket,
+        &format!(
+            r#"{{"token":"one-run-token","payload":{}}}"#,
+            allowlisted_proxy_payload().replace("google/gemini-3.5-flash", "attacker/exfil-model")
+        ),
+    );
+    assert!(
+        wrong_model.contains("\"status\":400"),
+        "a non-allowlisted model must be rejected before any upstream call: {wrong_model}"
+    );
+
+    let malformed = proxy_round_trip(&socket, r#"{"token":"one-run-token","payload":[1,2]}"#);
+    assert!(
+        malformed.contains("\"status\":400"),
+        "a non-object payload must be rejected: {malformed}"
+    );
+
+    stop_real_trusted_proxy(child);
+    let written = fs::read_to_string(&attestation).expect("read proxy attestation");
+    assert!(
+        written.contains("\"provider_calls\": 0") && written.contains("\"rejected\""),
+        "rejected traffic must never appear as provider proof: {written}"
+    );
+    assert!(
+        !socket.exists(),
+        "the proxy must remove its socket on shutdown under the host interpreter"
+    );
+    fs::remove_dir_all(root).expect("remove real proxy fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn real_trusted_proxy_enforces_a_global_call_budget() {
+    let (child, root, socket, attestation) =
+        spawn_real_trusted_proxy("real-proxy-budget", &["--max-calls", "0"]);
+    let over_budget = proxy_round_trip(
+        &socket,
+        &format!(
+            r#"{{"token":"one-run-token","payload":{}}}"#,
+            allowlisted_proxy_payload()
+        ),
+    );
+    assert!(
+        over_budget.contains("\"status\":429"),
+        "a schema-valid request beyond the global call budget must be refused without egress: {over_budget}"
+    );
+    stop_real_trusted_proxy(child);
+    let written = fs::read_to_string(&attestation).expect("read proxy attestation");
+    assert!(
+        written.contains("\"provider_calls\": 0"),
+        "budget-refused calls must not count as provider proof: {written}"
+    );
+    fs::remove_dir_all(root).expect("remove proxy budget fixture");
+}
+
+#[test]
+fn real_trusted_proxy_source_declares_redirect_schema_and_budget_guards() {
+    let proxy = read_repo_file("scripts/generation-061-trusted-provider-proxy.py");
+    assert_contains_all(
+        "scripts/generation-061-trusted-provider-proxy.py",
+        &proxy,
+        &[
+            "HTTPRedirectHandler",
+            "redirect_request",
+            "return None",
+            "validate_payload",
+            "ALLOWED_ROLES",
+            "max_calls",
+            "max_total_bytes",
+            "BoundedSemaphore",
+            "rejected_provider_calls",
+            "except FileNotFoundError:",
+        ],
+    );
+    assert!(
+        !proxy.contains("missing_ok"),
+        "the trusted proxy must stay runnable on the oldest declared python3 (3.7)"
+    );
+    assert!(
+        !proxy.contains("urllib.request.urlopen("),
+        "upstream calls must go through the redirect-refusing opener, never default urlopen"
+    );
+}
+
+#[cfg(unix)]
+fn run_honest_wrapper(
+    label: &str,
+    before_run: impl FnOnce(&std::path::Path),
+) -> (
+    std::process::Output,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let (root, scripts, fake_bin, original_cache, _target_receipt, _stale) =
         prepare_stale_receipt_fixture();
-    let cache = std::path::PathBuf::from(format!("/tmp/me098-honest-{}", std::process::id()));
+    let cache = std::path::PathBuf::from(format!("/tmp/me098-{label}-{}", std::process::id()));
     fs::remove_dir_all(&original_cache).expect("remove long fixture cache");
+    let _ = fs::remove_dir_all(&cache);
     fs::create_dir_all(&cache).expect("create short fixture cache");
     let proxy = root.join("honest-build-proxy.py");
     fs::write(&proxy, HONEST_BUILD_PROXY).expect("write honest build proxy");
@@ -1058,23 +1531,22 @@ fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
     )
     .expect("write honest attestation validator");
     let docker = fake_bin.join("docker");
-    fs::write(&docker, HONEST_BUILD_DOCKER).expect("write honest build docker");
-    let log = cache.join("honest-build-network.log");
-    let prepared = cache.join("prepared");
-    let mut permissions = fs::metadata(&proxy).expect("proxy metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&proxy, permissions).expect("make proxy executable");
-    let mut permissions = fs::metadata(&attestation_validator)
-        .expect("attestation validator metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&attestation_validator, permissions)
-        .expect("make attestation validator executable");
-    let mut permissions = fs::metadata(&docker)
-        .expect("docker metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&docker, permissions).expect("make docker executable");
+    fs::write(
+        &docker,
+        HONEST_BUILD_DOCKER.replace(
+            "__FIXTURE_CACHE__",
+            cache.to_str().expect("fixture cache path is UTF-8"),
+        ),
+    )
+    .expect("write honest build docker");
+    for path in [&proxy, &attestation_validator, &docker] {
+        let mut permissions = fs::metadata(path)
+            .expect("fixture helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make fixture helper executable");
+    }
+    before_run(&cache);
     let original_path = std::env::var("PATH").expect("test PATH");
     let result = std::process::Command::new("bash")
         .arg(scripts.join("generation-061-live-comparison.sh"))
@@ -1084,6 +1556,7 @@ fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
         .env("GENERATION_PROVIDER_KEY", "sk-test")
         .env("GENERATION_HEAD_SHA", "fixture-head")
         .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
+        .env("GENERATION_RUNTIME_IMAGE", "fixture-runtime-image")
         .env("GENERATION_CONTAINER_LABEL", "fixture-label")
         .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
         .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
@@ -1112,6 +1585,14 @@ fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
         .env("GENERATION_CONTAINER_NAME", "fixture-container")
         .output()
         .expect("run honest-path build canary");
+    (result, cache, root)
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
+    let (result, cache, root) = run_honest_wrapper("honest", |_| {});
+    let log = cache.join("honest-build-network.log");
     assert!(
         result.status.success(),
         "an exact benchmark must build before network-disabled execution and then run: {result:?}; log={:?}; evidence={:?}",
@@ -1122,11 +1603,62 @@ fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
         fs::read_to_string(&log).expect("read honest path network log"),
         "bridge\nnone\n"
     );
-    assert!(!prepared.join("memory-engine-bench").exists());
-    assert!(cache.join("runtime-cleanup.json").exists());
-    let _ = stale;
+    assert!(!cache.join("prepared").join("memory-engine-bench").exists());
+    let evidence =
+        fs::read_to_string(cache.join("runtime-cleanup.json")).expect("read cleanup evidence");
+    assert!(
+        evidence.contains("\"container_removed\":true"),
+        "honest cleanup must prove container removal: {evidence}"
+    );
     fs::remove_dir_all(&cache).expect("remove honest build cache fixture");
     fs::remove_dir_all(root).expect("remove honest build fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_live_wrapper_rejects_prepared_directory_with_extra_entries() {
+    let (result, cache, root) = run_honest_wrapper("prepared-extra", |cache| {
+        fs::write(cache.join("fixture-extra-entry"), "plant an extra artifact\n")
+            .expect("request an extra prepared entry");
+    });
+    assert!(
+        !result.status.success(),
+        "a build that leaves anything besides the exact benchmark binary in the prepared \
+         directory must fail closed before the provider proxy exists: {result:?}"
+    );
+    assert!(
+        !cache.join("provider-attestation.json").exists()
+            || !fs::read_to_string(cache.join("provider-attestation.json"))
+                .unwrap_or_default()
+                .contains("provider-calls-observed"),
+        "a poisoned prepared directory must never reach canonical acceptance"
+    );
+    fs::remove_dir_all(&cache).expect("remove prepared-extra cache fixture");
+    fs::remove_dir_all(root).expect("remove prepared-extra fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_live_cleanup_proof_fails_closed_on_docker_errors() {
+    let (result, cache, root) = run_honest_wrapper("broken-cleanup", |cache| {
+        fs::write(
+            cache.join("fixture-docker-broken-cleanup"),
+            "docker daemon errors during cleanup\n",
+        )
+        .expect("break docker container commands");
+    });
+    assert!(
+        !result.status.success(),
+        "docker errors during container cleanup must fail the run, not pass as absent: {result:?}"
+    );
+    let evidence =
+        fs::read_to_string(cache.join("runtime-cleanup.json")).expect("read cleanup evidence");
+    assert!(
+        evidence.contains("\"container_removed\":false"),
+        "cleanup evidence must fail closed when docker cannot prove removal: {evidence}"
+    );
+    fs::remove_dir_all(&cache).expect("remove broken-cleanup cache fixture");
+    fs::remove_dir_all(root).expect("remove broken-cleanup fixture");
 }
 
 #[test]
@@ -1143,6 +1675,7 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         .env("GENERATION_PROVIDER_KEY", "sk-test")
         .env("GENERATION_HEAD_SHA", "fixture-head")
         .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
+        .env("GENERATION_RUNTIME_IMAGE", "fixture-runtime-image")
         .env("GENERATION_CONTAINER_LABEL", "fixture-label")
         .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
         .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
@@ -1182,9 +1715,11 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         fs::read_to_string(&target_receipt).expect("read target receipt"),
         stale
     );
+    let evidence =
+        fs::read_to_string(cache.join("runtime-cleanup.json")).expect("read cleanup evidence");
     assert!(
-        !cache.join("live-output").exists(),
-        "failed benchmark cleanup must remove only its owned output directory"
+        evidence.contains("\"output_host_mount\":false"),
+        "the target report surface must be an in-container tmpfs, never a host mount: {evidence}"
     );
     fs::remove_dir_all(&cache).expect("remove stale receipt cache fixture");
     fs::remove_dir_all(root).expect("remove stale receipt fixture");
@@ -1204,6 +1739,7 @@ fn trusted_live_wrapper_rejects_target_forged_receipt_and_stdout_without_provide
         .env("GENERATION_PROVIDER_KEY", "sk-test")
         .env("GENERATION_HEAD_SHA", "fixture-head")
         .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
+        .env("GENERATION_RUNTIME_IMAGE", "fixture-runtime-image")
         .env("GENERATION_CONTAINER_LABEL", "fixture-label")
         .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
         .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
@@ -1239,9 +1775,11 @@ fn trusted_live_wrapper_rejects_target_forged_receipt_and_stdout_without_provide
         !result.status.success(),
         "a target-controlled receipt/stdout with zero provider calls must not become canonical proof: {result:?}"
     );
+    let evidence =
+        fs::read_to_string(cache.join("runtime-cleanup.json")).expect("read cleanup evidence");
     assert!(
-        !cache.join("live-output").exists(),
-        "forged target output must be cleaned from the isolated mount"
+        evidence.contains("\"output_host_mount\":false"),
+        "forged target output must stay inside the container tmpfs, never a host mount: {evidence}"
     );
     fs::remove_dir_all(&cache).expect("remove forged receipt cache fixture");
     fs::remove_dir_all(root).expect("remove forged receipt fixture");
@@ -1366,11 +1904,23 @@ fn trusted_live_scanner_rejects_missing_or_failing_scanner() {
         let safe = test_temp_dir("safe");
         fs::write(source.join("evidence.txt"), "safe evidence\n").expect("write evidence");
         let bin = test_temp_dir(fake_rg);
-        for utility in ["find", "rm", "mkdir", "cp", "basename", "sha256sum"] {
+        for utility in [
+            "find",
+            "rm",
+            "mkdir",
+            "cp",
+            "basename",
+            "dirname",
+            "sha256sum",
+            "python3",
+            "test",
+        ] {
             let system_path = [
                 std::path::Path::new("/usr/bin").join(utility),
                 std::path::Path::new("/bin").join(utility),
                 std::path::Path::new("/sbin").join(utility),
+                std::path::Path::new("/usr/local/bin").join(utility),
+                std::path::Path::new("/opt/homebrew/bin").join(utility),
             ]
             .into_iter()
             .find(|path| path.exists())
@@ -1453,6 +2003,13 @@ fn trusted_live_generation_documentation_names_the_security_oracle() {
             "same-repository target is still",
             "missing-secret",
             "prior-step snapshots",
+            "## Trust anchor",
+            "protected-master",
+            "target binary remains untrusted",
+            "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818",
+            "exactly one regular executable",
+            "noexec",
+            "check run",
         ],
     );
 }

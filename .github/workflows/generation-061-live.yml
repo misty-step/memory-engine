@@ -13,6 +13,7 @@ on:
 # reach fork or otherwise untrusted workflow code.
 permissions:
   contents: read
+  checks: read
 
 concurrency:
   group: generation-061-live
@@ -54,6 +55,39 @@ jobs:
           git cat-file -e "$HEAD_SHA^1"
           echo "validated exact origin/master card061 target $HEAD_SHA"
 
+      - name: Verify protected-master gates passed on the evaluated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # Trust anchor enforcement: the trusted helpers, proxy, and
+          # validators execute from this exact origin/master commit. "It is
+          # on master" is not assumed to imply the protected-branch gates
+          # ran — require a successful `ci` and Cerberus `review` check run
+          # on this exact SHA before any provider authority exists.
+          for gate in ci review; do
+            successful="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?check_name=${gate}&per_page=100" \
+              --jq '[.check_runs[] | select(.conclusion == "success")] | length')"
+            if [[ "$successful" -lt 1 ]]; then
+              echo "required protected-branch gate ${gate} has no successful check run on ${HEAD_SHA}; refusing to expose provider authority" >&2
+              exit 1
+            fi
+          done
+          # Pin the trusted-file set for the run log: reviewers can compare
+          # these digests against the evaluated commit.
+          sha256sum \
+            scripts/generation-061-live-comparison.sh \
+            scripts/generation-061-trusted-provider-proxy.py \
+            scripts/generation-061-copy-regular.py \
+            scripts/generation-061-stage-evidence.sh \
+            scripts/generation-061-scan-safe.sh \
+            scripts/generation-061-validate-receipt.sh \
+            scripts/generation-061-validate-provider-attestation.sh \
+            scripts/generation-061-audit-command-files.sh \
+            scripts/generation-061-cerberus-key.sh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # reviewed stable action commit
 
@@ -82,6 +116,7 @@ jobs:
             printf 'GENERATION_BUILD_TIMEOUT_SECONDS=%s\n' '1200'
             printf 'GENERATION_CONTAINER_TIMEOUT_SECONDS=%s\n' '1800'
             printf 'GENERATION_CONTAINER_IMAGE=%s\n' 'rust:1.88-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0'
+            printf 'GENERATION_RUNTIME_IMAGE=%s\n' 'debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818'
             printf 'GENERATION_TRUSTED_HELPER=%s\n' "$GITHUB_WORKSPACE/scripts/generation-061-live-comparison.sh"
             printf 'GENERATION_TRUSTED_VALIDATOR=%s\n' "$GITHUB_WORKSPACE/scripts/generation-061-validate-receipt.sh"
             printf 'GENERATION_TRUSTED_PROXY=%s\n' "$GITHUB_WORKSPACE/scripts/generation-061-trusted-provider-proxy.py"
@@ -99,6 +134,13 @@ jobs:
           mkdir -p target/generation-061-live
           base_sha="$(git rev-parse "$HEAD_SHA^1")"
           test "$base_sha" != "$HEAD_SHA"
+          # A distinct parent SHA is not enough: an empty commit on master
+          # would produce an empty evaluation range. Require the trees to
+          # actually differ.
+          if git diff --quiet "$base_sha" "$HEAD_SHA"; then
+            echo 'evaluated commit has an empty tree diff against its parent; refusing live evaluation' >&2
+            exit 1
+          fi
           cerberus request git-range \
             --repo-path . \
             --base "$base_sha" \
@@ -110,6 +152,7 @@ jobs:
             --allow-env RUSTUP_HOME \
             --allow-env GENERATION_HEAD_SHA \
             --allow-env GENERATION_CONTAINER_IMAGE \
+            --allow-env GENERATION_RUNTIME_IMAGE \
             --allow-env GENERATION_CONTAINER_LABEL \
             --allow-env GENERATION_CACHE_DIR \
             --allow-env GENERATION_TRUSTED_HELPER \
@@ -201,6 +244,7 @@ jobs:
             GENERATION_PROVIDER_KEY="$scoped_key" \
             GENERATION_HEAD_SHA="$GENERATION_HEAD_SHA" \
             GENERATION_CONTAINER_IMAGE="$GENERATION_CONTAINER_IMAGE" \
+            GENERATION_RUNTIME_IMAGE="$GENERATION_RUNTIME_IMAGE" \
             GENERATION_CONTAINER_LABEL="$GENERATION_CONTAINER_LABEL" \
             GENERATION_CACHE_DIR="$GENERATION_CACHE_DIR" \
             GENERATION_TRUSTED_HELPER="$GENERATION_TRUSTED_HELPER" \
@@ -232,13 +276,26 @@ jobs:
             printf 'stopped=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          mapfile -t containers < <("$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}")
-          for container in "${containers[@]}"; do
-            [[ -z "$container" ]] && continue
+          # Every docker command failure fails closed: a daemon error while
+          # a labeled container is possibly alive must never be read as
+          # "everything stopped".
+          set +e
+          containers="$("$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}")"
+          listing_status=$?
+          set -e
+          if [[ "$listing_status" -ne 0 ]]; then
+            echo 'docker could not enumerate labeled target containers; refusing trusted staging' >&2
+            exit 1
+          fi
+          for container in $containers; do
             "$docker_bin" container rm -f "$container"
           done
-          if "$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}" | grep -q .; then
-            echo 'a target container remained alive; refusing trusted staging' >&2
+          set +e
+          remaining="$("$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}")"
+          remaining_status=$?
+          set -e
+          if [[ "$remaining_status" -ne 0 || -n "$remaining" ]]; then
+            echo 'a target container remained alive or docker failed; refusing trusted staging' >&2
             exit 1
           fi
           printf 'stopped=true\n' >> "$GITHUB_OUTPUT"
@@ -350,6 +407,9 @@ jobs:
             /^--- GENERATION_061_RECEIPT_/d
             p
           }' target/generation-061-live/transcript.txt > "$raw_receipt"
+          # Published fields are size-capped trusted material; an oversized
+          # extraction can only be smuggled bulk content.
+          test "$(wc -c < "$raw_receipt")" -le 262144
           scripts/generation-061-validate-receipt.sh "$raw_receipt"
           scan_no_credentials() {
             set +e
@@ -429,15 +489,16 @@ jobs:
           candidates="target/generation-061-live-candidates"
           rm -rf -- "$candidates"
           mkdir -p "$candidates"
+          # Published evidence is only trusted schema-validated size-capped
+          # fields: the proxy's attestation, the wrapper's cleanup proof,
+          # and the validated dated receipt. The raw target transcript and
+          # harness bundles never leave the runner.
           scripts/generation-061-stage-evidence.sh "$candidates" \
-            target/generation-061-live/artifact.json \
-            target/generation-061-live/cerberus-receipt.json \
-            target/generation-061-live/transcript.txt \
             "$GENERATION_PROVIDER_ATTESTATION" \
             "$GENERATION_RUNTIME_CLEANUP_EVIDENCE"
           test -n "$RECEIPT_PATH"
           scripts/generation-061-stage-evidence.sh "$candidates" "$RECEIPT_PATH"
-          jq -e --arg expected_head "$HEAD_SHA" ".schema == \"memory-engine/generation-061-runtime-cleanup/v1\" and .target_sha == \$expected_head and .build_timed_out == false and .runtime_timed_out == false and .container_removed == true and .output_removed == true and .prepared_removed == true and .provider_proxy_stopped == true and .attestation_validated == true" "$GENERATION_RUNTIME_CLEANUP_EVIDENCE" >/dev/null
+          jq -e --arg expected_head "$HEAD_SHA" ".schema == \"memory-engine/generation-061-runtime-cleanup/v1\" and .target_sha == \$expected_head and .build_timed_out == false and .runtime_timed_out == false and .container_removed == true and .output_host_mount == false and .prepared_removed == true and .provider_proxy_stopped == true and .attestation_validated == true" "$GENERATION_RUNTIME_CLEANUP_EVIDENCE" >/dev/null
           test -s "$candidates/provider-attestation.json"
           test -s "$candidates/runtime-cleanup.json"
           test -s "$candidates/$(basename "$RECEIPT_PATH")"

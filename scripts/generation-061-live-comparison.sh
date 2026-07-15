@@ -26,12 +26,15 @@ redact_secret() {
 
 if [[ "${GENERATION_LIVE_IN_CONTAINER:-}" == true ]]; then
   : "${OPENROUTER_PROXY_TOKEN:?trusted provider proxy must inject only a one-run capability}"
- : "${GENERATION_OUTPUT_DIR:?container output directory is required}"
- : "${GENERATION_RECEIPT_VALIDATOR:?trusted receipt validator is required}"
- : "${OPENROUTER_PROXY_SOCKET:?trusted provider proxy socket is required}"
+  : "${GENERATION_OUTPUT_DIR:?container output directory is required}"
+  : "${GENERATION_RECEIPT_VALIDATOR:?trusted receipt validator is required}"
+  : "${OPENROUTER_PROXY_SOCKET:?trusted provider proxy socket is required}"
   : "${GENERATION_PREPARED_BINARY:?trusted prebuilt benchmark is required}"
   : "${GENERATION_PREPARED_BINARY_SHA256:?trusted prebuilt benchmark digest is required}"
- receipt="$GENERATION_OUTPUT_DIR/generation-061-live-comparison-$(date -u +%F).md"
+  receipt="$GENERATION_OUTPUT_DIR/generation-061-live-comparison-$(date -u +%F).md"
+  # Published fields are size-capped: anything larger than this is not
+  # trusted evidence, whatever it contains.
+  max_report_bytes=262144
 
   test -f "$GENERATION_PREPARED_BINARY"
   test ! -L "$GENERATION_PREPARED_BINARY"
@@ -48,6 +51,11 @@ if [[ "${GENERATION_LIVE_IN_CONTAINER:-}" == true ]]; then
     --out "$receipt" 2>&1)"
   status=$?
   set -e
+  if (( ${#output} > max_report_bytes )); then
+    rm -f -- "$receipt"
+    echo 'benchmark output exceeded the trusted report size cap; refusing to emit evidence' >&2
+    exit 1
+  fi
   redacted_output="$(redact_secret "$output" "$OPENROUTER_PROXY_TOKEN")"
   if [[ "$status" -ne 0 ]]; then
     printf '%s\n' "$redacted_output"
@@ -98,7 +106,8 @@ for config in "$absolute_git_dir/config" "$shared_git_dir/config"; do
   fi
 done
 
-: "${GENERATION_CONTAINER_IMAGE:?trusted workflow must pin the target image}"
+: "${GENERATION_CONTAINER_IMAGE:?trusted workflow must pin the build image}"
+: "${GENERATION_RUNTIME_IMAGE:?trusted workflow must pin the minimal runtime image}"
 : "${GENERATION_CONTAINER_LABEL:?trusted workflow must label the target container}"
 : "${GENERATION_CACHE_DIR:?trusted workflow must provide an isolated cache directory}"
 : "${GENERATION_TRUSTED_HELPER:?trusted workflow must provide the helper path}"
@@ -112,20 +121,20 @@ done
 : "${GENERATION_RUNTIME_CLEANUP_EVIDENCE:?trusted workflow must record cleanup evidence}"
 
 target_root="$(pwd -P)"
+corpus_dir="$target_root/crates/memory-engine-bench/corpus"
+test -d "$corpus_dir"
 mkdir -p "$GENERATION_CACHE_DIR"
 cache_root="$(cd -P -- "$GENERATION_CACHE_DIR" && pwd)"
 if [[ "$cache_root" == "$target_root" || "$cache_root" == "$target_root/"* ]]; then
   echo 'trusted generation cache must be outside the target tree' >&2
   exit 1
 fi
-output_dir="$cache_root/live-output"
 prepared_dir="$cache_root/prepared"
 prepared_binary="$prepared_dir/memory-engine-bench"
 provider_socket="$cache_root/provider.sock"
 provider_attestation="$GENERATION_PROVIDER_ATTESTATION"
 runtime_cleanup_evidence="$GENERATION_RUNTIME_CLEANUP_EVIDENCE"
 build_container_name="$GENERATION_CONTAINER_NAME-prepare"
-output_dir_owned=false
 prepared_dir_owned=false
 env_file=''
 provider_proxy_pid=''
@@ -133,6 +142,7 @@ provider_proxy_stopped=false
 attestation_validated=false
 build_timed_out=false
 runtime_timed_out=false
+container_removed=false
 docker_bin="$(command -v docker || true)"
 timeout_bin="$(command -v timeout || true)"
 stop_provider_proxy() {
@@ -145,39 +155,67 @@ stop_provider_proxy() {
 }
 write_cleanup_evidence() {
   local temporary
-  local output_removed=false
   local prepared_removed=false
-  [[ ! -e "$output_dir" && ! -L "$output_dir" ]] && output_removed=true
   [[ ! -e "$prepared_dir" && ! -L "$prepared_dir" ]] && prepared_removed=true
   temporary="${runtime_cleanup_evidence}.tmp.$$"
   umask 077
-  printf '{"schema":"memory-engine/generation-061-runtime-cleanup/v1","target_sha":"%s","container_name":"%s","build_timeout_seconds":%s,"runtime_timeout_seconds":%s,"build_timed_out":%s,"runtime_timed_out":%s,"container_removed":%s,"output_removed":%s,"prepared_removed":%s,"provider_proxy_stopped":%s,"attestation_validated":%s}\n' \
+  printf '{"schema":"memory-engine/generation-061-runtime-cleanup/v1","target_sha":"%s","container_name":"%s","build_timeout_seconds":%s,"runtime_timeout_seconds":%s,"build_timed_out":%s,"runtime_timed_out":%s,"container_removed":%s,"output_host_mount":false,"prepared_removed":%s,"provider_proxy_stopped":%s,"attestation_validated":%s}\n' \
     "$GENERATION_HEAD_SHA" "$GENERATION_CONTAINER_NAME" \
     "$GENERATION_BUILD_TIMEOUT_SECONDS" "$GENERATION_CONTAINER_TIMEOUT_SECONDS" \
     "$build_timed_out" "$runtime_timed_out" "$container_removed" \
-    "$output_removed" "$prepared_removed" "$provider_proxy_stopped" \
+    "$prepared_removed" "$provider_proxy_stopped" \
     "$attestation_validated" > "$temporary"
   chmod 600 "$temporary"
   mv -f -- "$temporary" "$runtime_cleanup_evidence"
 }
+# Distinguish "definitively absent" from "docker failed". Returns 0 when the
+# daemon explicitly reports no such container, 1 when the container exists,
+# and 2 on any other docker failure — which must always fail closed. Both
+# this function and every call site are errexit-safe: status is captured
+# with `|| status=$?`, never by toggling `set -e`.
+container_absent() {
+  local name="$1" inspect_output inspect_status=0
+  inspect_output="$("$docker_bin" container inspect --format '{{.Id}}' "$name" 2>&1)" || inspect_status=$?
+  if [[ "$inspect_status" -eq 0 ]]; then
+    return 1
+  fi
+  case "$inspect_output" in
+    *'No such container'*|*'no such container'*) return 0 ;;
+  esac
+  return 2
+}
 cleanup_container() {
+  # Cleanup proof fails closed: container_removed becomes true only when
+  # every named container is explicitly reported absent and the label sweep
+  # succeeds and is empty. Any docker error keeps it false.
   container_removed=true
-  for container_name in "$build_container_name" "$GENERATION_CONTAINER_NAME"; do
-    if [[ -n "$docker_bin" ]] && "$docker_bin" container inspect "$container_name" >/dev/null 2>&1; then
-      "$docker_bin" container rm -f "$container_name" >/dev/null 2>&1 || true
-      if "$docker_bin" container inspect "$container_name" >/dev/null 2>&1; then
+  if [[ -z "$docker_bin" ]]; then
+    container_removed=false
+  else
+    local absence_status labeled labeled_status
+    for container_name in "$build_container_name" "$GENERATION_CONTAINER_NAME"; do
+      absence_status=0
+      container_absent "$container_name" || absence_status=$?
+      if [[ "$absence_status" -eq 1 ]]; then
+        "$docker_bin" container rm -f "$container_name" >/dev/null 2>&1 || true
+        absence_status=0
+        container_absent "$container_name" || absence_status=$?
+      fi
+      if [[ "$absence_status" -ne 0 ]]; then
         container_removed=false
       fi
+    done
+    labeled_status=0
+    labeled="$("$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=$GENERATION_CONTAINER_LABEL" 2>/dev/null)" || labeled_status=$?
+    if [[ "$labeled_status" -ne 0 || -n "$labeled" ]]; then
+      container_removed=false
     fi
-  done
+  fi
   if [[ -n "$env_file" ]]; then
     rm -f -- "$env_file"
   fi
   stop_provider_proxy
   rm -f -- "$provider_socket" "$cache_root/provider-proxy.log"
-  if [[ "$output_dir_owned" == true ]]; then
-    rm -rf -- "$output_dir"
-  fi
   if [[ "$prepared_dir_owned" == true ]]; then
     rm -rf -- "$prepared_dir"
   fi
@@ -185,9 +223,6 @@ cleanup_container() {
 }
 trap cleanup_container EXIT INT TERM
 
-rm -rf -- "$output_dir"
-mkdir "$output_dir"
-output_dir_owned=true
 rm -rf -- "$prepared_dir"
 mkdir "$prepared_dir"
 prepared_dir_owned=true
@@ -234,11 +269,27 @@ set -e
 if [[ "$build_status" == 124 || "$build_status" == 137 ]]; then
   build_timed_out=true
 fi
-if "$docker_bin" container inspect "$build_container_name" >/dev/null 2>&1; then
+build_absence=0
+container_absent "$build_container_name" || build_absence=$?
+if [[ "$build_absence" -eq 1 ]]; then
   "$docker_bin" container rm -f "$build_container_name" >/dev/null 2>&1 || build_status=1
+  build_absence=0
+  container_absent "$build_container_name" || build_absence=$?
+fi
+if [[ "$build_absence" -ne 0 ]]; then
+  echo 'docker could not prove the build container is gone; refusing to continue' >&2
+  build_status=1
 fi
 if [[ "$build_status" -ne 0 ]]; then
   exit "$build_status"
+fi
+# The networked build stage is untrusted: its writable /prepared mount must
+# contain exactly the digest-checked benchmark and nothing else, and only
+# that exact file is ever mounted into the runtime container.
+unexpected_prepared_entry="$(find "$prepared_dir" -mindepth 1 ! -path "$prepared_binary" -print 2>/dev/null | head -n 1)"
+if [[ -n "$unexpected_prepared_entry" ]]; then
+  echo "prepared directory must contain exactly the digest-checked benchmark; found: $unexpected_prepared_entry" >&2
+  exit 1
 fi
 test -f "$prepared_binary"
 test ! -L "$prepared_binary"
@@ -252,6 +303,10 @@ proxy_token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
   --attestation "$provider_attestation" \
   --target-sha "$GENERATION_HEAD_SHA" \
   --token "$proxy_token" \
+  --model google/gemini-3.5-flash \
+  --max-calls 128 \
+  --max-total-bytes 268435456 \
+  --max-concurrency 4 \
   3<<<"$GENERATION_PROVIDER_KEY" \
   >"$cache_root/provider-proxy.log" 2>&1 &
 provider_proxy_pid=$!
@@ -273,6 +328,11 @@ GENERATION_PREPARED_BINARY=/prepared/memory-engine-bench
 GENERATION_PREPARED_BINARY_SHA256=$prepared_binary_sha256
 EOF
 
+# The runtime container is a digest-pinned minimal image with no toolchain:
+# it sees only the eval corpus data (never repository source), the exact
+# prepared binary, the trusted in-container helper/validator, the provider
+# socket, and a bounded noexec tmpfs for its report. The corpus path matches
+# the manifest directory baked into the prepared binary at build time.
 set +e
 "$timeout_bin" --foreground --signal=TERM --kill-after=30s \
   "${GENERATION_CONTAINER_TIMEOUT_SECONDS}s" "$docker_bin" run \
@@ -286,18 +346,18 @@ set +e
   --uts private \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /output:rw,noexec,nosuid,size=16m \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --pids-limit 256 \
-  --mount "type=bind,src=$target_root,dst=/workspace,readonly" \
-  --mount "type=bind,src=$output_dir,dst=/output,rw" \
-  --mount "type=bind,src=$prepared_dir,dst=/prepared,readonly" \
+  --mount "type=bind,src=$corpus_dir,dst=/workspace/crates/memory-engine-bench/corpus,readonly" \
+  --mount "type=bind,src=$prepared_binary,dst=/prepared/memory-engine-bench,readonly" \
   --mount "type=bind,src=$provider_socket,dst=/provider.sock,readonly" \
   --mount "type=bind,src=$GENERATION_TRUSTED_HELPER,dst=/trusted/generation-061-live-comparison.sh,readonly" \
   --mount "type=bind,src=$GENERATION_TRUSTED_VALIDATOR,dst=/trusted/validate-receipt.sh,readonly" \
   --env-file "$env_file" \
-  --workdir /workspace \
-  "$GENERATION_CONTAINER_IMAGE" \
+  --workdir /tmp \
+  "$GENERATION_RUNTIME_IMAGE" \
   /bin/bash /trusted/generation-061-live-comparison.sh
 status=$?
 set -e
@@ -309,8 +369,16 @@ fi
 # trap also kill a container if the docker client returns abnormally. The
 # workflow repeats label cleanup before trusted staging for timeout/SIGKILL
 # recovery paths.
-if "$docker_bin" container inspect "$GENERATION_CONTAINER_NAME" >/dev/null 2>&1; then
+runtime_absence=0
+container_absent "$GENERATION_CONTAINER_NAME" || runtime_absence=$?
+if [[ "$runtime_absence" -eq 1 ]]; then
   "$docker_bin" container rm -f "$GENERATION_CONTAINER_NAME" >/dev/null 2>&1 || status=1
+  runtime_absence=0
+  container_absent "$GENERATION_CONTAINER_NAME" || runtime_absence=$?
+fi
+if [[ "$runtime_absence" -ne 0 ]]; then
+  echo 'docker could not prove the target container is gone; refusing trusted staging' >&2
+  status=1
 fi
 stop_provider_proxy
 if ! "$GENERATION_TRUSTED_ATTESTATION_VALIDATOR" "$provider_attestation" "$GENERATION_HEAD_SHA"; then
@@ -320,4 +388,8 @@ else
 fi
 cleanup_container
 trap - EXIT INT TERM
+if [[ "$container_removed" != true ]]; then
+  echo 'cleanup could not prove every target container was removed' >&2
+  status=1
+fi
 exit "$status"

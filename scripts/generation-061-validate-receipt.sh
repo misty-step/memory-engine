@@ -7,6 +7,14 @@ if ! grep_bin="$(command -v grep)"; then
   echo 'receipt validator grep is missing; refusing to claim live proof' >&2
   exit 1
 fi
+# The receipt is target-produced report material: besides the exact-row
+# schema below it must stay small enough that it cannot smuggle bulk
+# filesystem content into published evidence.
+receipt_bytes="$(wc -c < "$receipt")"
+if [ "$receipt_bytes" -gt 262144 ]; then
+  echo 'live generation receipt exceeds the trusted size cap' >&2
+  exit 1
+fi
 grep -Fqx -- '- Corpus: 14 sources' "$receipt"
 
 expected_sources=(
