@@ -127,6 +127,37 @@ pub fn render_auth_recovery(title: &str, message: &str) -> String {
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
 
+#[must_use]
+pub fn render_return_notification_confirmation(token: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Return gently</p>
+<h1 class="me-display">Turn off due-count reminders?</h1>
+<p class="ae-lede ae-dim me-support">This confirmation is protected by the link sent to your reminder email. No sign-in is required.</p>
+<section class="ae-group me-capture-hero">
+<form action="/app/return-notifications" method="post">
+<input type="hidden" name="unsubscribeToken" value="{}">
+<div class="me-actions"><button class="ae-button" type="submit">Turn off reminders</button></div>
+</form>
+</section>
+<p><a class="ae-accent" href="/">Keep reminders on</a></p>
+</div>"#,
+        escape_html(token)
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_return_notification_disabled() -> String {
+    let view = r#"<div class="me-cover">
+<p class="me-kicker">Return gently</p>
+<h1 class="me-display">Reminders are off.</h1>
+<p class="ae-lede ae-dim me-support">You will not receive further due-count reminders. You can opt in again from your study space.</p>
+<p><a class="ae-accent" href="/">Back to Memory Engine</a></p>
+</div>"#;
+    document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
 fn document(inner: &str) -> String {
     format!(
@@ -136,14 +167,15 @@ fn document(inner: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#f6f2ea">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <title>Memory Engine</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/apple-touch-icon.svg">
+<link rel="icon" href="/favicon.png" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">

@@ -22,6 +22,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
+use hmac::Hmac;
 use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::BetaPersistenceStore;
@@ -32,6 +33,8 @@ use memory_engine_study::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+type UnsubscribeHmac = Hmac<Sha256>;
 
 mod jobs;
 mod registry;
@@ -396,6 +399,28 @@ impl ApiState {
         )
     }
 
+    /// Validate an email unsubscribe link without changing preference state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the signed token is invalid, expired, or no
+    /// longer matches the account-scoped preference.
+    pub fn validate_return_notification_token(&self, token: &str) -> Result<(), ApiFailure> {
+        self.accounts.validate_return_notification_token(token)
+    }
+
+    /// Disable reminders using an account-scoped email bearer token. This is a
+    /// POST-only mutation; the token intentionally does not require a browser
+    /// session because it is delivered to the opted-in mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the signed token is invalid, expired, or no
+    /// longer matches the account-scoped preference.
+    pub fn disable_return_notification(&self, token: &str) -> Result<(), ApiFailure> {
+        self.accounts.disable_return_notification(token)
+    }
+
     /// Reveal a review answer.
     ///
     /// # Errors
@@ -680,11 +705,23 @@ impl Default for ApiState {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthConfig {
     allowed_emails: Option<BTreeSet<String>>,
     expose_debug_links: bool,
     link_delivery: AuthLinkDelivery,
+    unsubscribe_secret: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            allowed_emails: None,
+            expose_debug_links: false,
+            link_delivery: AuthLinkDelivery::None,
+            unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -693,6 +730,34 @@ pub struct ReturnNotificationPreference {
     pub email: String,
     pub enabled: bool,
     pub last_sent_at_ms: Option<i64>,
+    #[serde(default)]
+    pub claim_id: Option<String>,
+    #[serde(default)]
+    pub claim_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub pending_delivery_key: Option<String>,
+    #[serde(default)]
+    pub pending_due_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReturnNotificationClaim {
+    pub email: String,
+    pub due_count: usize,
+    pub delivery_key: String,
+    pub claim_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReturnNotificationClaimRequest {
+    pub account_id: String,
+    pub now_ms: i64,
+    pub due_count: usize,
+    pub force_confirmation: bool,
+    pub interval_ms: i64,
+    pub claim_id: String,
+    pub delivery_key: String,
+    pub claim_expires_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -715,6 +780,7 @@ impl AuthConfig {
             allowed_emails: Some(allowed_emails),
             expose_debug_links: false,
             link_delivery: AuthLinkDelivery::None,
+            ..Self::default()
         }
     }
 
@@ -733,6 +799,15 @@ impl AuthConfig {
     #[must_use]
     pub fn with_mailer_command(mut self, command: impl Into<String>) -> Self {
         self.link_delivery = AuthLinkDelivery::Command(command.into());
+        self
+    }
+
+    /// Set the stable secret used to sign account-scoped unsubscribe links.
+    /// Production hosts should source this from a secret manager and keep it
+    /// stable across restarts so already-delivered links remain usable.
+    #[must_use]
+    pub fn with_unsubscribe_secret(mut self, secret: impl Into<String>) -> Self {
+        self.unsubscribe_secret = secret.into();
         self
     }
 
@@ -1376,6 +1451,7 @@ pub const AUTH_CHALLENGE_TTL_MS: i64 = 30 * 60 * 1_000;
 /// At most one due-count reminder per account per day, apart from the
 /// one-time confirmation sent immediately after an explicit opt-in.
 pub const RETURN_NOTIFICATION_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 fn source_id_for(account_id: &str, title: &str, body: &str) -> String {
     let stable = [account_id, title, body]

@@ -82,6 +82,12 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
     }
 
     let mut auth_config = AuthConfig::allow_emails(allowed_emails);
+    let unsubscribe_secret = env::var("MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET")
+        .map_err(|_| "MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET is required for memory-engine-api")?;
+    if unsubscribe_secret.trim().is_empty() {
+        return Err("MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET must not be empty".to_owned());
+    }
+    auth_config = auth_config.with_unsubscribe_secret(unsubscribe_secret);
     // Local/dev only: surface the magic link on the "check your email" page so
     // sign-in works without a real mailer. Never enable in production.
     if env::var("MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS").as_deref() == Ok("true") {

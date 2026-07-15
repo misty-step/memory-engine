@@ -185,7 +185,7 @@ bun run ci:full
 Run the production-shaped API locally with a file store:
 
 ```sh
-MEMORY_ENGINE_ENABLE_FILE_STORE=true MEMORY_ENGINE_API_STORE_DIR=.tmp/api-dev MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-dev/outbox.tsv HOST=127.0.0.1 PORT=18080 cargo run -p memory-engine-api
+MEMORY_ENGINE_ENABLE_FILE_STORE=true MEMORY_ENGINE_API_STORE_DIR=.tmp/api-dev MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dev-secret MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-dev/outbox.tsv HOST=127.0.0.1 PORT=18080 cargo run -p memory-engine-api
 ```
 
 From another shell, verify the local health route:

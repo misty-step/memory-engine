@@ -106,6 +106,7 @@ $ MEMORY_ENGINE_ENABLE_FILE_STORE=true \
   MEMORY_ENGINE_API_STORE_DIR=/tmp/me-mcp-dogfood/store \
   MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=dogfood-mcp@example.com \
   MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=/tmp/me-mcp-dogfood/outbox.tsv \
+  MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dogfood-secret \
   HOST=127.0.0.1 PORT=18199 ./target/debug/memory-engine-api &
 Memory Engine API listening on http://127.0.0.1:18199
 

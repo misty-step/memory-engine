@@ -2,6 +2,7 @@ use std::{
     fmt, fs, io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
@@ -12,8 +13,8 @@ use crate::{
     persisted_sources, postgres_failure, rate_limit_path, require_current_review,
     require_current_review_postgres, run_bridge_generation, run_reference_generation,
     run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord,
-    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
+    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -178,6 +179,31 @@ impl StudyStorage {
         account_id: &str,
     ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
         self.inner.load_return_notification_preference(account_id)
+    }
+
+    pub(crate) fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        self.inner.claim_return_notification(request)
+    }
+
+    pub(crate) fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner
+            .complete_return_notification(account_id, claim_id, sent_at_ms)
+    }
+
+    pub(crate) fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        self.inner.release_return_notification(account_id, claim_id)
     }
 
     pub(crate) fn record_rate_limit_attempts(
@@ -361,6 +387,47 @@ impl StudyStorage {
     }
 }
 
+struct FileReturnNotificationLock {
+    path: PathBuf,
+}
+
+const RETURN_NOTIFICATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
+
+impl FileReturnNotificationLock {
+    fn acquire(path: PathBuf) -> Result<Self, ApiFailure> {
+        for _ in 0..5_000 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > RETURN_NOTIFICATION_LOCK_STALE_AFTER)
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(ApiFailure::internal(error.to_string())),
+            }
+        }
+        Err(ApiFailure::internal(
+            "timed out acquiring return notification claim lock".to_owned(),
+        ))
+    }
+}
+
+impl Drop for FileReturnNotificationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 trait StudyStorageAdapter: fmt::Debug + Send + Sync {
     fn account_store_path(&self, account_id: &str) -> PathBuf;
     fn save_account_session(&self, account_id: &str, session_token: &str)
@@ -402,6 +469,21 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         &self,
         account_id: &str,
     ) -> Result<Option<ReturnNotificationPreference>, ApiFailure>;
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure>;
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure>;
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure>;
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -673,14 +755,20 @@ impl StudyStorageAdapter for FileStudyStorage {
         enabled: bool,
         last_sent_at_ms: Option<i64>,
     ) -> Result<(), ApiFailure> {
-        let path = self
-            .store_root
-            .join(account_id)
-            .join("return-notifications.json");
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
         let preference = ReturnNotificationPreference {
             email: email.to_owned(),
             enabled,
             last_sent_at_ms,
+            claim_id: None,
+            claim_expires_at_ms: None,
+            pending_delivery_key: None,
+            pending_due_count: None,
         };
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -701,6 +789,111 @@ impl StudyStorageAdapter for FileStudyStorage {
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        let account_dir = self.store_root.join(&request.account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(None);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let interval_elapsed = preference
+            .last_sent_at_ms
+            .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
+        let eligible = preference.pending_delivery_key.is_some()
+            || (interval_elapsed && (request.force_confirmation || request.due_count > 0));
+        if !preference.enabled
+            || !eligible
+            || preference
+                .claim_expires_at_ms
+                .is_some_and(|expires| expires > request.now_ms)
+        {
+            return Ok(None);
+        }
+        let delivery_key = preference
+            .pending_delivery_key
+            .clone()
+            .unwrap_or_else(|| request.delivery_key.clone());
+        let due_count = preference.pending_due_count.unwrap_or(request.due_count);
+        preference.claim_id = Some(request.claim_id.clone());
+        preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
+        preference.pending_delivery_key = Some(delivery_key.clone());
+        preference.pending_due_count = Some(due_count);
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(Some(ReturnNotificationClaim {
+            email: preference.email,
+            due_count,
+            delivery_key,
+            claim_id: request.claim_id.clone(),
+        }))
+    }
+
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(false);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if preference.claim_id.as_deref() != Some(claim_id) {
+            return Ok(false);
+        }
+        preference.last_sent_at_ms = Some(sent_at_ms);
+        preference.claim_id = None;
+        preference.claim_expires_at_ms = None;
+        preference.pending_delivery_key = None;
+        preference.pending_due_count = None;
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(());
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if preference.claim_id.as_deref() == Some(claim_id) {
+            preference.claim_id = None;
+            preference.claim_expires_at_ms = None;
+            let bytes = serde_json::to_vec(&preference)
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn record_rate_limit_attempts(
@@ -1118,8 +1311,68 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         email: preference.email,
                         enabled: preference.enabled,
                         last_sent_at_ms: preference.last_sent_at_ms,
+                        claim_id: None,
+                        claim_expires_at_ms: None,
+                        pending_delivery_key: None,
+                        pending_due_count: None,
                     })
                 })
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        let due_count = i64::try_from(request.due_count)
+            .map_err(|_| ApiFailure::internal("due count exceeds postgres range".to_owned()))?;
+        with_postgres_store(&self.database_url, |store| {
+            let request = memory_engine_persistence_postgres::ReturnNotificationClaimRequest {
+                account_id: request.account_id.clone(),
+                now_ms: request.now_ms,
+                due_count,
+                force_confirmation: request.force_confirmation,
+                interval_ms: request.interval_ms,
+                claim_id: request.claim_id.clone(),
+                delivery_key: request.delivery_key.clone(),
+                claim_expires_at_ms: request.claim_expires_at_ms,
+            };
+            store
+                .claim_return_notification(&request)
+                .map(|claim| {
+                    claim.map(|claim| ReturnNotificationClaim {
+                        email: claim.email,
+                        due_count: usize::try_from(claim.due_count).unwrap_or(usize::MAX),
+                        delivery_key: claim.delivery_key,
+                        claim_id: claim.claim_id,
+                    })
+                })
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .complete_return_notification(account_id, claim_id, sent_at_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .release_return_notification(account_id, claim_id)
                 .map_err(postgres_failure)
         })
     }

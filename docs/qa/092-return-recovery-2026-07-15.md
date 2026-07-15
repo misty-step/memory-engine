@@ -9,15 +9,16 @@ Viewport: Chrome headless, 390 × 844, light mode
 - `GET /healthz` returned `{"status":"ok","service":"memory-engine-api"}`.
 - `GET /manifest.webmanifest` returned `200 application/manifest+json`; `jq`
   verified `display=standalone`, `start_url=/`, and two declared icon sizes.
-- `GET /favicon.svg` and `GET /apple-touch-icon.svg` returned `200
-  image/svg+xml` with valid SVG bodies.
+- `GET /favicon.png` and `GET /apple-touch-icon.png` returned `200 image/png`
+  with truthful 192×192 and 180×180 PNG dimensions.
 - `GET /` contained manifest, favicon, apple-touch-icon, theme-color, and the
   opt-in “Enable due-count reminders” action.
 - A real local login request wrote an auth outbox record; following its link
   rendered the signed-in workspace without exposing session credentials.
-- Posting the opt-in form wrote a `due-count` outbox receipt. `GET
-  /app/return-notifications` disabled the channel and rendered “Due-count
-  reminders are off”; no second mail record was written.
+- Posting the opt-in form wrote a `due-count` outbox receipt. The signed email
+  GET rendered a confirmation without changing persisted state; its token POST
+  disabled the channel and rendered “Reminders are off”; no second mail record
+  was written.
 
 ## Retained phone proof
 

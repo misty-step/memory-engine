@@ -4,7 +4,7 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
     },
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -16,11 +16,15 @@ use axum::{
 use serde::Deserialize;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
+#[path = "icons.rs"]
+mod icons;
+
 use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_app_shell, render_auth_recovery,
-    render_login_requested, LEDGER_CSS,
+    render_login_requested, render_return_notification_confirmation,
+    render_return_notification_disabled, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -213,8 +217,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
         .route("/manifest.webmanifest", get(static_manifest))
-        .route("/favicon.svg", get(static_favicon))
-        .route("/apple-touch-icon.svg", get(static_apple_touch_icon))
+        .route("/favicon.png", get(static_favicon))
+        .route("/icon-192.png", get(static_icon_192))
+        .route("/icon-512.png", get(static_icon_512))
+        .route("/apple-touch-icon.png", get(static_apple_touch_icon))
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
@@ -224,7 +230,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/logout", post(logout_app_session))
         .route(
             "/app/return-notifications",
-            get(disable_return_notifications).post(update_return_notifications),
+            get(return_notification_page).post(update_return_notifications),
         )
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
@@ -314,21 +320,29 @@ async fn static_manifest() -> impl IntoResponse {
   "background_color": "#f6f2ea",
   "theme_color": "#f6f2ea",
   "icons": [
-    { "src": "/favicon.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable" },
-    { "src": "/favicon.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable" }
-  ]
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+]
 }"##;
     ([(CONTENT_TYPE, "application/manifest+json")], MANIFEST)
 }
 
-const APP_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="Memory Engine"><rect width="192" height="192" rx="32" fill="#f6f2ea"/><path d="M42 54h108v84H42z" fill="none" stroke="#1b1a16" stroke-width="10"/><path d="M63 83h66M63 109h42" stroke="#b24e27" stroke-width="10" stroke-linecap="round"/></svg>"##;
+use icons::{APPLE_TOUCH_ICON_PNG, APP_ICON_192_PNG, APP_ICON_512_PNG};
 
 async fn static_favicon() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "image/svg+xml")], APP_ICON_SVG)
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_192_PNG)
 }
 
 async fn static_apple_touch_icon() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "image/svg+xml")], APP_ICON_SVG)
+    ([(CONTENT_TYPE, "image/png")], APPLE_TOUCH_ICON_PNG)
+}
+
+async fn static_icon_192() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_192_PNG)
+}
+
+async fn static_icon_512() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_512_PNG)
 }
 
 async fn v1_openapi() -> impl IntoResponse {
@@ -670,35 +684,44 @@ async fn verify_app_login(
 #[serde(rename_all = "camelCase")]
 struct AppReturnNotificationForm {
     csrf_token: Option<String>,
+    #[serde(rename = "unsubscribeToken")]
+    unsubscribe_token: Option<String>,
     #[serde(rename = "reminderEmail")]
     reminder_email: Option<String>,
     enabled: Option<String>,
 }
 
-async fn disable_return_notifications(
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct AppReturnNotificationQuery {
+    token: Option<String>,
+}
+
+async fn return_notification_page(
     State(state): State<ApiState>,
+    Query(query): Query<AppReturnNotificationQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(token) = query.token.as_deref() {
+        return match state.validate_return_notification_token(token) {
+            Ok(()) => {
+                let mut response =
+                    Html(render_return_notification_confirmation(token)).into_response();
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+                    .headers_mut()
+                    .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+                response
+            }
+            Err(error) => app_failure_response(error),
+        };
+    }
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
         Err(error) => return app_failure_response(error),
     };
-    match state.set_return_notification(&account, None, false) {
-        Ok(()) => Html(render_account_page(
-            &state,
-            &account,
-            None,
-            Some("Due-count reminders are off."),
-        ))
-        .into_response(),
-        Err(error) => Html(render_account_page(
-            &state,
-            &account,
-            None,
-            Some(&error.message),
-        ))
-        .into_response(),
-    }
+    Html(render_account_page(&state, &account, None, None)).into_response()
 }
 
 async fn update_return_notifications(
@@ -706,6 +729,16 @@ async fn update_return_notifications(
     headers: HeaderMap,
     Form(form): Form<AppReturnNotificationForm>,
 ) -> Response {
+    if let Some(token) = form
+        .unsubscribe_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        return match state.disable_return_notification(token) {
+            Ok(()) => Html(render_return_notification_disabled()).into_response(),
+            Err(error) => app_failure_response(error),
+        };
+    }
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,

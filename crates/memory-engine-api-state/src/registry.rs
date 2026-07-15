@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, fs, process::Command};
+use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::Command};
 
 use axum::http::HeaderMap;
+use hmac::{KeyInit, Mac};
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 
 use crate::{
@@ -10,10 +11,12 @@ use crate::{
     source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
     AuthConfig, AuthLinkDelivery, BrowserSessionRecord, CreateProjectDeckRequest,
     CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
-    SourceRecord, StudyStorage, StudyViewResponse, SubmitReviewRequest,
-    APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS,
-    RETURN_NOTIFICATION_INTERVAL_MS,
+    ReturnNotificationClaimRequest, SourceRecord, StudyStorage, StudyViewResponse,
+    SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+    AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
+
+const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
 
 impl AccountRegistry {
     /// Create a local account record for the production shell.
@@ -201,11 +204,16 @@ impl AccountRegistry {
                 ));
             }
         }
+        let last_sent_at_ms = if enabled {
+            None
+        } else {
+            existing.and_then(|preference| preference.last_sent_at_ms)
+        };
         storage.save_return_notification_preference(
             account_id,
             &email,
             enabled,
-            existing.and_then(|preference| preference.last_sent_at_ms),
+            last_sent_at_ms,
         )?;
         let mut data = self.lock_data();
         data.accounts
@@ -222,41 +230,141 @@ impl AccountRegistry {
         force_confirmation: bool,
     ) -> Result<bool, ApiFailure> {
         self.require_account(account_id, session_token)?;
-        if due_count == 0 && !force_confirmation {
-            return Ok(false);
-        }
-        let storage = self.storage();
-        let Some(preference) = storage.load_return_notification_preference(account_id)? else {
-            return Ok(false);
-        };
-        if !preference.enabled {
-            return Ok(false);
-        }
         let now = self.now();
-        if !force_confirmation
-            && preference
-                .last_sent_at_ms
-                .is_some_and(|sent| now.saturating_sub(sent) < RETURN_NOTIFICATION_INTERVAL_MS)
-        {
-            return Ok(false);
-        }
-        let unsubscribe_link = "/app/return-notifications";
         let auth_config = {
             let data = self.lock_data();
             data.auth_config.clone()
         };
-        auth_config.deliver_due_count_notification(
-            &preference.email,
+        let claim_id = format!("return_claim_{:032x}", rand::random::<u128>());
+        let delivery_key = format!("return-notification:{account_id}:{now}");
+        let storage = self.storage();
+        let claim_request = ReturnNotificationClaimRequest {
+            account_id: account_id.to_owned(),
+            now_ms: now,
             due_count,
-            unsubscribe_link,
-        )?;
-        storage.save_return_notification_preference(
+            force_confirmation,
+            interval_ms: RETURN_NOTIFICATION_INTERVAL_MS,
+            claim_id,
+            delivery_key,
+            claim_expires_at_ms: now.saturating_add(RETURN_NOTIFICATION_CLAIM_TTL_MS),
+        };
+        let Some(claim) = storage.claim_return_notification(&claim_request)? else {
+            return Ok(false);
+        };
+        let token = signed_unsubscribe_token(
+            &auth_config.unsubscribe_secret,
             account_id,
-            &preference.email,
-            true,
-            Some(now),
-        )?;
+            &claim.email,
+            now.saturating_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS),
+        );
+        let unsubscribe_link = format!("/app/return-notifications?token={token}");
+        if let Err(error) = auth_config.deliver_due_count_notification(
+            &claim.email,
+            claim.due_count,
+            &unsubscribe_link,
+            &claim.delivery_key,
+        ) {
+            storage.release_return_notification(account_id, &claim.claim_id)?;
+            return Err(error);
+        }
+        if !storage.complete_return_notification(account_id, &claim.claim_id, now)? {
+            return Err(ApiFailure::internal(
+                "return notification claim was fenced before completion".to_owned(),
+            ));
+        }
         Ok(true)
+    }
+
+    pub(crate) fn validate_return_notification_token(&self, token: &str) -> Result<(), ApiFailure> {
+        let (account_id, email) = self.verify_unsubscribe_token(token)?;
+        let preference = self
+            .storage()
+            .load_return_notification_preference(&account_id)?
+            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is no longer valid."))?;
+        if preference.email != email {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is not for this reminder account.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn disable_return_notification(&self, token: &str) -> Result<(), ApiFailure> {
+        let (account_id, email) = self.verify_unsubscribe_token(token)?;
+        let storage = self.storage();
+        let preference = storage
+            .load_return_notification_preference(&account_id)?
+            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is no longer valid."))?;
+        if preference.email != email {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is not for this reminder account.",
+            ));
+        }
+        storage.save_return_notification_preference(
+            &account_id,
+            &email,
+            false,
+            preference.last_sent_at_ms,
+        )
+    }
+
+    fn verify_unsubscribe_token(&self, token: &str) -> Result<(String, String), ApiFailure> {
+        let (payload_hex, signature_hex) = token
+            .trim()
+            .split_once('.')
+            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is invalid or expired."))?;
+        let payload = decode_hex(payload_hex)
+            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is invalid or expired."))?;
+        let signature = decode_hex(signature_hex)
+            .ok_or_else(|| ApiFailure::forbidden("That unsubscribe link is invalid or expired."))?;
+        let auth_config = {
+            let data = self.lock_data();
+            data.auth_config.clone()
+        };
+        let mut mac =
+            crate::UnsubscribeHmac::new_from_slice(auth_config.unsubscribe_secret.as_bytes())
+                .map_err(|_| {
+                    ApiFailure::internal("unsubscribe signing secret is invalid".to_owned())
+                })?;
+        mac.update(&payload);
+        mac.verify_slice(&signature)
+            .map_err(|_| ApiFailure::forbidden("That unsubscribe link is invalid or expired."))?;
+        let mut fields = payload.split(|byte| *byte == b'\n');
+        if fields.next() != Some(b"v1") {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is invalid or expired.",
+            ));
+        }
+        let account_id = fields
+            .next()
+            .and_then(|value| String::from_utf8(value.to_owned()).ok())
+            .filter(|value| !value.is_empty());
+        let email = fields
+            .next()
+            .and_then(|value| String::from_utf8(value.to_owned()).ok())
+            .filter(|value| !value.is_empty());
+        let expires_at_ms = fields
+            .next()
+            .and_then(|value| String::from_utf8(value.to_owned()).ok())
+            .and_then(|value| value.parse::<i64>().ok());
+        if fields.next().is_some() {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is invalid or expired.",
+            ));
+        }
+        let (Some(account_id), Some(email), Some(expires_at_ms)) =
+            (account_id, email, expires_at_ms)
+        else {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is invalid or expired.",
+            ));
+        };
+        if expires_at_ms <= self.now() {
+            return Err(ApiFailure::forbidden(
+                "That unsubscribe link is invalid or expired.",
+            ));
+        }
+        Ok((account_id, email))
     }
 
     fn record_app_account_request(
@@ -874,6 +982,42 @@ impl AccountRegistry {
     }
 }
 
+fn signed_unsubscribe_token(
+    secret: &str,
+    account_id: &str,
+    email: &str,
+    expires_at_ms: i64,
+) -> String {
+    let payload = format!("v1\n{account_id}\n{email}\n{expires_at_ms}");
+    let Ok(mut mac) = crate::UnsubscribeHmac::new_from_slice(secret.as_bytes()) else {
+        return String::new();
+    };
+    mac.update(payload.as_bytes());
+    format!(
+        "{}.{}",
+        encode_hex(payload.as_bytes()),
+        encode_hex(&mac.finalize().into_bytes())
+    )
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.is_ascii() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
 impl AuthConfig {
     fn deliver_magic_link(&self, email: &str, link: &str) -> Result<(), ApiFailure> {
         match &self.link_delivery {
@@ -909,6 +1053,7 @@ impl AuthConfig {
         email: &str,
         due_count: usize,
         unsubscribe_link: &str,
+        delivery_key: &str,
     ) -> Result<(), ApiFailure> {
         match &self.link_delivery {
             AuthLinkDelivery::None => Ok(()),
@@ -917,10 +1062,14 @@ impl AuthConfig {
                     fs::create_dir_all(parent)
                         .map_err(|error| ApiFailure::internal(error.to_string()))?;
                 }
-                let existing = fs::read_to_string(path).unwrap_or_default();
-                fs::write(
-                    path,
-                    format!("{existing}due-count\t{email}\t{due_count}\t{unsubscribe_link}\n"),
+                let mut outbox = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                writeln!(
+                    outbox,
+                    "due-count\t{email}\t{due_count}\t{delivery_key}\t{unsubscribe_link}"
                 )
                 .map_err(|error| ApiFailure::internal(error.to_string()))
             }
@@ -934,6 +1083,10 @@ impl AuthConfig {
                     .env(
                         "MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE",
                         unsubscribe_link,
+                    )
+                    .env(
+                        "MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY",
+                        delivery_key,
                     )
                     .status()
                     .map_err(|error| ApiFailure::internal(error.to_string()))?;

@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS memory_engine_return_notification_preferences (
     last_sent_at_ms BIGINT,
     updated_at_ms BIGINT NOT NULL
 );
+ALTER TABLE memory_engine_return_notification_preferences
+    ADD COLUMN IF NOT EXISTS claim_id TEXT,
+    ADD COLUMN IF NOT EXISTS claim_expires_at_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS pending_delivery_key TEXT,
+    ADD COLUMN IF NOT EXISTS pending_due_count BIGINT;
 
 CREATE TABLE IF NOT EXISTS memory_engine_source_documents (
     account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
@@ -205,6 +210,26 @@ pub struct ReturnNotificationPreference {
     pub email: String,
     pub enabled: bool,
     pub last_sent_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationClaim {
+    pub email: String,
+    pub due_count: i64,
+    pub delivery_key: String,
+    pub claim_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationClaimRequest {
+    pub account_id: String,
+    pub now_ms: i64,
+    pub due_count: i64,
+    pub force_confirmation: bool,
+    pub interval_ms: i64,
+    pub claim_id: String,
+    pub delivery_key: String,
+    pub claim_expires_at_ms: i64,
 }
 
 /// TLS connector for Postgres, with Mozilla's compiled-in roots.
@@ -573,6 +598,10 @@ impl PostgresStudyStore {
              SET email_normalized = EXCLUDED.email_normalized,
                  enabled = EXCLUDED.enabled,
                  last_sent_at_ms = EXCLUDED.last_sent_at_ms,
+                 claim_id = NULL,
+                 claim_expires_at_ms = NULL,
+                 pending_delivery_key = NULL,
+                 pending_due_count = NULL,
                  updated_at_ms = EXCLUDED.updated_at_ms",
             &[
                 &account_id,
@@ -581,6 +610,107 @@ impl PostgresStudyStore {
                 &last_sent_at_ms,
                 &updated_at_ms,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically fence one reminder delivery before the external mailer runs.
+    /// The transaction is limited to this claim; callers must send mail after
+    /// this method returns and finalize it with the claim id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the claim transaction cannot be
+    /// committed or the database rejects the request.
+    pub fn claim_return_notification(
+        &mut self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, PostgresStoreError> {
+        let threshold_ms = request.now_ms.saturating_sub(request.interval_ms);
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let row = transaction.query_opt(
+            "UPDATE memory_engine_return_notification_preferences
+             SET claim_id = $6,
+                 claim_expires_at_ms = $7,
+                 pending_delivery_key = COALESCE(pending_delivery_key, $8),
+                 pending_due_count = COALESCE(pending_due_count, $3),
+                 updated_at_ms = $2
+             WHERE account_id = $1
+               AND enabled
+               AND (pending_delivery_key IS NOT NULL OR
+                    (($4 OR $3 > 0) AND
+                    (last_sent_at_ms IS NULL OR last_sent_at_ms <= $5)))
+               AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2)
+             RETURNING email_normalized,
+                       pending_due_count,
+                       pending_delivery_key",
+            &[
+                &request.account_id,
+                &request.now_ms,
+                &request.due_count,
+                &request.force_confirmation,
+                &threshold_ms,
+                &request.claim_id,
+                &request.claim_expires_at_ms,
+                &request.delivery_key,
+            ],
+        )?;
+        transaction.commit()?;
+        row.map(|row| {
+            let due_count: i64 = row.get(1);
+            let delivery_key: String = row.get(2);
+            Ok(ReturnNotificationClaim {
+                email: row.get(0),
+                due_count,
+                delivery_key,
+                claim_id: request.claim_id.clone(),
+            })
+        })
+        .transpose()
+    }
+
+    /// Finalize only the currently fenced claim. A stale worker cannot mark a
+    /// newer claim sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn complete_return_notification(
+        &mut self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let changed = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_return_notification_preferences
+             SET last_sent_at_ms = $3,
+                 claim_id = NULL,
+                 claim_expires_at_ms = NULL,
+                 pending_delivery_key = NULL,
+                 pending_due_count = NULL,
+                 updated_at_ms = $3
+             WHERE account_id = $1 AND claim_id = $2",
+            &[&account_id, &claim_id, &sent_at_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Release a failed claim while preserving its idempotency key for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn release_return_notification(
+        &mut self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "UPDATE memory_engine_return_notification_preferences
+             SET claim_id = NULL, claim_expires_at_ms = NULL
+             WHERE account_id = $1 AND claim_id = $2",
+            &[&account_id, &claim_id],
         )?;
         Ok(())
     }
@@ -1734,6 +1864,7 @@ mod tests {
     };
     use memory_engine_service::ServiceAttemptRecord;
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
+    use std::sync::{Arc, Barrier};
 
     use super::{
         applied_review_receipt_key, migration_sql, AccountScope, MemoryServiceStore,
@@ -1767,6 +1898,8 @@ mod tests {
         assert!(sql.contains("memory_engine_auth_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("consumed_at_ms BIGINT"));
+        assert!(sql.contains("claim_id TEXT"));
+        assert!(sql.contains("pending_delivery_key TEXT"));
         assert!(sql.contains("memory_engine_rate_limits"));
         assert!(sql.contains("rate_limit_key TEXT PRIMARY KEY"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
@@ -1848,6 +1981,88 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres rate limit contract");
+    }
+
+    #[test]
+    fn live_postgres_return_notification_claim_is_atomic_and_fenced() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_return_claim_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            {
+                let scope = super::AccountScope::new("acct-claim")?;
+                let mut account = setup.for_account(scope);
+                account.ensure_account(NOW)?;
+            }
+            setup.save_return_notification_preference(
+                "acct-claim",
+                "claim@example.com",
+                true,
+                None,
+                NOW,
+            )?;
+            drop(setup);
+
+            let barrier = Arc::new(Barrier::new(16));
+            let workers = (0..16)
+                .map(|index| {
+                    let barrier = Arc::clone(&barrier);
+                    let scoped_url = scoped_url.clone();
+                    std::thread::spawn(move || {
+                        let mut store = super::PostgresStudyStore::connect(&scoped_url)
+                            .expect("claim connection");
+                        barrier.wait();
+                        store
+                            .claim_return_notification(&super::ReturnNotificationClaimRequest {
+                                account_id: "acct-claim".to_owned(),
+                                now_ms: NOW,
+                                due_count: 4,
+                                force_confirmation: true,
+                                interval_ms: 86_400_000,
+                                claim_id: format!("claim-{index}"),
+                                delivery_key: "delivery-claim".to_owned(),
+                                claim_expires_at_ms: NOW + 300_000,
+                            })
+                            .expect("claim")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let claims = workers
+                .into_iter()
+                .filter_map(|worker| worker.join().expect("claim worker"))
+                .collect::<Vec<_>>();
+            assert_eq!(claims.len(), 1, "exactly one Postgres worker may claim");
+            let winner = &claims[0];
+            let mut finalize = super::PostgresStudyStore::connect(&scoped_url)?;
+            assert!(finalize.complete_return_notification(
+                "acct-claim",
+                &winner.claim_id,
+                NOW + 1,
+            )?);
+            assert!(!finalize.complete_return_notification(
+                "acct-claim",
+                &winner.claim_id,
+                NOW + 2,
+            )?);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live Postgres return claim contract");
     }
 
     fn run_live_postgres_store_contract(database_url: &str) -> Result<(), PostgresStoreError> {

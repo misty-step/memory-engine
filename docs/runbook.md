@@ -17,7 +17,8 @@ only current application runtime; rollback stays within DigitalOcean plus git.
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
 - Auth contract: allowlist plus magic links; production account creation and
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
-  `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path.
+  `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
+  `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
 - Smoke contract: every DigitalOcean deployment runs the health, home-page,
   and anonymous mutation boundary checks below before it can be called live.
 
@@ -42,8 +43,8 @@ case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
 
 curl -fsS --max-time 15 "$base/manifest.webmanifest" | jq -e \
   '.display == "standalone" and (.icons | length >= 2)' >/dev/null
-curl -fsS --max-time 15 "$base/favicon.svg" | grep -q '<svg'
-curl -fsS --max-time 15 "$base/apple-touch-icon.svg" | grep -q '<svg'
+curl -fsS --max-time 15 "$base/favicon.png" | file - | grep -q 'PNG image data, 192 x 192'
+curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG image data, 180 x 180'
 ```
 
 ## Production generation latency
@@ -160,6 +161,7 @@ an encrypted App Platform variable and never copy its value into this repo.
 | --- | --- |
 | `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
+| `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` | Stable secret for HMAC-signed, seven-day, account/email-scoped reminder unsubscribe links. |
 | `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Magic-link outbox file (no email provider wired yet; see Login). |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
 | `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.5-flash`; see docs/evals/). |
@@ -219,16 +221,20 @@ the account store and sends one confirmation through the same
 boundary. Subsequent authenticated home renders may send a reminder only when
 reviews are due and the persisted last-send time is at least 24 hours old. The
 policy is deterministic, has no streaks or promotional content, and a learner
-can disable it from the workspace or the unsubscribe link in the plain-text
-message. Disable is persisted and never sends mail.
+can disable it from the workspace or the signed unsubscribe link in the
+plain-text message. The email GET only renders a confirmation; its POST carries
+the scoped token and performs the mutation without requiring a browser session.
+Disable is persisted and never sends mail.
 
 The command boundary receives these variables for a due-count message:
 `MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL`,
 `MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT`, and
-`MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE`. The bundled sender supports
-both the magic-link and due-count envelopes. A file outbox line beginning with
-`due-count` is a local proof receipt; production proof still requires checking
-the provider send log and inbox placement.
+`MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE`; it also receives
+`MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY` so a retry can reuse the
+same durable delivery identity. The bundled sender supports both the magic-link
+and due-count envelopes. A file outbox line beginning with `due-count` is a
+local proof receipt; production proof still requires checking the provider send
+log and inbox placement.
 
 ### Deliverability (inbox, not spam)
 

@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
-use super::{router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS};
+use super::{
+    router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+};
 
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
@@ -1366,8 +1369,8 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
         .expect("home response");
     let home = response_text(home).await;
     assert!(home.contains(r#"rel="manifest" href="/manifest.webmanifest""#));
-    assert!(home.contains(r#"rel="icon" href="/favicon.svg""#));
-    assert!(home.contains(r#"rel="apple-touch-icon" href="/apple-touch-icon.svg""#));
+    assert!(home.contains(r#"rel="icon" href="/favicon.png""#));
+    assert!(home.contains(r#"rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180""#));
     assert!(home.contains(r#"name="theme-color""#));
 
     let manifest = app
@@ -1385,9 +1388,19 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
     assert_eq!(manifest["name"], json!("Memory Engine"));
     assert_eq!(manifest["display"], json!("standalone"));
     assert_eq!(manifest["start_url"], json!("/"));
-    assert_eq!(manifest["icons"][0]["src"], json!("/favicon.svg"));
+    assert_eq!(manifest["icons"][0]["src"], json!("/icon-192.png"));
+    assert_eq!(manifest["icons"][0]["sizes"], json!("192x192"));
+    assert_eq!(manifest["icons"][0]["type"], json!("image/png"));
+    assert_eq!(manifest["icons"][1]["src"], json!("/icon-512.png"));
+    assert_eq!(manifest["icons"][1]["sizes"], json!("512x512"));
+    assert_eq!(manifest["icons"][1]["type"], json!("image/png"));
 
-    for path in ["/favicon.svg", "/apple-touch-icon.svg"] {
+    for (path, width, height) in [
+        ("/favicon.png", 192_u32, 192_u32),
+        ("/icon-192.png", 192, 192),
+        ("/icon-512.png", 512, 512),
+        ("/apple-touch-icon.png", 180, 180),
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -1404,12 +1417,25 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("image/svg+xml")
+            Some("image/png")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("icon bytes");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(
+            u32::from_be_bytes(bytes[16..20].try_into().expect("width")),
+            width
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[20..24].try_into().expect("height")),
+            height
         );
     }
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
     let store_root = temp_store_root("return-notifications");
     let outbox_path = store_root.join("auth-outbox.tsv");
@@ -1470,38 +1496,241 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
     let after_enable = fs::read_to_string(&outbox_path).expect("outbox after enable");
     assert!(after_enable.contains("due-count\tlearner@example.com\t"));
 
-    let unsubscribed = app
+    let unsubscribe_link = after_enable
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("signed unsubscribe link")
+        .to_owned();
+    let confirmation = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/app/return-notifications")
+                .uri(&unsubscribe_link)
                 .header("cookie", &cookie)
                 .body(Body::empty())
                 .expect("unsubscribe request"),
         )
         .await
         .expect("unsubscribe response");
-    assert_eq!(unsubscribed.status(), StatusCode::OK);
-    assert!(response_text(unsubscribed)
+    assert_eq!(confirmation.status(), StatusCode::OK);
+    assert_eq!(
+        confirmation
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        confirmation
+            .headers()
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert!(response_text(confirmation)
         .await
-        .contains("Due-count reminders are off"));
+        .contains("Turn off due-count reminders"));
+    let preference_after_get = fs::read_dir(&store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| fs::read_to_string(entry.path().join("return-notifications.json")).ok())
+        .expect("preference after GET");
+    assert!(preference_after_get.contains("\"enabled\":true"));
 
     let disabled = app
         .clone()
-        .oneshot(form_request_with_cookie(
+        .oneshot(form_request(
             "POST",
             "/app/return-notifications",
-            &cookie,
-            &[("csrfToken", &csrf_token), ("enabled", "off")],
+            &[(
+                "unsubscribeToken",
+                unsubscribe_link.split("token=").nth(1).expect("token"),
+            )],
         ))
         .await
         .expect("disable return channel");
     assert_eq!(disabled.status(), StatusCode::OK);
-    assert!(response_text(disabled)
-        .await
-        .contains("Due-count reminders are off"));
+    let disabled_body = response_text(disabled).await;
+    assert!(
+        disabled_body.contains("Reminders are off"),
+        "unexpected token unsubscribe response: {disabled_body}"
+    );
     let after_disable = fs::read_to_string(&outbox_path).expect("outbox after disable");
     assert_eq!(after_disable, after_enable);
+}
+
+#[tokio::test]
+async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("unsubscribe-token-security");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let registry = AccountRegistry::with_store_root(&store_root)
+        .with_clock(expiry_clock)
+        .with_auth_config(
+            AuthConfig::allow_emails([
+                "owner@example.com".to_owned(),
+                "other@example.com".to_owned(),
+            ])
+            .with_unsubscribe_secret("test-unsubscribe-secret")
+            .with_link_outbox(&outbox_path),
+        );
+    let state = ApiState::new(registry);
+    let owner = state.create_account("owner@example.com").expect("owner");
+    let owner = state.create_browser_session(&owner).expect("owner session");
+    state
+        .set_return_notification(&owner, Some("owner@example.com"), true)
+        .expect("enable owner");
+    assert!(state
+        .maybe_send_due_count_notification(&owner, 2, true)
+        .expect("send owner"));
+    let link = fs::read_to_string(&outbox_path)
+        .expect("outbox")
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("unsubscribe link")
+        .to_owned();
+    let token = link.split("token=").nth(1).expect("token");
+    assert!(state.validate_return_notification_token(token).is_ok());
+
+    let mut tampered = token.to_owned();
+    let index = tampered.find('.').expect("signature separator") + 1;
+    tampered.replace_range(
+        index..=index,
+        if &tampered[index..=index] == "0" {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    assert!(
+        state.validate_return_notification_token(&tampered).is_err(),
+        "signature tampering must fail"
+    );
+
+    let mut wrong_scope = token.to_owned();
+    let replacement = if &wrong_scope[..1] == "0" { "1" } else { "0" };
+    wrong_scope.replace_range(..1, replacement);
+    assert!(
+        state
+            .validate_return_notification_token(&wrong_scope)
+            .is_err(),
+        "account-scope tampering must fail"
+    );
+
+    let other = state.create_account("other@example.com").expect("other");
+    let other = state.create_browser_session(&other).expect("other session");
+    state
+        .set_return_notification(&other, Some("other@example.com"), true)
+        .expect("enable other");
+    state
+        .disable_return_notification(token)
+        .expect("disable owner");
+    assert!(!state
+        .maybe_send_due_count_notification(&owner, 1, true)
+        .expect("owner remains disabled"));
+    assert!(state
+        .maybe_send_due_count_notification(&other, 1, true)
+        .expect("other remains independently enabled"));
+
+    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS + 1, Ordering::SeqCst);
+    assert!(
+        state.validate_return_notification_token(token).is_err(),
+        "expired unsubscribe links must fail"
+    );
+}
+
+#[test]
+fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after_failure() {
+    let store_root = temp_store_root("return-notification-claim");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let registry = AccountRegistry::with_store_root(&store_root).with_auth_config(
+        AuthConfig::allow_emails(["claim@example.com".to_owned()])
+            .with_unsubscribe_secret("claim-secret")
+            .with_link_outbox(&outbox_path),
+    );
+    let state = ApiState::new(registry.clone());
+    let created = state.create_account("claim@example.com").expect("account");
+    let account = state.create_browser_session(&created).expect("session");
+    state
+        .set_return_notification(&account, Some("claim@example.com"), true)
+        .expect("enable");
+
+    let barrier = Arc::new(Barrier::new(32));
+    let workers = (0..32)
+        .map(|_| {
+            let state = state.clone();
+            let account = account.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                state
+                    .maybe_send_due_count_notification(&account, 3, true)
+                    .expect("claim send")
+            })
+        })
+        .collect::<Vec<_>>();
+    let sent = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker"))
+        .filter(|sent| *sent)
+        .count();
+    assert_eq!(sent, 1, "one durable claim may send");
+    let outbox = fs::read_to_string(&outbox_path).expect("outbox");
+    assert_eq!(
+        outbox
+            .lines()
+            .filter(|line| line.starts_with("due-count\t"))
+            .count(),
+        1
+    );
+
+    let failing = registry.clone().with_auth_config(
+        AuthConfig::allow_emails(["retry@example.com".to_owned()])
+            .with_unsubscribe_secret("claim-secret")
+            .with_mailer_command("/bin/false"),
+    );
+    drop(failing);
+    let retry_account = state
+        .create_account("retry@example.com")
+        .expect("retry account");
+    let retry_account = state
+        .create_browser_session(&retry_account)
+        .expect("retry session");
+    state
+        .set_return_notification(&retry_account, Some("retry@example.com"), true)
+        .expect("enable retry");
+    assert!(state
+        .maybe_send_due_count_notification(&retry_account, 1, true)
+        .is_err());
+    let retry_path = fs::read_dir(&store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path().join("return-notifications.json");
+            fs::read_to_string(path)
+                .ok()
+                .filter(|body| body.contains("retry@example.com"))
+        })
+        .expect("failed claim persisted");
+    assert!(retry_path.contains("pendingDeliveryKey"));
+    let _ = registry.clone().with_auth_config(
+        AuthConfig::allow_emails(["retry@example.com".to_owned()])
+            .with_unsubscribe_secret("claim-secret")
+            .with_link_outbox(&outbox_path),
+    );
+    assert!(state
+        .maybe_send_due_count_notification(&retry_account, 1, true)
+        .expect("retry send"));
+    let outbox = fs::read_to_string(&outbox_path).expect("retry outbox");
+    assert_eq!(
+        outbox
+            .lines()
+            .filter(|line| line.starts_with("due-count\t"))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
