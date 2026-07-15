@@ -432,6 +432,41 @@
           }
         }
       }
+    },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/content-feedback": {
+      "post": {
+        "summary": "Record a binary learner judgment of generated content",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContentFeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account-scoped append-only feedback row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentFeedback"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -649,6 +684,49 @@
           "idempotencyKey": {
             "type": "string"
           }
+        }
+      },
+      "ContentFeedbackRequest": {
+        "type": "object",
+        "required": [
+          "verdict",
+          "idempotencyKey"
+        ],
+        "properties": {
+          "verdict": {
+            "type": "string",
+            "enum": ["kept", "dropped"]
+          },
+          "rationale": {
+            "type": ["string", "null"]
+          },
+          "idempotencyKey": {
+            "type": "string"
+          },
+          "supersedesId": {
+            "type": ["string", "null"]
+          }
+        }
+      },
+      "ContentFeedback": {
+        "type": "object",
+        "required": [
+          "id",
+          "reviewUnitId",
+          "verdict",
+          "source",
+          "accountId",
+          "occurredAt"
+        ],
+        "properties": {
+          "id": {"type": "string"},
+          "reviewUnitId": {"type": "string"},
+          "verdict": {"type": "string", "enum": ["kept", "dropped"]},
+          "rationale": {"type": ["string", "null"]},
+          "source": {"type": "string", "enum": ["human"]},
+          "accountId": {"type": "string"},
+          "occurredAt": {"type": "integer"},
+          "supersedesId": {"type": ["string", "null"]}
         }
       },
       "StudyViewResponse": {

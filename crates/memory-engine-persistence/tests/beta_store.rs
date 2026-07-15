@@ -10,7 +10,8 @@ use memory_engine_persistence::{
     SourcePermission,
 };
 use memory_engine_service::{
-    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
+    record_content_feedback, ContentFeedbackVerdict, GradeApplyReviewCommand, MemoryService,
+    MemoryServiceStore, RecordContentFeedbackCommand, ServiceError,
 };
 
 const NOW: i64 = 1_779_989_400_000;
@@ -428,6 +429,73 @@ fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history(
     );
 }
 
+#[test]
+fn content_feedback_is_append_only_latest_wins_and_resolves_generation_provenance() {
+    let directory = TempDirectory::new("content-feedback");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let first = record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: "feedback-first".to_owned(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Dropped,
+            rationale: Some("The prompt is ambiguous.".to_owned()),
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW,
+            supersedes_id: None,
+        },
+    )
+    .expect("first feedback");
+    let replay = record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: first.id.clone(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Dropped,
+            rationale: Some("The prompt is ambiguous.".to_owned()),
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW,
+            supersedes_id: None,
+        },
+    )
+    .expect("replay feedback");
+    assert_eq!(replay, first);
+
+    record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: "feedback-revision".to_owned(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Kept,
+            rationale: None,
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW + 1_000,
+            supersedes_id: Some(first.id),
+        },
+    )
+    .expect("revision feedback");
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.content_feedback.len(), 2);
+    let exported = store.export_content_feedback().expect("export feedback");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].human_keep);
+    assert!(exported[0].judge_keep);
+    assert_eq!(exported[0].gen_ai_request_model, "deterministic-draft");
+    assert_eq!(exported[0].gen_ai_system, "fixture");
+    assert_eq!(exported[0].gen_ai_prompt_version, "v1");
+    assert_eq!(exported[0].question, "Translate: Pater noster");
+    assert!(exported[0].fixture.is_none());
+    assert!(store
+        .export_content_feedback_json()
+        .expect("export json")
+        .contains("gen_ai.prompt.version"));
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload store");
+    assert_eq!(reloaded.snapshot().content_feedback.len(), 2);
+}
+
 fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {
     let mut store = BetaPersistenceStore::open(path).expect("open store");
     let source = store
@@ -475,6 +543,7 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
         schedules: Vec::new(),
         attempts: Vec::new(),
         generation_runs: Vec::new(),
+        content_feedback: Vec::new(),
         concept_reference_notes: Vec::new(),
         applied_reviews: Vec::new(),
     };

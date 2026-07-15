@@ -564,14 +564,46 @@ fn render_graded_review(account: &AppAccount, current: &BetaStudyCurrent) -> Str
 {reveal}
 {verdict}
 {meta}
+{content_feedback}
 {reference}
 {next}"#,
         prompt = escape_html(&current.prompt),
         reveal = render_answer_reveal(current),
         verdict = render_graded_verdict(current),
         meta = render_meta_ledger(current),
+        content_feedback = render_content_feedback(account, current),
         reference = render_reference(current),
         next = render_next(account, current),
+    )
+}
+
+/// Capture a binary judgment about the generated card after the learner has
+/// seen its answer. The stable id makes an accidental double submit a replay,
+/// while a later client can supply `supersedesId` for a revised judgment.
+fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> String {
+    if current.grade.is_none() {
+        return String::new();
+    }
+    let reps = current.review_state.as_ref().map_or(0, |state| state.reps);
+    let feedback_id = format!("feedback-{}-{reps}", current.review_unit_id);
+    format!(
+        r#"<section class="me-content-feedback" aria-labelledby="me-content-feedback-title">
+<h2 class="ae-h" id="me-content-feedback-title">This item:</h2>
+<p class="ae-dim">Was this generated card worth keeping?</p>
+<form action="/app/content-feedback" method="post">
+{csrf}<input type="hidden" name="reviewUnitId" value="{review_unit_id}">
+<input type="hidden" name="idempotencyKey" value="{feedback_id}">
+<div class="me-feedback-actions">
+<button class="ae-button ae-button-quiet" type="submit" name="verdict" value="kept" aria-label="Keep this card">👍 Keep</button>
+<button class="ae-button ae-button-quiet" type="submit" name="verdict" value="dropped" aria-label="Drop this card">👎 Drop</button>
+</div>
+<label class="ae-label" for="me-content-feedback-rationale">Why? <span class="ae-dim">(optional)</span></label>
+<textarea class="ae-input me-content-feedback-rationale" id="me-content-feedback-rationale" name="rationale" rows="2" placeholder="A quick note for future improvements…"></textarea>
+</form>
+</section>"#,
+        csrf = hidden_csrf_input(account),
+        review_unit_id = escape_html(&current.review_unit_id.to_string()),
+        feedback_id = escape_html(&feedback_id),
     )
 }
 

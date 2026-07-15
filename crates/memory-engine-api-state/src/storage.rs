@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use memory_engine_service::{record_content_feedback, RecordContentFeedbackCommand};
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
@@ -408,6 +409,16 @@ impl StudyStorage {
             idempotency_key,
         )
     }
+
+    pub(crate) fn record_content_feedback(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        self.inner
+            .record_content_feedback(account_id, store_path, command)
+    }
 }
 
 struct FileReturnNotificationLock {
@@ -621,6 +632,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         response_time_ms: u32,
         idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure>;
+    fn record_content_feedback(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure>;
 }
 
 #[derive(Debug)]
@@ -1298,6 +1315,17 @@ impl StudyStorageAdapter for FileStudyStorage {
 
         Ok(StudyViewResponse::from_view(view))
     }
+
+    fn record_content_feedback(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        let mut store = crate::open_persistence_store(store_path)?;
+        record_content_feedback(&mut store, command)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
 }
 
 #[derive(Debug)]
@@ -1896,6 +1924,23 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
             Ok(StudyViewResponse::from_view(view))
         })
+    }
+
+    fn record_content_feedback(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                record_content_feedback(&mut account, command)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))
+            },
+        )
     }
 }
 

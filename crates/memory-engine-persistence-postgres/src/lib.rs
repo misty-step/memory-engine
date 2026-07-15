@@ -16,7 +16,10 @@ use memory_engine_persistence::{
     BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus,
     GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
 };
-use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
+use memory_engine_service::{
+    content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
+    ServiceAttemptRecord,
+};
 use memory_engine_study::BetaStudyStore;
 use postgres::Client;
 
@@ -168,6 +171,21 @@ CREATE TABLE IF NOT EXISTS memory_engine_applied_reviews (
 
 CREATE INDEX IF NOT EXISTS memory_engine_attempts_account_review_idx
     ON memory_engine_attempts(account_id, review_unit_id, occurred_at_ms);
+
+CREATE TABLE IF NOT EXISTS memory_engine_content_feedback (
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    feedback_id TEXT NOT NULL,
+    review_unit_id TEXT NOT NULL,
+    feedback JSONB NOT NULL,
+    occurred_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (account_id, feedback_id),
+    FOREIGN KEY (account_id, review_unit_id)
+        REFERENCES memory_engine_review_units(account_id, review_unit_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
+    ON memory_engine_content_feedback(account_id, review_unit_id, occurred_at_ms);
 ";
 
 const CLAIM_RETURN_NOTIFICATION_SQL: &str = r"
@@ -882,6 +900,7 @@ impl AccountStudyStore<'_> {
             schedules: self.schedule_records()?,
             attempts: self.attempts()?,
             generation_runs: self.generation_runs()?,
+            content_feedback: self.content_feedback()?,
             applied_reviews: self.applied_reviews()?,
             concept_reference_notes: self.concept_reference_notes()?,
         })
@@ -1268,6 +1287,89 @@ impl AccountStudyStore<'_> {
         Ok(())
     }
 
+    /// Append one account-scoped learner content judgment. Replaying the same
+    /// feedback id is idempotent; a different payload under that id is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the account or review unit is
+    /// invalid, the idempotency payload conflicts, or the transaction fails.
+    pub fn record_content_feedback(
+        &mut self,
+        feedback: &ContentFeedback,
+    ) -> Result<ContentFeedback, PostgresStoreError> {
+        self.assert_known_review_unit(&feedback.review_unit_id)?;
+        if feedback.account_id != self.scope.account_id {
+            return Err(PostgresStoreError::FeedbackAccountMismatch);
+        }
+
+        let value = serde_json::to_value(feedback)?;
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        if let Some(row) = transaction.query_opt(
+            "SELECT feedback FROM memory_engine_content_feedback
+             WHERE account_id = $1 AND feedback_id = $2",
+            &[&self.scope.account_id, &feedback.id],
+        )? {
+            let existing: ContentFeedback = serde_json::from_value(row.get(0))?;
+            if content_feedback_replay_matches(&existing, feedback) {
+                transaction.rollback()?;
+                return Ok(existing);
+            }
+            transaction.rollback()?;
+            return Err(PostgresStoreError::DuplicateContentFeedback(
+                feedback.id.clone(),
+            ));
+        }
+        if let Some(supersedes_id) = &feedback.supersedes_id {
+            let row = transaction.query_opt(
+                "SELECT review_unit_id FROM memory_engine_content_feedback
+                 WHERE account_id = $1 AND feedback_id = $2",
+                &[&self.scope.account_id, supersedes_id],
+            )?;
+            let Some(row) = row else {
+                return Err(PostgresStoreError::FeedbackSupersedesUnknown(
+                    supersedes_id.clone(),
+                ));
+            };
+            let superseded_review_unit_id: String = row.get(0);
+            if superseded_review_unit_id != feedback.review_unit_id.as_str() {
+                return Err(PostgresStoreError::FeedbackSupersedesOtherReviewUnit(
+                    supersedes_id.clone(),
+                ));
+            }
+        }
+
+        transaction.execute(
+            "INSERT INTO memory_engine_content_feedback
+                (account_id, feedback_id, review_unit_id, feedback, occurred_at_ms)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &self.scope.account_id,
+                &feedback.id,
+                &feedback.review_unit_id.as_str(),
+                &value,
+                &feedback.occurred_at,
+            ],
+        )?;
+        transaction.commit()?;
+
+        Ok(feedback.clone())
+    }
+
+    /// Export active feedback using the same resolved provenance contract as
+    /// the file-backed store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the scoped snapshot cannot be read
+    /// or feedback provenance cannot be resolved.
+    pub fn export_content_feedback_json(&self) -> Result<String, PostgresStoreError> {
+        let snapshot = self.snapshot()?;
+        memory_engine_persistence::export_content_feedback_json(&snapshot)
+            .map_err(|error| PostgresStoreError::StudySession(error.to_string()))
+    }
+
     /// Set or clear the schedule for a review unit in the scoped account.
     ///
     /// # Errors
@@ -1454,6 +1556,16 @@ impl AccountStudyStore<'_> {
         )
     }
 
+    fn content_feedback(&self) -> Result<Vec<ContentFeedback>, PostgresStoreError> {
+        query_json_column(
+            self.client,
+            "SELECT feedback FROM memory_engine_content_feedback
+             WHERE account_id = $1
+             ORDER BY occurred_at_ms, feedback_id",
+            &self.scope.account_id,
+        )
+    }
+
     fn applied_reviews(&self) -> Result<Vec<AppliedReviewReceipt>, PostgresStoreError> {
         let rows = self.client.borrow_mut().query(
             "SELECT receipt_key, attempt, expected_prior_schedule_state, schedule_state
@@ -1521,6 +1633,17 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
         AccountStudyStore::save_generated_prompt_draft(self, &draft)?;
 
         Ok(draft)
+    }
+}
+
+impl ContentFeedbackStore for AccountStudyStore<'_> {
+    type Error = PostgresStoreError;
+
+    fn record_content_feedback(
+        &mut self,
+        feedback: ContentFeedback,
+    ) -> Result<ContentFeedback, Self::Error> {
+        AccountStudyStore::record_content_feedback(self, &feedback)
     }
 }
 
@@ -1789,6 +1912,10 @@ pub enum PostgresStoreError {
     ScheduleLastReviewMismatch,
     DuplicateAppliedReview(String),
     StaleScheduleWrite(ReviewUnitId),
+    FeedbackAccountMismatch,
+    DuplicateContentFeedback(String),
+    FeedbackSupersedesUnknown(String),
+    FeedbackSupersedesOtherReviewUnit(String),
     StudySession(String),
     Postgres(postgres::Error),
     Json(serde_json::Error),
@@ -1819,6 +1946,19 @@ impl fmt::Display for PostgresStoreError {
             Self::StaleScheduleWrite(id) => {
                 write!(formatter, "Stale schedule write for review unit: {id}")
             }
+            Self::FeedbackAccountMismatch => {
+                formatter.write_str("Content feedback account does not match the store scope")
+            }
+            Self::DuplicateContentFeedback(id) => {
+                write!(formatter, "Duplicate content feedback id: {id}")
+            }
+            Self::FeedbackSupersedesUnknown(id) => {
+                write!(formatter, "Content feedback supersedes unknown id: {id}")
+            }
+            Self::FeedbackSupersedesOtherReviewUnit(id) => write!(
+                formatter,
+                "Content feedback supersedes a different review unit: {id}"
+            ),
             Self::StudySession(error) => write!(formatter, "Study session error: {error}"),
             Self::Postgres(error) => write!(formatter, "Postgres error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
@@ -1841,6 +1981,10 @@ impl Error for PostgresStoreError {
             | Self::ScheduleLastReviewMismatch
             | Self::DuplicateAppliedReview(_)
             | Self::StaleScheduleWrite(_)
+            | Self::FeedbackAccountMismatch
+            | Self::DuplicateContentFeedback(_)
+            | Self::FeedbackSupersedesUnknown(_)
+            | Self::FeedbackSupersedesOtherReviewUnit(_)
             | Self::StudySession(_) => None,
         }
     }
@@ -1974,7 +2118,10 @@ mod tests {
         GeneratedPromptValidationStatus, GenerationRun, PersistedQueueCandidate, ReferenceSpan,
         SourceDocument, SourceDocumentKind, SourcePermission,
     };
-    use memory_engine_service::ServiceAttemptRecord;
+    use memory_engine_service::{
+        record_content_feedback, ContentFeedbackVerdict, RecordContentFeedbackCommand,
+        ServiceAttemptRecord,
+    };
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
     use std::sync::{Arc, Barrier};
 
@@ -2008,6 +2155,8 @@ mod tests {
         assert!(sql.contains("session_id_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("csrf_token_hash TEXT NOT NULL"));
         assert!(sql.contains("memory_engine_auth_challenges"));
+        assert!(sql.contains("memory_engine_content_feedback"));
+        assert!(sql.contains("PRIMARY KEY (account_id, feedback_id)"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("consumed_at_ms BIGINT"));
         assert!(sql.contains("claim_id TEXT"));
@@ -2512,6 +2661,8 @@ mod tests {
                 Err(PostgresStoreError::DuplicateAppliedReview(_))
             ));
 
+            record_live_content_feedback(&mut account_a, &review_unit_id)?;
+
             let snapshot = account_a.snapshot()?;
             assert_eq!(snapshot.source_documents, vec![source.clone()]);
             assert_eq!(snapshot.reference_spans, vec![reference.clone()]);
@@ -2528,6 +2679,8 @@ mod tests {
                 "idempotency:idempotent-live-a"
             );
             assert_eq!(snapshot.applied_reviews[0].attempt, attempt);
+            assert_eq!(snapshot.content_feedback.len(), 1);
+            assert_eq!(snapshot.content_feedback[0].id, "feedback-live-a");
             assert_eq!(
                 snapshot.applied_reviews[0].expected_prior_schedule_state,
                 Some(prior_schedule)
@@ -2554,6 +2707,29 @@ mod tests {
             assert_eq!(account_b.snapshot()?, BetaStoreSnapshot::default());
         }
 
+        Ok(())
+    }
+
+    fn record_live_content_feedback(
+        account: &mut super::AccountStudyStore<'_>,
+        review_unit_id: &ReviewUnitId,
+    ) -> Result<(), PostgresStoreError> {
+        record_content_feedback(
+            account,
+            RecordContentFeedbackCommand {
+                feedback_id: "feedback-live-a".to_owned(),
+                review_unit_id: review_unit_id.clone(),
+                verdict: ContentFeedbackVerdict::Dropped,
+                rationale: Some("The live fixture is too easy.".to_owned()),
+                account_id: "acct_live_a".to_owned(),
+                occurred_at: NOW,
+                supersedes_id: None,
+            },
+        )
+        .map_err(|error| PostgresStoreError::StudySession(error.to_string()))?;
+        assert!(account
+            .export_content_feedback_json()?
+            .contains("gen_ai.prompt.version"));
         Ok(())
     }
 

@@ -25,6 +25,152 @@ pub struct ServiceAttemptRecord {
     pub grade: Option<GradeResult>,
 }
 
+/// The learner's binary judgment of generated content.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentFeedbackVerdict {
+    Kept,
+    Dropped,
+}
+
+/// The actor that supplied content feedback. The first durable boundary is
+/// intentionally human-only; model judgments remain separate eval inputs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentFeedbackSource {
+    Human,
+}
+
+impl ContentFeedbackSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+        }
+    }
+}
+
+/// JSON-safe, append-only learner feedback for one generated review unit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentFeedback {
+    pub id: String,
+    pub review_unit_id: ReviewUnitId,
+    pub verdict: ContentFeedbackVerdict,
+    pub rationale: Option<String>,
+    pub source: ContentFeedbackSource,
+    pub account_id: String,
+    pub occurred_at: i64,
+    pub supersedes_id: Option<String>,
+}
+
+/// Typed command used by app/API boundaries to record one learner judgment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordContentFeedbackCommand {
+    pub feedback_id: String,
+    pub review_unit_id: ReviewUnitId,
+    pub verdict: ContentFeedbackVerdict,
+    pub rationale: Option<String>,
+    pub account_id: String,
+    pub occurred_at: i64,
+    pub supersedes_id: Option<String>,
+}
+
+/// Compatibility name for callers that model all service actions as commands.
+pub type ContentFeedbackCommand = RecordContentFeedbackCommand;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContentFeedbackError<TStoreError> {
+    Store(TStoreError),
+    BlankFeedbackId,
+    BlankAccountId,
+}
+
+impl<TStoreError: fmt::Display> fmt::Display for ContentFeedbackError<TStoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "feedback store error: {error}"),
+            Self::BlankFeedbackId => formatter.write_str("Content feedback id must not be blank"),
+            Self::BlankAccountId => {
+                formatter.write_str("Content feedback account id must not be blank")
+            }
+        }
+    }
+}
+
+impl<TStoreError> Error for ContentFeedbackError<TStoreError> where TStoreError: Error + 'static {}
+
+/// Consumer-owned persistence for content feedback.
+pub trait ContentFeedbackStore {
+    type Error;
+
+    /// Append feedback, returning the existing record when the id is replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error when the feedback is invalid or cannot be
+    /// durably appended.
+    fn record_content_feedback(
+        &mut self,
+        feedback: ContentFeedback,
+    ) -> Result<ContentFeedback, Self::Error>;
+}
+
+/// Compare the stable payload of two feedback rows for idempotent replay.
+///
+/// `occurred_at` is assigned by the account/session boundary, so a retried
+/// request may arrive with a different wall-clock value while still being the
+/// same idempotency operation.
+#[must_use]
+pub fn content_feedback_replay_matches(
+    existing: &ContentFeedback,
+    incoming: &ContentFeedback,
+) -> bool {
+    existing.id == incoming.id
+        && existing.review_unit_id == incoming.review_unit_id
+        && existing.verdict == incoming.verdict
+        && existing.rationale == incoming.rationale
+        && existing.source == incoming.source
+        && existing.account_id == incoming.account_id
+        && existing.supersedes_id == incoming.supersedes_id
+}
+
+/// Execute the typed feedback command at the persistence boundary.
+///
+/// # Errors
+///
+/// Returns validation errors before touching the store, or the store error
+/// when the append cannot be committed.
+pub fn record_content_feedback<S: ContentFeedbackStore>(
+    store: &mut S,
+    command: RecordContentFeedbackCommand,
+) -> Result<ContentFeedback, ContentFeedbackError<S::Error>> {
+    if command.feedback_id.trim().is_empty() {
+        return Err(ContentFeedbackError::BlankFeedbackId);
+    }
+    if command.account_id.trim().is_empty() {
+        return Err(ContentFeedbackError::BlankAccountId);
+    }
+
+    let feedback = ContentFeedback {
+        id: command.feedback_id,
+        review_unit_id: command.review_unit_id,
+        verdict: command.verdict,
+        rationale: command
+            .rationale
+            .and_then(|rationale| (!rationale.trim().is_empty()).then_some(rationale)),
+        source: ContentFeedbackSource::Human,
+        account_id: command.account_id,
+        occurred_at: command.occurred_at,
+        supersedes_id: command.supersedes_id,
+    };
+
+    store
+        .record_content_feedback(feedback)
+        .map_err(ContentFeedbackError::Store)
+}
+
 pub trait MemoryServiceStore {
     type Error;
 

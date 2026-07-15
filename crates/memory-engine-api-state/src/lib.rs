@@ -27,6 +27,7 @@ use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::BetaPersistenceStore;
 use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
+use memory_engine_service::{ContentFeedback, ContentFeedbackVerdict};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions,
     BetaStudySession, BetaStudySummary, BetaStudyView,
@@ -633,6 +634,43 @@ impl ApiState {
         )
     }
 
+    /// Record a learner's binary content-quality judgment for a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account session, feedback command, or
+    /// account-scoped persistence rejects the record.
+    pub fn record_content_feedback(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: &ContentFeedbackRequest,
+    ) -> Result<ContentFeedback, ApiFailure> {
+        self.accounts
+            .record_content_feedback(account_id, session_token, review_unit_id, request)
+    }
+
+    /// Record feedback for a browser-authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account session, feedback command, or
+    /// account-scoped persistence rejects the record.
+    pub fn record_app_content_feedback(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+        request: &ContentFeedbackRequest,
+    ) -> Result<ContentFeedback, ApiFailure> {
+        self.accounts.record_content_feedback(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+            request,
+        )
+    }
+
     /// Enqueue a background generation job, coalescing onto an existing
     /// queued/running job for the same account+source (082) instead of
     /// starting a duplicate.
@@ -1033,6 +1071,15 @@ pub struct SubmitReviewRequest {
     pub answer: String,
     pub response_time_ms: u32,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentFeedbackRequest {
+    pub verdict: ContentFeedbackVerdict,
+    pub rationale: Option<String>,
+    pub idempotency_key: String,
+    pub supersedes_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

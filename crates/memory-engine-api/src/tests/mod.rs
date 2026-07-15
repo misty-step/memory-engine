@@ -544,10 +544,11 @@ async fn free_response_review_shows_a_prominent_input_not_choice_buttons() {
     // No choice rows in the markup (the .me-graded-choice CSS rule still ships
     // in the inline stylesheet — assert on the element, not the class string).
     assert!(!graded.contains(r#"<li class="me-graded-choice"#));
-    assert_not_contains_any(
-        &graded,
-        &["Answer feedback", "Concept health", "This item:"],
-    );
+    assert!(graded.contains("This item:"));
+    assert!(graded.contains("Keep"));
+    assert!(graded.contains("Drop"));
+    assert!(graded.contains("me-content-feedback-rationale"));
+    assert_not_contains_any(&graded, &["Answer feedback", "Concept health"]);
 }
 
 #[tokio::test]
@@ -746,6 +747,7 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
     let review_unit_id = html_value(&current, "reviewUnitId");
 
     let submitted = app
+        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/submit",
@@ -778,7 +780,6 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
         &submitted,
         &[
             "Expected answer",
-            "This item:",
             "Answer feedback",
             "Concept health",
             "Wrong(",
@@ -788,6 +789,43 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
             "validation",
         ],
     );
+
+    let feedback = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("verdict", "dropped"),
+                ("rationale", "The distractor makes the card misleading."),
+                ("idempotencyKey", "content-feedback-mobile-nato-a"),
+            ],
+        ))
+        .await
+        .expect("record content feedback");
+    assert_eq!(feedback.status(), StatusCode::OK);
+    let feedback = response_text(feedback).await;
+    assert!(feedback.contains("Saved. This card will help improve future generation."));
+
+    let replay = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("verdict", "dropped"),
+                ("rationale", "The distractor makes the card misleading."),
+                ("idempotencyKey", "content-feedback-mobile-nato-a"),
+            ],
+        ))
+        .await
+        .expect("replay content feedback");
+    assert_eq!(replay.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -3860,6 +3898,28 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
         submit_review_v1(&app, &account, &review_unit_id, "ALFA").await,
         (String::from("correct"), 1)
     );
+    let feedback = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/content-feedback",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "verdict": "kept",
+                "rationale": "The generated card is useful.",
+                "idempotencyKey": "v1-content-feedback-scry-a"
+            }),
+        ))
+        .await
+        .expect("content feedback");
+    assert_eq!(feedback.status(), StatusCode::OK);
+    let feedback = response_json(feedback).await;
+    assert_eq!(feedback["verdict"], "kept");
+    assert_eq!(feedback["source"], "human");
+    assert_eq!(feedback["accountId"], account.account_id);
 
     archive_source_v1(&app, &account, &source_id).await;
 }
@@ -5011,12 +5071,13 @@ fn assert_submitted_review_html(body: &str) {
     assert!(body.contains("you'll see this again"));
     assert!(body.contains("Continue"));
     assert!(body.contains(r#"class="me-meta-ledger""#));
+    assert!(body.contains("This item:"));
+    assert!(body.contains("Was this generated card worth keeping?"));
     assert_not_contains_any(
         body,
         &[
             "Answer feedback",
             "Expected answer",
-            "This item:",
             "Concept health",
             "response time",
             "Last result",

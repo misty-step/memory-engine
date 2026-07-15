@@ -226,4 +226,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(result.is_err(), "invalid JSON must error");
     }
+
+    #[test]
+    fn run_accepts_the_content_feedback_export_shape() {
+        let path = std::env::temp_dir().join("me-content-feedback-export.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"feedback_id":"f-keep","review_unit_id":"unit-keep","question":"Keep?","judge_keep":true,"human_keep":true,"gen_ai.prompt.version":"v1"},
+                {"feedback_id":"f-drop","review_unit_id":"unit-drop","question":"Drop?","judge_keep":true,"human_keep":false,"gen_ai.evaluation.explanation":"Too vague"}
+            ]"#,
+        )
+        .expect("write feedback export");
+        let result = run(&["--labels".to_owned(), path.display().to_string()]);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "calibrate must consume feedback export: {result:?}"
+        );
+    }
 }

@@ -838,6 +838,7 @@ dependencies = [
  "memory-engine-core",
  "memory-engine-persistence",
  "memory-engine-persistence-postgres",
+ "memory-engine-service",
  "memory-engine-study",
  "postgres",
  "rand 0.9.4",
