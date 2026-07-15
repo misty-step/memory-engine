@@ -1680,7 +1680,7 @@ fn return_notification_email_must_belong_to_authenticated_account() {
         .expect("account B's own allowlisted email");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_return_notification_nonce_invalidates_replayed_tokens() {
     let Some(database) = PostgresTestDatabase::new("return_unsubscribe_nonce") else {
         eprintln!(
