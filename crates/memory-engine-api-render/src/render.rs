@@ -107,6 +107,59 @@ pub fn render_app_shell(
     document(&inner)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AnalyticsConceptFilter {
+    #[default]
+    All,
+    AtRisk,
+    Struggling,
+    Mixed,
+    Solid,
+    Untried,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AnalyticsConceptSort {
+    #[default]
+    Health,
+    Name,
+    Success,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnalyticsViewOptions {
+    pub filter: AnalyticsConceptFilter,
+    pub sort: AnalyticsConceptSort,
+    pub page: usize,
+}
+
+/// Render the focused, bounded Analytics read surface. The API route owns
+/// authentication and query parsing; this crate owns the presentation policy
+/// so the default ordering and page window cannot drift between callers.
+#[must_use]
+pub fn render_analytics_page(
+    account: &AppAccount,
+    view: &StudyViewResponse,
+    options: AnalyticsViewOptions,
+) -> String {
+    let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
+    let footer = format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
+        hidden_csrf_input(account)
+    );
+    let body = format!(
+        r#"<section class="me-analytics">
+<p class="me-kicker">Analytics</p>
+<h1 class="me-display me-analytics-title">Concept health</h1>
+<p class="ae-lede ae-dim me-analytics-support">Find the concepts that need another pass, then work down the ledger.</p>
+{surface}
+</section>"#,
+        surface = render_concept_health_surface(&view.concept_progress, options),
+    );
+    document(&screen(header_right, &body, &footer))
+}
+
 #[must_use]
 pub fn render_login_requested(debug_link: Option<&str>) -> String {
     let debug = debug_link.map_or_else(String::new, |link| {
@@ -866,31 +919,280 @@ fn render_concept_progress(concepts: &[BetaStudyConceptProgress]) -> String {
         return String::new();
     }
 
-    let mut rows = String::new();
-    for concept in concepts {
-        let pct = if concept.attempts > 0 {
-            (concept.correct * 100 / concept.attempts).min(100)
-        } else {
-            0
-        };
-        let _ = write!(
-            rows,
-            r#"<div class="me-concept">
-<div class="me-concept-head"><strong>{label}</strong><span class="me-trend ae-dim">{trend_icon} {trend}</span></div>
-<div class="ae-meter"><div class="ae-meter-fill {fill}" style="width:{pct}%"></div></div>
-<p class="me-concept-note ae-dim">{success_rate} · {summary}</p>
-</div>"#,
-            label = escape_html(&concept.concept_label),
-            trend_icon = trend_icon(&concept.trend),
-            trend = escape_html(&concept.trend),
-            fill = health_fill_class(&concept.health),
-            success_rate = escape_html(&concept.success_rate),
-            summary = escape_html(&concept.summary),
-        );
-    }
+    let preview_count = concepts.len().min(WORKSPACE_CONCEPT_PREVIEW_SIZE);
+    let rows = concepts
+        .iter()
+        .take(WORKSPACE_CONCEPT_PREVIEW_SIZE)
+        .map(render_concept_row)
+        .collect::<String>();
 
     format!(
-        r#"<section class="ae-group me-concepts"><h2 class="ae-h">Concept health</h2>{rows}</section>"#
+        r#"<section class="ae-group me-concepts"><h2 class="ae-h"><span>Concept health</span><a class="me-concepts-link" href="/app/analytics">View analytics {ICON_ARROW}</a></h2><p class="me-concepts-summary ae-dim">Showing {preview_count} of {total} {concepts}; Analytics holds the full ledger.</p>{rows}</section>"#,
+        preview_count = preview_count,
+        total = concepts.len(),
+        concepts = plural(concepts.len(), "concept", "concepts"),
+    )
+}
+
+const ANALYTICS_PAGE_SIZE: usize = 12;
+const WORKSPACE_CONCEPT_PREVIEW_SIZE: usize = 6;
+
+fn render_concept_health_surface(
+    concepts: &[BetaStudyConceptProgress],
+    options: AnalyticsViewOptions,
+) -> String {
+    let mut concepts = concepts
+        .iter()
+        .filter(|concept| concept_matches_filter(concept, options.filter))
+        .collect::<Vec<_>>();
+    concepts.sort_by(|left, right| compare_concepts(left, right, options.sort));
+
+    let total = concepts.len();
+    let page_count = total.div_ceil(ANALYTICS_PAGE_SIZE).max(1);
+    let page = options.page.max(1).min(page_count);
+    let start = (page - 1) * ANALYTICS_PAGE_SIZE;
+    let end = (start + ANALYTICS_PAGE_SIZE).min(total);
+    let rows = concepts[start..end]
+        .iter()
+        .map(|concept| render_concept_row(concept))
+        .collect::<String>();
+
+    let count = if total == 0 {
+        r#"<p class="me-analytics-empty ae-dim">No concepts match this filter.</p>"#.to_owned()
+    } else {
+        format!(
+            r#"<p class="me-analytics-count ae-dim">Showing {}–{} of {} {}</p>"#,
+            start + 1,
+            end,
+            total,
+            concept_count_label(total, options.filter),
+        )
+    };
+    let controls = render_analytics_controls(options);
+    let pagination = render_analytics_pagination(page, page_count, options);
+    let list = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="me-analytics-list">{rows}</div>"#)
+    };
+
+    format!(
+        r#"<section class="ae-group me-analytics-group">
+{controls}
+{count}
+{list}
+{pagination}
+</section>"#,
+    )
+}
+
+fn render_analytics_controls(options: AnalyticsViewOptions) -> String {
+    format!(
+        r#"<form class="me-analytics-controls" action="/app/analytics" method="get">
+<label class="ae-label" for="me-analytics-filter">Health<select class="ae-input me-analytics-select" id="me-analytics-filter" name="filter">
+{filter_options}
+</select></label>
+<label class="ae-label" for="me-analytics-sort">Sort<select class="ae-input me-analytics-select" id="me-analytics-sort" name="sort">
+{sort_options}
+</select></label>
+<button class="ae-button ae-button-compact" type="submit">Apply</button>
+</form>"#,
+        filter_options = analytics_filter_options(options.filter),
+        sort_options = analytics_sort_options(options.sort),
+    )
+}
+
+fn analytics_filter_options(selected: AnalyticsConceptFilter) -> String {
+    let mut options = String::new();
+    for (filter, value, label) in [
+        (AnalyticsConceptFilter::All, "all", "All concepts"),
+        (AnalyticsConceptFilter::AtRisk, "at-risk", "At risk"),
+        (
+            AnalyticsConceptFilter::Struggling,
+            "struggling",
+            "Struggling",
+        ),
+        (AnalyticsConceptFilter::Mixed, "mixed", "Mixed"),
+        (AnalyticsConceptFilter::Solid, "solid", "Solid"),
+        (AnalyticsConceptFilter::Untried, "untried", "Untried"),
+    ] {
+        let selected_attribute = if filter == selected { " selected" } else { "" };
+        let _ = write!(
+            options,
+            r#"<option value="{value}"{selected_attribute}>{label}</option>"#
+        );
+    }
+    options
+}
+
+fn analytics_sort_options(selected: AnalyticsConceptSort) -> String {
+    let mut options = String::new();
+    for (sort, value, label) in [
+        (
+            AnalyticsConceptSort::Health,
+            "health",
+            "Health · at risk first",
+        ),
+        (AnalyticsConceptSort::Name, "name", "Name"),
+        (AnalyticsConceptSort::Success, "success", "Success rate"),
+    ] {
+        let selected_attribute = if sort == selected { " selected" } else { "" };
+        let _ = write!(
+            options,
+            r#"<option value="{value}"{selected_attribute}>{label}</option>"#
+        );
+    }
+    options
+}
+
+fn render_analytics_pagination(
+    page: usize,
+    page_count: usize,
+    options: AnalyticsViewOptions,
+) -> String {
+    if page_count <= 1 {
+        return String::new();
+    }
+    let previous = if page > 1 {
+        format!(
+            r#"<a class="ae-button-quiet ae-button-compact" href="{}">Previous</a>"#,
+            analytics_page_href(options, page - 1)
+        )
+    } else {
+        r#"<span class="me-pagination-spacer" aria-hidden="true"></span>"#.to_owned()
+    };
+    let next = if page < page_count {
+        format!(
+            r#"<a class="ae-button-quiet ae-button-compact" href="{}">Next</a>"#,
+            analytics_page_href(options, page + 1)
+        )
+    } else {
+        r#"<span class="me-pagination-spacer" aria-hidden="true"></span>"#.to_owned()
+    };
+    format!(
+        r#"<nav class="me-analytics-pagination" aria-label="Concept pages">{previous}<span>{page} of {page_count}</span>{next}</nav>"#,
+    )
+}
+
+fn analytics_page_href(options: AnalyticsViewOptions, page: usize) -> String {
+    format!(
+        "/app/analytics?filter={}&amp;sort={}&amp;page={page}",
+        analytics_filter_value(options.filter),
+        analytics_sort_value(options.sort),
+    )
+}
+
+fn analytics_filter_value(filter: AnalyticsConceptFilter) -> &'static str {
+    match filter {
+        AnalyticsConceptFilter::All => "all",
+        AnalyticsConceptFilter::AtRisk => "at-risk",
+        AnalyticsConceptFilter::Struggling => "struggling",
+        AnalyticsConceptFilter::Mixed => "mixed",
+        AnalyticsConceptFilter::Solid => "solid",
+        AnalyticsConceptFilter::Untried => "untried",
+    }
+}
+
+fn analytics_sort_value(sort: AnalyticsConceptSort) -> &'static str {
+    match sort {
+        AnalyticsConceptSort::Health => "health",
+        AnalyticsConceptSort::Name => "name",
+        AnalyticsConceptSort::Success => "success",
+    }
+}
+
+fn concept_count_label(total: usize, filter: AnalyticsConceptFilter) -> String {
+    let noun = if total == 1 { "concept" } else { "concepts" };
+    match filter {
+        AnalyticsConceptFilter::All => noun.to_owned(),
+        AnalyticsConceptFilter::AtRisk => format!("at-risk {noun}"),
+        AnalyticsConceptFilter::Struggling => format!("struggling {noun}"),
+        AnalyticsConceptFilter::Mixed => format!("mixed {noun}"),
+        AnalyticsConceptFilter::Solid => format!("solid {noun}"),
+        AnalyticsConceptFilter::Untried => format!("untried {noun}"),
+    }
+}
+
+fn concept_matches_filter(
+    concept: &BetaStudyConceptProgress,
+    filter: AnalyticsConceptFilter,
+) -> bool {
+    match filter {
+        AnalyticsConceptFilter::All => true,
+        AnalyticsConceptFilter::AtRisk => is_at_risk(&concept.health),
+        AnalyticsConceptFilter::Struggling => concept.health == "struggling",
+        AnalyticsConceptFilter::Mixed => concept.health == "mixed",
+        AnalyticsConceptFilter::Solid => concept.health == "solid",
+        AnalyticsConceptFilter::Untried => concept.health == "untried",
+    }
+}
+
+fn is_at_risk(health: &str) -> bool {
+    matches!(health, "struggling" | "mixed")
+}
+
+fn compare_concepts(
+    left: &BetaStudyConceptProgress,
+    right: &BetaStudyConceptProgress,
+    sort: AnalyticsConceptSort,
+) -> std::cmp::Ordering {
+    let ordering = match sort {
+        AnalyticsConceptSort::Health => health_rank(&left.health).cmp(&health_rank(&right.health)),
+        AnalyticsConceptSort::Name => left.concept_label.cmp(&right.concept_label),
+        AnalyticsConceptSort::Success => compare_success_rate(left, right),
+    };
+    ordering
+        .then_with(|| right.attempts.cmp(&left.attempts))
+        .then_with(|| left.concept_label.cmp(&right.concept_label))
+}
+
+fn health_rank(health: &str) -> u8 {
+    match health {
+        "struggling" | "at risk" | "at-risk" | "weak" => 0,
+        "mixed" | "watch" => 1,
+        "solid" | "healthy" | "strong" => 2,
+        _ => 3,
+    }
+}
+
+fn compare_success_rate(
+    left: &BetaStudyConceptProgress,
+    right: &BetaStudyConceptProgress,
+) -> std::cmp::Ordering {
+    match (left.attempts == 0, right.attempts == 0) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => {
+            // Compare left.correct / left.attempts with right.correct /
+            // right.attempts without floating-point rounding. u128 keeps the
+            // cross-products lossless for usize-sized counters.
+            let left_cross = (left.correct as u128) * (right.attempts as u128);
+            let right_cross = (right.correct as u128) * (left.attempts as u128);
+            right_cross.cmp(&left_cross)
+        }
+    }
+}
+
+fn render_concept_row(concept: &BetaStudyConceptProgress) -> String {
+    let pct = if concept.attempts > 0 {
+        (concept.correct * 100 / concept.attempts).min(100)
+    } else {
+        0
+    };
+    format!(
+        r#"<article class="me-concept" data-health="{health}">
+<div class="me-concept-head"><div class="me-concept-label"><strong>{label}</strong><span class="me-health-label {fill}">{health}</span></div><span class="me-trend ae-dim">{trend_icon} {trend}</span></div>
+<div class="ae-meter"><div class="ae-meter-fill {fill}" style="width:{pct}%"></div></div>
+<p class="me-concept-note ae-dim">{success_rate} · {summary}</p>
+</article>"#,
+        label = escape_html(&concept.concept_label),
+        health = escape_html(&concept.health),
+        trend_icon = trend_icon(&concept.trend),
+        trend = escape_html(&concept.trend),
+        fill = health_fill_class(&concept.health),
+        success_rate = escape_html(&concept.success_rate),
+        summary = escape_html(&concept.summary),
     )
 }
 
@@ -1030,9 +1332,9 @@ fn verdict_icon(verdict: impl std::fmt::Debug) -> &'static str {
 
 fn health_fill_class(health: &str) -> &'static str {
     match health {
-        "healthy" | "strong" => "ae-ok",
+        "healthy" | "strong" | "solid" => "ae-ok",
         "watch" | "mixed" => "ae-warn",
-        "at risk" | "at-risk" | "weak" => "ae-err",
+        "struggling" | "at risk" | "at-risk" | "weak" => "ae-err",
         _ => "",
     }
 }
@@ -1153,5 +1455,257 @@ mod source_loading_tests {
             },
         );
         assert_eq!(workspace_loads.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod analytics_tests {
+    use memory_engine_api_state::{AppAccount, StudyViewResponse};
+    use memory_engine_study::BetaStudyConceptProgress;
+    use memory_engine_study::BetaStudySummary;
+
+    use super::{
+        render_concept_health_surface, AnalyticsConceptFilter, AnalyticsConceptSort,
+        AnalyticsViewOptions,
+    };
+
+    fn concept(
+        label: &str,
+        health: &str,
+        correct: usize,
+        attempts: usize,
+    ) -> BetaStudyConceptProgress {
+        BetaStudyConceptProgress {
+            concept_key: label.to_owned(),
+            concept_label: label.to_owned(),
+            attempts,
+            correct,
+            success_rate: format!("{correct} of {attempts} correct"),
+            trend: "steady correct".to_owned(),
+            average_response_time_ms: Some(900),
+            response_time_trend: "steady".to_owned(),
+            health: health.to_owned(),
+            summary: format!("{label} is {health}"),
+        }
+    }
+
+    #[test]
+    fn analytics_surface_filters_risk_sorts_and_paginates() {
+        let concepts = (0..13)
+            .map(|index| {
+                concept(
+                    &format!("Concept {index:02}"),
+                    if index == 0 { "solid" } else { "struggling" },
+                    if index == 0 { 9 } else { 1 },
+                    10,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let page = render_concept_health_surface(
+            &concepts,
+            AnalyticsViewOptions {
+                filter: AnalyticsConceptFilter::AtRisk,
+                sort: AnalyticsConceptSort::Health,
+                page: 1,
+            },
+        );
+
+        assert_eq!(page.matches("class=\"me-concept\"").count(), 12);
+        assert!(page.contains("Concept 01"));
+        assert!(!page.contains("Concept 00"));
+        assert!(page.contains("Showing 1–12 of 12 at-risk concepts"));
+        assert!(!page.contains("page=2"));
+    }
+
+    #[test]
+    fn analytics_surface_keeps_page_two_bounded_and_preserves_controls() {
+        let concepts = (0..25)
+            .map(|index| concept(&format!("Concept {index:02}"), "solid", 9, 10))
+            .collect::<Vec<_>>();
+
+        let page = render_concept_health_surface(
+            &concepts,
+            AnalyticsViewOptions {
+                filter: AnalyticsConceptFilter::All,
+                sort: AnalyticsConceptSort::Name,
+                page: 2,
+            },
+        );
+
+        assert_eq!(page.matches("class=\"me-concept\"").count(), 12);
+        assert!(!page.contains("Concept 00"));
+        assert!(page.contains("Concept 12"));
+        assert!(page.contains("Showing 13–24 of 25 concepts"));
+        assert!(page.contains("filter=all&amp;sort=name&amp;page=1"));
+        assert!(page.contains("filter=all&amp;sort=name&amp;page=3"));
+    }
+
+    #[test]
+    fn analytics_pagination_keeps_a_centered_page_slot_at_both_boundaries() {
+        let first = super::render_analytics_pagination(1, 3, AnalyticsViewOptions::default());
+        let last = super::render_analytics_pagination(3, 3, AnalyticsViewOptions::default());
+
+        assert!(first.contains(
+            r#"<span class="me-pagination-spacer" aria-hidden="true"></span><span>1 of 3</span>"#
+        ));
+        assert!(last.contains(
+            r#"<span>3 of 3</span><span class="me-pagination-spacer" aria-hidden="true"></span>"#
+        ));
+    }
+
+    #[test]
+    fn success_sort_uses_rate_not_lexicographic_counts_and_puts_untried_last() {
+        let concepts = vec![
+            concept("Nine of ten", "solid", 9, 10),
+            concept("Perfect eight", "solid", 8, 8),
+            concept("More evidence", "solid", 8, 10),
+            concept("Less evidence", "solid", 4, 5),
+            concept("Untried", "untried", 0, 0),
+        ];
+
+        let page = render_concept_health_surface(
+            &concepts,
+            AnalyticsViewOptions {
+                filter: AnalyticsConceptFilter::All,
+                sort: AnalyticsConceptSort::Success,
+                page: 1,
+            },
+        );
+
+        let perfect = page
+            .find("<strong>Perfect eight</strong>")
+            .expect("perfect");
+        let nine = page.find("<strong>Nine of ten</strong>").expect("nine");
+        let more_evidence = page
+            .find("<strong>More evidence</strong>")
+            .expect("more evidence");
+        let less_evidence = page
+            .find("<strong>Less evidence</strong>")
+            .expect("less evidence");
+        let untried = page.find("<strong>Untried</strong>").expect("untried");
+        assert!(
+            perfect < nine,
+            "success rate must outrank raw correct count: {page}"
+        );
+        assert!(
+            more_evidence < less_evidence,
+            "equal rates prefer more evidence: {page}"
+        );
+        assert!(
+            nine < untried,
+            "untried concepts sort after measured concepts: {page}"
+        );
+    }
+
+    #[test]
+    fn analytics_page_is_a_complete_document_with_one_asset_contract() {
+        let state = memory_engine_api_state::ApiState::default();
+        let created = state
+            .create_account("analytics-document@example.com")
+            .expect("account");
+        let account: AppAccount = state.create_browser_session(&created).expect("session");
+        let view = StudyViewResponse {
+            drafts: Vec::new(),
+            current: None,
+            concept_progress: Vec::new(),
+            summary: BetaStudySummary {
+                source_count: 0,
+                accepted_draft_count: 0,
+                approved_review_unit_count: 0,
+                attempt_count: 0,
+                last_outcome: None,
+                next_review_unit_id: None,
+            },
+            due_count: 0,
+            generation_notices: Vec::new(),
+        };
+
+        let page = super::render_analytics_page(&account, &view, AnalyticsViewOptions::default());
+
+        assert!(page.starts_with("<!doctype html>"));
+        assert!(page
+            .contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#));
+        assert!(page.contains(r#"<meta name="color-scheme" content="light dark">"#));
+        assert_eq!(page.matches(r#"href="/static/ledger.css""#).count(), 1);
+        assert_eq!(page.matches(r#"src="/static/app.js""#).count(), 1);
+    }
+
+    #[test]
+    fn workspace_concept_health_is_a_bounded_preview_for_large_accounts() {
+        let concepts = (0..20)
+            .map(|index| concept(&format!("Concept {index:02}"), "struggling", 1, 10))
+            .collect::<Vec<_>>();
+
+        let page = super::render_concept_progress(&concepts);
+
+        assert_eq!(page.matches(r#"class="me-concept""#).count(), 6);
+        assert!(page.contains("Showing 6 of 20 concepts"));
+        assert!(page.contains(r#"href="/app/analytics""#));
+        assert!(page.contains("View analytics"));
+    }
+
+    #[test]
+    fn analytics_filter_separates_untried_from_at_risk() {
+        let concepts = vec![
+            concept("Needs work", "struggling", 1, 10),
+            concept("Needs data", "untried", 0, 0),
+        ];
+
+        let page = super::render_concept_health_surface(
+            &concepts,
+            AnalyticsViewOptions {
+                filter: AnalyticsConceptFilter::Untried,
+                sort: AnalyticsConceptSort::Health,
+                page: 1,
+            },
+        );
+
+        assert!(page.contains(r#"value="untried" selected>Untried</option>"#));
+        assert!(page.contains("<strong>Needs data</strong>"));
+        assert!(!page.contains("<strong>Needs work</strong>"));
+        assert!(page.contains("Showing 1–1 of 1 untried concept"));
+    }
+
+    #[test]
+    fn analytics_page_applies_untried_filter_to_a_study_view_response() {
+        let state = memory_engine_api_state::ApiState::default();
+        let created = state
+            .create_account("analytics-untried@example.com")
+            .expect("account");
+        let account = state.create_browser_session(&created).expect("session");
+        let view = StudyViewResponse {
+            drafts: Vec::new(),
+            current: None,
+            concept_progress: vec![
+                concept("Needs data", "untried", 0, 0),
+                concept("Needs work", "struggling", 1, 10),
+            ],
+            summary: BetaStudySummary {
+                source_count: 1,
+                accepted_draft_count: 2,
+                approved_review_unit_count: 2,
+                attempt_count: 1,
+                last_outcome: None,
+                next_review_unit_id: None,
+            },
+            due_count: 0,
+            generation_notices: Vec::new(),
+        };
+
+        let page = super::render_analytics_page(
+            &account,
+            &view,
+            AnalyticsViewOptions {
+                filter: AnalyticsConceptFilter::Untried,
+                sort: AnalyticsConceptSort::Health,
+                page: 1,
+            },
+        );
+
+        assert!(page.contains(r#"<h1 class="me-display me-analytics-title">Concept health</h1>"#));
+        assert!(page.contains(r#"<option value="untried" selected>Untried</option>"#));
+        assert!(page.contains("<strong>Needs data</strong>"));
+        assert!(!page.contains("<strong>Needs work</strong>"));
     }
 }

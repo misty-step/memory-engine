@@ -1631,6 +1631,52 @@ async fn management_surface_lists_concepts_worst_first() {
     assert!(workspace.contains("struggling"));
     assert!(!workspace.contains("Add all to reviews"));
     assert_not_contains_any(&workspace, &["chart", "streak", "badge"]);
+
+    let analytics = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/analytics")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("analytics request"),
+        )
+        .await
+        .expect("analytics response");
+    assert_eq!(analytics.status(), StatusCode::OK);
+    let analytics = response_text(analytics).await;
+    assert!(analytics.starts_with("<!doctype html>"));
+    assert!(analytics
+        .contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#));
+    assert!(analytics.contains(r#"<link rel="stylesheet" href="/static/ledger.css">"#));
+    assert!(analytics.contains(r#"<script src="/static/app.js" defer></script>"#));
+    assert!(analytics.contains(r#"<h1 class="me-display me-analytics-title">Concept health</h1>"#));
+    assert!(analytics.contains("Health"));
+    assert!(analytics.contains("Health · at risk first"));
+    let weak = analytics
+        .find("<strong>nato letter a</strong>")
+        .expect("weak concept in analytics");
+    let strong = analytics
+        .find("<strong>nato cat composition</strong>")
+        .expect("strong concept in analytics");
+    assert!(weak < strong, "{analytics}");
+    assert!(analytics.contains(r#"name="filter"#));
+    assert!(analytics.contains(r#"value="at-risk">At risk</option>"#));
+
+    let filtered = app
+        .oneshot(
+            Request::builder()
+                .uri("/app/analytics?filter=at-risk")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("filtered analytics request"),
+        )
+        .await
+        .expect("filtered analytics response");
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered = response_text(filtered).await;
+    assert!(filtered.contains("nato letter a"));
+    assert!(!filtered.contains("nato cat composition"));
 }
 
 #[tokio::test]

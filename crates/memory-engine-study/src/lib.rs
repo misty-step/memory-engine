@@ -1246,7 +1246,7 @@ where
             .iter()
             .filter(|candidate| candidate.due <= now)
             .count();
-        let concept_progress = concept_progress(&snapshot);
+        let concept_progress = concept_progress(&snapshot, &active_source_ids);
         let current =
             self.current_projection(&snapshot, &active_source_ids, &concept_progress, now)?;
 
@@ -1760,12 +1760,36 @@ fn item_history(
     }
 }
 
-fn concept_progress(snapshot: &BetaStoreSnapshot) -> Vec<BetaStudyConceptProgress> {
+fn concept_progress(
+    snapshot: &BetaStoreSnapshot,
+    active_source_ids: &BTreeSet<String>,
+) -> Vec<BetaStudyConceptProgress> {
     let mut rows: BTreeMap<String, ConceptAccumulator> = BTreeMap::new();
+    let tracked_review_unit_ids = snapshot
+        .review_units
+        .iter()
+        .filter(|unit| {
+            unit.archived_at.is_none()
+                && approved_draft_from_unit(&snapshot.generated_prompt_drafts, unit)
+                    .is_some_and(|draft| draft_has_active_source(&draft, active_source_ids))
+        })
+        .map(|unit| unit.review_unit_id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+
+    for review_unit_id in &tracked_review_unit_ids {
+        let (concept_key, concept_label) =
+            concept_identity_for_review_unit(snapshot, &ReviewUnitId::new(review_unit_id));
+        rows.entry(concept_key.clone())
+            .or_insert_with(|| ConceptAccumulator::new(concept_key, concept_label));
+    }
+
     let mut attempts = snapshot
         .attempts
         .iter()
-        .filter(|attempt| attempt.grade.is_some())
+        .filter(|attempt| {
+            attempt.grade.is_some()
+                && tracked_review_unit_ids.contains(attempt.review_unit_id.as_str())
+        })
         .collect::<Vec<_>>();
     attempts.sort_by_key(|attempt| attempt.occurred_at);
     for attempt in attempts {
