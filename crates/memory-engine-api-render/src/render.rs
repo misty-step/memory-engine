@@ -581,7 +581,7 @@ fn render_job_row(account: &AppAccount, job: &GenerationJob) -> String {
 /// enhancement never adds one either (the list is server-authoritative, so a
 /// job that fails live gets its Retry button on the next full page load).
 fn render_job_retry(account: &AppAccount, job: &GenerationJob) -> String {
-    if job.status != JobStatus::Failed {
+    if job.status != JobStatus::Failed || !job.retryable {
         return String::new();
     }
     format!(
@@ -597,6 +597,7 @@ fn job_meta(job: &GenerationJob) -> String {
     match job.status {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
+        JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
         JobStatus::Succeeded => format!(
             "{} {} · scheduled for review",
             job.card_count,

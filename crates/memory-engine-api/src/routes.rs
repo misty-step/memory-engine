@@ -32,8 +32,9 @@ use memory_engine_api_state::{
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
     CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
-    InvalidateProjectDeckRequest, ProjectDeckRecord, ScheduledReturnNotificationReport, SourceList,
-    SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    InvalidateProjectDeckRequest, ProjectDeckRecord, ReadinessResponse,
+    ScheduledReturnNotificationReport, SourceList, SourceRecord, StudyViewResponse,
+    SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -263,6 +264,7 @@ pub(crate) fn v1_contract_operations() -> Vec<V1ContractOperation> {
 pub fn router(state: ApiState) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/", get(app_home))
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
@@ -382,6 +384,16 @@ async fn run_return_notification_scheduler(
                 ApiFailure::internal(format!("scheduler worker join failed: {error}"))
             })??;
     Ok(Json(report))
+}
+
+async fn readyz(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let readiness = state.readiness();
+    let status = if readiness.status == "ready" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(readiness))
 }
 
 /// Serve the Ledger design system stylesheet (DESIGN.md). The render crate
@@ -1054,9 +1066,10 @@ async fn capture_app_source(
                 &request.title,
             ) {
                 EnqueueOutcome::Started(_) => {
-                    "Generating your cards. They'll appear below as they're ready."
+                    "Generating your cards. They'll appear below as they're ready.".to_owned()
                 }
-                EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
+                EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
+                EnqueueOutcome::Rejected(reason) => reason,
             }
         }
         Err(error) => {
@@ -1070,7 +1083,7 @@ async fn capture_app_source(
         }
     };
 
-    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
 }
 
 fn render_save_result_html(
@@ -1125,11 +1138,12 @@ async fn generate_app_source(
         })
         .unwrap_or_else(|| "New material".to_owned());
     let notice = match state.enqueue_generation_job_by_source(&account, &form.source_id, &title) {
-        EnqueueOutcome::Started(_) => "Generating. Watch the activity log.",
-        EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
+        EnqueueOutcome::Started(_) => "Generating. Watch the activity log.".to_owned(),
+        EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
+        EnqueueOutcome::Rejected(reason) => reason,
     };
 
-    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
 }
 
 async fn archive_app_source(

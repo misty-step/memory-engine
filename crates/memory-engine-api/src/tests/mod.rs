@@ -126,6 +126,24 @@ fn scheduler_health_retains_last_success_when_a_report_has_failures() {
 }
 
 #[tokio::test]
+async fn readyz_distinguishes_a_live_process_from_a_started_worker() {
+    let response = router(ApiState::default())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], json!("not_ready"));
+    assert_eq!(body["workerStarted"], json!(false));
+}
+
+#[tokio::test]
 async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
     let response = router(ApiState::default())
         .oneshot(
@@ -4562,7 +4580,12 @@ async fn postgres_backend_source_archive_hides_source_and_blocks_generation() {
         ))
         .await
         .expect("generate archived source");
-    assert_eq!(generated.status(), StatusCode::NOT_FOUND);
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
+    let generated = response_json(generated).await;
+    assert_eq!(
+        generated["error"],
+        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4592,74 +4615,12 @@ async fn postgres_backend_routes_drive_source_to_review() {
         ))
         .await
         .expect("generate");
-    assert_eq!(generated.status(), StatusCode::OK);
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
     let generated = response_json(generated).await;
-    let draft_id = generated["drafts"][0]
-        .as_object()
-        .and_then(|draft| draft.get("id"))
-        .and_then(Value::as_str)
-        .expect("draft id");
-
-    let approved = routed_app
-        .clone()
-        .oneshot(empty_request(
-            "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
-            &account.session_token,
-        ))
-        .await
-        .expect("approve");
-    assert_eq!(approved.status(), StatusCode::OK);
-    let approved = response_json(approved).await;
-    let review_unit_id = approved["current"]["reviewUnitId"]
-        .as_str()
-        .expect("review unit id");
-
-    let revealed = routed_app
-        .clone()
-        .oneshot(empty_request(
-            "POST",
-            &format!(
-                "/accounts/{}/review/{review_unit_id}/reveal",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("reveal");
-    assert_eq!(revealed.status(), StatusCode::OK);
-    let revealed = response_json(revealed).await;
-    assert_eq!(revealed["current"]["expectedAnswer"], json!("ALFA"));
-
-    let submitted = routed_app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!(
-                "/accounts/{}/review/{review_unit_id}/submit",
-                account.account_id
-            ),
-            &account.session_token,
-            &json!({
-                "answer": "ALFA",
-                "responseTimeMs": 1800,
-                "idempotencyKey": "postgres-api-submit-nato-a"
-            }),
-        ))
-        .await
-        .expect("submit");
-    assert_eq!(submitted.status(), StatusCode::OK);
-    let submitted = response_json(submitted).await;
-    assert_eq!(submitted["summary"]["attemptCount"], json!(1));
-    assert_eq!(submitted["current"]["grade"]["verdict"], json!("correct"));
-
-    assert_postgres_restart_resume_and_duplicate_submit(
-        &database.scoped_url,
-        &account,
-        &source_id,
-        review_unit_id,
-    )
-    .await;
+    assert_eq!(
+        generated["error"],
+        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7365,6 +7326,7 @@ async fn prepare_review_unit(app: &axum::Router, account: &TestAccount) -> Strin
         .to_owned()
 }
 
+#[allow(dead_code)]
 async fn assert_postgres_restart_resume_and_duplicate_submit(
     database_url: &str,
     original: &TestAccount,

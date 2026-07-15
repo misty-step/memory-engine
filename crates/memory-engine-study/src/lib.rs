@@ -734,6 +734,27 @@ where
         self.view()
     }
 
+    /// Generate deterministic drafts with a caller-owned run id. Background
+    /// jobs use this to bind provider usage to their durable attempt rather
+    /// than looking up the latest run for an account/source pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when generation or store writes fail.
+    pub fn generate_with_run_id(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request =
+            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into());
+        self.invalidate_snapshot();
+        run_beta_generation(&mut self.store, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
     /// Generate drafts from saved sources using the supplied provider.
     ///
     /// Lets the consumer choose a model-backed provider for arbitrary prose
@@ -756,10 +777,43 @@ where
         self.view()
     }
 
+    /// Provider-backed counterpart to [`Self::generate_with_run_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when provider generation or store writes fail.
+    pub fn generate_with_provider_and_run_id(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        provider: &dyn DraftProvider,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request =
+            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into());
+        self.invalidate_snapshot();
+        run_beta_generation_with_provider(&mut self.store, provider, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
     fn generation_request(
         &self,
         snapshot: &BetaStoreSnapshot,
         source_document_ids: Option<Vec<String>>,
+    ) -> BetaGenerationRequest {
+        self.generation_request_with_run_id(
+            snapshot,
+            source_document_ids,
+            format!("study-run-{}", snapshot.generation_runs.len() + 1),
+        )
+    }
+
+    fn generation_request_with_run_id(
+        &self,
+        snapshot: &BetaStoreSnapshot,
+        source_document_ids: Option<Vec<String>>,
+        run_id: String,
     ) -> BetaGenerationRequest {
         let active_source_ids = active_source_ids(snapshot);
         let requested_ids = source_document_ids.unwrap_or_else(|| {
@@ -774,7 +828,7 @@ where
             .collect();
 
         BetaGenerationRequest {
-            run_id: format!("study-run-{}", snapshot.generation_runs.len() + 1),
+            run_id,
             source_document_ids: ids,
             parent_review_unit_id: None,
             started_at: (self.now)(),

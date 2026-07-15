@@ -203,7 +203,8 @@
     },
     "/v1/accounts/{account_id}/sources/{source_id}/generate": {
       "post": {
-        "summary": "Generate draft review items from one source",
+        "summary": "Legacy synchronous compatibility route for direct generation",
+        "description": "This direct v1 route is rejected with 409 Conflict on Postgres-backed production deployments. Durable production generation uses the queued app workflow and polling.",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -213,15 +214,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Study view with generated drafts",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StudyViewResponse"
-                }
-              }
-            }
+          "409": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }

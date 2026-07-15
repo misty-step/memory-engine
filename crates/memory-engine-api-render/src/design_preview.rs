@@ -119,9 +119,12 @@ fn job(
         status,
         card_count,
         attempts: 1,
+        retryable: true,
         error: error.map(str::to_owned),
         created_at,
         updated_at: created_at,
+        retry_at: None,
+        lease_expires_at: None,
     }
 }
 

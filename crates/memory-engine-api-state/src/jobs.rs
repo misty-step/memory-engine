@@ -7,17 +7,25 @@
 //! (`queued → running → succeeded | failed`) is held in memory and pushed to
 //! the browser over SSE; failed jobs can be retried.
 //!
-//! Job history is held in memory and, on the file-backed host, mirrored to a
-//! `_jobs.json` file under the store root so the activity log survives a
-//! restart (the *cards* were already durable — the study store persists them on
-//! success). A job still running when the process stops is restored as a
-//! retryable `failed` ("interrupted by a restart"), since no worker owns it
-//! after the restart. The postgres host keeps history in memory for now (a
-//! durable table behind the same `JobQueue` surface is the scale path).
+//! File-backed development queues mirror history to `_jobs.json`; production
+//! queues use the Postgres job ledger with leases, retry state, and bounded
+//! admission. A worker that stops mid-generation leaves a lease that a fresh
+//! process can reclaim. Generation writes are replay-safe because draft and
+//! review-unit identities are stable and persisted before the job is terminal.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
+use memory_engine_persistence_postgres::{
+    PostgresEnqueueOutcome, PostgresGenerationJob, PostgresStudyStore,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
@@ -26,6 +34,16 @@ use crate::AccountRegistry;
 /// Most generation jobs run at once; the rest wait. Bounds concurrent model
 /// calls so a burst of captures can't open dozens of sockets at once.
 const MAX_CONCURRENT_JOBS: usize = 4;
+const MAX_QUEUE_DEPTH_PER_ACCOUNT: i64 = 8;
+const MAX_QUEUE_DEPTH_GLOBAL: i64 = 64;
+const MAX_ATTEMPTS: i32 = 3;
+const JOB_LEASE_MS: i64 = 5 * 60 * 1_000;
+// The grace exceeds one heartbeat interval, giving an old blocking provider
+// call time to observe cancellation before another worker can reclaim it.
+const JOB_RECLAIM_GRACE_MS: i64 = 2 * 60 * 1_000;
+const RETRY_DELAY_MS: i64 = 1_000;
+const ACCOUNT_MODEL_BUDGET_USD_MICROS: i64 = 100_000;
+const MODEL_BUDGET_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Capacity of the SSE broadcast buffer. Events are full job snapshots, so a
 /// slow subscriber that lags simply skips to the latest state.
 const UPDATES_BUFFER: usize = 256;
@@ -35,11 +53,16 @@ const UPDATES_BUFFER: usize = 256;
 /// long-lived process. The generated cards are durably persisted regardless.
 const MAX_TERMINAL_JOBS_PER_ACCOUNT: usize = 50;
 
+fn default_retryable() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
     Running,
+    Retry,
     Succeeded,
     Failed,
 }
@@ -50,6 +73,7 @@ impl JobStatus {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Retry => "retry",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
         }
@@ -89,9 +113,16 @@ pub struct GenerationJob {
     pub status: JobStatus,
     pub card_count: usize,
     pub attempts: u32,
+    /// False once the bounded attempt budget is exhausted. This is sent over
+    /// SSE so the browser never advertises a retry that the API must reject.
+    pub retryable: bool,
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(skip)]
+    pub retry_at: Option<i64>,
+    #[serde(skip)]
+    pub lease_expires_at: Option<i64>,
 }
 
 /// The on-disk shape of a [`GenerationJob`]. Distinct from the UI serialization
@@ -108,9 +139,15 @@ struct PersistedJob {
     status: JobStatus,
     card_count: usize,
     attempts: u32,
+    #[serde(default = "default_retryable")]
+    retryable: bool,
     error: Option<String>,
     created_at: i64,
     updated_at: i64,
+    #[serde(default)]
+    retry_at: Option<i64>,
+    #[serde(default)]
+    lease_expires_at: Option<i64>,
 }
 
 impl From<&GenerationJob> for PersistedJob {
@@ -126,9 +163,12 @@ impl From<&GenerationJob> for PersistedJob {
             status,
             card_count,
             attempts,
+            retryable,
             error,
             created_at,
             updated_at,
+            retry_at,
+            lease_expires_at,
         } = job;
         Self {
             id: id.clone(),
@@ -138,9 +178,12 @@ impl From<&GenerationJob> for PersistedJob {
             status: *status,
             card_count: *card_count,
             attempts: *attempts,
+            retryable: *retryable,
             error: error.clone(),
             created_at: *created_at,
             updated_at: *updated_at,
+            retry_at: *retry_at,
+            lease_expires_at: *lease_expires_at,
         }
     }
 }
@@ -155,9 +198,12 @@ impl From<PersistedJob> for GenerationJob {
             status: record.status,
             card_count: record.card_count,
             attempts: record.attempts,
+            retryable: record.retryable,
             error: record.error,
             created_at: record.created_at,
             updated_at: record.updated_at,
+            retry_at: record.retry_at,
+            lease_expires_at: record.lease_expires_at,
         }
     }
 }
@@ -171,6 +217,7 @@ impl From<PersistedJob> for GenerationJob {
 pub enum EnqueueOutcome {
     Started(String),
     AlreadyInFlight(String),
+    Rejected(String),
 }
 
 impl EnqueueOutcome {
@@ -180,6 +227,7 @@ impl EnqueueOutcome {
     pub fn job_id(&self) -> &str {
         match self {
             Self::Started(id) | Self::AlreadyInFlight(id) => id,
+            Self::Rejected(_) => "",
         }
     }
 }
@@ -207,6 +255,10 @@ struct Inner {
     /// write a stale snapshot. Held only across a snapshot+write, never with the
     /// jobs lock, so it cannot deadlock against it.
     persist_lock: Mutex<()>,
+    postgres_url: Option<String>,
+    worker_started: AtomicBool,
+    worker_ready: AtomicBool,
+    worker_id: String,
 }
 
 impl JobQueue {
@@ -216,7 +268,13 @@ impl JobQueue {
     /// jobs directly).
     #[must_use]
     pub fn new(registry: AccountRegistry) -> Self {
-        Self::build(registry, Vec::new(), None)
+        Self::build(registry, Vec::new(), None, None)
+    }
+
+    /// Build a queue backed by the production Postgres job ledger.
+    #[must_use]
+    pub fn with_postgres(registry: AccountRegistry, database_url: impl Into<String>) -> Self {
+        Self::build(registry, Vec::new(), None, Some(database_url.into()))
     }
 
     /// Build a queue whose history is mirrored to `path` and restored from it on
@@ -225,7 +283,7 @@ impl JobQueue {
     #[must_use]
     pub fn with_persistence(registry: AccountRegistry, path: PathBuf) -> Self {
         let restored = load_jobs(&path, registry.now());
-        let queue = Self::build(registry, restored, Some(path));
+        let queue = Self::build(registry, restored, Some(path), None);
         // Make the in-flight -> failed reset durable now, so a second crash
         // before the next mutation doesn't replay against stale on-disk state.
         // The worker isn't running yet, so this write is uncontended.
@@ -237,6 +295,7 @@ impl JobQueue {
         registry: AccountRegistry,
         jobs: Vec<GenerationJob>,
         persist_path: Option<PathBuf>,
+        postgres_url: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (updates, _keep_alive) = broadcast::channel(UPDATES_BUFFER);
@@ -249,6 +308,10 @@ impl JobQueue {
                 updates,
                 persist_path,
                 persist_lock: Mutex::new(()),
+                postgres_url,
+                worker_started: AtomicBool::new(false),
+                worker_ready: AtomicBool::new(false),
+                worker_id: format!("api-{}-{:032x}", std::process::id(), rand::random::<u128>()),
             }),
         }
     }
@@ -256,11 +319,30 @@ impl JobQueue {
     /// Start the background worker. Must run inside a Tokio runtime. Idempotent:
     /// a second call is a no-op because the single receiver is already taken.
     pub fn spawn_worker(&self) {
+        if !claim_worker_start(&self.inner.worker_started) {
+            return;
+        }
+        if self.inner.postgres_url.is_some() {
+            let worker = self.clone();
+            tokio::spawn(worker.run_postgres());
+            return;
+        }
+        self.inner.worker_ready.store(true, Ordering::Release);
         let Some(rx) = self.lock_rx().take() else {
             return;
         };
         let worker = self.clone();
         tokio::spawn(worker.run(rx));
+    }
+
+    #[must_use]
+    pub fn worker_started(&self) -> bool {
+        self.inner.worker_started.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn worker_ready(&self) -> bool {
+        self.inner.worker_ready.load(Ordering::Acquire)
     }
 
     /// Enqueue generation for an already-saved source. Returns the job id; the
@@ -273,7 +355,10 @@ impl JobQueue {
     // Callers fire-and-forget (the id is incidental), so the return is routinely
     // discarded; `must_use` would only force noisy `let _ =` at every site.
     #[allow(clippy::must_use_candidate)]
-    pub fn enqueue(&self, account_id: &str, source_id: &str, title: &str) -> String {
+    pub fn enqueue(&self, account_id: &str, source_id: &str, title: &str) -> EnqueueOutcome {
+        if self.inner.postgres_url.is_some() {
+            return self.enqueue_postgres(account_id, source_id, title);
+        }
         let job = self.new_job(account_id, source_id, title);
         let snapshot = job.clone();
         // Commit to the Vec first, then broadcast — so an SSE subscriber that
@@ -285,7 +370,7 @@ impl JobQueue {
             enforce_terminal_retention(&mut jobs, account_id);
         }
         self.start(&snapshot);
-        snapshot.id
+        EnqueueOutcome::Started(snapshot.id)
     }
 
     /// Enqueue generation for an already-saved source, coalescing onto an
@@ -301,6 +386,9 @@ impl JobQueue {
         source_id: &str,
         title: &str,
     ) -> EnqueueOutcome {
+        if self.inner.postgres_url.is_some() {
+            return self.enqueue_postgres(account_id, source_id, title);
+        }
         let candidate = self.new_job(account_id, source_id, title);
         let outcome = {
             let mut jobs = self.lock_jobs();
@@ -330,6 +418,45 @@ impl JobQueue {
         }
     }
 
+    fn enqueue_postgres(&self, account_id: &str, source_id: &str, title: &str) -> EnqueueOutcome {
+        let Some(database_url) = self.inner.postgres_url.as_deref() else {
+            return EnqueueOutcome::Rejected("Postgres job store is not configured.".to_owned());
+        };
+        let model_key = std::env::var("MEMORY_ENGINE_GENERATION_MODEL")
+            .unwrap_or_else(|_| "deterministic".to_owned());
+        let job_id = format!("job-{:032x}", rand::random::<u128>());
+        let result = with_postgres_store(database_url, |store| {
+            store.enqueue_generation_job(
+                account_id,
+                &job_id,
+                source_id,
+                title,
+                &model_key,
+                self.inner.registry.now(),
+                MAX_QUEUE_DEPTH_PER_ACCOUNT,
+                MAX_QUEUE_DEPTH_GLOBAL,
+                ACCOUNT_MODEL_BUDGET_USD_MICROS,
+                MODEL_BUDGET_WINDOW_MS,
+            )
+        });
+        match result {
+            Ok(PostgresEnqueueOutcome::Started(job)) => {
+                self.broadcast_postgres(&job);
+                EnqueueOutcome::Started(job.id)
+            }
+            Ok(PostgresEnqueueOutcome::AlreadyInFlight(job)) => {
+                EnqueueOutcome::AlreadyInFlight(job.id)
+            }
+            Ok(PostgresEnqueueOutcome::Rejected(reason)) => EnqueueOutcome::Rejected(reason),
+            Err(error) => {
+                eprintln!("memory-engine: generation enqueue failed: {error}");
+                EnqueueOutcome::Rejected(
+                    "Generation is temporarily unavailable. Please try again.".to_owned(),
+                )
+            }
+        }
+    }
+
     /// Build a fresh queued job. Shared by `enqueue` and `enqueue_or_coalesce`
     /// so the two entry points can never drift on the job's initial shape.
     fn new_job(&self, account_id: &str, source_id: &str, title: &str) -> GenerationJob {
@@ -342,9 +469,12 @@ impl JobQueue {
             status: JobStatus::Queued,
             card_count: 0,
             attempts: 0,
+            retryable: true,
             error: None,
             created_at: now,
             updated_at: now,
+            retry_at: None,
+            lease_expires_at: None,
         }
     }
 
@@ -364,6 +494,17 @@ impl JobQueue {
     // it `must_use` would force a `let _ =` at the fire-and-forget sites.
     #[allow(clippy::must_use_candidate)]
     pub fn retry(&self, account_id: &str, job_id: &str) -> bool {
+        if let Some(database_url) = self.inner.postgres_url.as_deref() {
+            return with_postgres_store(database_url, |store| {
+                store.retry_generation_job(
+                    account_id,
+                    job_id,
+                    self.inner.registry.now(),
+                    MAX_ATTEMPTS,
+                )
+            })
+            .unwrap_or(false);
+        }
         let requeued = {
             let mut jobs = self.lock_jobs();
             match jobs
@@ -371,6 +512,9 @@ impl JobQueue {
                 .find(|job| job.id == job_id && job.account_id == account_id)
             {
                 Some(job) if job.status == JobStatus::Failed => {
+                    if !job.retryable {
+                        return false;
+                    }
                     job.status = JobStatus::Queued;
                     job.error = None;
                     job.updated_at = self.inner.registry.now();
@@ -393,6 +537,13 @@ impl JobQueue {
     /// activity log rendered on every page load.
     #[must_use]
     pub fn jobs_for(&self, account_id: &str) -> Vec<GenerationJob> {
+        if let Some(database_url) = self.inner.postgres_url.as_deref() {
+            return with_postgres_store(database_url, |store| {
+                store.list_generation_jobs(account_id, 50)
+            })
+            .map(|jobs| jobs.into_iter().map(GenerationJob::from).collect())
+            .unwrap_or_default();
+        }
         let mut jobs = self
             .lock_jobs()
             .iter()
@@ -412,7 +563,28 @@ impl JobQueue {
 
     /// Look up a single job (test + handler convenience).
     #[must_use]
+    pub fn job_for_account(&self, account_id: &str, job_id: &str) -> Option<GenerationJob> {
+        if let Some(database_url) = self.inner.postgres_url.as_deref() {
+            return with_postgres_store(database_url, |store| {
+                store.generation_job(account_id, job_id)
+            })
+            .ok()
+            .flatten()
+            .map(GenerationJob::from);
+        }
+        self.lock_jobs()
+            .iter()
+            .find(|job| job.id == job_id && job.account_id == account_id)
+            .cloned()
+    }
+
+    /// Test-only lookup for file-backed queues. Production reads must carry an
+    /// authenticated account id; a Postgres queue refuses an unscoped lookup.
+    #[must_use]
     pub fn job(&self, job_id: &str) -> Option<GenerationJob> {
+        if self.inner.postgres_url.is_some() {
+            return None;
+        }
         self.lock_jobs()
             .iter()
             .find(|job| job.id == job_id)
@@ -423,16 +595,104 @@ impl JobQueue {
     /// worker drains the queue asynchronously in production; this is the
     /// deterministic path for tests (and any host without an async runtime).
     pub fn run_pending_blocking(&self) {
+        if self.inner.postgres_url.is_some() {
+            while let Ok(Some(job)) = self.claim_postgres() {
+                self.broadcast_postgres(&job);
+                self.run_claimed_blocking(&job);
+            }
+            return;
+        }
         while let Some(job_id) = self.next_queued() {
             if let Some((account_id, source_id)) = self.mark_running(&job_id) {
                 let result = self
                     .inner
                     .registry
-                    .run_generation_job(&account_id, &source_id)
+                    .run_generation_job(
+                        &account_id,
+                        &source_id,
+                        &format!("file-job-{job_id}"),
+                        0,
+                        "",
+                        || true,
+                    )
                     .map_err(|failure| failure.message);
                 self.finish(&job_id, result);
             }
         }
+    }
+
+    fn run_claimed_blocking(&self, job: &PostgresGenerationJob) {
+        let run_id = format!("job:{}:attempt:{}", job.id, job.attempts);
+        let Some(database_url) = self.inner.postgres_url.as_deref() else {
+            return;
+        };
+        let bound = with_postgres_store(database_url, |store| {
+            store.bind_generation_job_attempt_run(
+                &job.account_id,
+                &job.id,
+                job.attempts,
+                job.lease_token.as_deref().unwrap_or_default(),
+                &run_id,
+            )
+        })
+        .unwrap_or(false);
+        if !bound {
+            return;
+        }
+        let fence_database_url = database_url.to_owned();
+        let fence_account_id = job.account_id.clone();
+        let fence_job_id = job.id.clone();
+        let fence_token = job.lease_token.clone().unwrap_or_default();
+        let fence_reservation = job.reserved_cost_usd_micros;
+        let fence_run_id = run_id.clone();
+        let fence_registry = self.inner.registry.clone();
+        let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
+        let generation_lease_token = job.lease_token.clone().unwrap_or_default();
+        let result = self
+            .inner
+            .registry
+            .run_generation_job(
+                &job.account_id,
+                &job.source_id,
+                &run_id,
+                generation_attempt,
+                &generation_lease_token,
+                move || {
+                    with_postgres_store(&fence_database_url, |store| {
+                        let current = store.generation_job(&fence_account_id, &fence_job_id)?;
+                        let cost =
+                            store.generation_cost_for_run(&fence_account_id, &fence_run_id)?;
+                        Ok(current.is_some_and(|current| {
+                            current.status == "running"
+                                && current.lease_token.as_deref() == Some(fence_token.as_str())
+                                && current
+                                    .lease_expires_at
+                                    .is_some_and(|expires| expires > fence_registry.now())
+                                && cost <= fence_reservation
+                        }))
+                    })
+                    .ok()
+                    .unwrap_or(false)
+                },
+            )
+            .and_then(|card_count| {
+                self.inner
+                    .registry
+                    .generation_cost_for_run(&job.account_id, &run_id)
+                    .map(|cost| (card_count, cost))
+            })
+            .map_err(|failure| failure.message);
+        let _ = with_postgres_store(database_url, |store| {
+            store.finish_generation_job(
+                &job.account_id,
+                &job.id,
+                job.lease_token.as_deref().unwrap_or_default(),
+                self.inner.registry.now(),
+                result,
+                MAX_ATTEMPTS,
+                RETRY_DELAY_MS,
+            )
+        });
     }
 
     fn next_queued(&self) -> Option<String> {
@@ -458,15 +718,217 @@ impl JobQueue {
         }
     }
 
+    async fn run_postgres(self) {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
+        loop {
+            let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                break;
+            };
+            let worker = self.clone();
+            let Ok(claimed) = tokio::task::spawn_blocking(move || worker.claim_postgres()).await
+            else {
+                self.inner.worker_ready.store(false, Ordering::Release);
+                drop(permit);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            };
+            let job = match claimed {
+                Ok(Some(job)) => job,
+                Ok(None) => {
+                    self.inner.worker_ready.store(true, Ordering::Release);
+                    drop(permit);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(_) => {
+                    self.inner.worker_ready.store(false, Ordering::Release);
+                    drop(permit);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+            self.inner.worker_ready.store(true, Ordering::Release);
+            self.broadcast_postgres(&job);
+            let worker = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                worker.run_claimed_postgres(job).await;
+            });
+        }
+    }
+
+    fn claim_postgres(
+        &self,
+    ) -> Result<Option<PostgresGenerationJob>, memory_engine_persistence_postgres::PostgresStoreError>
+    {
+        let Some(database_url) = self.inner.postgres_url.as_deref() else {
+            return Ok(None);
+        };
+        with_postgres_store(database_url, |store| {
+            store.claim_generation_job(
+                &self.inner.worker_id,
+                self.inner.registry.now(),
+                JOB_LEASE_MS,
+                JOB_RECLAIM_GRACE_MS,
+                i64::try_from(MAX_CONCURRENT_JOBS).unwrap_or(i64::MAX),
+                MAX_ATTEMPTS,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_claimed_postgres(&self, job: PostgresGenerationJob) {
+        let registry = self.inner.registry.clone();
+        let account_id = job.account_id.clone();
+        let source_id = job.source_id.clone();
+        let run_id = format!("job:{}:attempt:{}", job.id, job.attempts);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let generation_cancelled = cancelled.clone();
+        let generation_run_id = run_id.clone();
+        let Some(database_url) = self.inner.postgres_url.as_deref() else {
+            return;
+        };
+        let fence_database_url = database_url.to_owned();
+        let fence_account_id = job.account_id.clone();
+        let fence_job_id = job.id.clone();
+        let fence_token = job.lease_token.clone().unwrap_or_default();
+        let fence_reservation = job.reserved_cost_usd_micros;
+        let fence_run_id = run_id.clone();
+        let fence_registry = registry.clone();
+        let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
+        let generation_lease_token = job.lease_token.clone().unwrap_or_default();
+        let bound = with_postgres_store(database_url, |store| {
+            store.bind_generation_job_attempt_run(
+                &job.account_id,
+                &job.id,
+                job.attempts,
+                job.lease_token.as_deref().unwrap_or_default(),
+                &run_id,
+            )
+        })
+        .unwrap_or(false);
+        if !bound {
+            return;
+        }
+        let generation = tokio::task::spawn_blocking(move || {
+            registry
+                .run_generation_job(
+                    &account_id,
+                    &source_id,
+                    &generation_run_id,
+                    generation_attempt,
+                    &generation_lease_token,
+                    move || {
+                        if generation_cancelled.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        with_postgres_store(&fence_database_url, |store| {
+                            let current = store.generation_job(&fence_account_id, &fence_job_id)?;
+                            let cost =
+                                store.generation_cost_for_run(&fence_account_id, &fence_run_id)?;
+                            Ok(current.is_some_and(|current| {
+                                current.status == "running"
+                                    && current.lease_token.as_deref() == Some(fence_token.as_str())
+                                    && current
+                                        .lease_expires_at
+                                        .is_some_and(|expires| expires > fence_registry.now())
+                                    && cost <= fence_reservation
+                            }))
+                        })
+                        .ok()
+                        .unwrap_or(false)
+                    },
+                )
+                .and_then(|card_count| {
+                    registry
+                        .generation_cost_for_run(&account_id, &generation_run_id)
+                        .map(|cost| (card_count, cost))
+                })
+                .map_err(|failure| failure.message)
+        });
+        tokio::pin!(generation);
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(
+            u64::try_from((JOB_LEASE_MS / 3).max(1)).unwrap_or(1),
+        ));
+        let outcome = loop {
+            tokio::select! {
+                result = &mut generation => {
+                    break result.unwrap_or_else(|_| Err("Generation crashed unexpectedly.".to_owned()));
+                }
+                _ = heartbeat.tick() => {
+                    let Some(database_url) = self.inner.postgres_url.clone() else {
+                        return;
+                    };
+                    let account_id = job.account_id.clone();
+                    let job_id = job.id.clone();
+                    let lease_token = job.lease_token.clone().unwrap_or_default();
+                    let now_ms = self.inner.registry.now();
+                    let renewed = tokio::task::spawn_blocking(move || {
+                        with_postgres_store(&database_url, |store| {
+                            store.renew_generation_job(
+                                &account_id,
+                                &job_id,
+                                &lease_token,
+                                now_ms,
+                                JOB_LEASE_MS,
+                            )
+                        })
+                    }).await;
+                    if !matches!(renewed, Ok(Ok(true))) {
+                        cancelled.store(true, Ordering::Release);
+                        let outcome = tokio::time::timeout(
+                            std::time::Duration::from_millis(JOB_RECLAIM_GRACE_MS as u64),
+                            &mut generation,
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_else(|| Err("Generation lease was lost.".to_owned()));
+                        let _ = self.finish_postgres_attempt(&job, outcome);
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = self.finish_postgres_attempt(&job, outcome);
+        if let Ok(Some(updated)) = with_postgres_store(database_url, |store| {
+            store.generation_job(&job.account_id, &job.id)
+        }) {
+            self.broadcast_postgres(&updated);
+        }
+    }
+
+    fn finish_postgres_attempt(
+        &self,
+        job: &PostgresGenerationJob,
+        outcome: Result<(usize, i64), String>,
+    ) -> Result<bool, memory_engine_persistence_postgres::PostgresStoreError> {
+        let Some(database_url) = self.inner.postgres_url.as_deref() else {
+            return Ok(false);
+        };
+        with_postgres_store(database_url, |store| {
+            store.finish_generation_job(
+                &job.account_id,
+                &job.id,
+                job.lease_token.as_deref().unwrap_or_default(),
+                self.inner.registry.now(),
+                outcome,
+                MAX_ATTEMPTS,
+                RETRY_DELAY_MS,
+            )
+        })
+    }
+
     async fn run_job(&self, job_id: &str) {
         let Some((account_id, source_id)) = self.mark_running(job_id) else {
             return;
         };
         let registry = self.inner.registry.clone();
+        let run_id = format!("file-job-{job_id}");
         // The model call is synchronous (`ureq`); run it off the async runtime
         // on the blocking pool so it never parks a Tokio worker thread.
         let outcome = tokio::task::spawn_blocking(move || {
-            registry.run_generation_job(&account_id, &source_id)
+            registry.run_generation_job(&account_id, &source_id, &run_id, 0, "", || true)
         })
         .await;
 
@@ -509,6 +971,7 @@ impl JobQueue {
                 }
                 Err(message) => {
                     job.status = JobStatus::Failed;
+                    job.retryable = job.attempts < MAX_ATTEMPTS as u32;
                     job.error = Some(message);
                 }
             }
@@ -565,6 +1028,11 @@ impl JobQueue {
         }
     }
 
+    fn broadcast_postgres(&self, job: &PostgresGenerationJob) {
+        let job = postgres_job_payload(job);
+        self.broadcast(&job);
+    }
+
     fn lock_jobs(&self) -> std::sync::MutexGuard<'_, Vec<GenerationJob>> {
         self.inner
             .jobs
@@ -578,6 +1046,74 @@ impl JobQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn postgres_store(
+    database_url: &str,
+) -> Result<PostgresStudyStore, memory_engine_persistence_postgres::PostgresStoreError> {
+    static MIGRATED_URLS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let mut store = PostgresStudyStore::connect(database_url)?;
+    let migrated = MIGRATED_URLS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let mut migrated = migrated
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !migrated.contains(database_url) {
+        store.migrate()?;
+        migrated.insert(database_url.to_owned());
+    }
+    Ok(store)
+}
+
+fn claim_worker_start(started: &AtomicBool) -> bool {
+    !started.swap(true, Ordering::AcqRel)
+}
+
+fn with_postgres_store<R>(
+    database_url: &str,
+    operation: impl FnOnce(
+        &mut PostgresStudyStore,
+    ) -> Result<R, memory_engine_persistence_postgres::PostgresStoreError>,
+) -> Result<R, memory_engine_persistence_postgres::PostgresStoreError> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| {
+            let mut store = postgres_store(database_url)?;
+            operation(&mut store)
+        })
+    } else {
+        let mut store = postgres_store(database_url)?;
+        operation(&mut store)
+    }
+}
+
+impl From<PostgresGenerationJob> for GenerationJob {
+    fn from(job: PostgresGenerationJob) -> Self {
+        let status = match job.status.as_str() {
+            "queued" => JobStatus::Queued,
+            "running" => JobStatus::Running,
+            "retry" => JobStatus::Retry,
+            "succeeded" => JobStatus::Succeeded,
+            _ => JobStatus::Failed,
+        };
+        Self {
+            id: job.id,
+            account_id: job.account_id,
+            source_id: job.source_id,
+            title: job.title,
+            status,
+            card_count: job.card_count,
+            attempts: job.attempts,
+            retryable: job.attempts < MAX_ATTEMPTS as u32,
+            error: job.error,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            retry_at: job.retry_at,
+            lease_expires_at: job.lease_expires_at,
+        }
+    }
+}
+
+fn postgres_job_payload(job: &PostgresGenerationJob) -> GenerationJob {
+    GenerationJob::from(job.clone())
 }
 
 /// Keep at most `MAX_TERMINAL_JOBS_PER_ACCOUNT` terminal jobs for `account_id`,
@@ -628,6 +1164,7 @@ fn load_jobs(path: &Path, now: i64) -> Vec<GenerationJob> {
             let mut job = GenerationJob::from(record);
             if !job.status.is_terminal() {
                 job.status = JobStatus::Failed;
+                job.retryable = job.attempts < MAX_ATTEMPTS as u32;
                 job.error = Some(
                     "Interrupted by a server restart. Press Retry to generate again.".to_owned(),
                 );
@@ -646,15 +1183,27 @@ mod tests {
     // A ghost source fails fast in the worker (no model call), so every job
     // becomes terminal (failed) without touching the network.
     const GHOST: &str = "ghost-source";
+    static TEST_CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    fn enqueue_id(outcome: EnqueueOutcome) -> String {
+        match outcome {
+            EnqueueOutcome::Started(id) | EnqueueOutcome::AlreadyInFlight(id) => id,
+            EnqueueOutcome::Rejected(reason) => panic!("test enqueue rejected: {reason}"),
+        }
+    }
+
+    fn test_clock_ms() -> i64 {
+        TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     #[test]
     fn terminal_history_is_bounded_per_account() {
         let queue = JobQueue::new(AccountRegistry::default());
         for i in 0..(MAX_TERMINAL_JOBS_PER_ACCOUNT + 12) {
-            queue.enqueue("acct", GHOST, &format!("job {i}"));
+            let _ = queue.enqueue("acct", GHOST, &format!("job {i}"));
         }
         queue.run_pending_blocking();
-        let newest = queue.enqueue("acct", GHOST, "newest"); // triggers the prune
+        let newest = enqueue_id(queue.enqueue("acct", GHOST, "newest")); // triggers the prune
 
         let jobs = queue.jobs_for("acct");
         let terminal = jobs.iter().filter(|job| job.status.is_terminal()).count();
@@ -689,11 +1238,11 @@ mod tests {
     fn retention_is_per_account() {
         let queue = JobQueue::new(AccountRegistry::default());
         for i in 0..(MAX_TERMINAL_JOBS_PER_ACCOUNT + 5) {
-            queue.enqueue("noisy", GHOST, &format!("n {i}"));
+            let _ = queue.enqueue("noisy", GHOST, &format!("n {i}"));
         }
-        let quiet = queue.enqueue("quiet", GHOST, "quiet-one");
+        let quiet = enqueue_id(queue.enqueue("quiet", GHOST, "quiet-one"));
         queue.run_pending_blocking();
-        queue.enqueue("noisy", GHOST, "trigger"); // prunes the noisy account only
+        let _ = queue.enqueue("noisy", GHOST, "trigger"); // prunes the noisy account only
 
         let noisy_terminal = queue
             .jobs_for("noisy")
@@ -714,7 +1263,7 @@ mod tests {
         let queue = JobQueue::new(AccountRegistry::default());
         queue.spawn_worker();
         let ids: Vec<String> = (0..(MAX_CONCURRENT_JOBS * 4))
-            .map(|i| queue.enqueue("acct", GHOST, &format!("burst {i}")))
+            .map(|i| enqueue_id(queue.enqueue("acct", GHOST, &format!("burst {i}"))))
             .collect();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -730,6 +1279,15 @@ mod tests {
         })
         .await
         .expect("the whole burst must drain within 10s");
+    }
+
+    #[test]
+    fn worker_start_claim_is_idempotent() {
+        let started = AtomicBool::new(false);
+
+        assert!(claim_worker_start(&started));
+        assert!(!claim_worker_start(&started));
+        assert!(!claim_worker_start(&started));
     }
 
     /// A unique temp dir that cleans itself up, so durability tests never share
@@ -764,7 +1322,7 @@ mod tests {
         let succeeded_id;
         {
             let queue = JobQueue::with_persistence(AccountRegistry::default(), path.clone());
-            succeeded_id = queue.enqueue("acct", GHOST, "first run");
+            succeeded_id = enqueue_id(queue.enqueue("acct", GHOST, "first run"));
             queue.run_pending_blocking(); // GHOST fails fast -> terminal
         }
 
@@ -835,7 +1393,7 @@ mod tests {
         // Leave durable history at the path a persistent queue would use.
         {
             let durable = JobQueue::with_persistence(AccountRegistry::default(), path.clone());
-            durable.enqueue("acct", GHOST, "persisted");
+            let _ = durable.enqueue("acct", GHOST, "persisted");
         }
         assert!(
             path.exists(),
@@ -848,5 +1406,310 @@ mod tests {
             volatile.jobs_for("acct").is_empty(),
             "JobQueue::new must not restore history from disk"
         );
+    }
+
+    #[test]
+    fn rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule() {
+        let store = TempStore::new("idempotent-generation");
+        let registry = AccountRegistry::with_store_root(store.0.clone());
+        let account = registry
+            .create_account("idempotent@example.com")
+            .expect("test account");
+        let source = registry
+            .save_source(
+                &account.account_id,
+                &account.session_token,
+                &crate::CreateSourceRequest {
+                    title: "Idempotent source".to_owned(),
+                    body: "Concept: Stable generation\nQuestion: What stays stable?\nAnswer: The job identity."
+                        .to_owned(),
+                },
+            )
+            .expect("source");
+
+        let first = registry
+            .run_generation_job(
+                &account.account_id,
+                &source.source_id,
+                "test-run-1",
+                0,
+                "",
+                || true,
+            )
+            .expect("first generation");
+        let second = registry
+            .run_generation_job(
+                &account.account_id,
+                &source.source_id,
+                "test-run-2",
+                0,
+                "",
+                || true,
+            )
+            .expect("replayed generation");
+        assert!(first > 0, "fixture must produce scheduled material");
+        assert_eq!(second, 0, "a replay must not schedule duplicate material");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reclaimed_postgres_generation_cannot_commit_after_the_lease_turns_stale() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres fence regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let now_ms = 1_779_465_600_000_i64;
+        let schema = format!("memory_engine_test_fence_{}_{}", std::process::id(), now_ms);
+        let scoped_url = format!(
+            "{}{}options=-csearch_path%3D{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema
+        );
+        let mut admin = memory_engine_persistence_postgres::connect_client(&database_url)
+            .expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let result = (|| -> Result<(), String> {
+            let registry = AccountRegistry::with_postgres_url(scoped_url.clone());
+            let account = registry
+                .create_account("fence@example.com")
+                .map_err(|error| error.message.clone())?;
+            let source = registry
+                .save_source(
+                    &account.account_id,
+                    &account.session_token,
+                    &crate::CreateSourceRequest {
+                        title: "Fence source".to_owned(),
+                        body: "Concept: Fence\nQuestion: What keeps stale work out?\nAnswer: The durable attempt ledger."
+                            .to_owned(),
+                    },
+                )
+                .map_err(|error| error.message.clone())?;
+            let mut ledger =
+                PostgresStudyStore::connect(&scoped_url).map_err(|error| error.to_string())?;
+            ledger.migrate().map_err(|error| error.to_string())?;
+            let started = ledger
+                .enqueue_generation_job(
+                    &account.account_id,
+                    "job-fence",
+                    &source.source_id,
+                    "Fence source",
+                    "model-fence",
+                    now_ms,
+                    2,
+                    4,
+                    100,
+                    86_400_000,
+                )
+                .map_err(|error| error.to_string())?;
+            let job = match started {
+                memory_engine_persistence_postgres::PostgresEnqueueOutcome::Started(job) => job,
+                other => return Err(format!("unexpected enqueue outcome: {other:?}")),
+            };
+            let run_id = format!("job:{}:attempt:{}", job.id, 1);
+            let claimed = ledger
+                .claim_generation_job("worker-a", now_ms, 10, 0, 1, 3)
+                .map_err(|error| error.to_string())?
+                .expect("claim job");
+            assert_eq!(claimed.id, "job-fence");
+            assert!(ledger
+                .bind_generation_job_attempt_run(
+                    &account.account_id,
+                    &claimed.id,
+                    claimed.attempts,
+                    claimed.lease_token.as_deref().expect("lease token"),
+                    &run_id,
+                )
+                .map_err(|error| error.to_string())?);
+
+            let (reclaim_tx, reclaim_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let reclaim_triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reclaim_url = scoped_url.clone();
+            let reclaim_account_id = account.account_id.clone();
+            let reclaim_job_id = claimed.id.clone();
+            let reclaim_run_id = run_id.clone();
+            let worker = std::thread::spawn(move || {
+                reclaim_rx.recv().expect("reclaim signal");
+                let mut store =
+                    PostgresStudyStore::connect(&reclaim_url).expect("connect reclaim store");
+                store.migrate().expect("migrate reclaim store");
+                let _ = store
+                    .claim_generation_job("worker-b", now_ms + 16, 10, 0, 1, 3)
+                    .expect("reclaim stale job");
+                let _ = reclaim_account_id;
+                let _ = reclaim_job_id;
+                let _ = reclaim_run_id;
+                done_tx.send(()).expect("done signal");
+            });
+            let approval_gate = {
+                let reclaim_tx = reclaim_tx.clone();
+                let done_rx = std::sync::Arc::new(std::sync::Mutex::new(done_rx));
+                let reclaim_triggered = std::sync::Arc::clone(&reclaim_triggered);
+                move || {
+                    if !reclaim_triggered.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        reclaim_tx.send(()).expect("send reclaim signal");
+                        done_rx.lock().expect("done lock").recv().expect("done ack");
+                    }
+                    true
+                }
+            };
+            let outcome = registry.run_generation_job(
+                &account.account_id,
+                &source.source_id,
+                &run_id,
+                i32::try_from(claimed.attempts).unwrap_or(i32::MAX),
+                claimed.lease_token.as_deref().unwrap_or_default(),
+                approval_gate,
+            );
+            worker.join().expect("worker thread");
+            let scope =
+                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
+                    .map_err(|error| error.to_string())?;
+            let account = ledger.for_account(scope);
+            let snapshot = account.snapshot().map_err(|error| error.to_string())?;
+            assert!(
+                snapshot.review_units.is_empty(),
+                "stale worker must not commit any review units after reclaim"
+            );
+            match outcome {
+                Ok(_) => Err("stale worker was able to commit review units".to_owned()),
+                Err(error) => {
+                    assert!(
+                        error.message.contains("Generation lease lost")
+                            || error.message.contains("committed"),
+                        "unexpected fence error: {}",
+                        error.message
+                    );
+                    Ok(())
+                }
+            }
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("postgres generation fence");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn postgres_generation_cannot_commit_after_live_lease_expiry_without_reclaim() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres expiry regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let start_ms = 1_779_465_600_000_i64;
+        TEST_CLOCK_MS.store(start_ms, std::sync::atomic::Ordering::SeqCst);
+        let schema = format!(
+            "memory_engine_test_live_expiry_{}_{}",
+            std::process::id(),
+            start_ms
+        );
+        let scoped_url = format!(
+            "{}{}options=-csearch_path%3D{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema
+        );
+        let mut admin = memory_engine_persistence_postgres::connect_client(&database_url)
+            .expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let result = (|| -> Result<(), String> {
+            let registry =
+                AccountRegistry::with_postgres_url(scoped_url.clone()).with_clock(test_clock_ms);
+            let account = registry
+                .create_account("expiry@example.com")
+                .map_err(|error| error.message.clone())?;
+            let source = registry
+                .save_source(
+                    &account.account_id,
+                    &account.session_token,
+                    &crate::CreateSourceRequest {
+                        title: "Expiry source".to_owned(),
+                        body: "Concept: Expiry\nQuestion: What keeps stale work out?\nAnswer: The durable attempt ledger."
+                            .to_owned(),
+                    },
+                )
+                .map_err(|error| error.message.clone())?;
+            let mut ledger =
+                PostgresStudyStore::connect(&scoped_url).map_err(|error| error.to_string())?;
+            ledger.migrate().map_err(|error| error.to_string())?;
+            let started = ledger
+                .enqueue_generation_job(
+                    &account.account_id,
+                    "job-expiry",
+                    &source.source_id,
+                    "Expiry source",
+                    "model-expiry",
+                    start_ms,
+                    2,
+                    4,
+                    100,
+                    5_000,
+                )
+                .map_err(|error| error.to_string())?;
+            let job = match started {
+                memory_engine_persistence_postgres::PostgresEnqueueOutcome::Started(job) => job,
+                other => return Err(format!("unexpected enqueue outcome: {other:?}")),
+            };
+            let run_id = format!("job:{}:attempt:{}", job.id, 1);
+            let claimed = ledger
+                .claim_generation_job("worker-a", start_ms, 10, 0, 1, 3)
+                .map_err(|error| error.to_string())?
+                .expect("claim job");
+            assert_eq!(claimed.id, "job-expiry");
+            assert!(ledger
+                .bind_generation_job_attempt_run(
+                    &account.account_id,
+                    &claimed.id,
+                    claimed.attempts,
+                    claimed.lease_token.as_deref().expect("lease token"),
+                    &run_id,
+                )
+                .map_err(|error| error.to_string())?);
+
+            let generation_attempt = i32::try_from(claimed.attempts).unwrap_or(i32::MAX);
+            let generation_lease_token = claimed.lease_token.clone().unwrap_or_default();
+            let outcome = registry.run_generation_job(
+                &account.account_id,
+                &source.source_id,
+                &run_id,
+                generation_attempt,
+                &generation_lease_token,
+                move || {
+                    TEST_CLOCK_MS.store(start_ms + 16, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
+            );
+            let err = outcome.expect_err("expired lease must block commit");
+            assert!(
+                err.message.contains("Generation lease lost") || err.message.contains("committed"),
+                "unexpected fence error: {}",
+                err.message
+            );
+            let scope =
+                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
+                    .map_err(|error| error.to_string())?;
+            let account = ledger.for_account(scope);
+            let snapshot = account.snapshot().map_err(|error| error.to_string())?;
+            assert!(
+                snapshot.review_units.is_empty(),
+                "expired lease must not commit review units"
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        TEST_CLOCK_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        result.expect("live lease expiry fence");
     }
 }
