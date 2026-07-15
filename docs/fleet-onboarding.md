@@ -12,7 +12,7 @@ authorities.
 | Powder | Powder board | Shipped. Powder is the sole work ledger under the current `AGENTS.md` contract. This checkout has no `backlog.d/` to import; the historical file-import criterion is superseded rather than recreated. |
 | Landmark | `.landmark.yml` plus Landmark CLI | Adopted in manifest-only/synthesis-only mode. The repo has no release-secret authority, so no release-mutating workflow is added. Preview with `landmark setup --repo-root . --dry-run` and `landmark run --provider local --repo-root . --dry-run` from a Landmark checkout. |
 | Project map | `docs/architecture/memory-engine.map.json` and `workbench.html` | This is the live repo-local architecture-map successor for project structure. It is static, diffable, and explicitly separate from Landmark release intelligence. |
-| Cerberus | `.github/workflows/cerberus-review.yml` | CI-native `review-pr` path is wired to Cerberus v0.72.0 with an explicit per-job GitHub token and a narrow `CERBERUS_OPENROUTER_KEY`. The job skips visibly when that key is not provisioned. |
+| Cerberus | `.github/workflows/cerberus-review.yml` | CI-native `review-pr` path is wired to Cerberus v0.72.0 with an explicit per-job GitHub token, `container-opencode`, and a capped per-review key minted from `CERBERUS_OPENROUTER_PROVISIONING_KEY`. The job skips visibly when that provisioning key is not provisioned. |
 
 ## Cerberus boundary
 
@@ -23,9 +23,12 @@ which is safe to validate in a pull request and does not require resurrecting a
 retired webhook service.
 
 The workflow does not use `pull_request_target`, checkout PR code, ambient `gh`
-authentication, or a broad provider key. A live posted review still requires
-the operator to provision the narrowly scoped `CERBERUS_OPENROUTER_KEY` secret;
-that external authority was not available during this onboarding change.
+authentication, or the unsafe plain `--allow-env OPENROUTER_API_KEY` plus
+`--harness opencode` combination. `container-opencode` isolates the substrate,
+while Cerberus mints and revokes a USD-capped per-review key using the
+host-only `CERBERUS_OPENROUTER_PROVISIONING_KEY`. A live posted review still
+requires the operator to provision that management key; that external
+authority was not available during this onboarding change.
 
 ## Verification
 

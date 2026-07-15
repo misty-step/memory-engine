@@ -234,14 +234,27 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "v0.72.0",
             "review-pr",
             "CERBERUS_GH_TOKEN",
-            "CERBERUS_OPENROUTER_KEY",
+            "CERBERUS_OPENROUTER_PROVISIONING_KEY",
+            "--harness container-opencode",
+            "--container-binary",
+            "--openrouter-scoped-key",
+            "--openrouter-provisioning-key-env CERBERUS_OPENROUTER_PROVISIONING_KEY",
+            "--openrouter-key-limit-usd 2",
             "--summary-target status",
             "--post",
         ],
     );
     assert!(
         cerberus.contains("if: steps.preflight.outputs.ready == 'true'"),
-        "Cerberus must skip cleanly when its narrow provider key is unavailable"
+        "Cerberus must skip cleanly when its provisioning key is unavailable"
+    );
+    assert!(
+        !cerberus.contains("--allow-env OPENROUTER_API_KEY"),
+        "Cerberus must not forward a long-lived provider key to an untrusted PR"
+    );
+    assert!(
+        !cerberus.contains("--harness opencode"),
+        "Cerberus must not use the unsandboxed OpenCode harness for PR reviews"
     );
 
     let onboarding = read_repo_file("docs/fleet-onboarding.md");
@@ -269,5 +282,9 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "node.fleet.canary",
             "node.fleet.powder",
         ],
+    );
+    assert!(
+        !map.contains("edge.fleet.powder-to-card"),
+        "the Powder fleet node already references memory-engine-067; do not retain a stale historical-card edge"
     );
 }

@@ -1363,18 +1363,6 @@
       ]
     },
     {
-      "id": "edge.fleet.powder-to-card",
-      "from": "node.fleet.powder",
-      "to": "node.powder.016",
-      "label": "records delivery work",
-      "kind": "tracks",
-      "summary": "Powder records the onboarding card and its durable proof rather than a repository-local backlog.",
-      "viewTags": ["fleet-integration"],
-      "refs": [
-        {"kind": "powder", "path": "memory-engine-067", "label": "onboarding card"}
-      ]
-    },
-    {
       "id": "edge.fleet.cerberus-to-github",
       "from": "node.fleet.cerberus",
       "to": "node.fleet.project-map",

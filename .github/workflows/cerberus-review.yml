@@ -24,14 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Check narrow Cerberus provider key
+      - name: Check Cerberus provisioning key
         id: preflight
         env:
-          CERBERUS_OPENROUTER_KEY: ${{ secrets.CERBERUS_OPENROUTER_KEY }}
+          CERBERUS_OPENROUTER_PROVISIONING_KEY: ${{ secrets.CERBERUS_OPENROUTER_PROVISIONING_KEY }}
         run: |
-          if [ -z "$CERBERUS_OPENROUTER_KEY" ]; then
+          if [ -z "$CERBERUS_OPENROUTER_PROVISIONING_KEY" ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Cerberus review skipped: CERBERUS_OPENROUTER_KEY is not provisioned."
+            echo "::notice::Cerberus review skipped: CERBERUS_OPENROUTER_PROVISIONING_KEY is not provisioned."
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
@@ -59,16 +59,21 @@ jobs:
         if: steps.preflight.outputs.ready == 'true'
         env:
           CERBERUS_GH_TOKEN: ${{ github.token }}
-          OPENROUTER_API_KEY: ${{ secrets.CERBERUS_OPENROUTER_KEY }}
+          CERBERUS_OPENROUTER_PROVISIONING_KEY: ${{ secrets.CERBERUS_OPENROUTER_PROVISIONING_KEY }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request_number }}
         run: |
+          OPENCODE_BIN="$(find "$(npm root --global)/opencode-ai/node_modules" -path '*/bin/opencode' -type f -perm -111 -print -quit)"
+          test -n "$OPENCODE_BIN"
           cerberus review-pr \
             --number "$PR_NUMBER" \
             --repo "$GITHUB_REPOSITORY" \
             --out-dir target/cerberus/review-pr \
             --gh-token-env CERBERUS_GH_TOKEN \
-            --allow-env OPENROUTER_API_KEY \
-            --harness opencode \
+            --harness container-opencode \
+            --container-binary "$OPENCODE_BIN" \
+            --openrouter-scoped-key \
+            --openrouter-provisioning-key-env CERBERUS_OPENROUTER_PROVISIONING_KEY \
+            --openrouter-key-limit-usd 2 \
             --model openrouter/z-ai/glm-5.2 \
             --summary-target status \
             --post
