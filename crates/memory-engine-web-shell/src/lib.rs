@@ -24,6 +24,32 @@ use serde::{Deserialize, Serialize};
 
 const NOW: i64 = 1_779_984_000_000;
 
+/// Ceiling for a plausible single-answer response time (ten minutes).
+///
+/// A local host cannot verify a client-reported duration. Missing, malformed,
+/// non-positive, and implausibly large values therefore take the slow path so
+/// they can never manufacture the fast-answer `Easy` rating.
+const MAX_PLAUSIBLE_RESPONSE_TIME_MS: u32 = 600_000;
+
+const HONEST_TIMING_SCRIPT: &str = r#"<script>
+(function () {
+  "use strict";
+  var timingInput = document.querySelector('input[name="responseTimeMs"]');
+  if (!timingInput) return;
+  var monotonic = window.performance && typeof performance.now === "function";
+  var now = function () { return monotonic ? performance.now() : Date.now(); };
+  var shownAt = now();
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form || !form.querySelector) return;
+    var input = form.querySelector('input[name="responseTimeMs"]');
+    if (!input) return;
+    var elapsed = now() - shownAt;
+    input.value = String(Math.max(1, Math.round(elapsed)));
+  });
+})();
+</script>"#;
+
 const INTERFACE_PRESSURE: [&str; 3] = [
     "Reveal is UI-owned because the service has no first-class revealed review command.",
     "Review-state visibility needs a compact DTO; raw ScheduleState is too engine-shaped for UI copy.",
@@ -545,7 +571,12 @@ pub fn route(session: &mut WebShellSession, request: &HttpRequest) -> HttpRespon
         ("POST", "/answer") => match read_answer(&request.body) {
             Ok(answer) => response_for(
                 request,
-                session.submit_answer(answer.answer, answer.response_time_ms),
+                session.submit_answer(
+                    answer.answer,
+                    answer
+                        .response_time_ms
+                        .unwrap_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS),
+                ),
             ),
             Err(error) => HttpResponse::bad_request(&error),
         },
@@ -687,7 +718,7 @@ impl HttpResponse {
 #[serde(rename_all = "camelCase")]
 struct AnswerPayload {
     answer: String,
-    response_time_ms: u32,
+    response_time_ms: Option<u32>,
 }
 
 fn handle_stream(
@@ -729,14 +760,10 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
         let response_time_ms = fields
             .iter()
             .find_map(|(key, value)| (key == "responseTimeMs").then_some(value))
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or_else(|| "responseTimeMs must be a positive integer".to_owned())?;
-        if response_time_ms == 0 {
-            return Err("responseTimeMs must be a positive integer".to_owned());
-        }
+            .and_then(|value| value.trim().parse::<u32>().ok());
         return Ok(AnswerPayload {
             answer,
-            response_time_ms,
+            response_time_ms: Some(sanitize_response_time_ms(response_time_ms)),
         });
     }
 
@@ -745,11 +772,17 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
     if payload.answer.trim().is_empty() {
         return Err("answer must be a non-empty string".to_owned());
     }
-    if payload.response_time_ms == 0 {
-        return Err("responseTimeMs must be a positive integer".to_owned());
-    }
+    Ok(AnswerPayload {
+        response_time_ms: Some(sanitize_response_time_ms(payload.response_time_ms)),
+        ..payload
+    })
+}
 
-    Ok(payload)
+fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
+    raw.filter(|&elapsed| elapsed > 0)
+        .map_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS, |elapsed| {
+            elapsed.min(MAX_PLAUSIBLE_RESPONSE_TIME_MS)
+        })
 }
 
 fn looks_like_json(body: &[u8]) -> bool {
@@ -821,7 +854,11 @@ fn render_page(view: &WebShellView) -> String {
     render_summary(&mut html, view);
     render_queue(&mut html, view);
     render_pressure(&mut html, view);
-    html.push_str("</aside></main></body></html>");
+    html.push_str("</aside></main>");
+    if view.current.is_some() {
+        html.push_str(HONEST_TIMING_SCRIPT);
+    }
+    html.push_str("</body></html>");
     html
 }
 
@@ -841,7 +878,7 @@ fn render_current(html: &mut String, current: Option<&WebShellCurrent>) {
     ));
     html.push_str("</h1>");
     if let Some(current) = current {
-        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
+        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
         if let Some(expected) = &current.expected_answer {
             html.push_str("<div class=\"answer\">");
             html.push_str(&escape_html(expected));
@@ -1079,13 +1116,13 @@ mod tests {
         );
 
         let reviewed = shell
-            .submit_answer("I believe in one God".to_owned(), 2_400)
+            .submit_answer("I believe in one God".to_owned(), 6_500)
             .expect("review");
         assert_eq!(reviewed.status, WebShellStatus::Graded);
         let reviewed_current = reviewed.current.as_ref().expect("current");
         assert_eq!(
             reviewed_current.grade.as_ref().map(|grade| grade.rating),
-            Some(4)
+            Some(3)
         );
         assert_eq!(
             reviewed_current
@@ -1132,6 +1169,20 @@ mod tests {
     }
 
     #[test]
+    fn renders_honest_response_timing_for_review_forms() {
+        let mut shell = WebShellSession::new();
+        shell.start().expect("start");
+
+        let html = String::from_utf8(route(&mut shell, &request("GET", "/", "")).body)
+            .expect("review html");
+        assert!(html.contains(r#"name="responseTimeMs" value=""#));
+        assert!(!html.contains(r#"name="responseTimeMs" value="2400"#));
+        assert!(html.contains("performance.now"));
+        assert!(html.contains("Date.now"));
+        assert!(html.contains("Math.max(1, Math.round(elapsed))"));
+    }
+
+    #[test]
     fn serves_html_state_and_validates_answer_payloads() {
         let mut shell = WebShellSession::new();
         shell.start().expect("start");
@@ -1142,11 +1193,6 @@ mod tests {
         assert!(String::from_utf8(html.body)
             .expect("html")
             .contains("Memory Engine Web Shell"));
-        assert!(
-            !String::from_utf8(route(&mut shell, &request("GET", "/", "")).body)
-                .expect("html")
-                .contains("<script")
-        );
 
         let state = route(&mut shell, &request("GET", "/state", ""));
         assert_eq!(state.status, 200);
@@ -1179,16 +1225,14 @@ mod tests {
         assert_eq!(revealed.content_type, "text/html; charset=utf-8");
         let revealed = String::from_utf8(revealed.body).expect("revealed html");
         assert!(revealed.contains("I believe in one God"));
-        assert!(!revealed.contains("<script"));
 
         let answered = route(
             &mut shell,
-            &form_request("/answer", "answer=I+believe+in+one+God&responseTimeMs=2400"),
+            &form_request("/answer", "answer=I+believe+in+one+God"),
         );
         assert_eq!(answered.status, 200);
         let answered = String::from_utf8(answered.body).expect("answered html");
-        assert!(answered.contains("Correct rating 4"));
-        assert!(!answered.contains("<script"));
+        assert!(answered.contains("Correct rating 3"));
     }
 
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {

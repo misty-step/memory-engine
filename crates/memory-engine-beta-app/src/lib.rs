@@ -24,6 +24,32 @@ pub struct BetaAppConfig {
     pub study: BetaStudyOptions,
 }
 
+/// Ceiling for a plausible single-answer response time (ten minutes).
+///
+/// A local host cannot verify a client-reported duration. Missing, malformed,
+/// non-positive, and implausibly large values therefore take the slow path so
+/// they can never manufacture the fast-answer `Easy` rating.
+const MAX_PLAUSIBLE_RESPONSE_TIME_MS: u32 = 600_000;
+
+const HONEST_TIMING_SCRIPT: &str = r#"<script>
+(function () {
+  "use strict";
+  var timingInput = document.querySelector('input[name="responseTimeMs"]');
+  if (!timingInput) return;
+  var monotonic = window.performance && typeof performance.now === "function";
+  var now = function () { return monotonic ? performance.now() : Date.now(); };
+  var shownAt = now();
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form || !form.querySelector) return;
+    var input = form.querySelector('input[name="responseTimeMs"]');
+    if (!input) return;
+    var elapsed = now() - shownAt;
+    input.value = String(Math.max(1, Math.round(elapsed)));
+  });
+})();
+</script>"#;
+
 #[derive(Debug)]
 pub enum BetaAppError {
     Io(io::Error),
@@ -122,7 +148,12 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
         ("POST", "/answer") => match read_answer(&request.body) {
             Ok(answer) => response_for(
                 request,
-                session.submit_answer(answer.answer, answer.response_time_ms),
+                session.submit_answer(
+                    answer.answer,
+                    answer
+                        .response_time_ms
+                        .unwrap_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS),
+                ),
             ),
             Err(error) => HttpResponse::bad_request(&error),
         },
@@ -325,7 +356,7 @@ struct SourcePayload {
 #[serde(rename_all = "camelCase")]
 struct AnswerPayload {
     answer: String,
-    response_time_ms: u32,
+    response_time_ms: Option<u32>,
 }
 
 struct RevisionPayload {
@@ -390,25 +421,27 @@ fn read_answer(body: &[u8]) -> Result<AnswerPayload, String> {
         let response_time_ms = fields
             .iter()
             .find_map(|(key, value)| (key == "responseTimeMs").then_some(value))
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or_else(|| "responseTimeMs must be a positive integer".to_owned())?;
-        if response_time_ms == 0 {
-            return Err("responseTimeMs must be a positive integer".to_owned());
-        }
+            .and_then(|value| value.trim().parse::<u32>().ok());
         return Ok(AnswerPayload {
             answer,
-            response_time_ms,
+            response_time_ms: Some(sanitize_response_time_ms(response_time_ms)),
         });
     }
 
     let payload: AnswerPayload = serde_json::from_slice(body)
         .map_err(|error| format!("Request body must be an answer object: {error}"))?;
     require_non_blank(&payload.answer, "answer")?;
-    if payload.response_time_ms == 0 {
-        return Err("responseTimeMs must be a positive integer".to_owned());
-    }
+    Ok(AnswerPayload {
+        response_time_ms: Some(sanitize_response_time_ms(payload.response_time_ms)),
+        ..payload
+    })
+}
 
-    Ok(payload)
+fn sanitize_response_time_ms(raw: Option<u32>) -> u32 {
+    raw.filter(|&elapsed| elapsed > 0)
+        .map_or(MAX_PLAUSIBLE_RESPONSE_TIME_MS, |elapsed| {
+            elapsed.min(MAX_PLAUSIBLE_RESPONSE_TIME_MS)
+        })
 }
 
 fn read_required_string(body: &[u8], key: &str) -> Result<String, String> {
@@ -560,7 +593,11 @@ fn render_page(view: &BetaStudyView, error: Option<&str>) -> String {
     render_source_form(&mut html);
     render_drafts(&mut html, view);
     render_queue(&mut html, view);
-    html.push_str("</aside></main></body></html>");
+    html.push_str("</aside></main>");
+    if view.current.is_some() {
+        html.push_str(HONEST_TIMING_SCRIPT);
+    }
+    html.push_str("</body></html>");
     html
 }
 
@@ -596,7 +633,7 @@ fn render_current(html: &mut String, current: Option<&BetaStudyCurrent>, error: 
     }
     if let Some(current) = current {
         render_choices(html, current);
-        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer or worked solution</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"2400\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/current/learn-more\"><button type=\"submit\" class=\"secondary\">Learn more</button></form><form method=\"post\" action=\"/current/snooze\"><input type=\"hidden\" name=\"snoozedUntil\" value=\"");
+        html.push_str("<form method=\"post\" action=\"/answer\"><label for=\"answer\">Answer or worked solution</label><textarea id=\"answer\" name=\"answer\" autocomplete=\"off\" spellcheck=\"false\"></textarea><input type=\"hidden\" name=\"responseTimeMs\" value=\"\"><div class=\"actions\"><button type=\"submit\">Submit</button></form><form method=\"post\" action=\"/reveal\"><button type=\"submit\" class=\"secondary\">Reveal</button></form><form method=\"post\" action=\"/current/learn-more\"><button type=\"submit\" class=\"secondary\">Learn more</button></form><form method=\"post\" action=\"/current/snooze\"><input type=\"hidden\" name=\"snoozedUntil\" value=\"");
         html.push_str(&snooze_until().to_string());
         html.push_str("\"><button type=\"submit\" class=\"secondary\">Snooze</button></form><form method=\"post\" action=\"/current/delete\"><button type=\"submit\" class=\"secondary danger\">Delete</button></form><form method=\"post\" action=\"/next\"><button type=\"submit\" class=\"secondary\">Next</button></form></div>");
         html.push_str("<form class=\"edit\" method=\"post\" action=\"/current/edit\"><label for=\"prompt-edit\">Edit prompt</label><textarea id=\"prompt-edit\" name=\"prompt\">");
@@ -866,13 +903,30 @@ mod tests {
             &request(
                 "POST",
                 "/answer",
-                &json!({"answer": "ALFA", "responseTimeMs": 1800}).to_string(),
+                &json!({"answer": "ALFA", "responseTimeMs": 6500}).to_string(),
             ),
         );
         let answered: Value = serde_json::from_slice(&answered.body).expect("answered");
         assert_eq!(answered["status"], json!("graded"));
         assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
+        assert_eq!(answered["current"]["grade"]["rating"], json!(3));
         assert_eq!(answered["summary"]["attemptCount"], json!(1));
+    }
+
+    #[test]
+    fn renders_honest_response_timing_for_review_forms() {
+        let directory = TempDirectory::new("honest-timing-markup");
+        let mut session = session(directory.path().join("study.json"));
+        seed_nato_source_and_generate(&mut session);
+        approve_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
+
+        let html = String::from_utf8(route(&mut session, &request("GET", "/", "")).body)
+            .expect("review html");
+        assert!(html.contains(r#"name="responseTimeMs" value=""#));
+        assert!(!html.contains(r#"name="responseTimeMs" value="2400"#));
+        assert!(html.contains("performance.now"));
+        assert!(html.contains("Date.now"));
+        assert!(html.contains("Math.max(1, Math.round(elapsed))"));
     }
 
     #[test]
@@ -1084,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_response_time_before_touching_the_session() {
+    fn unavailable_response_time_uses_conservative_rating() {
         let directory = TempDirectory::new("zero-response-time");
         let mut session = session(directory.path().join("study.json"));
         route(
@@ -1119,11 +1173,11 @@ mod tests {
             ),
         );
 
-        assert_eq!(answered.status, 400);
-        assert!(String::from_utf8(answered.body)
-            .expect("body")
-            .contains("responseTimeMs must be"));
-        assert_eq!(session.view().expect("view").summary.attempt_count, 0);
+        assert_eq!(answered.status, 200);
+        let answered: Value = serde_json::from_slice(&answered.body).expect("answered");
+        assert_eq!(answered["current"]["grade"]["verdict"], json!("correct"));
+        assert_eq!(answered["current"]["grade"]["rating"], json!(3));
+        assert_eq!(answered["summary"]["attemptCount"], json!(1));
     }
 
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {
