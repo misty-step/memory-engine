@@ -30,8 +30,10 @@ use memory_engine_persistence::{
 use serde::Deserialize;
 
 mod content_fit;
+mod enumerable;
 
 use content_fit::{ContentFitExpectation, ContentFitScore};
+use enumerable::{EnumerableSetExpectation, EnumerableSetScore};
 
 const NOW: i64 = 1_780_162_400_000;
 
@@ -63,6 +65,8 @@ struct Expectations {
     requires_variants: bool,
     #[serde(default)]
     content_fit: Option<ContentFitExpectation>,
+    #[serde(default)]
+    enumerable_set: Option<EnumerableSetExpectation>,
 }
 
 /// Deterministic judge scores for one source's provider output.
@@ -102,6 +106,8 @@ pub struct SourceScore {
     /// Content-type, coverage, shape, and directionality checks for fixtures
     /// whose learning objective is structural rather than sampled concept Q&A.
     pub content_fit: Option<ContentFitScore>,
+    /// Exact membership, direction, and sequence checks for enumerable fixtures.
+    pub enumerable_set: Option<EnumerableSetScore>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: Option<i64>,
@@ -389,6 +395,7 @@ fn score_source(
             distractor_cohesion: 1.0,
             self_referential_free: 1.0,
             content_fit: None,
+            enumerable_set: enumerable::score(source.expect.enumerable_set.as_ref(), &[]),
             input_tokens: 0,
             output_tokens: 0,
             cost_usd_micros: None,
@@ -688,6 +695,7 @@ fn deterministic_judges(
         distractor_cohesion: distractor_cohesion(candidates),
         self_referential_free: self_referential_free(candidates),
         content_fit,
+        enumerable_set: enumerable::score(expect.enumerable_set.as_ref(), candidates),
         input_tokens: 0,
         output_tokens: 0,
         cost_usd_micros: None,
@@ -1121,6 +1129,7 @@ fn render_receipt(
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     render_score_rows(&mut receipt, scores);
+    render_enumerable_scores(&mut receipt, scores);
     let _ = writeln!(receipt);
     render_model_judge(&mut receipt, scores, baseline);
     render_receipt_totals(&mut receipt, scores, bridge);
@@ -1166,6 +1175,45 @@ fn render_score_rows(receipt: &mut String, scores: &[SourceScore]) {
             score.output_tokens,
             format_cost(score.cost_usd_micros),
             score.latency_ms,
+        );
+    }
+}
+
+fn render_enumerable_scores(receipt: &mut String, scores: &[SourceScore]) {
+    let enumerable = scores
+        .iter()
+        .filter_map(|score| score.enumerable_set.as_ref().map(|set| (score, set)))
+        .collect::<Vec<_>>();
+    if enumerable.is_empty() {
+        return;
+    }
+    let _ = writeln!(receipt);
+    let _ = writeln!(receipt, "## Enumerable-set completeness");
+    let _ = writeln!(receipt);
+    let _ = writeln!(
+        receipt,
+        "| source | expected | observed | covered | missing | duplicate | invented | misassigned | reversed | order | direction | pass |"
+    );
+    let _ = writeln!(
+        receipt,
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
+    );
+    for (source, set) in enumerable {
+        let _ = writeln!(
+            receipt,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            source.source_id,
+            set.expected,
+            set.observed,
+            set.covered,
+            set.missing,
+            set.duplicates,
+            set.invented,
+            set.misassigned,
+            set.reversed,
+            if set.order_ok { "yes" } else { "NO" },
+            if set.direction_ok { "yes" } else { "NO" },
+            if set.passes() { "yes" } else { "NO" },
         );
     }
 }
@@ -1462,6 +1510,7 @@ mod tests {
             requires_distractors: false,
             requires_variants: false,
             content_fit: None,
+            enumerable_set: None,
         }
     }
 
@@ -1609,6 +1658,10 @@ mod tests {
             receipt.contains("| source | category | accepted | rejected | failures | runtime |")
         );
         assert!(receipt.contains("| letters | fixture | 1 | 0 | 1 | 50% |"));
+        assert!(
+            receipt.contains("| N/A | N/A | N/A | N/A |"),
+            "content-fit None must render explicitly as N/A: {receipt}"
+        );
     }
 
     #[test]
@@ -1851,6 +1904,25 @@ mod tests {
                 score.provenance
             );
         }
+    }
+
+    #[test]
+    fn presidents_fixture_records_current_fake_provider_gap_as_red() {
+        let source = load_corpus()
+            .expect("corpus")
+            .into_iter()
+            .find(|source| source.id == "us-presidents-ordinal")
+            .expect("presidents fixture");
+
+        let score = score_source(&FakeModelProvider, None, &source);
+        let enumerable = score.enumerable_set.expect("enumerable score");
+
+        assert_eq!(enumerable.expected, 47);
+        assert!(
+            !enumerable.passes(),
+            "the fixture must expose the current gap"
+        );
+        assert!(enumerable.missing > 0);
     }
 
     #[test]

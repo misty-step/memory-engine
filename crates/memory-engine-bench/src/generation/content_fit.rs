@@ -230,10 +230,10 @@ pub(super) fn cells(score: Option<&ContentFitScore>) -> (String, String, String,
             check_cell(score.directionality).to_owned(),
         ),
         None => (
-            "—".to_owned(),
-            "—".to_owned(),
-            "—".to_owned(),
-            "—".to_owned(),
+            "N/A".to_owned(),
+            "N/A".to_owned(),
+            "N/A".to_owned(),
+            "N/A".to_owned(),
         ),
     }
 }
