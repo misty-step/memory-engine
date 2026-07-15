@@ -108,11 +108,12 @@ impl Default for SchedulerRuntime {
 impl ApiState {
     #[must_use]
     pub fn new(accounts: AccountRegistry) -> Self {
-        // The file-backed host mirrors job history to disk so the activity log
-        // survives a restart; the postgres host keeps it in memory for now.
-        let jobs = match accounts.job_history_path() {
-            Some(path) => JobQueue::with_persistence(accounts.clone(), path),
-            None => JobQueue::new(accounts.clone()),
+        // The file-backed host mirrors job history to disk; production uses the
+        // Postgres ledger so queued/running/retry state survives process loss.
+        let jobs = match (accounts.job_history_path(), accounts.postgres_url()) {
+            (Some(path), _) => JobQueue::with_persistence(accounts.clone(), path),
+            (None, Some(database_url)) => JobQueue::with_postgres(accounts.clone(), database_url),
+            (None, None) => JobQueue::new(accounts.clone()),
         };
         Self {
             accounts,
@@ -1008,6 +1009,19 @@ impl ApiState {
         self.jobs.run_pending_blocking();
     }
 
+    /// Enqueue a generation job by account id, coalescing like production
+    /// enqueue. Test helper for production-shaped (queued) route coverage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn enqueue_generation_job_for_account_id(
+        &self,
+        account_id: &str,
+        source_id: &str,
+        title: &str,
+    ) -> EnqueueOutcome {
+        self.jobs.enqueue_or_coalesce(account_id, source_id, title)
+    }
+
     /// Read durable reminder state for boundary tests and operator receipts.
     #[doc(hidden)]
     pub fn load_return_notification_preference_for_test(
@@ -1024,6 +1038,25 @@ impl ApiState {
     #[must_use]
     pub fn job(&self, job_id: &str) -> Option<GenerationJob> {
         self.jobs.job(job_id)
+    }
+
+    /// Readiness is separate from `/healthz`: it requires the production
+    /// dependency and the worker loop, so a live but non-serving process is not
+    /// advertised as ready.
+    #[must_use]
+    pub fn readiness(&self) -> ReadinessResponse {
+        let worker_started = self.jobs.worker_ready();
+        let postgres = self.accounts.postgres_ready();
+        ReadinessResponse {
+            status: if worker_started && postgres {
+                "ready"
+            } else {
+                "not_ready"
+            },
+            service: "memory-engine-api",
+            worker_started,
+            postgres,
+        }
     }
 }
 
@@ -1322,6 +1355,38 @@ impl AccountRegistry {
         }
     }
 
+    pub(crate) fn postgres_url(&self) -> Option<String> {
+        match &self.lock_data().storage {
+            StudyStorageConfig::Postgres { database_url } => Some(database_url.clone()),
+            StudyStorageConfig::File { .. } => None,
+        }
+    }
+
+    fn postgres_ready(&self) -> bool {
+        let Some(database_url) = self.postgres_url() else {
+            return true;
+        };
+        with_postgres_store(&database_url, |store| {
+            store.ping().map_err(postgres_failure)
+        })
+        .is_ok()
+    }
+
+    pub(crate) fn generation_cost_for_run(
+        &self,
+        account_id: &str,
+        run_id: &str,
+    ) -> Result<i64, ApiFailure> {
+        let Some(database_url) = self.postgres_url() else {
+            return Ok(0);
+        };
+        with_postgres_store(&database_url, |store| {
+            store
+                .generation_cost_for_run(account_id, run_id)
+                .map_err(postgres_failure)
+        })
+    }
+
     fn lock_data(&self) -> MutexGuard<'_, AccountRegistryData> {
         self.inner
             .lock()
@@ -1484,6 +1549,15 @@ pub struct HealthResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReadinessResponse {
+    pub status: &'static str,
+    pub service: &'static str,
+    pub worker_started: bool,
+    pub postgres: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiError {
     pub error: String,
 }
@@ -1599,6 +1673,14 @@ impl ApiFailure {
     }
 
     #[must_use]
+    pub fn payload_too_large(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.to_owned(),
+        }
+    }
+
+    #[must_use]
     pub fn is_session_expired(&self) -> bool {
         self.status == StatusCode::UNAUTHORIZED
     }
@@ -1708,6 +1790,17 @@ fn normalize_required_text(text: &str, label: &'static str) -> Result<String, Ap
             "Idempotency key" => "Idempotency key must not be blank.",
             _ => "Value must not be blank.",
         }));
+    }
+
+    if label.contains("body") && trimmed.len() > MAX_SOURCE_BODY_BYTES {
+        return Err(ApiFailure::payload_too_large(
+            "Source body exceeds the 256 KiB generation limit.",
+        ));
+    }
+    if label.contains("title") && trimmed.len() > MAX_SOURCE_TITLE_BYTES {
+        return Err(ApiFailure::payload_too_large(
+            "Source title exceeds the 512 byte limit.",
+        ));
     }
 
     Ok(trimmed.to_owned())
@@ -1868,6 +1961,8 @@ fn new_magic_link_token() -> String {
 pub const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
 const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
 pub const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
+pub const MAX_SOURCE_BODY_BYTES: usize = 256 * 1024;
+pub const MAX_SOURCE_TITLE_BYTES: usize = 512;
 const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // 30 minutes: links travel through email, where spam checks and device
 // switches routinely burn ten minutes. Found in dogfood: a link expired
@@ -1975,18 +2070,33 @@ where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
+    let run_id = format!("study-run-{:032x}", rand::random::<u128>());
+    run_source_generation_with_run_id(study, source_id, &run_id)
+}
+
+pub(crate) fn run_source_generation_with_run_id<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    run_id: &str,
+) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    let ids = Some(vec![source_id.to_owned()]);
     match OpenRouterConfig::from_env() {
         Ok(config) => {
             let structured = StructuredBlockProvider;
             let model = OpenRouterProvider::new(config);
             let provider = FallbackProvider::new(&structured, &model);
-            run_source_generation_with_provider(study, source_id, &provider)
+            study.generate_with_provider_and_run_id(ids, &provider, run_id)
         }
-        Err(_) => run_source_generation_with_provider(study, source_id, &StructuredBlockProvider),
+        Err(_) => study.generate_with_run_id(ids, run_id),
     }
     .map_err(study_failure)
 }
 
+#[cfg(test)]
 pub(crate) fn run_source_generation_with_provider<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
@@ -2309,5 +2419,24 @@ mod tests {
         assert!(!health.enabled);
         assert!(!health.running);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_validation_rejects_oversized_generation_input() {
+        let body = "x".repeat(MAX_SOURCE_BODY_BYTES + 1);
+        let error = normalize_required_text(&body, "Source body").expect_err("body is bounded");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let title = "x".repeat(MAX_SOURCE_TITLE_BYTES + 1);
+        let error = normalize_required_text(&title, "Source title").expect_err("title is bounded");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn readiness_requires_the_worker_even_when_file_dependencies_are_local() {
+        let readiness = ApiState::default().readiness();
+        assert_eq!(readiness.status, "not_ready");
+        assert!(!readiness.worker_started);
+        assert!(readiness.postgres);
     }
 }

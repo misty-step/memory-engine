@@ -5,6 +5,7 @@ use hmac::{KeyInit, Mac};
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_service::RecordContentFeedbackCommand;
 
+use crate::storage::GenerationCommitFence;
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
     new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
@@ -666,6 +667,11 @@ impl AccountRegistry {
         session_token: &str,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        if self.postgres_url().is_some() {
+            return Err(ApiFailure::conflict(
+                "Direct synchronous generation is disabled in production. Use the queued generation workflow.",
+            ));
+        }
         let account = self.require_account(account_id, session_token)?;
         self.storage()
             .generate_source(account_id, &account.store_path, source_id)
@@ -687,14 +693,26 @@ impl AccountRegistry {
         &self,
         account_id: &str,
         source_id: &str,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        lease_valid: impl Fn() -> bool,
     ) -> Result<usize, ApiFailure> {
-        let storage = self.storage();
-        let store_path = storage.account_store_path(account_id);
-        storage.generate_source(account_id, &store_path, source_id)?;
+        // Serialize generation per account: two captures otherwise read-modify-
+        // write the whole study store concurrently and clobber each other's
+        // cards (059). Held across the whole run; different accounts never block.
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let storage = self.storage();
+        let store_path = storage.account_store_path(account_id);
+        storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
+        if !lease_valid() {
+            return Err(ApiFailure::conflict(
+                "Generation lease lost before cards could be committed.",
+            ));
+        }
         let view = storage.study_view(account_id, &store_path)?;
         let pending = view
             .drafts
@@ -707,7 +725,21 @@ impl AccountRegistry {
             .collect::<Vec<_>>();
         let card_count = pending.len();
         for draft_id in pending {
-            storage.approve_draft(account_id, &store_path, &draft_id)?;
+            if !lease_valid() {
+                return Err(ApiFailure::conflict(
+                    "Generation lease lost before cards could be committed.",
+                ));
+            }
+            storage.approve_draft(
+                account_id,
+                &store_path,
+                &draft_id,
+                Some(GenerationCommitFence {
+                    generation_run_id: run_id,
+                    generation_attempt,
+                    lease_token,
+                }),
+            )?;
         }
         Ok(card_count)
     }
@@ -779,7 +811,7 @@ impl AccountRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
-            .approve_draft(account_id, &account.store_path, draft_id)
+            .approve_draft(account_id, &account.store_path, draft_id, None)
     }
 
     /// Runs an API registry operation.

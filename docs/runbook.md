@@ -39,6 +39,12 @@ status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}"
 test "$status" = "200"
 grep -q '"status":"ok"' /tmp/memory-engine-healthz
 
+# Readiness is dependency-aware: it is only 200 when Postgres and the
+# generation worker are available. `/healthz` above remains liveness-only.
+status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-readyz -w "%{http_code}" "$base/readyz")
+test "$status" = "200"
+grep -q '"status":"ready"' /tmp/memory-engine-readyz
+
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-home -w "%{http_code}" "$base/")
 test "$status" = "200"
 
@@ -51,14 +57,17 @@ curl -fsS --max-time 15 "$base/favicon.png" | file - | grep -q 'PNG image data, 
 curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG image data, 180 x 180'
 ```
 
-## Production generation latency
+## Legacy v1 compatibility latency
 
-Use this when a ticket needs model-backed production latency evidence. It
-uses an existing allowlisted v1 account/session, saves one article-sized
-source, times the end-to-end `generate` request, records the response, and
-archives the source. Production account creation is allowlist-protected, so do
-not use a throwaway email here; export a pre-provisioned account id and session
-token first.
+Use this when a ticket needs the synchronous compatibility-path latency for
+`/v1/accounts/{account_id}/sources/{source_id}/generate`. This route remains a
+legacy direct API surface; production durable generation uses the queued app
+workflow and should not be described as this path. The command below uses an
+existing allowlisted v1 account/session, saves one article-sized source,
+times the end-to-end direct request, records the response, and archives the
+source. Production account creation is allowlist-protected, so do not use a
+throwaway email here; export a pre-provisioned account id and session token
+first.
 
 ```sh
 set -euo pipefail

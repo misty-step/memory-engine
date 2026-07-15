@@ -24,7 +24,7 @@ use super::{
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
-use memory_engine_api_state::RETURN_NOTIFICATION_INTERVAL_MS;
+use memory_engine_api_state::{EnqueueOutcome, RETURN_NOTIFICATION_INTERVAL_MS};
 
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
@@ -123,6 +123,24 @@ fn scheduler_health_retains_last_success_when_a_report_has_failures() {
     assert_eq!(second.failed, 1);
     assert_eq!(state.scheduler_health().last_success_at_ms, last_success);
     let _ = fs::remove_dir_all(store_root);
+}
+
+#[tokio::test]
+async fn readyz_distinguishes_a_live_process_from_a_started_worker() {
+    let response = router(ApiState::default())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], json!("not_ready"));
+    assert_eq!(body["workerStarted"], json!(false));
 }
 
 #[tokio::test]
@@ -2901,18 +2919,13 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
             },
         )
         .expect("Postgres source");
-    let generated = state
-        .generate_source(
-            account.account_id(),
-            account.session_token(),
-            &source.source_id,
-        )
-        .expect("Postgres generation");
-    for draft in &generated.drafts {
-        state
-            .approve_draft(account.account_id(), account.session_token(), &draft.id)
-            .expect("Postgres approve");
-    }
+    generate_source_queued(
+        &state,
+        account.account_id(),
+        &source.source_id,
+        "Postgres scheduled source",
+    )
+    .await;
     let view = state
         .study_view(account.account_id(), account.session_token())
         .expect("Postgres study view");
@@ -2964,7 +2977,7 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
             .with_clock(postgres_retry_clock)
             .with_auth_config(auth_config()),
     );
-    let account = prepare_postgres_due_account(&first_state, "recovery@example.com");
+    let account = prepare_postgres_due_account(&first_state, "recovery@example.com").await;
     first_state
         .set_return_notification(&account, Some("recovery@example.com"), true)
         .expect("Postgres recovery opt-in");
@@ -4562,7 +4575,12 @@ async fn postgres_backend_source_archive_hides_source_and_blocks_generation() {
         ))
         .await
         .expect("generate archived source");
-    assert_eq!(generated.status(), StatusCode::NOT_FOUND);
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
+    let generated = response_json(generated).await;
+    assert_eq!(
+        generated["error"],
+        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4592,74 +4610,12 @@ async fn postgres_backend_routes_drive_source_to_review() {
         ))
         .await
         .expect("generate");
-    assert_eq!(generated.status(), StatusCode::OK);
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
     let generated = response_json(generated).await;
-    let draft_id = generated["drafts"][0]
-        .as_object()
-        .and_then(|draft| draft.get("id"))
-        .and_then(Value::as_str)
-        .expect("draft id");
-
-    let approved = routed_app
-        .clone()
-        .oneshot(empty_request(
-            "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
-            &account.session_token,
-        ))
-        .await
-        .expect("approve");
-    assert_eq!(approved.status(), StatusCode::OK);
-    let approved = response_json(approved).await;
-    let review_unit_id = approved["current"]["reviewUnitId"]
-        .as_str()
-        .expect("review unit id");
-
-    let revealed = routed_app
-        .clone()
-        .oneshot(empty_request(
-            "POST",
-            &format!(
-                "/accounts/{}/review/{review_unit_id}/reveal",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("reveal");
-    assert_eq!(revealed.status(), StatusCode::OK);
-    let revealed = response_json(revealed).await;
-    assert_eq!(revealed["current"]["expectedAnswer"], json!("ALFA"));
-
-    let submitted = routed_app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            &format!(
-                "/accounts/{}/review/{review_unit_id}/submit",
-                account.account_id
-            ),
-            &account.session_token,
-            &json!({
-                "answer": "ALFA",
-                "responseTimeMs": 1800,
-                "idempotencyKey": "postgres-api-submit-nato-a"
-            }),
-        ))
-        .await
-        .expect("submit");
-    assert_eq!(submitted.status(), StatusCode::OK);
-    let submitted = response_json(submitted).await;
-    assert_eq!(submitted["summary"]["attemptCount"], json!(1));
-    assert_eq!(submitted["current"]["grade"]["verdict"], json!("correct"));
-
-    assert_postgres_restart_resume_and_duplicate_submit(
-        &database.scoped_url,
-        &account,
-        &source_id,
-        review_unit_id,
-    )
-    .await;
+    assert_eq!(
+        generated["error"],
+        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4682,8 +4638,14 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
         session_token: browser.session_token().to_owned(),
     };
     let source_id = create_source_v1(&app, &source_account, "Copy source", &source_body()).await;
-    let draft_id = generate_source_v1(&app, &source_account, &source_id).await;
-    let review_unit_id = approve_draft_v1(&app, &source_account, &draft_id).await;
+    generate_source_queued(
+        &state,
+        &source_account.account_id,
+        &source_id,
+        "Copy source",
+    )
+    .await;
+    let review_unit_id = next_review_v1(&app, &source_account).await;
     let _ = submit_review_v1(&app, &source_account, &review_unit_id, "ALFA").await;
     let feedback = app
         .clone()
@@ -5050,9 +5012,10 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
     let Some(database) = PostgresTestDatabase::new("v1_concept_snooze") else {
         return;
     };
-    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    )));
+    ));
+    let app = router(state.clone());
     let first = create_account_v1(&app, "first-concept@example.com").await;
     let second = create_account_v1(&app, "second-concept@example.com").await;
 
@@ -5064,11 +5027,13 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
             &shared_and_other_concept_body(),
         )
         .await;
-        let draft_ids = generate_source_v1_draft_ids(&app, account, &source_id).await;
-        assert_eq!(draft_ids.len(), 3);
-        for draft_id in &draft_ids {
-            approve_draft_v1(&app, account, draft_id).await;
-        }
+        generate_source_queued(
+            &state,
+            &account.account_id,
+            &source_id,
+            "Shared NATO concept notes",
+        )
+        .await;
     }
 
     let first_before = postgres_account_snapshot(&database.scoped_url, &first.account_id);
@@ -5836,9 +5801,10 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
     let Some(database) = PostgresTestDatabase::new("stale_concept_snooze") else {
         return;
     };
-    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    )));
+    ));
+    let app = router(state.clone());
     let account = create_account_v1(&app, "stale-postgres-concept@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -5847,10 +5813,13 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
         &shared_and_other_concept_body(),
     )
     .await;
-    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
-    for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
-    }
+    generate_source_queued(
+        &state,
+        &account.account_id,
+        &source_id,
+        "Shared NATO concept notes",
+    )
+    .await;
     let stale_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
 
@@ -5906,9 +5875,10 @@ async fn postgres_two_connections_archive_requested_before_concept_snooze() {
     let Some(database) = PostgresTestDatabase::new("stale_concept_two_connections") else {
         return;
     };
-    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    )));
+    ));
+    let app = router(state.clone());
     let account = create_account_v1(&app, "stale-two-connection@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -5917,10 +5887,13 @@ async fn postgres_two_connections_archive_requested_before_concept_snooze() {
         &shared_and_other_concept_body(),
     )
     .await;
-    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
-    for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
-    }
+    generate_source_queued(
+        &state,
+        &account.account_id,
+        &source_id,
+        "Shared NATO concept notes",
+    )
+    .await;
     let stale_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
     let (first_ready_tx, first_ready_rx) = mpsc::channel();
@@ -6002,9 +5975,10 @@ async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
     let Some(database) = PostgresTestDatabase::new("stale_full_record_save") else {
         return;
     };
-    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    )));
+    ));
+    let app = router(state.clone());
     let account = create_account_v1(&app, "stale-full-record@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -6013,10 +5987,13 @@ async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
         &shared_and_other_concept_body(),
     )
     .await;
-    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
-    for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
-    }
+    generate_source_queued(
+        &state,
+        &account.account_id,
+        &source_id,
+        "Shared NATO concept notes",
+    )
+    .await;
     let requested_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
 
@@ -6639,6 +6616,37 @@ async fn generate_source_v1_draft_ids(
         .collect()
 }
 
+/// Generate through the production queued workflow: enqueue the durable job
+/// and drain it synchronously off the async runtime. Production
+/// (Postgres-backed) states reject the direct synchronous generate route with
+/// 409, so Postgres tests must set up scheduled cards through the same durable
+/// job path the deployed worker uses; the worker approves every accepted
+/// draft as part of the job.
+async fn generate_source_queued(state: &ApiState, account_id: &str, source_id: &str, title: &str) {
+    let blocking_state = state.clone();
+    let account = account_id.to_owned();
+    let source = source_id.to_owned();
+    let title = title.to_owned();
+    tokio::task::spawn_blocking(move || {
+        match blocking_state.enqueue_generation_job_for_account_id(&account, &source, &title) {
+            EnqueueOutcome::Started(_) | EnqueueOutcome::AlreadyInFlight(_) => {}
+            EnqueueOutcome::Rejected(reason) => panic!("queued generation rejected: {reason}"),
+        }
+        blocking_state.run_pending_jobs_blocking();
+    })
+    .await
+    .expect("queued generation drain");
+    let succeeded = state
+        .jobs_for_account_id(account_id)
+        .iter()
+        .any(|job| job.status == crate::JobStatus::Succeeded && job.source_id == source_id);
+    assert!(
+        succeeded,
+        "queued generation for {source_id} must succeed: {:?}",
+        state.jobs_for_account_id(account_id)
+    );
+}
+
 async fn generate_source_v1_latest_draft(
     app: &axum::Router,
     account: &TestAccount,
@@ -7216,7 +7224,7 @@ fn slow_failing_provider_script(store_root: &FsPath) -> String {
     script_path.to_string_lossy().into_owned()
 }
 
-fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAccount {
+async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAccount {
     let created = state
         .create_account(email)
         .expect("Postgres recovery account");
@@ -7233,18 +7241,13 @@ fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAcco
             },
         )
         .expect("Postgres recovery source");
-    let generated = state
-        .generate_source(
-            account.account_id(),
-            account.session_token(),
-            &source.source_id,
-        )
-        .expect("Postgres recovery generation");
-    for draft in &generated.drafts {
-        state
-            .approve_draft(account.account_id(), account.session_token(), &draft.id)
-            .expect("Postgres recovery approval");
-    }
+    generate_source_queued(
+        state,
+        account.account_id(),
+        &source.source_id,
+        "Postgres recovery source",
+    )
+    .await;
     account
 }
 
@@ -7365,6 +7368,7 @@ async fn prepare_review_unit(app: &axum::Router, account: &TestAccount) -> Strin
         .to_owned()
 }
 
+#[allow(dead_code)]
 async fn assert_postgres_restart_resume_and_duplicate_submit(
     database_url: &str,
     original: &TestAccount,

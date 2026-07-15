@@ -279,10 +279,7 @@ where
     // rather than last-write-wins. Per-draft model stamping stays exact.
     let mut producing_models: Vec<GeneratedPromptModel> = Vec::new();
 
-    store
-        .save_generation_run(run_receipt(&request, &model, RunProgress::Started))
-        .map_err(BetaGenerationError::Store)?;
-
+    save_generation_run_progress(store, &request, &model, RunProgress::Started)?;
     let mut seen_signatures =
         existing_accepted_candidate_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
@@ -342,23 +339,32 @@ where
                 &mut max_candidate_index,
             )?,
         );
+        save_generation_run_progress(
+            store,
+            &request,
+            &model,
+            RunProgress::InProgress {
+                draft_ids: draft_ids.clone(),
+                validation_failures: validation_failures.clone(),
+                usage: usage.clone(),
+            },
+        )?;
     }
 
     let run_model = match producing_models.as_slice() {
         [single] => single.clone(),
         _ => model.clone(),
     };
-    store
-        .save_generation_run(run_receipt(
-            &request,
-            &run_model,
-            RunProgress::Completed {
-                draft_ids: draft_ids.clone(),
-                validation_failures: validation_failures.clone(),
-                usage,
-            },
-        ))
-        .map_err(BetaGenerationError::Store)?;
+    save_generation_run_progress(
+        store,
+        &request,
+        &run_model,
+        RunProgress::Completed {
+            draft_ids: draft_ids.clone(),
+            validation_failures: validation_failures.clone(),
+            usage,
+        },
+    )?;
 
     Ok(BetaGenerationResult {
         run_id: request.run_id,
@@ -434,6 +440,21 @@ where
     )?;
 
     Ok(usage)
+}
+
+fn save_generation_run_progress<S>(
+    store: &mut S,
+    request: &BetaGenerationRequest,
+    model: &GeneratedPromptModel,
+    progress: RunProgress,
+) -> Result<(), BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    store
+        .save_generation_run(run_receipt(request, model, progress))
+        .map(|_| ())
+        .map_err(BetaGenerationError::Store)
 }
 
 struct PersistCandidatesContext<'a> {
@@ -888,6 +909,11 @@ where
 
 enum RunProgress {
     Started,
+    InProgress {
+        draft_ids: Vec<String>,
+        validation_failures: Vec<String>,
+        usage: Option<GenerationRunUsage>,
+    },
     Completed {
         draft_ids: Vec<String>,
         validation_failures: Vec<String>,
@@ -902,6 +928,11 @@ fn run_receipt(
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
         RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::InProgress {
+            draft_ids,
+            validation_failures,
+            usage,
+        } => (draft_ids, None, validation_failures, usage),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
