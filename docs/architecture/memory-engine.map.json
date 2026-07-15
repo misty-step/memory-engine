@@ -2,7 +2,7 @@
   "schema": "memory-engine.architecture-map/v1",
   "mapId": "memory-engine.system-visualization",
   "title": "Memory Engine System Visualization Workbench Map",
-  "updatedAt": "2026-05-25",
+  "updatedAt": "2026-07-15",
   "views": [
     {
       "id": "architecture-boundary",
@@ -23,6 +23,11 @@
       "id": "extraction-decision-map",
       "label": "Extraction Decision Map",
       "description": "Evidence and boundaries that inform keep-vs-extract decisions for service and clients."
+    },
+    {
+      "id": "fleet-integration",
+      "label": "Fleet Integration",
+      "description": "Current repo-owned evidence for Canary, Powder, Landmark, the project map, and Cerberus review."
     }
   ],
   "nodes": [
@@ -701,6 +706,66 @@
           "label": "docs/qa/system.md"
         }
       ]
+    },
+    {
+      "id": "node.fleet.landmark",
+      "label": "Landmark Manifest",
+      "kind": "release",
+      "summary": "Manifest-only release intelligence adoption; release mutation remains operator-owned.",
+      "viewTags": ["fleet-integration"],
+      "layout": {"fleet-integration": {"x": 280, "y": 140}},
+      "refs": [
+        {"kind": "config", "path": ".landmark.yml", "label": ".landmark.yml"},
+        {"kind": "doc", "path": "docs/fleet-onboarding.md", "label": "onboarding decision"}
+      ]
+    },
+    {
+      "id": "node.fleet.project-map",
+      "label": "Canonical Project Map",
+      "kind": "doc",
+      "summary": "Repo-local JSON map and static workbench remain the architecture-map authority.",
+      "viewTags": ["fleet-integration"],
+      "layout": {"fleet-integration": {"x": 610, "y": 140}},
+      "refs": [
+        {"kind": "doc", "path": "docs/architecture/README.md", "label": "map authority"},
+        {"kind": "doc", "path": "docs/architecture/workbench.html", "label": "static workbench"}
+      ]
+    },
+    {
+      "id": "node.fleet.canary",
+      "label": "Canary Runtime Reporter",
+      "kind": "observability",
+      "summary": "Production API errors report to Canary as memory-engine-api when configured.",
+      "viewTags": ["fleet-integration"],
+      "layout": {"fleet-integration": {"x": 940, "y": 140}},
+      "refs": [
+        {"kind": "source", "path": "crates/memory-engine-canary/src/lib.rs", "label": "Canary contract"},
+        {"kind": "doc", "path": "docs/runbook.md", "label": "production readback"}
+      ]
+    },
+    {
+      "id": "node.fleet.powder",
+      "label": "Powder Work Ledger",
+      "kind": "powder",
+      "summary": "Powder is the sole durable work ledger; no retired backlog.d importer is kept here.",
+      "viewTags": ["fleet-integration"],
+      "layout": {"fleet-integration": {"x": 280, "y": 360}},
+      "refs": [
+        {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
+        {"kind": "powder", "path": "memory-engine-067", "label": "onboarding card"}
+      ]
+    },
+    {
+      "id": "node.fleet.cerberus",
+      "label": "Cerberus PR Review",
+      "kind": "review",
+      "summary": "Pinned CI-native Cerberus review-pr path with explicit GitHub auth and narrow provider-key preflight.",
+      "viewTags": ["fleet-integration"],
+      "layout": {"fleet-integration": {"x": 610, "y": 360}},
+      "refs": [
+        {"kind": "config", "path": ".github/workflows/cerberus-review.yml", "label": "PR review workflow"},
+        {"kind": "doc", "path": "docs/fleet-onboarding.md", "label": "Cerberus boundary"}
+      ]
     }
   ],
   "edges": [
@@ -1271,6 +1336,54 @@
           "path": "memory-engine-016",
           "label": "Powder card memory-engine-016"
         }
+      ]
+    },
+    {
+      "id": "edge.fleet.landmark-to-map",
+      "from": "node.fleet.landmark",
+      "to": "node.fleet.project-map",
+      "label": "release intelligence stays separate",
+      "kind": "boundary",
+      "summary": "Landmark reads release declarations; it does not generate or own the project architecture map.",
+      "viewTags": ["fleet-integration"],
+      "refs": [
+        {"kind": "doc", "path": "docs/architecture/README.md", "label": "authority boundary"}
+      ]
+    },
+    {
+      "id": "edge.fleet.canary-to-runtime",
+      "from": "node.fleet.canary",
+      "to": "node.service.prototype",
+      "label": "reports API failures",
+      "kind": "observes",
+      "summary": "The production API state boundary emits fire-and-forget Canary error reports.",
+      "viewTags": ["fleet-integration"],
+      "refs": [
+        {"kind": "source", "path": "crates/memory-engine-api-state/src/lib.rs", "label": "Canary reporter integration"}
+      ]
+    },
+    {
+      "id": "edge.fleet.powder-to-card",
+      "from": "node.fleet.powder",
+      "to": "node.powder.016",
+      "label": "records delivery work",
+      "kind": "tracks",
+      "summary": "Powder records the onboarding card and its durable proof rather than a repository-local backlog.",
+      "viewTags": ["fleet-integration"],
+      "refs": [
+        {"kind": "powder", "path": "memory-engine-067", "label": "onboarding card"}
+      ]
+    },
+    {
+      "id": "edge.fleet.cerberus-to-github",
+      "from": "node.fleet.cerberus",
+      "to": "node.fleet.project-map",
+      "label": "workflow is declarative",
+      "kind": "declares",
+      "summary": "The review path is kept in GitHub workflow configuration and documented without runtime-crate changes.",
+      "viewTags": ["fleet-integration"],
+      "refs": [
+        {"kind": "config", "path": ".github/workflows/cerberus-review.yml", "label": "Cerberus workflow"}
       ]
     }
   ]

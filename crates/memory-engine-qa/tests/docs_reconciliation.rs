@@ -207,3 +207,67 @@ fn current_runtime_contract_has_no_retired_provider_recreation_path() {
         }
     }
 }
+
+#[test]
+fn fleet_onboarding_contract_is_declarative_and_current() {
+    let landmark = read_repo_file(".landmark.yml");
+    assert_contains_all(
+        ".landmark.yml",
+        &landmark,
+        &[
+            "product:",
+            "name: Memory Engine",
+            "changelog:",
+            "source: auto",
+            "release:",
+            "profile: synthesis-only",
+        ],
+    );
+
+    let cerberus = read_repo_file(".github/workflows/cerberus-review.yml");
+    assert_contains_all(
+        ".github/workflows/cerberus-review.yml",
+        &cerberus,
+        &[
+            "pull_request:",
+            "misty-step/cerberus",
+            "v0.72.0",
+            "review-pr",
+            "CERBERUS_GH_TOKEN",
+            "CERBERUS_OPENROUTER_KEY",
+            "--summary-target status",
+            "--post",
+        ],
+    );
+    assert!(
+        cerberus.contains("if: steps.preflight.outputs.ready == 'true'"),
+        "Cerberus must skip cleanly when its narrow provider key is unavailable"
+    );
+
+    let onboarding = read_repo_file("docs/fleet-onboarding.md");
+    assert_contains_all(
+        "docs/fleet-onboarding.md",
+        &onboarding,
+        &[
+            "memory-engine.map.json",
+            "CANARY_ENDPOINT",
+            "memory-engine-api",
+            "Powder",
+            "Cerberus",
+            "Bitterblossom",
+        ],
+    );
+
+    let map = read_repo_file("docs/architecture/memory-engine.map.json");
+    assert_contains_all(
+        "docs/architecture/memory-engine.map.json",
+        &map,
+        &[
+            "fleet-integration",
+            "node.fleet.landmark",
+            "node.fleet.cerberus",
+            "node.fleet.canary",
+            "node.fleet.powder",
+        ],
+    );
+}

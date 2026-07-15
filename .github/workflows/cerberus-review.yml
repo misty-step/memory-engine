@@ -1,0 +1,74 @@
+name: Cerberus PR review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request number to review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: cerberus-${{ github.event.pull_request.number || inputs.pull_request_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check narrow Cerberus provider key
+        id: preflight
+        env:
+          CERBERUS_OPENROUTER_KEY: ${{ secrets.CERBERUS_OPENROUTER_KEY }}
+        run: |
+          if [ -z "$CERBERUS_OPENROUTER_KEY" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cerberus review skipped: CERBERUS_OPENROUTER_KEY is not provisioned."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        if: steps.preflight.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pinned Cerberus
+        if: steps.preflight.outputs.ready == 'true'
+        # v0.72.0; pin the release commit so PRs cannot change the reviewer.
+        run: cargo install --locked --git https://github.com/misty-step/cerberus.git --rev b10bffb6ddb14ec553fbcf4f5e687aee13424717 --bin cerberus
+
+      - name: Install pinned OpenCode substrate
+        if: steps.preflight.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install OpenCode 1.2.6
+        if: steps.preflight.outputs.ready == 'true'
+        run: npm install --global opencode-ai@1.2.6
+
+      - name: Review pull request
+        if: steps.preflight.outputs.ready == 'true'
+        env:
+          CERBERUS_GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.CERBERUS_OPENROUTER_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request_number }}
+        run: |
+          cerberus review-pr \
+            --number "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --out-dir target/cerberus/review-pr \
+            --gh-token-env CERBERUS_GH_TOKEN \
+            --allow-env OPENROUTER_API_KEY \
+            --harness opencode \
+            --model openrouter/z-ai/glm-5.2 \
+            --summary-target status \
+            --post
