@@ -11,7 +11,11 @@ use std::{
     fs,
     io::Write as _,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::Duration,
 };
 
 use axum::{
@@ -39,6 +43,7 @@ use sha2::{Digest, Sha256};
 
 type UnsubscribeHmac = Hmac<Sha256>;
 
+mod file_lock;
 mod jobs;
 mod registry;
 mod storage;
@@ -52,6 +57,52 @@ use storage::StudyStorageConfig;
 pub struct ApiState {
     accounts: AccountRegistry,
     jobs: JobQueue,
+    scheduler: Arc<SchedulerRuntime>,
+}
+
+struct SchedulerRuntime {
+    enabled: AtomicBool,
+    running: AtomicBool,
+    last_run_at_ms: AtomicI64,
+    last_success_at_ms: AtomicI64,
+    failure_count: AtomicU64,
+}
+
+/// Owns the scheduler task and joins it after signalling shutdown.
+pub struct SchedulerHandle {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SchedulerHandle {
+    fn disabled() -> Self {
+        Self {
+            shutdown: None,
+            task: None,
+        }
+    }
+
+    /// Stop the scheduler and wait for any in-flight blocking sweep to finish.
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Default for SchedulerRuntime {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            last_run_at_ms: AtomicI64::new(0),
+            last_success_at_ms: AtomicI64::new(0),
+            failure_count: AtomicU64::new(0),
+        }
+    }
 }
 
 impl ApiState {
@@ -63,7 +114,11 @@ impl ApiState {
             Some(path) => JobQueue::with_persistence(accounts.clone(), path),
             None => JobQueue::new(accounts.clone()),
         };
-        Self { accounts, jobs }
+        Self {
+            accounts,
+            jobs,
+            scheduler: Arc::new(SchedulerRuntime::default()),
+        }
     }
 
     /// Start the background generation worker. Call once, from inside the Tokio
@@ -400,6 +455,172 @@ impl ApiState {
             due_count,
             force_confirmation,
         )
+    }
+
+    /// Run one bounded, request-independent reminder sweep. This is the
+    /// scheduler's explicit execution surface; it is safe to call from a
+    /// cron/manual trigger and uses the durable account claim before mail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when enumeration itself cannot be completed.
+    pub fn run_scheduled_return_notifications(
+        &self,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        self.run_scheduled_return_notifications_with_config(
+            ReturnNotificationSchedulerConfig::default(),
+        )
+    }
+
+    /// Run one scheduler sweep with an explicit bound. This is public for the
+    /// safe manual/backfill trigger and deterministic boundary tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when enumeration itself cannot be completed.
+    pub fn run_scheduled_return_notifications_with_config(
+        &self,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let result = self.accounts.run_scheduled_return_notifications(config);
+        match &result {
+            Ok(report) => {
+                self.scheduler
+                    .last_run_at_ms
+                    .store(report.finished_at_ms, Ordering::Relaxed);
+                if report.failed == 0 {
+                    self.scheduler
+                        .last_success_at_ms
+                        .store(report.finished_at_ms, Ordering::Relaxed);
+                }
+                self.scheduler
+                    .failure_count
+                    .fetch_add(report.failed as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.scheduler.failure_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+
+    /// Start the production scheduled trigger. Multiple API instances are
+    /// safe because durable storage owns the per-account claim/fence.
+    #[must_use]
+    pub fn start_return_notification_scheduler(&self) -> SchedulerHandle {
+        let interval_ms = scheduler_interval_ms();
+        let config = ReturnNotificationSchedulerConfig::from_env();
+        if !scheduler_enabled() {
+            return SchedulerHandle::disabled();
+        }
+        self.start_return_notification_scheduler_with_config(interval_ms, config)
+    }
+
+    /// Start a scheduler with explicit timing and batch controls.
+    ///
+    /// This is also the lifecycle seam used by deterministic boundary tests;
+    /// production hosts should use [`Self::start_return_notification_scheduler`].
+    #[must_use]
+    pub fn start_return_notification_scheduler_with_interval(
+        &self,
+        interval: Duration,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> SchedulerHandle {
+        let interval_ms =
+            u64::try_from(interval.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+        self.start_return_notification_scheduler_with_config(interval_ms, config)
+    }
+
+    fn start_return_notification_scheduler_with_config(
+        &self,
+        interval_ms: u64,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> SchedulerHandle {
+        self.scheduler.enabled.store(true, Ordering::Relaxed);
+        let state = self.clone();
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                state.scheduler.running.store(true, Ordering::Relaxed);
+                let run_state = state.clone();
+                let mut run = std::pin::pin!(tokio::task::spawn_blocking(move || {
+                    run_state.run_scheduled_return_notifications_with_config(config)
+                }));
+                let result = tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = &mut shutdown_rx => {
+                        let _ = (&mut run).await;
+                        None
+                    }
+                };
+                state.scheduler.running.store(false, Ordering::Relaxed);
+                let Some(result) = result else {
+                    break;
+                };
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("return notification scheduler enumeration failed: {error:?}");
+                    }
+                    Err(error) => {
+                        state
+                            .scheduler
+                            .failure_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("return notification scheduler worker failed: {error}");
+                    }
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+            state.scheduler.enabled.store(false, Ordering::Relaxed);
+            state.scheduler.running.store(false, Ordering::Relaxed);
+        });
+        SchedulerHandle {
+            shutdown: Some(shutdown),
+            task: Some(task),
+        }
+    }
+
+    /// Run the bounded scheduler through the operator-only manual token.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the manual trigger is not configured or the
+    /// supplied token does not match.
+    pub fn run_manual_return_notification_scheduler(
+        &self,
+        token: &str,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let configured = self
+            .accounts
+            .lock_data()
+            .auth_config
+            .scheduler_manual_token
+            .clone();
+        if configured.as_deref().is_none_or(|value| value != token) {
+            return Err(ApiFailure::forbidden(
+                "Scheduled reminder trigger is not authorized.",
+            ));
+        }
+        self.run_scheduled_return_notifications()
+    }
+
+    #[must_use]
+    pub fn scheduler_health(&self) -> SchedulerHealth {
+        SchedulerHealth {
+            enabled: self.scheduler.enabled.load(Ordering::Relaxed),
+            running: self.scheduler.running.load(Ordering::Relaxed),
+            last_run_at_ms: nonzero_timestamp(
+                self.scheduler.last_run_at_ms.load(Ordering::Relaxed),
+            ),
+            last_success_at_ms: nonzero_timestamp(
+                self.scheduler.last_success_at_ms.load(Ordering::Relaxed),
+            ),
+            failure_count: self.scheduler.failure_count.load(Ordering::Relaxed),
+        }
     }
 
     /// Validate an email unsubscribe link without changing preference state.
@@ -764,6 +985,17 @@ impl ApiState {
         self.jobs.run_pending_blocking();
     }
 
+    /// Read durable reminder state for boundary tests and operator receipts.
+    #[doc(hidden)]
+    pub fn load_return_notification_preference_for_test(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        self.accounts
+            .storage()
+            .load_return_notification_preference(account_id)
+    }
+
     /// Return one job by id. Test helper for route coverage.
     #[doc(hidden)]
     #[must_use]
@@ -784,6 +1016,7 @@ pub struct AuthConfig {
     expose_debug_links: bool,
     link_delivery: AuthLinkDelivery,
     unsubscribe_secret: String,
+    scheduler_manual_token: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -793,6 +1026,7 @@ impl Default for AuthConfig {
             expose_debug_links: false,
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
+            scheduler_manual_token: None,
         }
     }
 }
@@ -815,6 +1049,10 @@ pub struct ReturnNotificationPreference {
     pub pending_due_count: Option<usize>,
     #[serde(default)]
     pub pending_unsubscribe_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub retry_attempts: u32,
+    #[serde(default)]
+    pub next_retry_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,6 +1077,71 @@ pub(crate) struct ReturnNotificationClaimRequest {
     pub claim_expires_at_ms: i64,
     pub unsubscribe_nonce: String,
     pub unsubscribe_expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledReturnNotificationReport {
+    pub examined: usize,
+    pub due: usize,
+    pub sent: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub truncated: bool,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationSchedulerConfig {
+    pub batch_size: usize,
+}
+
+impl Default for ReturnNotificationSchedulerConfig {
+    fn default() -> Self {
+        Self { batch_size: 100 }
+    }
+}
+
+impl ReturnNotificationSchedulerConfig {
+    #[must_use]
+    pub fn from_env() -> Self {
+        let batch_size = std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map_or(100, |value| value.min(1_000));
+        Self { batch_size }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerHealth {
+    pub enabled: bool,
+    pub running: bool,
+    pub last_run_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub failure_count: u64,
+}
+
+fn nonzero_timestamp(value: i64) -> Option<i64> {
+    (value > 0).then_some(value)
+}
+
+fn scheduler_enabled() -> bool {
+    std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED")
+        .map(|value| value.trim() != "false")
+        .unwrap_or(true)
+}
+
+fn scheduler_interval_ms() -> u64 {
+    std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map_or(900, |value| value.min(86_400))
+        .saturating_mul(1_000)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -889,6 +1192,12 @@ impl AuthConfig {
     #[must_use]
     pub fn with_unsubscribe_secret(mut self, secret: impl Into<String>) -> Self {
         self.unsubscribe_secret = secret.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_scheduler_manual_token(mut self, token: impl Into<String>) -> Self {
+        self.scheduler_manual_token = Some(token.into());
         self
     }
 
@@ -1147,6 +1456,7 @@ impl StudyViewResponse {
 pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
+    pub return_notification_scheduler: SchedulerHealth,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1953,5 +2263,26 @@ mod tests {
         );
 
         assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
+    }
+
+    #[tokio::test]
+    async fn scheduler_handle_shutdown_stops_and_joins_the_owned_task() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-scheduler-lifecycle-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        fs::create_dir_all(&root).expect("scheduler store root");
+        let state = ApiState::new(AccountRegistry::with_store_root(&root));
+        let handle = state.start_return_notification_scheduler_with_interval(
+            Duration::from_millis(1),
+            ReturnNotificationSchedulerConfig { batch_size: 1 },
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.shutdown().await;
+        let health = state.scheduler_health();
+        assert!(!health.enabled);
+        assert!(!health.running);
+        let _ = fs::remove_dir_all(root);
     }
 }

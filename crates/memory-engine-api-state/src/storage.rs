@@ -3,7 +3,6 @@ use std::{
     fmt, fs, io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use memory_engine_service::{
@@ -267,8 +266,20 @@ impl StudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
-        self.inner.release_return_notification(account_id, claim_id)
+        self.inner
+            .release_return_notification(account_id, claim_id, now_ms)
+    }
+
+    pub(crate) fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        self.inner
+            .enabled_return_notification_accounts(limit, now_ms, interval_ms)
     }
 
     pub(crate) fn record_rate_limit_attempts(
@@ -472,47 +483,6 @@ impl StudyStorage {
     }
 }
 
-struct FileReturnNotificationLock {
-    path: PathBuf,
-}
-
-const RETURN_NOTIFICATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
-
-impl FileReturnNotificationLock {
-    fn acquire(path: PathBuf) -> Result<Self, ApiFailure> {
-        for _ in 0..5_000 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > RETURN_NOTIFICATION_LOCK_STALE_AFTER)
-                    {
-                        let _ = fs::remove_file(&path);
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => return Err(ApiFailure::internal(error.to_string())),
-            }
-        }
-        Err(ApiFailure::internal(
-            "timed out acquiring return notification claim lock".to_owned(),
-        ))
-    }
-}
-
-impl Drop for FileReturnNotificationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 trait StudyStorageAdapter: fmt::Debug + Send + Sync {
     fn account_store_path(&self, account_id: &str) -> PathBuf;
     fn save_account_session(&self, account_id: &str, session_token: &str)
@@ -577,7 +547,14 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure>;
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure>;
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -890,8 +867,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let existing = match fs::read(&path) {
             Ok(bytes) => Some(
@@ -954,6 +930,20 @@ impl StudyStorageAdapter for FileStudyStorage {
                         .and_then(|preference| preference.pending_unsubscribe_expires_at_ms)
                 })
                 .flatten(),
+            retry_attempts: if preserve_pending {
+                existing
+                    .as_ref()
+                    .map_or(0, |preference| preference.retry_attempts)
+            } else {
+                0
+            },
+            next_retry_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.next_retry_at_ms)
+                })
+                .flatten(),
         };
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -987,8 +977,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1008,6 +997,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
         preference.pending_unsubscribe_expires_at_ms = None;
+        preference.retry_attempts = 0;
+        preference.next_retry_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes)
@@ -1022,8 +1013,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(&request.account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Ok(None);
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(None);
@@ -1033,8 +1027,13 @@ impl StudyStorageAdapter for FileStudyStorage {
         let interval_elapsed = preference
             .last_sent_at_ms
             .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
-        let eligible = preference.pending_delivery_key.is_some()
-            || (interval_elapsed && (request.force_confirmation || request.due_count > 0));
+        let eligible = (preference.pending_delivery_key.is_some()
+            && preference
+                .next_retry_at_ms
+                .is_none_or(|retry_at| retry_at <= request.now_ms))
+            || (preference.pending_delivery_key.is_none()
+                && interval_elapsed
+                && (request.force_confirmation || request.due_count > 0));
         if !preference.enabled
             || !eligible
             || preference
@@ -1084,8 +1083,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Ok(false);
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1101,6 +1103,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
         preference.pending_unsubscribe_expires_at_ms = None;
+        preference.retry_attempts = 0;
+        preference.next_retry_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1111,12 +1115,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Err(ApiFailure::conflict(
+                "Return notification state is busy; retry the delivery.",
+            ));
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(());
@@ -1126,6 +1136,15 @@ impl StudyStorageAdapter for FileStudyStorage {
         if preference.claim_id.as_deref() == Some(claim_id) {
             preference.claim_id = None;
             preference.claim_expires_at_ms = None;
+            let delay_ms = 60_000_i64.saturating_mul(
+                1_i64
+                    .checked_shl(preference.retry_attempts.min(9))
+                    .unwrap_or(512)
+                    .min(360),
+            );
+            preference.retry_attempts = preference.retry_attempts.saturating_add(1);
+            preference.next_retry_at_ms =
+                Some(now_ms.saturating_add(delay_ms.min(6 * 60 * 60 * 1_000)));
             let bytes = serde_json::to_vec(&preference)
                 .map_err(|error| ApiFailure::internal(error.to_string()))?;
             write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1170,6 +1189,65 @@ impl StudyStorageAdapter for FileStudyStorage {
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
         Ok(account_session_path(&self.store_root, account_id).exists()
             || account_store_path(&self.store_root, account_id).exists())
+    }
+
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        let mut account_ids = Vec::new();
+        for entry in fs::read_dir(&self.store_root)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let account_id = entry.file_name().to_string_lossy().into_owned();
+            if account_id.starts_with('_') {
+                continue;
+            }
+            let path = entry.path().join("return-notifications.json");
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ApiFailure::internal(format!(
+                        "failed to read return notification preference for {account_id}: {error}"
+                    )))
+                }
+            };
+            let preference = serde_json::from_slice::<ReturnNotificationPreference>(&bytes)
+                .map_err(|error| {
+                    ApiFailure::internal(format!(
+                        "failed to parse return notification preference for {account_id}: {error}"
+                    ))
+                })?;
+            let pending_ready = preference.pending_delivery_key.is_some()
+                && preference
+                    .next_retry_at_ms
+                    .is_none_or(|retry_at_ms| retry_at_ms <= now_ms);
+            let cadence_ready = preference.last_sent_at_ms.is_none_or(|last_sent_at_ms| {
+                last_sent_at_ms <= now_ms.saturating_sub(interval_ms)
+            });
+            let claim_ready = preference
+                .claim_expires_at_ms
+                .is_none_or(|claim_expires_at_ms| claim_expires_at_ms <= now_ms);
+            if preference.enabled
+                && claim_ready
+                && (pending_ready || (preference.pending_delivery_key.is_none() && cadence_ready))
+            {
+                account_ids.push(account_id);
+            }
+        }
+        account_ids.sort();
+        account_ids.truncate(limit);
+        Ok(account_ids)
     }
 
     fn copy_account(
@@ -1593,11 +1671,17 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         enabled: preference.enabled,
                         last_sent_at_ms: preference.last_sent_at_ms,
                         unsubscribe_nonce: preference.unsubscribe_nonce,
-                        claim_id: None,
-                        claim_expires_at_ms: None,
-                        pending_delivery_key: None,
-                        pending_due_count: None,
-                        pending_unsubscribe_expires_at_ms: None,
+                        claim_id: preference.claim_id,
+                        claim_expires_at_ms: preference.claim_expires_at_ms,
+                        pending_delivery_key: preference.pending_delivery_key,
+                        pending_due_count: preference
+                            .pending_due_count
+                            .and_then(|value| usize::try_from(value).ok()),
+                        pending_unsubscribe_expires_at_ms: preference
+                            .pending_unsubscribe_expires_at_ms,
+                        retry_attempts: u32::try_from(preference.retry_attempts)
+                            .map_or(u32::MAX, |value| value),
+                        next_retry_at_ms: preference.next_retry_at_ms,
                     })
                 })
                 .map_err(postgres_failure)
@@ -1677,10 +1761,33 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
         with_postgres_store(&self.database_url, |store| {
             store
-                .release_return_notification(account_id, claim_id)
+                .release_return_notification(account_id, claim_id, now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn enabled_return_notification_accounts(
+        &self,
+        limit: usize,
+        now_ms: i64,
+        interval_ms: i64,
+    ) -> Result<Vec<String>, ApiFailure> {
+        let limit = i64::try_from(limit).map_err(|_| {
+            ApiFailure::internal("scheduler batch exceeds postgres range".to_owned())
+        })?;
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .enabled_return_notification_accounts(limit, now_ms, interval_ms)
+                .map(|accounts| {
+                    accounts
+                        .into_iter()
+                        .map(|account| account.account_id)
+                        .collect()
+                })
                 .map_err(postgres_failure)
         })
     }
@@ -2106,6 +2213,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
     };
@@ -2313,6 +2421,197 @@ mod tests {
     }
 
     #[test]
+    fn file_return_notification_lock_is_nonblocking_and_descriptor_owned() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        fs::create_dir_all(&root).expect("lock directory");
+        let path = root.join("return-notifications.lock");
+        fs::write(&path, b"existing-owner-marker").expect("existing lock path");
+
+        let first = crate::file_lock::try_acquire(&path)
+            .expect("first lock attempt")
+            .expect("first owner");
+        let started = std::time::Instant::now();
+        assert!(
+            crate::file_lock::try_acquire(&path)
+                .expect("contended lock attempt")
+                .is_none(),
+            "a contended owner must not be acquired"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "contended lock acquisition must not sleep"
+        );
+        drop(first);
+
+        assert!(path.exists(), "dropping an owner must not unlink the path");
+        assert_eq!(
+            fs::read(&path).expect("lock marker"),
+            b"existing-owner-marker"
+        );
+        let second = crate::file_lock::try_acquire(&path)
+            .expect("second lock attempt")
+            .expect("ownership after first drop");
+        drop(second);
+        assert!(path.exists(), "the shared lock path remains durable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_scheduler_filters_future_retries_before_batch_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-fairness-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-a-future-retry",
+                "future@example.com",
+                true,
+                None,
+                "future-nonce",
+            )
+            .expect("future preference");
+        storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-a-future-retry".to_owned(),
+                now_ms: test_now(),
+                due_count: 1,
+                force_confirmation: true,
+                interval_ms: 86_400_000,
+                claim_id: "future-claim".to_owned(),
+                delivery_key: "future-delivery".to_owned(),
+                claim_expires_at_ms: test_now() + 100,
+                unsubscribe_nonce: "future-nonce".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("future claim")
+            .expect("future claim available");
+        storage
+            .release_return_notification("account-a-future-retry", "future-claim", test_now())
+            .expect("future retry release");
+        storage
+            .save_return_notification_preference(
+                "account-b-ready",
+                "ready@example.com",
+                true,
+                None,
+                "ready-nonce",
+            )
+            .expect("ready preference");
+        storage
+            .save_return_notification_preference(
+                "account-c-active-claim",
+                "active@example.com",
+                true,
+                None,
+                "active-nonce",
+            )
+            .expect("active preference");
+        storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-c-active-claim".to_owned(),
+                now_ms: test_now(),
+                due_count: 1,
+                force_confirmation: true,
+                interval_ms: 86_400_000,
+                claim_id: "active-claim".to_owned(),
+                delivery_key: "active-delivery".to_owned(),
+                claim_expires_at_ms: test_now() + 60_000,
+                unsubscribe_nonce: "active-nonce".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("active claim")
+            .expect("active claim available");
+
+        assert_eq!(
+            storage
+                .enabled_return_notification_accounts(1, test_now(), 86_400_000)
+                .expect("eligible accounts"),
+            vec!["account-b-ready"]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_scheduler_surfaces_malformed_notification_preferences() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-malformed-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_dir = root.join("account-malformed");
+        fs::create_dir_all(&account_dir).expect("account directory");
+        fs::write(account_dir.join("return-notifications.json"), b"not-json")
+            .expect("malformed preference");
+        let storage = StudyStorage::file(&root, test_now);
+        let error = storage
+            .enabled_return_notification_accounts(10, test_now(), 86_400_000)
+            .expect_err("malformed preference must fail enumeration");
+        assert!(error.message.contains("account-malformed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_retry_backoff_reaches_and_holds_at_six_hours() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-backoff-cap-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-backoff-cap",
+                "backoff@example.com",
+                true,
+                None,
+                "backoff-nonce",
+            )
+            .expect("backoff preference");
+        let mut now_ms = test_now();
+        for (attempt, expected_minutes) in [1_i64, 2, 4, 8, 16, 32, 64, 128, 256, 360, 360]
+            .into_iter()
+            .enumerate()
+        {
+            let claim_id = format!("backoff-claim-{attempt}");
+            storage
+                .claim_return_notification(&ReturnNotificationClaimRequest {
+                    account_id: "account-backoff-cap".to_owned(),
+                    now_ms,
+                    due_count: 1,
+                    force_confirmation: true,
+                    interval_ms: 86_400_000,
+                    claim_id: claim_id.clone(),
+                    delivery_key: "backoff-delivery".to_owned(),
+                    claim_expires_at_ms: now_ms + 100,
+                    unsubscribe_nonce: "backoff-nonce".to_owned(),
+                    unsubscribe_expires_at_ms: now_ms + 604_800_000,
+                })
+                .expect("backoff claim")
+                .expect("backoff claim available");
+            storage
+                .release_return_notification("account-backoff-cap", &claim_id, now_ms)
+                .expect("backoff release");
+            let preference = storage
+                .load_return_notification_preference("account-backoff-cap")
+                .expect("backoff load")
+                .expect("backoff preference");
+            assert_eq!(
+                preference.next_retry_at_ms,
+                Some(now_ms + expected_minutes * 60_000)
+            );
+            now_ms = preference.next_retry_at_ms.expect("retry timestamp");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_unsubscribe_race_cannot_leave_stale_token_disabled_after_reenable() {
         let root = std::env::temp_dir().join(format!(
             "memory-engine-return-race-{}-{}",
@@ -2357,7 +2656,21 @@ mod tests {
         });
 
         let stale_result = stale.join().expect("stale worker");
-        reenable.join().expect("reenable worker").expect("reenable");
+        match reenable.join().expect("reenable worker") {
+            Ok(()) => {}
+            Err(error) => {
+                assert_eq!(error.status, StatusCode::CONFLICT);
+                storage
+                    .save_return_notification_preference(
+                        "account-a",
+                        "a@example.com",
+                        true,
+                        None,
+                        "nonce-reenabled",
+                    )
+                    .expect("reenable after contention");
+            }
+        }
         let preference = storage
             .load_return_notification_preference("account-a")
             .expect("load preference")

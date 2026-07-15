@@ -12,10 +12,10 @@ use crate::{
     source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
     AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
     CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
-    ProjectDeckRecord, ReturnNotificationClaimRequest, SourceRecord, StudyStorage,
-    StudyViewResponse, SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
-    APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
+    ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
+    SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+    AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -248,6 +248,86 @@ impl AccountRegistry {
         force_confirmation: bool,
     ) -> Result<bool, ApiFailure> {
         self.require_account(account_id, session_token)?;
+        self.send_due_count_notification(account_id, due_count, force_confirmation)
+    }
+
+    pub(crate) fn run_scheduled_return_notifications(
+        &self,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> Result<ScheduledReturnNotificationReport, ApiFailure> {
+        let started_at_ms = self.now();
+        let storage = self.storage();
+        let mut account_ids = storage.enabled_return_notification_accounts(
+            config.batch_size.saturating_add(1),
+            started_at_ms,
+            RETURN_NOTIFICATION_INTERVAL_MS,
+        )?;
+        let truncated = account_ids.len() > config.batch_size;
+        account_ids.truncate(config.batch_size);
+        let mut report = ScheduledReturnNotificationReport {
+            started_at_ms,
+            ..ScheduledReturnNotificationReport::default()
+        };
+        report.examined = account_ids.len();
+        for account_id in account_ids {
+            let preference = match storage.load_return_notification_preference(&account_id) {
+                Ok(Some(preference)) => preference,
+                Ok(None) => {
+                    report.skipped = report.skipped.saturating_add(1);
+                    continue;
+                }
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!(
+                        "return notification scheduler preference failed account={account_id}: {error:?}"
+                    );
+                    continue;
+                }
+            };
+            let view = match storage
+                .study_view(&account_id, &storage.account_store_path(&account_id))
+            {
+                Ok(view) => view,
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!("return notification scheduler due-count failed account={account_id}: {error:?}");
+                    continue;
+                }
+            };
+            if view.due_count == 0 {
+                if preference.pending_delivery_key.is_none() {
+                    report.skipped = report.skipped.saturating_add(1);
+                    continue;
+                }
+            } else {
+                report.due = report.due.saturating_add(1);
+            }
+            match self.send_due_count_notification(&account_id, view.due_count, false) {
+                Ok(true) => report.sent = report.sent.saturating_add(1),
+                Ok(false) => report.skipped = report.skipped.saturating_add(1),
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    eprintln!(
+                        "return notification scheduler send failed account={account_id}: {error:?}"
+                    );
+                }
+            }
+        }
+        report.truncated = truncated;
+        report.finished_at_ms = self.now();
+        eprintln!(
+            "return notification scheduler examined={} due={} sent={} skipped={} failed={} truncated={}",
+            report.examined, report.due, report.sent, report.skipped, report.failed, report.truncated
+        );
+        Ok(report)
+    }
+
+    fn send_due_count_notification(
+        &self,
+        account_id: &str,
+        due_count: usize,
+        force_confirmation: bool,
+    ) -> Result<bool, ApiFailure> {
         let now = self.now();
         let auth_config = {
             let data = self.lock_data();
@@ -288,13 +368,16 @@ impl AccountRegistry {
             &unsubscribe_link,
             &claim.delivery_key,
         ) {
-            storage.release_return_notification(account_id, &claim.claim_id)?;
+            let release_at_ms = self.now();
+            storage.release_return_notification(account_id, &claim.claim_id, release_at_ms)?;
             return Err(error);
         }
-        if !storage.complete_return_notification(account_id, &claim.claim_id, now)? {
-            return Err(ApiFailure::internal(
-                "return notification claim was fenced before completion".to_owned(),
-            ));
+        let completed_at_ms = self.now();
+        if !storage.complete_return_notification(account_id, &claim.claim_id, completed_at_ms)? {
+            // A contended completion or an expired lease is a fenced send,
+            // not a scheduler failure. The durable delivery key makes the
+            // next reclaim idempotent while the persisted claim is recovered.
+            return Ok(false);
         }
         Ok(true)
     }
@@ -1054,7 +1137,7 @@ impl AccountRegistry {
         Ok(())
     }
 
-    fn storage(&self) -> StudyStorage {
+    pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
         data.storage.storage(data.now_fn)
     }
@@ -1188,6 +1271,16 @@ impl AuthConfig {
                     fs::create_dir_all(parent)
                         .map_err(|error| ApiFailure::internal(error.to_string()))?;
                 }
+                let lock_path = path.with_extension("lock");
+                let _lock = crate::file_lock::acquire(&lock_path)?;
+                let already_recorded = fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("due-count\t"))
+                    .any(|line| line.split('\t').nth(3) == Some(delivery_key));
+                if already_recorded {
+                    return Ok(());
+                }
                 let mut outbox = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1225,5 +1318,115 @@ impl AuthConfig {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
+
+    fn test_now() -> i64 {
+        1_700_000_000_000
+    }
+
+    #[test]
+    fn file_outbox_deduplicates_a_reclaimed_slow_send_by_delivery_key() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-outbox-reclaim-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let outbox = root.join("reminders.tsv");
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-slow-send",
+                "slow@example.com",
+                true,
+                None,
+                "slow-nonce",
+            )
+            .expect("preference");
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-slow-send".to_owned(),
+                now_ms: test_now(),
+                due_count: 3,
+                force_confirmation: true,
+                interval_ms: RETURN_NOTIFICATION_INTERVAL_MS,
+                claim_id: "slow-claim-1".to_owned(),
+                delivery_key: "slow-delivery-key".to_owned(),
+                claim_expires_at_ms: test_now() + 50,
+                unsubscribe_nonce: "slow-nonce".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("first claim")
+            .expect("first claim available");
+        let second_storage = storage.clone();
+        let first_auth = AuthConfig::default().with_link_outbox(&outbox);
+        let second_auth = first_auth.clone();
+        let first = Arc::new(first);
+        let first_for_thread = Arc::clone(&first);
+        let slow_send_started = Arc::new(Barrier::new(2));
+        let reclaimed_send_finished = Arc::new(Barrier::new(2));
+        let slow_send_started_for_thread = Arc::clone(&slow_send_started);
+        let reclaimed_send_finished_for_thread = Arc::clone(&reclaimed_send_finished);
+        let slow_sender = thread::spawn(move || {
+            // The provider accepted the request only after the lease expired;
+            // the durable outbox must still collapse the reclaim to one key.
+            slow_send_started_for_thread.wait();
+            reclaimed_send_finished_for_thread.wait();
+            first_auth
+                .deliver_due_count_notification(
+                    &first_for_thread.email,
+                    first_for_thread.due_count,
+                    "/unsubscribe/slow",
+                    &first_for_thread.delivery_key,
+                )
+                .expect("slow sender outbox");
+        });
+
+        slow_send_started.wait();
+        thread::sleep(Duration::from_millis(75));
+        let second = second_storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-slow-send".to_owned(),
+                now_ms: test_now() + 100,
+                due_count: 4,
+                force_confirmation: false,
+                interval_ms: RETURN_NOTIFICATION_INTERVAL_MS,
+                claim_id: "slow-claim-2".to_owned(),
+                delivery_key: "new-delivery-key-must-not-replace-pending".to_owned(),
+                claim_expires_at_ms: test_now() + 1_000,
+                unsubscribe_nonce: "new-nonce-must-not-replace-pending".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_100,
+            })
+            .expect("reclaim")
+            .expect("expired claim is reclaimable");
+        assert_eq!(second.delivery_key, first.delivery_key);
+        second_auth
+            .deliver_due_count_notification(
+                &second.email,
+                second.due_count,
+                "/unsubscribe/slow",
+                &second.delivery_key,
+            )
+            .expect("reclaimed sender outbox");
+        reclaimed_send_finished.wait();
+        slow_sender.join().expect("slow sender");
+
+        let lines = fs::read_to_string(&outbox)
+            .expect("outbox")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "one delivery key produces one durable send");
+        assert!(lines[0].contains("slow-delivery-key"));
+        let _ = fs::remove_dir_all(root);
     }
 }

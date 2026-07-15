@@ -19,6 +19,10 @@ only current application runtime; rollback stays within DigitalOcean plus git.
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
   `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
   `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
+- Return scheduler: the API process owns a bounded, Postgres-backed sweep;
+  disable it with `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED=false`,
+  and keep the operator-only `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN`
+  out of source control.
 - Smoke contract: every DigitalOcean deployment runs the health, home-page,
   and anonymous mutation boundary checks below before it can be called live.
 
@@ -162,6 +166,10 @@ an encrypted App Platform variable and never copy its value into this repo.
 | `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
 | `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` | Stable secret for HMAC-signed, seven-day, account/email-scoped reminder unsubscribe links. |
+| `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED` | Optional kill switch; set `false` to disable scheduled reminder sweeps. |
+| `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN` | Operator-only token for bounded manual scheduler runs; store encrypted. |
+| `MEMORY_ENGINE_RETURN_NOTIFICATION_BATCH_SIZE` | Optional bounded sweep size, default 100 and capped at 1000. |
+| `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS` | Optional sweep interval, default 900 seconds and capped at 86400. |
 | `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Magic-link outbox file (no email provider wired yet; see Login). |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
 | `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.5-flash`; see docs/evals/). |
@@ -227,13 +235,61 @@ The signed-in workspace offers one explicit, optional return channel: “Enable
 due-count reminders.” It stores the normalized, allowlisted reminder address in
 the account store and sends one confirmation through the same
 `MEMORY_ENGINE_AUTH_MAILER_COMMAND` / `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH`
-boundary. Subsequent authenticated home renders may send a reminder only when
+boundary. The scheduled boundary enumerates enabled preferences without a
+browser request, computes each account's live due count, and sends only when
 reviews are due and the persisted last-send time is at least 24 hours old. The
 policy is deterministic, has no streaks or promotional content, and a learner
 can disable it from the workspace or the signed unsubscribe link in the
 plain-text message. The email GET only renders a confirmation; its POST carries
 the scoped token and performs the mutation without requiring a browser session.
-Disable is persisted and never sends mail.
+Disable is persisted and never sends mail. Home/render GETs are read-only and
+never invoke this boundary.
+
+### Scheduled execution and operations
+
+Every API instance starts the scheduler unless
+`MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED=false`. Each sweep is
+bounded by `MEMORY_ENGINE_RETURN_NOTIFICATION_BATCH_SIZE` (default 100,
+maximum 1000), runs at
+`MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS` (default 900),
+and uses the durable per-account claim as the multi-instance lease/fence. The
+current implementation deliberately uses one synchronous worker per instance;
+Postgres/file claims provide the cross-instance concurrency bound and provider
+idempotency prevents duplicate logical sends.
+
+The file adapter's per-account notification lock is a persistent path with an
+OS descriptor lock acquired nonblockingly. It is never deleted as part of
+ownership release, so stale paths are harmless; a process crash releases the
+descriptor and a contending scheduler skips that account until it can acquire
+the lock. The same libc-backed helper protects the repository-owned file
+outbox: it scans durable delivery keys while holding the descriptor lock and
+does not append a duplicate after a lease-expiry reclaim.
+
+The scheduler returns an owned lifecycle handle. The production binary joins
+that handle during graceful shutdown, including any in-flight blocking
+provider call, before exiting. Manual and interactive reminder routes run
+storage and provider work on blocking workers; health requests remain
+responsive while a provider is slow. `lastRunAtMs` records every sweep, while
+`lastSuccessAtMs` advances only for a sweep with zero failed accounts.
+
+The liveness counters are included in `/healthz` under
+`returnNotificationScheduler`. A bounded manual/backfill run is available only
+with the operator token:
+
+```sh
+curl -fsS -X POST \
+  -H "x-scheduler-token: ${MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN:?set token}" \
+  "$base/internal/scheduler/return-notifications"
+```
+
+A failed provider send releases the claim but preserves the complete 092
+delivery envelope and applies bounded exponential retry backoff (one minute,
+doubling to six hours). A crash after provider acceptance retries only after
+the lease expires with the same idempotency key and payload; stale finalize is
+fenced by claim id. To disable or roll back the trigger, set the scheduler
+flag false or revert the application commit and deploy through the normal
+DigitalOcean rollback procedure below. Inspect `/healthz`, provider send logs,
+and Canary failures together during an incident.
 
 Each unsubscribe link is a seven-day HMAC token bound to the account, normalized
 email, and a persisted unsubscribe nonce. The GET remains read-only; the POST

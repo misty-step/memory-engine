@@ -31,8 +31,8 @@ use memory_engine_api_state::{
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
     CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
-    InvalidateProjectDeckRequest, ProjectDeckRecord, SourceList, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest,
+    InvalidateProjectDeckRequest, ProjectDeckRecord, ScheduledReturnNotificationReport, SourceList,
+    SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -242,6 +242,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/icon-192.png", get(static_icon_192))
         .route("/icon-512.png", get(static_icon_512))
         .route("/apple-touch-icon.png", get(static_apple_touch_icon))
+        .route(
+            "/internal/scheduler/return-notifications",
+            post(run_return_notification_scheduler),
+        )
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
@@ -322,11 +326,30 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<HealthResponse> {
+async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "memory-engine-api",
+        return_notification_scheduler: state.scheduler_health(),
     })
+}
+
+async fn run_return_notification_scheduler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ScheduledReturnNotificationReport>, ApiFailure> {
+    let token = headers
+        .get("x-scheduler-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let report =
+        tokio::task::spawn_blocking(move || state.run_manual_return_notification_scheduler(&token))
+            .await
+            .map_err(|error| {
+                ApiFailure::internal(format!("scheduler worker join failed: {error}"))
+            })??;
+    Ok(Json(report))
 }
 
 /// Serve the Ledger design system stylesheet (DESIGN.md). The render crate
@@ -768,19 +791,26 @@ async fn return_notification_page(
     Query(query): Query<AppReturnNotificationQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(token) = query.token.as_deref() {
-        return match state.validate_return_notification_token(token) {
-            Ok(()) => no_store_response(
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(token) = query.token.as_deref() {
+            state.validate_return_notification_token(token)?;
+            return Ok(no_store_response(
                 Html(render_return_notification_confirmation(token)).into_response(),
-            ),
-            Err(error) => no_store_response(app_failure_response(error)),
-        };
+            ));
+        }
+        let account = state.require_browser_session_readonly(&headers)?;
+        Ok(no_store_response(
+            Html(render_account_page(&state, &account, None, None)).into_response(),
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => no_store_response(app_failure_response(error)),
+        Err(error) => no_store_response(app_failure_response(ApiFailure::internal(format!(
+            "notification page worker join failed: {error}"
+        )))),
     }
-    let account = match state.require_browser_session_readonly(&headers) {
-        Ok(account) => account,
-        Err(error) => return no_store_response(app_failure_response(error)),
-    };
-    no_store_response(Html(render_account_page(&state, &account, None, None)).into_response())
 }
 
 async fn update_return_notifications(
@@ -793,7 +823,14 @@ async fn update_return_notifications(
         .as_deref()
         .filter(|token| !token.trim().is_empty())
     {
-        return no_store_response(match state.disable_return_notification(token) {
+        let token = token.to_owned();
+        let result = tokio::task::spawn_blocking(move || state.disable_return_notification(&token))
+            .await
+            .map_err(|error| {
+                ApiFailure::internal(format!("unsubscribe worker join failed: {error}"))
+            })
+            .and_then(|result| result);
+        return no_store_response(match result {
             Ok(()) => Html(render_return_notification_disabled()).into_response(),
             Err(error) => app_failure_response(error),
         });
@@ -804,20 +841,28 @@ async fn update_return_notifications(
             Err(error) => return no_store_response(app_failure_response(error)),
         };
     let enabled = form.enabled.as_deref() == Some("on");
-    let due_count = state
-        .app_study_view(&account)
-        .map_or(0, |view| view.due_count);
-    let result = state
-        .set_return_notification(&account, form.reminder_email.as_deref(), enabled)
-        .and_then(|()| {
-            if enabled {
-                state
-                    .maybe_send_due_count_notification(&account, due_count, true)
-                    .map(|_| ())
-            } else {
-                Ok(())
-            }
-        });
+    let reminder_email = form.reminder_email.clone();
+    let state_for_work = state.clone();
+    let account_for_work = account.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let due_count = state_for_work
+            .app_study_view(&account_for_work)
+            .map_or(0, |view| view.due_count);
+        state_for_work
+            .set_return_notification(&account_for_work, reminder_email.as_deref(), enabled)
+            .and_then(|()| {
+                if enabled {
+                    state_for_work
+                        .maybe_send_due_count_notification(&account_for_work, due_count, true)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            })
+    })
+    .await
+    .map_err(|error| ApiFailure::internal(format!("notification worker join failed: {error}")))
+    .and_then(|result| result);
     let notice = match result {
         Ok(()) if enabled => "Due-count reminders are on. One confirmation was sent; reminders stay to one per day and can be turned off below.",
         Ok(()) => "Due-count reminders are off.",
