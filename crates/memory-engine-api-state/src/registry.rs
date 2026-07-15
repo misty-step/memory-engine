@@ -1323,7 +1323,11 @@ impl AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     fn test_now() -> i64 {
         1_700_000_000_000
@@ -1367,8 +1371,15 @@ mod tests {
         let second_auth = first_auth.clone();
         let first = Arc::new(first);
         let first_for_thread = Arc::clone(&first);
+        let slow_send_started = Arc::new(Barrier::new(2));
+        let reclaimed_send_finished = Arc::new(Barrier::new(2));
+        let slow_send_started_for_thread = Arc::clone(&slow_send_started);
+        let reclaimed_send_finished_for_thread = Arc::clone(&reclaimed_send_finished);
         let slow_sender = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(150));
+            // The provider accepted the request only after the lease expired;
+            // the durable outbox must still collapse the reclaim to one key.
+            slow_send_started_for_thread.wait();
+            reclaimed_send_finished_for_thread.wait();
             first_auth
                 .deliver_due_count_notification(
                     &first_for_thread.email,
@@ -1379,6 +1390,7 @@ mod tests {
                 .expect("slow sender outbox");
         });
 
+        slow_send_started.wait();
         thread::sleep(Duration::from_millis(75));
         let second = second_storage
             .claim_return_notification(&ReturnNotificationClaimRequest {
@@ -1404,6 +1416,7 @@ mod tests {
                 &second.delivery_key,
             )
             .expect("reclaimed sender outbox");
+        reclaimed_send_finished.wait();
         slow_sender.join().expect("slow sender");
 
         let lines = fs::read_to_string(&outbox)
