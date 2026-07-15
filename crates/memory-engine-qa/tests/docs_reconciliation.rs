@@ -503,7 +503,8 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
         "the isolated benchmark must use explicit shared-Git and cargo invariants"
     );
     assert!(
-        comparison.contains("output_dir=\"$GENERATION_CACHE_DIR/live-output\"")
+        comparison.contains("cache_root=\"$(cd -P -- \"$GENERATION_CACHE_DIR\" && pwd)\"")
+            && comparison.contains("output_dir=\"$cache_root/live-output\"")
             && comparison.contains("rm -rf -- \"$output_dir\"")
             && comparison.contains("--mount \"type=bind,src=$output_dir,dst=/output,rw\""),
         "the benchmark output mount must be freshly recreated outside the target tree"
@@ -553,6 +554,21 @@ PATH="$FAKE_BIN:/usr/bin:/bin" \
 bash "$helper_mount"
 "#;
 
+const STALE_RECEIPT_GIT: &str = r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = rev-parse ]; then
+  case "${2:-}" in
+    --git-common-dir) printf '%s\n' "$FAKE_GIT_DIR" ;;
+    --absolute-git-dir) printf '%s/worktree\n' "$FAKE_GIT_DIR" ;;
+    HEAD) printf '%s\n' "$GENERATION_HEAD_SHA" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = config ]; then exit 1; fi
+exit 1
+"#;
+
 fn prepare_stale_receipt_fixture() -> (
     std::path::PathBuf,
     std::path::PathBuf,
@@ -564,28 +580,13 @@ fn prepare_stale_receipt_fixture() -> (
     let root = test_temp_dir("stale-live-receipt");
     let scripts = root.join("scripts");
     let fake_bin = root.join("fake-bin");
-    let cache = root.join("cache");
+    let cache = fs::canonicalize(test_temp_dir("stale-live-cache")).expect("canonicalize cache");
+    let fake_git_dir = root.join("git-common");
     fs::create_dir_all(root.join("docs/evals")).expect("create target eval directory");
     fs::create_dir_all(&scripts).expect("create temporary scripts directory");
     fs::create_dir_all(&fake_bin).expect("create fake command directory");
-    fs::write(root.join("README"), "target\n").expect("write target fixture");
-    for args in [
-        vec!["init", "-q"],
-        vec!["config", "user.email", "qa@example.invalid"],
-        vec!["config", "user.name", "qa"],
-        vec!["add", "."],
-        vec!["commit", "-qm", "fixture"],
-    ] {
-        let result = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&root)
-            .status()
-            .expect("run target git fixture command");
-        assert!(
-            result.success(),
-            "target git fixture command failed: {args:?}"
-        );
-    }
+    fs::create_dir_all(&fake_git_dir).expect("create fake shared git directory");
+    fs::write(fake_git_dir.join("config"), "[core]\n").expect("write fake git config");
     fs::copy(
         repo_root().join("scripts/generation-061-live-comparison.sh"),
         scripts.join("generation-061-live-comparison.sh"),
@@ -635,8 +636,9 @@ fn prepare_stale_receipt_fixture() -> (
         "#!/bin/sh\n# malicious benchmark succeeds without producing a receipt\nexit 0\n",
     )
     .expect("write fake cargo");
+    fs::write(fake_bin.join("git"), STALE_RECEIPT_GIT).expect("write fake git");
     fs::write(fake_bin.join("docker"), STALE_RECEIPT_DOCKER).expect("write fake docker");
-    for name in ["cargo", "docker"] {
+    for name in ["cargo", "docker", "git"] {
         let path = fake_bin.join(name);
         let mut permissions = fs::metadata(&path)
             .expect("fake command metadata")
@@ -650,15 +652,6 @@ fn prepare_stale_receipt_fixture() -> (
 #[test]
 fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
     let (root, scripts, fake_bin, cache, target_receipt, stale) = prepare_stale_receipt_fixture();
-    let head = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&root)
-        .output()
-        .expect("read target head");
-    let head = String::from_utf8(head.stdout)
-        .expect("target head utf8")
-        .trim()
-        .to_owned();
     let mount_log = root.join("output-mount.txt");
     let original_path = std::env::var("PATH").expect("test PATH");
     let result = std::process::Command::new("bash")
@@ -667,8 +660,9 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         .env("PATH", format!("{}:{original_path}", fake_bin.display()))
         .env("FAKE_BIN", &fake_bin)
         .env("DOCKER_OUTPUT_MOUNT_LOG", &mount_log)
+        .env("FAKE_GIT_DIR", root.join("git-common"))
         .env("OPENROUTER_API_KEY", "sk-test")
-        .env("GENERATION_HEAD_SHA", head)
+        .env("GENERATION_HEAD_SHA", "fixture-head")
         .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
         .env("GENERATION_CONTAINER_LABEL", "fixture-label")
         .env("GENERATION_CACHE_DIR", &cache)
@@ -699,6 +693,7 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         !cache.join("live-output").exists(),
         "failed benchmark cleanup must remove only its owned output directory"
     );
+    fs::remove_dir_all(&cache).expect("remove stale receipt cache fixture");
     fs::remove_dir_all(root).expect("remove stale receipt fixture");
 }
 

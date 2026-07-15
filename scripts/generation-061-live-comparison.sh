@@ -166,8 +166,8 @@ set +e
   --pids-limit 256 \
   --mount "type=bind,src=$target_root,dst=/workspace,readonly" \
   --mount "type=bind,src=$output_dir,dst=/output,rw" \
-  --mount "type=bind,src=$GENERATION_CACHE_DIR/cargo-home,dst=/cargo-home,rw" \
-  --mount "type=bind,src=$GENERATION_CACHE_DIR/cargo-target,dst=/cargo-target,rw" \
+  --mount "type=bind,src=$cache_root/cargo-home,dst=/cargo-home,rw" \
+  --mount "type=bind,src=$cache_root/cargo-target,dst=/cargo-target,rw" \
   --mount "type=bind,src=$GENERATION_TRUSTED_HELPER,dst=/trusted/generation-061-live-comparison.sh,readonly" \
   --mount "type=bind,src=$GENERATION_TRUSTED_VALIDATOR,dst=/trusted/validate-receipt.sh,readonly" \
   --env-file "$env_file" \
