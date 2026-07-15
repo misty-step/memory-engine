@@ -2,7 +2,7 @@
 
 Date: 2026-07-15  
 Branch: `cx/097-scheduled-reminders`  
-Implementation commit: `e8a7e521c720906c6d61010eae8f12e638db8a21`  
+Implementation commit: `0f1b5389b4b46f9e47f2c6c4ebd68e4683279cf4`  
 Base: `85db8aff01446dc6ab2a627376623848e3ea2b1e`  
 Draft PR: [#57](https://github.com/misty-step/memory-engine/pull/57)
 
@@ -41,9 +41,9 @@ start or mutate a send. `GET /healthz` returns `status: "ok"`,
 - `bun run ci` — passed: format, workspace tests, clippy, and rustdoc.
 - `bun run ci:full` — passed through the repo-owned Dagger pipeline: pinned
   workspace tests (including 97 API tests), clippy, rustdoc, and secrets scan.
-- Hosted GitHub CI [run 29442439565](https://github.com/misty-step/memory-engine/actions/runs/29442439565)
-  — passed on `b23e013`; hosted Cerberus review [run
-  29442440681](https://github.com/misty-step/memory-engine/actions/runs/29442440681)
+- Hosted GitHub CI [run 29443170248](https://github.com/misty-step/memory-engine/actions/runs/29443170248)
+  — passed on `0f1b538`; hosted Cerberus review [run
+  29443170244](https://github.com/misty-step/memory-engine/actions/runs/29443170244)
   — passed. CodeRabbit reported an explicit draft skip, not a review result.
 - Focused API coverage includes pending-retry fairness, active-claim exclusion,
   malformed preference surfacing, exact capped backoff, slow-provider clock
@@ -59,8 +59,7 @@ start or mutate a send. `GET /healthz` returns `status: "ok"`,
 
 ## Residuals
 
-This is merge-ready but intentionally not merged or marked complete. The final
-receipt-doc synchronization will produce one more hosted CI run. Production
+This is merge-ready but intentionally not merged or marked complete. Production
 scheduled-reminder evidence awaits deployment. Card092 remains open
 for child056 real inbox deliverability; its merged/deployed proof and the
 097 relation are recorded in Powder.
