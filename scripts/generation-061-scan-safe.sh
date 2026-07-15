@@ -21,6 +21,8 @@ for path in "${sources[@]}"; do
   set +e
   "$scanner" -n --hidden -F \
     -e 'CERBERUS_OPENROUTER_PROVISIONING_KEY' \
+    -e 'GENERATION_PROVIDER_KEY=' \
+    -e 'OPENROUTER_PROXY_TOKEN=' \
     -e 'OPENROUTER_API_KEY=' \
     -e 'sk-or-v1-' \
     -- "$path" >/dev/null 2>&1

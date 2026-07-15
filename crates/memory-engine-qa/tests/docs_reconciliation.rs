@@ -319,12 +319,11 @@ fn trusted_live_generation_lane_is_default_branch_only_and_fail_closed() {
             "github.ref == 'refs/heads/master'",
             "ref: master",
             "[[ \"$HEAD_SHA\" =~ ^[0-9a-f]{40}$ ]]",
-            "refs/heads/*:refs/remotes/origin/*",
-            "git for-each-ref --format='%(objectname)' refs/remotes/origin/",
+            "test \"$HEAD_SHA\" = \"$(git rev-parse refs/remotes/origin/master)\"",
             "--local-runtime-command \"$GITHUB_WORKSPACE/scripts/generation-061-live-comparison.sh\"",
-            "--allow-env OPENROUTER_API_KEY",
+            "--allow-env GENERATION_PROVIDER_KEY",
             "CERBERUS_OPENROUTER_PROVISIONING_KEY is required; refusing to run live generation",
-            "receipt=\"docs/evals/generation-061-live-comparison-${date_utc}.md\"",
+            "receipt=\"$published_dir/generation-061-live-comparison-${date_utc}.md\"",
             "id: sanitize_evidence",
             "steps.run_benchmark.outcome == 'success'",
             "steps.publish_receipt.outcome == 'success'",
@@ -374,6 +373,75 @@ fn trusted_live_generation_lane_is_default_branch_only_and_fail_closed() {
         !workflow.contains("find docs/evals -maxdepth 1") && !workflow.contains("! rg -n -F"),
         "staging and scans must be exact and explicit, never historical/globbed or inverted"
     );
+    assert!(
+        !workflow.contains("target SHA is not a head of any branch"),
+        "the target must not be accepted merely because it heads another remote branch"
+    );
+}
+
+#[test]
+fn trusted_live_request_uses_a_nonempty_parent_to_exact_head_range() {
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    let request = workflow
+        .split("- name: Build the exact live-generation request")
+        .nth(1)
+        .expect("request step exists")
+        .split("- name: Pin the Cerberus fixture substrate")
+        .next()
+        .expect("request step ends before fixture setup");
+    assert!(
+        request.contains("base_sha=\"$(git rev-parse \"$HEAD_SHA^1\")\"")
+            && request.contains("--base \"$base_sha\"")
+            && request.contains("--head \"$HEAD_SHA\""),
+        "the exact current master commit must be evaluated against its parent, not an empty master-to-self range"
+    );
+}
+
+#[test]
+fn trusted_live_executed_helpers_have_executable_modes() {
+    for relative in [
+        "scripts/generation-061-live-comparison.sh",
+        "scripts/generation-061-validate-provider-attestation.sh",
+        "scripts/generation-061-stage-evidence.sh",
+    ] {
+        let mode = fs::metadata(repo_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative} metadata: {error}"))
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "workflow-executed helper {relative} must be committed executable"
+        );
+    }
+}
+
+#[test]
+fn trusted_staging_rejects_malicious_symlink_origins() {
+    let staging = repo_root().join("scripts/generation-061-stage-evidence.sh");
+    assert!(
+        staging.is_file(),
+        "trusted staging must be an executable repo-owned boundary"
+    );
+    let root = test_temp_dir("symlink-stage");
+    let source = root.join("target-receipt.md");
+    let outside = root.join("trusted-runner-file");
+    let destination = root.join("safe");
+    fs::write(&outside, "must never be copied through a target symlink\n")
+        .expect("write trusted runner file");
+    symlink(&outside, &source).expect("create malicious target symlink");
+    let result = std::process::Command::new("bash")
+        .arg(&staging)
+        .arg(&destination)
+        .arg(&source)
+        .output()
+        .expect("run trusted staging helper");
+    assert!(
+        !result.status.success(),
+        "trusted staging must reject a target-controlled symlink before any copy: {result:?}"
+    );
+    assert!(!destination.join("target-receipt.md").exists());
+    fs::remove_dir_all(root).expect("remove symlink staging fixture");
 }
 
 #[test]
@@ -468,6 +536,7 @@ fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
             && validator.contains("Corpus: 14 sources")
             && validator.contains("Provider failures: [1-9]")
             && validator.contains("FAILED")
+            && validator.contains("Bridge fixture:.*FAIL")
             && validator.contains("error"),
         "receipt validation must reject failed/error rows"
     );
@@ -478,6 +547,43 @@ fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
             && scanner.contains("*)"),
         "safe-evidence scanning must fail closed on scanner errors"
     );
+}
+
+#[test]
+fn trusted_live_secret_steps_audit_their_command_files_before_exit() {
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    for (step, secret_names) in [
+        (
+            "Mint bounded key in short-lived process",
+            "CERBERUS_OPENROUTER_PROVISIONING_KEY",
+        ),
+        (
+            "Run exact benchmark with scoped key only",
+            "scoped_key GENERATION_PROVIDER_KEY",
+        ),
+        (
+            "Revoke scoped key (always)",
+            "CERBERUS_OPENROUTER_PROVISIONING_KEY",
+        ),
+        ("Publish a dated redacted eval receipt", ""),
+    ] {
+        let section = workflow
+            .split(&format!("- name: {step}"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n      - name:").next())
+            .unwrap_or_else(|| panic!("workflow step missing: {step}"));
+        assert!(
+            section.contains("source scripts/generation-061-audit-command-files.sh")
+                && section
+                    .contains("command_file_dir=\"$RUNNER_TEMP/generation-061-command-files\"")
+                && section.contains("capture_command_files")
+                && section.contains("cp --")
+                && section.contains("trap ")
+                && section.contains("audit_generation_command_files")
+                && section.contains(secret_names),
+            "{step} must audit its own GitHub command files before exiting"
+        );
+    }
 }
 
 #[test]
@@ -495,19 +601,110 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
         "the trusted job must be gated to the exact repository and master branch"
     );
     assert!(
-        comparison.contains("cargo_bin=\"$(command -v cargo || true)\"")
-            && comparison.contains("/usr/local/cargo/bin/cargo")
-            && comparison.contains("if [[ -z \"$cargo_bin\" ]]")
+        comparison.contains("cargo build --quiet --locked -p memory-engine-bench")
+            && comparison.contains("--network bridge")
+            && comparison.contains("GENERATION_PREPARED_BINARY")
+            && comparison.contains("sha256sum \"$prepared_binary\"")
             && comparison.contains("! -d \"$shared_git_dir\"")
             && comparison.contains("! -f \"$shared_git_dir/config\""),
-        "the isolated benchmark must use explicit shared-Git and cargo invariants"
+        "the trusted boundary must prepare and digest the exact benchmark before runtime"
     );
     assert!(
         comparison.contains("cache_root=\"$(cd -P -- \"$GENERATION_CACHE_DIR\" && pwd)\"")
             && comparison.contains("output_dir=\"$cache_root/live-output\"")
             && comparison.contains("rm -rf -- \"$output_dir\"")
-            && comparison.contains("--mount \"type=bind,src=$output_dir,dst=/output,rw\""),
+            && comparison.contains("--mount \"type=bind,src=$output_dir,dst=/output,rw\"")
+            && comparison.contains("prepared_dir=\"$cache_root/prepared\"")
+            && comparison.contains("GENERATION_RUNTIME_CLEANUP_EVIDENCE"),
         "the benchmark output mount must be freshly recreated outside the target tree"
+    );
+}
+
+#[test]
+fn trusted_live_audits_prior_step_command_file_snapshots() {
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    let publish = workflow
+        .find("- name: Publish a dated redacted eval receipt")
+        .expect("publish step exists");
+    let final_audit = workflow
+        .find("- name: Final audit command files and runner state before staging")
+        .expect("final audit step exists");
+    assert!(
+        final_audit > publish,
+        "final aggregate command-file audit must run after publish snapshots are created"
+    );
+    assert!(
+        workflow.contains("generation-061-command-files")
+            && workflow.contains("capture_command_files")
+            && workflow.contains("command_files+=(\"$command_file\")")
+            && workflow
+                .contains("find \"$RUNNER_TEMP/generation-061-command-files\" -type f -print0")
+            && workflow.contains("rm -rf -- \"${RUNNER_TEMP:-}/generation-061-command-files\""),
+        "transport audit must scan prior-step command-file snapshots and clean them up"
+    );
+}
+
+#[test]
+fn trusted_live_target_cannot_retain_provider_key_or_use_unrestricted_egress() {
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    let comparison = read_repo_file("scripts/generation-061-live-comparison.sh");
+    let proxy = read_repo_file("scripts/generation-061-trusted-provider-proxy.py");
+    let attestation = read_repo_file("scripts/generation-061-validate-provider-attestation.sh");
+    assert_contains_all(
+        "trusted live target boundary",
+        &workflow,
+        &["GENERATION_PROVIDER_KEY=", "provider-attestation.json"],
+    );
+    assert_contains_all(
+        "scripts/generation-061-live-comparison.sh",
+        &comparison,
+        &[
+            "--network none",
+            "--tmpfs /cargo-home:rw",
+            "--tmpfs /cargo-target:rw",
+            "OPENROUTER_PROXY_SOCKET=/provider.sock",
+        ],
+    );
+    assert!(
+        !workflow.contains("OPENROUTER_API_KEY=\"$scoped_key\"")
+            && !workflow.contains("--allow-env OPENROUTER_API_KEY")
+            && !comparison.contains("OPENROUTER_API_KEY=$OPENROUTER_API_KEY")
+            && !comparison.contains("dst=/cargo-home")
+            && !comparison.contains("dst=/cargo-target"),
+        "target build/runtime canaries must not receive the provider key or persistent caches"
+    );
+    assert_contains_all(
+        "scripts/generation-061-trusted-provider-proxy.py",
+        &proxy,
+        &[
+            "provider-key-fd",
+            "ThreadingUnixStreamServer",
+            "UPSTREAM_URL",
+            "SOCKET_READ_TIMEOUT_SECONDS",
+            "settimeout",
+            "readline(MAX_REQUEST_BYTES + 1)",
+            "provider_calls",
+            "request_sha256",
+            "response_sha256",
+            "os.replace",
+        ],
+    );
+    assert_contains_all(
+        "runtime cleanup contract",
+        &workflow,
+        &[
+            "GENERATION_BUILD_TIMEOUT_SECONDS",
+            "GENERATION_CONTAINER_TIMEOUT_SECONDS",
+            "GENERATION_RUNTIME_CLEANUP_EVIDENCE",
+            "prepared_removed",
+            "attestation_validated",
+            "generation-061-stage-evidence.sh",
+        ],
+    );
+    assert_contains_all(
+        "scripts/generation-061-validate-provider-attestation.sh",
+        &attestation,
+        &["provider-calls-observed", "-ge 15", ".calls | length"],
     );
 }
 
@@ -515,12 +712,16 @@ const STALE_RECEIPT_DOCKER: &str = r#"#!/bin/bash
 set -euo pipefail
 if [[ "${1:-}" == container ]]; then exit 1; fi
 [[ "${1:-}" == run ]]
+network=''
 output_mount=''
+target_mount=''
+prepared_mount=''
 helper_mount=''
 validator_mount=''
 env_file=''
 while (($#)); do
   case "$1" in
+    --network) network="$2"; shift 2 ;;
     --env-file) env_file="$2"; shift 2 ;;
     --mount)
       mount="$2"
@@ -528,6 +729,14 @@ while (($#)); do
         *",dst=/output,rw")
           output_mount="${mount#type=bind,src=}"
           output_mount="${output_mount%,dst=/output,rw}"
+          ;;
+        *",dst=/workspace,readonly")
+          target_mount="${mount#type=bind,src=}"
+          target_mount="${target_mount%,dst=/workspace,readonly}"
+          ;;
+        *",dst=/prepared,rw")
+          prepared_mount="${mount#type=bind,src=}"
+          prepared_mount="${prepared_mount%,dst=/prepared,rw}"
           ;;
         *",dst=/trusted/generation-061-live-comparison.sh,readonly")
           helper_mount="${mount#type=bind,src=}"
@@ -543,6 +752,28 @@ while (($#)); do
     *) shift ;;
   esac
 done
+if [[ "$network" == bridge ]]; then
+  mkdir -p "$prepared_mount"
+  if [[ -f "$target_mount/forge-receipt.txt" ]]; then
+    cat > "$prepared_mount/memory-engine-bench" <<EOF
+#!/bin/sh
+set -eu
+out=''
+while [[ "\$#" -gt 0 ]]; do
+  if [[ "\$1" == --out ]]; then out="\$2"; shift 2; else shift; fi
+done
+cat "$target_mount/forge-receipt.txt" > "\$out"
+EOF
+  else
+    cat > "$prepared_mount/memory-engine-bench" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  fi
+  chmod 0555 "$prepared_mount/memory-engine-bench"
+  sha256sum "$prepared_mount/memory-engine-bench" > "$prepared_mount/memory-engine-bench.sha256"
+  exit 0
+fi
 printf '%s' "$output_mount" > "$DOCKER_OUTPUT_MOUNT_LOG"
 set -a
 . "$env_file"
@@ -550,6 +781,8 @@ set +a
 GENERATION_LIVE_IN_CONTAINER=true \
 GENERATION_OUTPUT_DIR="$output_mount" \
 GENERATION_RECEIPT_VALIDATOR="$validator_mount" \
+GENERATION_PREPARED_BINARY="$prepared_mount/memory-engine-bench" \
+GENERATION_PREPARED_BINARY_SHA256="$(cut -d ' ' -f1 "$prepared_mount/memory-engine-bench.sha256")" \
 PATH="$FAKE_BIN:/usr/bin:/bin" \
 bash "$helper_mount"
 "#;
@@ -597,6 +830,16 @@ fn prepare_stale_receipt_fixture() -> (
         scripts.join("generation-061-validate-receipt.sh"),
     )
     .expect("copy trusted validator");
+    fs::copy(
+        repo_root().join("scripts/generation-061-trusted-provider-proxy.py"),
+        scripts.join("generation-061-trusted-provider-proxy.py"),
+    )
+    .expect("copy trusted provider proxy");
+    fs::copy(
+        repo_root().join("scripts/generation-061-validate-provider-attestation.sh"),
+        scripts.join("generation-061-validate-provider-attestation.sh"),
+    )
+    .expect("copy trusted provider attestation validator");
     let date = std::process::Command::new("date")
         .args(["-u", "+%F"])
         .output()
@@ -649,22 +892,201 @@ fn prepare_stale_receipt_fixture() -> (
     (root, scripts, fake_bin, cache, target_receipt, stale)
 }
 
+fn prepare_forged_receipt_fixture() -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let (root, scripts, fake_bin, cache, _target_receipt, stale) = prepare_stale_receipt_fixture();
+    let mut forged = stale;
+    forged.push_str("- Bridge fixture: easier 100% · faithful 100% · duplicate 0% · PASS\n");
+    let script = format!(
+        "#!/bin/sh\nset -eu\n# Malicious build.rs/runtime canary: only the one-run proxy capability may exist.\ntest -z \"${{GENERATION_PROVIDER_KEY:-}}\"\ntest -z \"${{OPENROUTER_API_KEY:-}}\"\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --out ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nprintf '%s' '{forged}' > \"$out\"\nprintf '%s\\n' 'malicious target stdout marker; provider_calls=0; attempted cache retention and direct egress'\nexit 0\n",
+        forged = forged.replace('\'', "'\\''")
+    );
+    fs::write(root.join("forge-receipt.txt"), &forged).expect("write forged build receipt marker");
+    fs::write(fake_bin.join("cargo"), script).expect("write forged benchmark");
+    let path = fake_bin.join("cargo");
+    let mut permissions = fs::metadata(&path)
+        .expect("forged benchmark metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("make forged benchmark executable");
+    (root, scripts, fake_bin, cache)
+}
+
+const HONEST_BUILD_DOCKER: &str = r#"#!/bin/sh
+set -eu
+network=''
+env_file=''
+output_mount=''
+helper_mount=''
+validator_mount=''
+prepared_mount=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --network) network="$2"; shift 2 ;;
+    --env-file) env_file="$2"; shift 2 ;;
+    --mount)
+      mount="$2"
+      case "$mount" in
+        *",dst=/output,rw")
+          output_mount="${mount#type=bind,src=}"
+          output_mount="${output_mount%,dst=/output,rw}"
+          ;;
+        *",dst=/trusted/generation-061-live-comparison.sh,readonly")
+          helper_mount="${mount#type=bind,src=}"
+          helper_mount="${helper_mount%,dst=/trusted/generation-061-live-comparison.sh,readonly}"
+          ;;
+        *",dst=/trusted/validate-receipt.sh,readonly")
+          validator_mount="${mount#type=bind,src=}"
+          validator_mount="${validator_mount%,dst=/trusted/validate-receipt.sh,readonly}"
+          ;;
+        *",dst=/prepared,readonly")
+          prepared_mount="${mount#type=bind,src=}"
+          prepared_mount="${prepared_mount%,dst=/prepared,readonly}"
+          ;;
+        *",dst=/prepared,rw")
+          prepared_mount="${mount#type=bind,src=}"
+          prepared_mount="${prepared_mount%,dst=/prepared,rw}"
+          ;;
+      esac
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$prepared_mount" ]; then
+  printf '%s\n' "$network" >> "$(dirname "$prepared_mount")/honest-build-network.log"
+fi
+if [ "$network" = bridge ]; then
+  test -z "${GENERATION_PROVIDER_KEY:-}"
+  mkdir -p "$prepared_mount"
+  cat > "$prepared_mount/memory-engine-bench" <<'EOF'
+#!/bin/sh
+set -eu
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --out ]; then out="$2"; shift 2; else shift; fi
+done
+cat > "$out" <<'RECEIPT'
+# Generation eval receipt
+
+- Corpus: 14 sources
+- Provider failures: 0/14 sources
+| mitochondria | fixture | pass |
+| nato-alphabet | fixture | pass |
+| http-caching | fixture | pass |
+| rubicon | fixture | pass |
+| sourdough | fixture | pass |
+| gdpr-basis | fixture | pass |
+| hope-feathers | fixture | pass |
+| pythagorean | fixture | pass |
+| curie | fixture | pass |
+| git-branching | fixture | pass |
+| spacing-effect | fixture | pass |
+| water-boiling | fixture | pass |
+| apostles-creed | fixture | pass |
+| us-presidents-ordinal | fixture | pass |
+- Bridge fixture: quality · PASS
+RECEIPT
+EOF
+  chmod 0555 "$prepared_mount/memory-engine-bench"
+  sha256sum "$prepared_mount/memory-engine-bench" > "$prepared_mount/memory-engine-bench.sha256"
+  exit 0
+fi
+test "$network" = none
+test -s "$env_file"
+if grep -Eq 'GENERATION_PROVIDER_KEY|CARGO_HOME|CARGO_TARGET_DIR' "$env_file"; then
+  exit 1
+fi
+test -n "$prepared_mount"
+test -x "$prepared_mount/memory-engine-bench"
+test -s "$prepared_mount/memory-engine-bench.sha256"
+exit 0
+"#;
+
+const HONEST_BUILD_PROXY: &str = r"#!/usr/bin/env python3
+import json
+import signal
+import socket
+import sys
+import time
+from pathlib import Path
+
+socket_path = Path(sys.argv[sys.argv.index('--socket') + 1])
+socket_path.unlink(missing_ok=True)
+server_socket = socket.socket(socket.AF_UNIX)
+server_socket.bind(str(socket_path))
+server_socket.listen(1)
+attestation = Path(sys.argv[sys.argv.index('--attestation') + 1])
+target_sha = sys.argv[sys.argv.index('--target-sha') + 1]
+
+def finish(_signum, _frame):
+    calls = [{'request_sha256': str(index), 'response_sha256': str(index), 'http_status': 200, 'successful': True} for index in range(15)]
+    attestation.write_text(json.dumps({
+        'schema': 'memory-engine/generation-061-provider-attestation/v1',
+        'target_sha': target_sha,
+        'provider_calls': 15,
+        'successful_provider_calls': 15,
+        'canonical_acceptance': 'provider-calls-observed',
+        'calls': calls,
+    }) + '\n')
+    server_socket.close()
+    socket_path.unlink(missing_ok=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, finish)
+while True:
+    time.sleep(1)
+";
+
 #[test]
-fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
-    let (root, scripts, fake_bin, cache, target_receipt, stale) = prepare_stale_receipt_fixture();
-    let mount_log = root.join("output-mount.txt");
+fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
+    let (root, scripts, fake_bin, original_cache, _target_receipt, stale) =
+        prepare_stale_receipt_fixture();
+    let cache = std::path::PathBuf::from(format!("/tmp/me098-honest-{}", std::process::id()));
+    fs::remove_dir_all(&original_cache).expect("remove long fixture cache");
+    fs::create_dir_all(&cache).expect("create short fixture cache");
+    let proxy = root.join("honest-build-proxy.py");
+    fs::write(&proxy, HONEST_BUILD_PROXY).expect("write honest build proxy");
+    let attestation_validator = root.join("honest-attestation-validator.sh");
+    fs::write(
+        &attestation_validator,
+        "#!/bin/sh\nset -eu\ntest -s \"$1\"\ntest \"$2\" = fixture-head\n",
+    )
+    .expect("write honest attestation validator");
+    let docker = fake_bin.join("docker");
+    fs::write(&docker, HONEST_BUILD_DOCKER).expect("write honest build docker");
+    let log = cache.join("honest-build-network.log");
+    let prepared = cache.join("prepared");
+    let mut permissions = fs::metadata(&proxy).expect("proxy metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&proxy, permissions).expect("make proxy executable");
+    let mut permissions = fs::metadata(&attestation_validator)
+        .expect("attestation validator metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&attestation_validator, permissions)
+        .expect("make attestation validator executable");
+    let mut permissions = fs::metadata(&docker)
+        .expect("docker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&docker, permissions).expect("make docker executable");
     let original_path = std::env::var("PATH").expect("test PATH");
     let result = std::process::Command::new("bash")
         .arg(scripts.join("generation-061-live-comparison.sh"))
         .current_dir(&root)
         .env("PATH", format!("{}:{original_path}", fake_bin.display()))
-        .env("FAKE_BIN", &fake_bin)
-        .env("DOCKER_OUTPUT_MOUNT_LOG", &mount_log)
         .env("FAKE_GIT_DIR", root.join("git-common"))
-        .env("OPENROUTER_API_KEY", "sk-test")
+        .env("GENERATION_PROVIDER_KEY", "sk-test")
         .env("GENERATION_HEAD_SHA", "fixture-head")
         .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
         .env("GENERATION_CONTAINER_LABEL", "fixture-label")
+        .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
+        .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
         .env("GENERATION_CACHE_DIR", &cache)
         .env(
             "GENERATION_TRUSTED_HELPER",
@@ -673,6 +1095,81 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         .env(
             "GENERATION_TRUSTED_VALIDATOR",
             scripts.join("generation-061-validate-receipt.sh"),
+        )
+        .env("GENERATION_TRUSTED_PROXY", &proxy)
+        .env(
+            "GENERATION_PROVIDER_ATTESTATION",
+            cache.join("provider-attestation.json"),
+        )
+        .env(
+            "GENERATION_RUNTIME_CLEANUP_EVIDENCE",
+            cache.join("runtime-cleanup.json"),
+        )
+        .env(
+            "GENERATION_TRUSTED_ATTESTATION_VALIDATOR",
+            &attestation_validator,
+        )
+        .env("GENERATION_CONTAINER_NAME", "fixture-container")
+        .output()
+        .expect("run honest-path build canary");
+    assert!(
+        result.status.success(),
+        "an exact benchmark must build before network-disabled execution and then run: {result:?}; log={:?}; evidence={:?}",
+        fs::read_to_string(&log).ok(),
+        fs::read_to_string(cache.join("runtime-cleanup.json")).ok()
+    );
+    assert_eq!(
+        fs::read_to_string(&log).expect("read honest path network log"),
+        "bridge\nnone\n"
+    );
+    assert!(!prepared.join("memory-engine-bench").exists());
+    assert!(cache.join("runtime-cleanup.json").exists());
+    let _ = stale;
+    fs::remove_dir_all(&cache).expect("remove honest build cache fixture");
+    fs::remove_dir_all(root).expect("remove honest build fixture");
+}
+
+#[test]
+fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
+    let (root, scripts, fake_bin, cache, target_receipt, stale) = prepare_stale_receipt_fixture();
+    let original_path = std::env::var("PATH").expect("test PATH");
+    let result = std::process::Command::new("bash")
+        .arg(scripts.join("generation-061-live-comparison.sh"))
+        .current_dir(&root)
+        .env("PATH", format!("{}:{original_path}", fake_bin.display()))
+        .env("FAKE_BIN", &fake_bin)
+        .env("DOCKER_OUTPUT_MOUNT_LOG", root.join("output-mount.txt"))
+        .env("FAKE_GIT_DIR", root.join("git-common"))
+        .env("GENERATION_PROVIDER_KEY", "sk-test")
+        .env("GENERATION_HEAD_SHA", "fixture-head")
+        .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
+        .env("GENERATION_CONTAINER_LABEL", "fixture-label")
+        .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
+        .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
+        .env("GENERATION_CACHE_DIR", &cache)
+        .env(
+            "GENERATION_TRUSTED_HELPER",
+            scripts.join("generation-061-live-comparison.sh"),
+        )
+        .env(
+            "GENERATION_TRUSTED_VALIDATOR",
+            scripts.join("generation-061-validate-receipt.sh"),
+        )
+        .env(
+            "GENERATION_TRUSTED_PROXY",
+            scripts.join("generation-061-trusted-provider-proxy.py"),
+        )
+        .env(
+            "GENERATION_PROVIDER_ATTESTATION",
+            cache.join("provider-attestation.json"),
+        )
+        .env(
+            "GENERATION_RUNTIME_CLEANUP_EVIDENCE",
+            cache.join("runtime-cleanup.json"),
+        )
+        .env(
+            "GENERATION_TRUSTED_ATTESTATION_VALIDATOR",
+            scripts.join("generation-061-validate-provider-attestation.sh"),
         )
         .env("GENERATION_CONTAINER_NAME", "fixture-container")
         .output()
@@ -685,10 +1182,6 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
         fs::read_to_string(&target_receipt).expect("read target receipt"),
         stale
     );
-    let output_mount = fs::read_to_string(&mount_log).expect("read output mount log");
-    assert!(output_mount.starts_with(cache.to_str().expect("cache path")));
-    assert!(!output_mount.starts_with(root.join("docs/evals").to_str().expect("target path")));
-    assert!(!output_mount.contains("generation-061-live-comparison"));
     assert!(
         !cache.join("live-output").exists(),
         "failed benchmark cleanup must remove only its owned output directory"
@@ -698,13 +1191,70 @@ fn trusted_live_wrapper_rejects_preseeded_target_receipt_without_new_output() {
 }
 
 #[test]
+fn trusted_live_wrapper_rejects_target_forged_receipt_and_stdout_without_provider_call() {
+    let (root, scripts, fake_bin, cache) = prepare_forged_receipt_fixture();
+    let original_path = std::env::var("PATH").expect("test PATH");
+    let result = std::process::Command::new("bash")
+        .arg(scripts.join("generation-061-live-comparison.sh"))
+        .current_dir(&root)
+        .env("PATH", format!("{}:{original_path}", fake_bin.display()))
+        .env("FAKE_BIN", &fake_bin)
+        .env("DOCKER_OUTPUT_MOUNT_LOG", root.join("output-mount.txt"))
+        .env("FAKE_GIT_DIR", root.join("git-common"))
+        .env("GENERATION_PROVIDER_KEY", "sk-test")
+        .env("GENERATION_HEAD_SHA", "fixture-head")
+        .env("GENERATION_CONTAINER_IMAGE", "fixture-image")
+        .env("GENERATION_CONTAINER_LABEL", "fixture-label")
+        .env("GENERATION_BUILD_TIMEOUT_SECONDS", "30")
+        .env("GENERATION_CONTAINER_TIMEOUT_SECONDS", "30")
+        .env("GENERATION_CACHE_DIR", &cache)
+        .env(
+            "GENERATION_TRUSTED_HELPER",
+            scripts.join("generation-061-live-comparison.sh"),
+        )
+        .env(
+            "GENERATION_TRUSTED_VALIDATOR",
+            scripts.join("generation-061-validate-receipt.sh"),
+        )
+        .env(
+            "GENERATION_TRUSTED_PROXY",
+            scripts.join("generation-061-trusted-provider-proxy.py"),
+        )
+        .env(
+            "GENERATION_PROVIDER_ATTESTATION",
+            cache.join("provider-attestation.json"),
+        )
+        .env(
+            "GENERATION_RUNTIME_CLEANUP_EVIDENCE",
+            cache.join("runtime-cleanup.json"),
+        )
+        .env(
+            "GENERATION_TRUSTED_ATTESTATION_VALIDATOR",
+            scripts.join("generation-061-validate-provider-attestation.sh"),
+        )
+        .env("GENERATION_CONTAINER_NAME", "fixture-container")
+        .output()
+        .expect("run trusted wrapper against forged target");
+    assert!(
+        !result.status.success(),
+        "a target-controlled receipt/stdout with zero provider calls must not become canonical proof: {result:?}"
+    );
+    assert!(
+        !cache.join("live-output").exists(),
+        "forged target output must be cleaned from the isolated mount"
+    );
+    fs::remove_dir_all(&cache).expect("remove forged receipt cache fixture");
+    fs::remove_dir_all(root).expect("remove forged receipt fixture");
+}
+
+#[test]
 fn trusted_live_receipt_validator_rejects_failed_receipts() {
     let validator = repo_root().join("scripts/generation-061-validate-receipt.sh");
     let directory = test_temp_dir("failed-receipt");
     let failed = directory.join("failed.md");
     fs::write(
         &failed,
-        "# Generation eval receipt\n\n- Corpus: 14 sources\n- Provider failures: 1/14\n| 001 | fixture | FAILED: provider unavailable |\n",
+        "# Generation eval receipt\n\n- Corpus: 14 sources\n- Provider failures: 1/14\n| 001 | fixture | FAILED: provider unavailable |\n- Bridge fixture: quality · FAIL\n",
     )
     .expect("write failed receipt");
     let result = std::process::Command::new("bash")
@@ -717,6 +1267,50 @@ fn trusted_live_receipt_validator_rejects_failed_receipts() {
         "a FAILED receipt must not be accepted as live proof"
     );
     fs::remove_dir_all(directory).expect("remove temporary receipt directory");
+}
+
+#[test]
+fn trusted_live_receipt_validator_rejects_bridge_fixture_failures() {
+    let validator = repo_root().join("scripts/generation-061-validate-receipt.sh");
+    let directory = test_temp_dir("bridge-failed-receipt");
+    let receipt = directory.join("bridge-failed.md");
+    let sources = [
+        "mitochondria",
+        "nato-alphabet",
+        "http-caching",
+        "rubicon",
+        "sourdough",
+        "gdpr-basis",
+        "hope-feathers",
+        "pythagorean",
+        "curie",
+        "git-branching",
+        "spacing-effect",
+        "water-boiling",
+        "apostles-creed",
+        "us-presidents-ordinal",
+    ];
+    let mut rows = String::new();
+    for source in sources {
+        writeln!(&mut rows, "| {source} | fixture | pass |").expect("write receipt row");
+    }
+    fs::write(
+        &receipt,
+        format!(
+            "# Generation eval receipt\n\n- Corpus: 14 sources\n{rows}- Provider failures: 0/14 sources\n- Bridge fixture: easier 100% · faithful 100% · duplicate 0% · FAIL\n"
+        ),
+    )
+    .expect("write bridge-failed receipt");
+    let result = std::process::Command::new("/bin/bash")
+        .arg(&validator)
+        .arg(&receipt)
+        .output()
+        .expect("run receipt validator");
+    assert!(
+        !result.status.success(),
+        "a bridge FAIL receipt must not be accepted as live proof: {result:?}"
+    );
+    fs::remove_dir_all(directory).expect("remove bridge-failed receipt directory");
 }
 
 #[test]
@@ -747,7 +1341,7 @@ fn trusted_live_receipt_validator_accepts_only_complete_receipts() {
     fs::write(
         &receipt,
         format!(
-            "# Generation eval receipt\n\n- Corpus: 14 sources\n{rows}- Provider failures: 0/14 sources\n"
+            "# Generation eval receipt\n\n- Corpus: 14 sources\n{rows}- Provider failures: 0/14 sources\n- Bridge fixture: easier 100% · faithful 100% · duplicate 0% · pass\n"
         ),
     )
     .expect("write complete receipt");
@@ -818,7 +1412,7 @@ fn trusted_live_generation_helper_owns_the_exact_benchmark_and_redacts_secrets()
         "scripts/generation-061-live-comparison.sh",
         &helper,
         &[
-            "OPENROUTER_API_KEY:?",
+            "GENERATION_PROVIDER_KEY:?",
             "GENERATION_HEAD_SHA:?",
             "git rev-parse HEAD",
             "git rev-parse --git-common-dir",
@@ -828,7 +1422,7 @@ fn trusted_live_generation_helper_owns_the_exact_benchmark_and_redacts_secrets()
             "--out \"$receipt\"",
             "literalize_glob",
             "redact_secret",
-            "grep -Fq -- \"$OPENROUTER_API_KEY\" \"$receipt\"",
+            "grep -Fq -- \"$OPENROUTER_PROXY_TOKEN\" \"$receipt\"",
             "--- GENERATION_061_RECEIPT_BEGIN ---",
         ],
     );
@@ -851,13 +1445,14 @@ fn trusted_live_generation_documentation_names_the_security_oracle() {
         &[
             "manual workflow on `master`",
             "40-character commit SHA",
-            "exact head of a branch",
+            "exact `refs/remotes/origin/master`",
             "b10bffb6ddb14ec553fbcf4f5e687aee13424717",
             "USD 2",
             "no `pull_request` trigger",
             "arbitrary fork",
-            "same-repository target is still treated as untrusted",
+            "same-repository target is still",
             "missing-secret",
+            "prior-step snapshots",
         ],
     );
 }

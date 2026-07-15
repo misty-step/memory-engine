@@ -20,14 +20,19 @@ done
 grep -Fqx -- '- Provider failures: 0/14 sources' "$receipt"
 
 # A nonempty markdown file is not proof: reject provider, bridge, and any
-# error row before the receipt is copied into trusted evidence.
+# error row before the receipt is copied into trusted evidence. The bridge
+# score is a gate in its own right, so require the benchmark's explicit PASS.
+if ! "$grep_bin" -Eiq -- '^- Bridge fixture: .*[·[:space:]]+PASS[[:space:]]*$' "$receipt"; then
+  echo 'live generation receipt is missing an explicit passing bridge fixture' >&2
+  exit 1
+fi
 set +e
-"$grep_bin" -nEi -- 'FAILED|ERROR|error|Provider failures: [1-9][0-9]*/|Bridge fixture: FAILED' "$receipt" >/dev/null 2>&1
+"$grep_bin" -nEi -- 'FAILED|ERROR|error|Provider failures: [1-9][0-9]*/|Bridge fixture:.*FAIL' "$receipt" >/dev/null 2>&1
 status=$?
 set -e
 case "$status" in
   0)
-    echo 'live generation receipt contains a FAILED/error row' >&2
+    echo 'live generation receipt contains a FAILED/error/bridge-failure row' >&2
     exit 1
     ;;
   1)
