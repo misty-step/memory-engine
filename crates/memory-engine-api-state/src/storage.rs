@@ -1,11 +1,14 @@
 use std::{
+    collections::HashSet,
     fmt, fs, io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use memory_engine_service::{record_content_feedback, RecordContentFeedbackCommand};
+use memory_engine_service::{
+    record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
+};
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
@@ -67,6 +70,43 @@ impl StudyStorageConfig {
 #[derive(Clone)]
 pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
+}
+
+fn order_content_feedback_for_copy(
+    feedback: Vec<ContentFeedback>,
+) -> Result<Vec<ContentFeedback>, String> {
+    let mut remaining = feedback;
+    let mut copied_ids = HashSet::with_capacity(remaining.len());
+    let mut ordered = Vec::with_capacity(remaining.len());
+
+    while !remaining.is_empty() {
+        let next_index = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, feedback)| {
+                feedback
+                    .supersedes_id
+                    .as_ref()
+                    .is_none_or(|parent_id| copied_ids.contains(parent_id))
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.review_unit_id
+                    .as_str()
+                    .cmp(right.review_unit_id.as_str())
+                    .then(left.occurred_at.cmp(&right.occurred_at))
+                    .then(left.id.cmp(&right.id))
+            })
+            .map(|(index, _)| index);
+
+        let Some(next_index) = next_index else {
+            return Err("content feedback ancestry is not a deterministic DAG".to_owned());
+        };
+        let next = remaining.swap_remove(next_index);
+        copied_ids.insert(next.id.clone());
+        ordered.push(next);
+    }
+
+    Ok(ordered)
 }
 
 impl fmt::Debug for StudyStorage {
@@ -1642,7 +1682,9 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         .save_review_unit(&review_unit)
                         .map_err(postgres_failure)?;
                 }
-                for mut feedback in snapshot.content_feedback {
+                let feedback = order_content_feedback_for_copy(snapshot.content_feedback)
+                    .map_err(ApiFailure::internal)?;
+                for mut feedback in feedback {
                     target_account_id.clone_into(&mut feedback.account_id);
                     account
                         .record_content_feedback(&feedback)

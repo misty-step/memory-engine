@@ -3591,6 +3591,14 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
         .expect("source feedback");
     assert_eq!(feedback.status(), StatusCode::OK);
 
+    // A revision's ancestry is independent of wall-clock order. The helper
+    // persists a parent later than its child for the copy oracle.
+    seed_out_of_order_copy_feedback(
+        &database.scoped_url,
+        &source_account.account_id,
+        &review_unit_id,
+    );
+
     let target = state
         .save_account(&browser, "copy-target@example.com")
         .expect("copy account");
@@ -3604,9 +3612,64 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
         );
         account.snapshot().expect("target snapshot")
     });
-    assert_eq!(snapshot.content_feedback.len(), 1);
-    assert_eq!(snapshot.content_feedback[0].id, "copy-feedback-a");
+    assert_eq!(snapshot.content_feedback.len(), 3);
+    assert!(snapshot
+        .content_feedback
+        .iter()
+        .any(|feedback| feedback.id == "copy-feedback-a"));
+    assert!(snapshot
+        .content_feedback
+        .iter()
+        .any(|feedback| feedback.id == "copy-feedback-parent"));
+    assert!(snapshot
+        .content_feedback
+        .iter()
+        .any(|feedback| feedback.id == "copy-feedback-child"));
     assert_eq!(snapshot.content_feedback[0].account_id, target.account_id);
+}
+
+fn seed_out_of_order_copy_feedback(database_url: &str, account_id: &str, review_unit_id: &str) {
+    use memory_engine_core::ReviewUnitId;
+    use memory_engine_service::{
+        record_content_feedback, ContentFeedbackVerdict, RecordContentFeedbackCommand,
+    };
+
+    tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("seed out-of-order feedback");
+        let mut account = store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                .expect("source scope"),
+        );
+        let review_unit_id = ReviewUnitId::new(review_unit_id);
+        record_content_feedback(
+            &mut account,
+            RecordContentFeedbackCommand {
+                feedback_id: "copy-feedback-parent".to_owned(),
+                review_unit_id: review_unit_id.clone(),
+                verdict: ContentFeedbackVerdict::Kept,
+                rationale: Some("parent".to_owned()),
+                account_id: account_id.to_owned(),
+                occurred_at: 1_000,
+                supersedes_id: Some("copy-feedback-a".to_owned()),
+            },
+        )
+        .expect("parent feedback");
+        record_content_feedback(
+            &mut account,
+            RecordContentFeedbackCommand {
+                feedback_id: "copy-feedback-child".to_owned(),
+                review_unit_id,
+                verdict: ContentFeedbackVerdict::Dropped,
+                rationale: Some("child".to_owned()),
+                account_id: account_id.to_owned(),
+                occurred_at: 500,
+                supersedes_id: Some("copy-feedback-parent".to_owned()),
+            },
+        )
+        .expect("child feedback");
+    });
 }
 
 #[tokio::test]
