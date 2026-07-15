@@ -18,7 +18,7 @@ use memory_engine_persistence::{
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::{
     infer_capture_title, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
-    DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_SKIP_DEFER_MS,
+    DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_SKIP_DEFER_MS, DEFAULT_SNOOZE_DEFER_MS,
 };
 use serde_json::json;
 
@@ -728,6 +728,92 @@ fn skip_defers_current_item_without_recording_a_review_attempt() {
 }
 
 #[test]
+fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
+    let directory = TempDirectory::new("concept-snooze");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(concept_snooze_input()).expect("source");
+    let generated = study.generate(None).expect("generate");
+    for draft in &generated.drafts {
+        study.approve_draft(&draft.id).expect("approve");
+    }
+
+    let started = study.start().expect("start");
+    assert_eq!(
+        started
+            .current
+            .as_ref()
+            .and_then(|current| current.concept_key.as_deref()),
+        Some("nato-letter-a")
+    );
+
+    let current_id = started
+        .current
+        .as_ref()
+        .expect("current")
+        .review_unit_id
+        .clone();
+    let persisted: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read study snapshot"))
+            .expect("decode study snapshot");
+    let concept_member_ids = persisted["reviewUnits"]
+        .as_array()
+        .expect("review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .map(|unit| ReviewUnitId::new(unit["reviewUnitId"].as_str().expect("unit id")))
+        .collect::<Vec<_>>();
+    assert_eq!(concept_member_ids.len(), 2);
+    let reviewed = study.submit_answer("ALFA", 1_800).expect("review");
+    let reviewed_schedule = reviewed
+        .current
+        .as_ref()
+        .expect("reviewed current")
+        .review_state
+        .clone()
+        .expect("reviewed schedule");
+
+    let horizon = NOW + DEFAULT_SNOOZE_DEFER_MS;
+    let snoozed = study
+        .snooze_current_concept_until(horizon)
+        .expect("snooze concept");
+
+    assert_eq!(snoozed.summary.attempt_count, 1);
+    assert_eq!(snoozed.due_count, 1);
+    let snoozed_reviewed_row = snoozed
+        .queue
+        .iter()
+        .find(|row| row.review_unit_id == current_id)
+        .expect("snoozed reviewed row");
+    assert_eq!(snoozed_reviewed_row.reps, reviewed_schedule.reps);
+    assert_eq!(snoozed_reviewed_row.state, Some(reviewed_schedule.state));
+    assert_eq!(
+        snoozed
+            .queue
+            .iter()
+            .filter(|row| concept_member_ids.contains(&row.review_unit_id))
+            .map(|row| row.due)
+            .collect::<Vec<_>>(),
+        [horizon, horizon]
+    );
+    assert!(snoozed
+        .queue
+        .iter()
+        .any(|row| !concept_member_ids.contains(&row.review_unit_id) && row.due < horizon));
+
+    let mut resumed = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_snooze))
+        .expect("resume");
+    let resumed = resumed.start().expect("resume start");
+    assert_eq!(resumed.due_count, 3);
+    assert!(resumed
+        .queue
+        .iter()
+        .filter(|row| concept_member_ids.contains(&row.review_unit_id))
+        .all(|row| row.due <= after_snooze()));
+}
+
+#[test]
 fn learn_more_generates_and_caches_concept_note_when_source_span_is_missing() {
     let directory = TempDirectory::new("reference-fallback");
     let path = directory.path().join("study.json");
@@ -1003,6 +1089,41 @@ fn source_input() -> BetaStudySourceInput {
         id: "src-nato".to_owned(),
         title: "NATO practice notes".to_owned(),
         body: source_body(),
+        project_key: None,
+        ttl_expires_at: None,
+    }
+}
+
+fn concept_snooze_input() -> BetaStudySourceInput {
+    BetaStudySourceInput {
+        id: "src-concept-snooze".to_owned(),
+        title: "Concept snooze practice".to_owned(),
+        body: [
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for A?",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for A is ALFA.",
+            "",
+            "Concept: NATO letter A",
+            "Activity: quiz",
+            "Stage: cued-recall",
+            "Question: Type the code word used for the letter A.",
+            "Answer: ALFA",
+            "Distractors: BRAVO, CHARLIE",
+            "Reference: A is represented by ALFA in the NATO phonetic alphabet.",
+            "",
+            "Concept: NATO letter B",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for B?",
+            "Answer: BRAVO",
+            "Distractors: ALFA, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for B is BRAVO.",
+        ]
+        .join("\n"),
         project_key: None,
         ttl_expires_at: None,
     }
@@ -1353,6 +1474,10 @@ fn now() -> i64 {
 
 fn later() -> i64 {
     NOW + 1_000
+}
+
+fn after_snooze() -> i64 {
+    NOW + DEFAULT_SNOOZE_DEFER_MS + 1
 }
 
 trait ToStringForTest {

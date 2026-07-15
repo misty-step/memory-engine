@@ -336,6 +336,20 @@ impl Default for BetaStoreSnapshot {
     }
 }
 
+/// Parse the persisted Boolean prompt-edit answer contract shared by every
+/// persistence adapter.
+#[must_use]
+pub fn parse_strict_boolean_answer(value: &str) -> Option<bool> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ApproveGeneratedPromptDraftOptions {
     pub initial_schedule_state: Option<ScheduleState>,
@@ -349,6 +363,7 @@ pub enum BetaStoreError {
     Blank {
         label: &'static str,
     },
+    InvalidBooleanAnswer,
     UnknownSourceDocument(String),
     UnknownReferenceSpan(String),
     UnknownConceptReferenceNote(String),
@@ -390,6 +405,9 @@ impl fmt::Display for BetaStoreError {
                 )
             }
             Self::Blank { label } => write!(formatter, "{label} must not be blank"),
+            Self::InvalidBooleanAnswer => {
+                formatter.write_str("Boolean answers must be true or false")
+            }
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReferenceSpan(id) => write!(formatter, "Unknown reference span: {id}"),
             Self::UnknownConceptReferenceNote(id) => {
@@ -528,6 +546,7 @@ impl PartialEq for BetaStoreError {
                 Self::GeneratedPromptDraftReviewUnitMismatch,
             )
             | (Self::ReviewUnitMismatch, Self::ReviewUnitMismatch)
+            | (Self::InvalidBooleanAnswer, Self::InvalidBooleanAnswer)
             | (Self::AttemptAnswerBlank, Self::AttemptAnswerBlank)
             | (Self::AttemptResponseTimeNonPositive, Self::AttemptResponseTimeNonPositive)
             | (Self::ScheduleLastReviewMismatch, Self::ScheduleLastReviewMismatch)
@@ -630,11 +649,10 @@ impl BetaPersistenceStore {
     ) -> Result<SourceDocument, BetaStoreError> {
         assert_non_blank(&document.id, "Source document id")?;
         assert_non_blank(&document.title, "Source document title")?;
-        let mut next = self.data.clone();
-        upsert_by_id(&mut next.source_documents, document.clone());
-        self.commit(&next)?;
-
-        Ok(document)
+        self.transact(|snapshot| {
+            upsert_by_id(&mut snapshot.source_documents, document.clone());
+            Ok(document)
+        })
     }
 
     /// Hide source material from learner-facing flows while preserving receipts.
@@ -648,17 +666,17 @@ impl BetaPersistenceStore {
         source_document_id: &str,
         archived_at: i64,
     ) -> Result<SourceDocument, BetaStoreError> {
-        let mut next = self.data.clone();
-        let source = next
-            .source_documents
-            .iter_mut()
-            .find(|source| source.id == source_document_id)
-            .ok_or_else(|| BetaStoreError::UnknownSourceDocument(source_document_id.to_owned()))?;
-        source.archived_at = Some(archived_at);
-        let archived = source.clone();
-        self.commit(&next)?;
-
-        Ok(archived)
+        self.transact(|snapshot| {
+            let source = snapshot
+                .source_documents
+                .iter_mut()
+                .find(|source| source.id == source_document_id)
+                .ok_or_else(|| {
+                    BetaStoreError::UnknownSourceDocument(source_document_id.to_owned())
+                })?;
+            source.archived_at = Some(archived_at);
+            Ok(source.clone())
+        })
     }
 
     /// Save or replace a cited source span.
@@ -671,13 +689,12 @@ impl BetaPersistenceStore {
         reference: ReferenceSpan,
     ) -> Result<ReferenceSpan, BetaStoreError> {
         assert_non_blank(&reference.id, "Reference span id")?;
-        assert_known_source(&self.data, &reference.source_document_id)?;
         assert_non_blank(&reference.text, "Reference span text")?;
-        let mut next = self.data.clone();
-        upsert_by_id(&mut next.reference_spans, reference.clone());
-        self.commit(&next)?;
-
-        Ok(reference)
+        self.transact(|snapshot| {
+            assert_known_source(snapshot, &reference.source_document_id)?;
+            upsert_by_id(&mut snapshot.reference_spans, reference.clone());
+            Ok(reference)
+        })
     }
 
     /// Save or replace a generation run.
@@ -690,14 +707,13 @@ impl BetaPersistenceStore {
         run: GenerationRun,
     ) -> Result<GenerationRun, BetaStoreError> {
         assert_non_blank(&run.id, "Generation run id")?;
-        for source_document_id in &run.source_document_ids {
-            assert_known_source(&self.data, source_document_id)?;
-        }
-        let mut next = self.data.clone();
-        upsert_by_id(&mut next.generation_runs, run.clone());
-        self.commit(&next)?;
-
-        Ok(run)
+        self.transact(|snapshot| {
+            for source_document_id in &run.source_document_ids {
+                assert_known_source(snapshot, source_document_id)?;
+            }
+            upsert_by_id(&mut snapshot.generation_runs, run.clone());
+            Ok(run)
+        })
     }
 
     /// Append one learner content judgment, preserving every prior revision.
@@ -799,11 +815,10 @@ impl BetaPersistenceStore {
         note: ConceptReferenceNote,
     ) -> Result<ConceptReferenceNote, BetaStoreError> {
         assert_concept_reference_note_contract(&note)?;
-        let mut next = self.data.clone();
-        upsert_concept_reference_note(&mut next.concept_reference_notes, note.clone());
-        self.commit(&next)?;
-
-        Ok(note)
+        self.transact(|snapshot| {
+            upsert_concept_reference_note(&mut snapshot.concept_reference_notes, note.clone());
+            Ok(note)
+        })
     }
 
     /// Save or replace a generated prompt draft.
@@ -815,12 +830,11 @@ impl BetaPersistenceStore {
         &mut self,
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, BetaStoreError> {
-        assert_draft_contract(&self.data, &draft)?;
-        let mut next = self.data.clone();
-        upsert_by_id(&mut next.generated_prompt_drafts, draft.clone());
-        self.commit(&next)?;
-
-        Ok(draft)
+        self.transact(|snapshot| {
+            assert_draft_contract(snapshot, &draft)?;
+            upsert_by_id(&mut snapshot.generated_prompt_drafts, draft.clone());
+            Ok(draft)
+        })
     }
 
     /// Promote an accepted generated draft into a review unit.
@@ -833,41 +847,50 @@ impl BetaPersistenceStore {
         draft_id: &str,
         options: ApproveGeneratedPromptDraftOptions,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        let draft = find_by_id(&self.data.generated_prompt_drafts, draft_id)
-            .ok_or_else(|| BetaStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))?;
-        if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
-            return Err(BetaStoreError::RejectedGeneratedPromptDraft);
-        }
-        if draft
-            .generation_run_id
-            .as_ref()
-            .is_none_or(|run_id| find_by_id(&self.data.generation_runs, run_id).is_none())
-        {
-            return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
-        }
+        self.transact(|snapshot| {
+            let draft = find_by_id(&snapshot.generated_prompt_drafts, draft_id)
+                .cloned()
+                .ok_or_else(|| BetaStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))?;
+            if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
+                return Err(BetaStoreError::RejectedGeneratedPromptDraft);
+            }
+            if draft
+                .generation_run_id
+                .as_ref()
+                .is_none_or(|run_id| find_by_id(&snapshot.generation_runs, run_id).is_none())
+            {
+                return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
+            }
 
-        let review_unit = BetaReviewUnitRecord {
-            review_unit_id: draft.review_unit_id.clone(),
-            prompt_id: draft.prompt_id.clone(),
-            prompt: draft.prompt.clone(),
-            queue: draft.queue.clone(),
-            reference_span_ids: draft.reference_span_ids.clone(),
-            concept_reference_note_key: draft.concept_reference_note_key.clone(),
-            generated_prompt_draft_id: Some(draft.id.clone()),
-            archived_at: None,
-            snoozed_until: None,
-            created_at: draft.created_at,
-        };
-        let mut next = self.data.clone();
-        upsert_review_unit(&mut next.review_units, review_unit.clone());
-        apply_schedule_record(
-            &mut next,
-            &draft.review_unit_id,
-            options.initial_schedule_state,
-        );
-        self.commit(&next)?;
+            if let Some(existing) = snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == draft.review_unit_id)
+            {
+                return Ok(existing.clone());
+            }
 
-        Ok(review_unit)
+            let review_unit = BetaReviewUnitRecord {
+                review_unit_id: draft.review_unit_id.clone(),
+                prompt_id: draft.prompt_id.clone(),
+                prompt: draft.prompt.clone(),
+                queue: draft.queue.clone(),
+                reference_span_ids: draft.reference_span_ids.clone(),
+                concept_reference_note_key: draft.concept_reference_note_key.clone(),
+                generated_prompt_draft_id: Some(draft.id.clone()),
+                archived_at: None,
+                snoozed_until: None,
+                created_at: draft.created_at,
+            };
+            snapshot.review_units.push(review_unit.clone());
+            apply_schedule_record(
+                snapshot,
+                &draft.review_unit_id,
+                options.initial_schedule_state,
+            );
+
+            Ok(review_unit)
+        })
     }
 
     /// Replace an approved review unit's prompt text while preserving its answer contract.
@@ -883,42 +906,42 @@ impl BetaPersistenceStore {
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
         assert_non_blank(prompt_text, "Review unit prompt")?;
         assert_non_blank(expected_answer, "Review unit expected answer")?;
-        let mut next = self.data.clone();
-        let review_unit = next
-            .review_units
-            .iter_mut()
-            .find(|unit| &unit.review_unit_id == review_unit_id)
-            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
-        if review_unit.archived_at.is_some() {
-            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
-        }
-
-        replace_prompt_text(&mut review_unit.prompt, prompt_text);
-        replace_prompt_answer(&mut review_unit.prompt, expected_answer);
-        if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
-            if let Some(draft) = next
-                .generated_prompt_drafts
+        self.transact(|snapshot| {
+            let review_unit = snapshot
+                .review_units
                 .iter_mut()
-                .find(|draft| &draft.id == draft_id)
-            {
-                replace_prompt_text(&mut draft.prompt, prompt_text);
-                replace_prompt_answer(&mut draft.prompt, expected_answer);
-                if !draft
-                    .critique_notes
-                    .iter()
-                    .any(|note| note == "Learner edited approved wording.")
+                .find(|unit| &unit.review_unit_id == review_unit_id)
+                .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+            if review_unit.archived_at.is_some() {
+                return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+            }
+
+            replace_prompt_text(&mut review_unit.prompt, prompt_text);
+            replace_prompt_answer(&mut review_unit.prompt, expected_answer)?;
+            if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
+                if let Some(draft) = snapshot
+                    .generated_prompt_drafts
+                    .iter_mut()
+                    .find(|draft| &draft.id == draft_id)
                 {
-                    draft
+                    replace_prompt_text(&mut draft.prompt, prompt_text);
+                    replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+                    if !draft
                         .critique_notes
-                        .push("Learner edited approved wording.".to_owned());
+                        .iter()
+                        .any(|note| note == "Learner edited approved wording.")
+                    {
+                        draft
+                            .critique_notes
+                            .push("Learner edited approved wording.".to_owned());
+                    }
                 }
             }
-        }
-        let updated = review_unit.clone();
-        assert_review_unit_contract(&next, &updated)?;
-        self.commit(&next)?;
+            let updated = review_unit.clone();
+            assert_review_unit_contract(snapshot, &updated)?;
 
-        Ok(updated)
+            Ok(updated)
+        })
     }
 
     /// Hide an approved review unit from the active queue while preserving receipts.
@@ -931,17 +954,15 @@ impl BetaPersistenceStore {
         review_unit_id: &ReviewUnitId,
         archived_at: i64,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        let mut next = self.data.clone();
-        let review_unit = next
-            .review_units
-            .iter_mut()
-            .find(|unit| &unit.review_unit_id == review_unit_id)
-            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
-        review_unit.archived_at = Some(archived_at);
-        let archived = review_unit.clone();
-        self.commit(&next)?;
-
-        Ok(archived)
+        self.transact(|snapshot| {
+            let review_unit = snapshot
+                .review_units
+                .iter_mut()
+                .find(|unit| &unit.review_unit_id == review_unit_id)
+                .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+            review_unit.archived_at = Some(archived_at);
+            Ok(review_unit.clone())
+        })
     }
 
     /// Move an approved review unit's beta-owned queue availability forward.
@@ -957,20 +978,48 @@ impl BetaPersistenceStore {
         review_unit_id: &ReviewUnitId,
         snoozed_until: i64,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        let mut next = self.data.clone();
-        let review_unit = next
-            .review_units
-            .iter_mut()
-            .find(|unit| &unit.review_unit_id == review_unit_id)
-            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
-        if review_unit.archived_at.is_some() {
-            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
-        }
-        review_unit.snoozed_until = Some(snoozed_until);
-        let snoozed = review_unit.clone();
-        self.commit(&next)?;
+        self.transact(|snapshot| {
+            let review_unit = snapshot
+                .review_units
+                .iter_mut()
+                .find(|unit| &unit.review_unit_id == review_unit_id)
+                .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+            if review_unit.archived_at.is_some() {
+                return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+            }
+            review_unit.snoozed_until = Some(snoozed_until);
+            Ok(review_unit.clone())
+        })
+    }
 
-        Ok(snoozed)
+    /// Move every non-archived review unit under one persisted concept key
+    /// forward in one file-store commit.
+    ///
+    /// This does not mutate schedule or attempt history. The returned records
+    /// are the exact members changed by the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the single snapshot commit fails.
+    pub fn snooze_review_units_for_concept_until(
+        &mut self,
+        concept_key: &str,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, BetaStoreError> {
+        self.transact(|snapshot| {
+            let snoozed = snapshot
+                .review_units
+                .iter_mut()
+                .filter(|review_unit| review_unit.archived_at.is_none())
+                .filter(|review_unit| review_unit.queue.concept_key.as_deref() == Some(concept_key))
+                .map(|review_unit| {
+                    review_unit.snoozed_until = Some(snoozed_until);
+                    review_unit.clone()
+                })
+                .collect::<Vec<_>>();
+
+            Ok(snoozed)
+        })
     }
 
     /// Replace an approved review unit's volatile lifecycle metadata.
@@ -983,23 +1032,21 @@ impl BetaPersistenceStore {
         review_unit_id: &ReviewUnitId,
         lifecycle: ReviewUnitLifecycle,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        let mut next = self.data.clone();
-        let review_unit = next
-            .review_units
-            .iter_mut()
-            .find(|unit| &unit.review_unit_id == review_unit_id)
-            .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
-        if review_unit.archived_at.is_some() {
-            return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
-        }
-        review_unit.queue.lifecycle = lifecycle;
-        let updated = review_unit.clone();
-        self.commit(&next)?;
-
-        Ok(updated)
+        self.transact(|snapshot| {
+            let review_unit = snapshot
+                .review_units
+                .iter_mut()
+                .find(|unit| &unit.review_unit_id == review_unit_id)
+                .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
+            if review_unit.archived_at.is_some() {
+                return Err(BetaStoreError::ReviewUnitArchived(review_unit_id.clone()));
+            }
+            review_unit.queue.lifecycle = lifecycle;
+            Ok(review_unit.clone())
+        })
     }
 
-    /// Save or replace a beta review unit.
+    /// Create a beta review unit, or return the existing persisted unit untouched.
     ///
     /// # Errors
     ///
@@ -1008,12 +1055,19 @@ impl BetaPersistenceStore {
         &mut self,
         review_unit: BetaReviewUnitRecord,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        assert_review_unit_contract(&self.data, &review_unit)?;
-        let mut next = self.data.clone();
-        upsert_review_unit(&mut next.review_units, review_unit.clone());
-        self.commit(&next)?;
+        self.transact(|snapshot| {
+            if let Some(existing) = snapshot
+                .review_units
+                .iter()
+                .find(|unit| unit.review_unit_id == review_unit.review_unit_id)
+            {
+                return Ok(existing.clone());
+            }
+            assert_review_unit_contract(snapshot, &review_unit)?;
+            snapshot.review_units.push(review_unit.clone());
 
-        Ok(review_unit)
+            Ok(review_unit)
+        })
     }
 
     /// Set or clear schedule state for a known review unit.
@@ -1026,28 +1080,11 @@ impl BetaPersistenceStore {
         review_unit_id: &ReviewUnitId,
         schedule_state: Option<ScheduleState>,
     ) -> Result<(), BetaStoreError> {
-        assert_known_review_unit(&self.data, review_unit_id)?;
-        let mut next = self.data.clone();
-        apply_schedule_record(&mut next, review_unit_id, schedule_state);
-        self.commit(&next)
-    }
-
-    fn commit(&mut self, next: &BetaStoreSnapshot) -> Result<(), BetaStoreError> {
-        if self.fail_next_commit {
-            self.fail_next_commit = false;
-            return Err(BetaStoreError::InjectedCommitFailure);
-        }
-
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let _lock = StoreFileLock::acquire(&self.path)?;
-        let latest = load_snapshot(&self.path)?;
-        let next = merge_snapshot(&self.data, next, latest);
-        persist_snapshot(&self.path, &next)?;
-        self.data = next;
-
-        Ok(())
+        self.transact(|snapshot| {
+            assert_known_review_unit(snapshot, review_unit_id)?;
+            apply_schedule_record(snapshot, review_unit_id, schedule_state);
+            Ok(())
+        })
     }
 
     fn transact<T>(
@@ -1074,10 +1111,11 @@ impl MemoryServiceStore for BetaPersistenceStore {
     type Error = BetaStoreError;
 
     fn record_attempt(&mut self, attempt: ServiceAttemptRecord) -> Result<(), Self::Error> {
-        assert_attempt_contract(&self.data, &attempt)?;
-        let mut next = self.data.clone();
-        next.attempts.push(attempt);
-        self.commit(&next)
+        self.transact(|snapshot| {
+            assert_attempt_contract(snapshot, &attempt)?;
+            snapshot.attempts.push(attempt);
+            Ok(())
+        })
     }
 
     fn read_schedule_state(
@@ -1408,122 +1446,6 @@ fn current_feedback_head<'a>(
         .max_by_key(|row| (row.occurred_at, row.id.as_str()))
 }
 
-fn merge_snapshot(
-    base: &BetaStoreSnapshot,
-    proposed: &BetaStoreSnapshot,
-    mut latest: BetaStoreSnapshot,
-) -> BetaStoreSnapshot {
-    merge_upserted(
-        &mut latest.source_documents,
-        &base.source_documents,
-        &proposed.source_documents,
-        |row| row.id.clone(),
-    );
-    merge_upserted(
-        &mut latest.reference_spans,
-        &base.reference_spans,
-        &proposed.reference_spans,
-        |row| row.id.clone(),
-    );
-    merge_upserted(
-        &mut latest.generated_prompt_drafts,
-        &base.generated_prompt_drafts,
-        &proposed.generated_prompt_drafts,
-        |row| row.id.clone(),
-    );
-    merge_upserted(
-        &mut latest.review_units,
-        &base.review_units,
-        &proposed.review_units,
-        |row| row.review_unit_id.clone(),
-    );
-    merge_upserted(
-        &mut latest.generation_runs,
-        &base.generation_runs,
-        &proposed.generation_runs,
-        |row| row.id.clone(),
-    );
-    merge_upserted(
-        &mut latest.concept_reference_notes,
-        &base.concept_reference_notes,
-        &proposed.concept_reference_notes,
-        |row| row.concept_key.clone(),
-    );
-    merge_appended(&mut latest.attempts, &base.attempts, &proposed.attempts);
-    merge_appended(
-        &mut latest.content_feedback,
-        &base.content_feedback,
-        &proposed.content_feedback,
-    );
-    merge_appended(
-        &mut latest.applied_reviews,
-        &base.applied_reviews,
-        &proposed.applied_reviews,
-    );
-    merge_schedules(&mut latest.schedules, &base.schedules, &proposed.schedules);
-    latest
-}
-
-fn merge_upserted<T: Clone + PartialEq, K: Eq>(
-    latest: &mut Vec<T>,
-    base: &[T],
-    proposed: &[T],
-    key: impl Fn(&T) -> K,
-) {
-    for row in proposed {
-        let row_key = key(row);
-        let changed = base.iter().find(|old| key(old) == row_key) != Some(row);
-        if changed {
-            if let Some(existing) = latest.iter_mut().find(|old| key(old) == row_key) {
-                *existing = row.clone();
-            } else {
-                latest.push(row.clone());
-            }
-        }
-    }
-}
-
-fn merge_appended<T: Clone + PartialEq>(latest: &mut Vec<T>, base: &[T], proposed: &[T]) {
-    for row in proposed.iter().filter(|row| !base.contains(row)) {
-        if !latest.contains(row) {
-            latest.push(row.clone());
-        }
-    }
-}
-
-fn merge_schedules(
-    latest: &mut Vec<ScheduleRecord>,
-    base: &[ScheduleRecord],
-    proposed: &[ScheduleRecord],
-) {
-    for old in base {
-        let before = Some(old);
-        let after = proposed
-            .iter()
-            .find(|row| row.review_unit_id == old.review_unit_id);
-        if before != after {
-            latest.retain(|row| row.review_unit_id != old.review_unit_id);
-            if let Some(after) = after {
-                latest.push(after.clone());
-            }
-        }
-    }
-    for row in proposed.iter().filter(|row| {
-        !base
-            .iter()
-            .any(|old| old.review_unit_id == row.review_unit_id)
-    }) {
-        if let Some(existing) = latest
-            .iter_mut()
-            .find(|old| old.review_unit_id == row.review_unit_id)
-        {
-            *existing = row.clone();
-        } else {
-            latest.push(row.clone());
-        }
-    }
-}
-
 fn temporary_path(path: &Path) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1713,7 +1635,7 @@ fn replace_prompt_text(prompt: &mut Prompt, prompt_text: &str) {
     }
 }
 
-fn replace_prompt_answer(prompt: &mut Prompt, expected_answer: &str) {
+fn replace_prompt_answer(prompt: &mut Prompt, expected_answer: &str) -> Result<(), BetaStoreError> {
     match prompt {
         Prompt::Mcq {
             choices,
@@ -1726,12 +1648,14 @@ fn replace_prompt_answer(prompt: &mut Prompt, expected_answer: &str) {
             }
         }
         Prompt::Boolean { correct_answer, .. } => {
-            *correct_answer = expected_answer.eq_ignore_ascii_case("true");
+            *correct_answer = parse_strict_boolean_answer(expected_answer)
+                .ok_or(BetaStoreError::InvalidBooleanAnswer)?;
         }
         Prompt::Exact(prompt) => {
             prompt.accepted_answers = vec![expected_answer.to_owned()];
         }
     }
+    Ok(())
 }
 
 trait HasId {
@@ -1780,17 +1704,6 @@ fn upsert_by_id<T: HasId>(items: &mut Vec<T>, item: T) {
     if let Some(index) = items
         .iter()
         .position(|candidate| candidate.id() == item.id())
-    {
-        items[index] = item;
-    } else {
-        items.push(item);
-    }
-}
-
-fn upsert_review_unit(items: &mut Vec<BetaReviewUnitRecord>, item: BetaReviewUnitRecord) {
-    if let Some(index) = items
-        .iter()
-        .position(|candidate| candidate.review_unit_id == item.review_unit_id)
     {
         items[index] = item;
     } else {

@@ -160,6 +160,7 @@ fn nato_jobs() -> Vec<GenerationJob> {
 fn current(prompt: &str) -> BetaStudyCurrent {
     BetaStudyCurrent {
         review_unit_id: ReviewUnitId::new("ru-current"),
+        concept_key: Some("nato-phonetic-alphabet".to_owned()),
         prompt_id: "prompt-current".to_owned(),
         activity_kind: GeneratedLearningActivityKind::Quiz,
         activity_stage: "recognition".to_owned(),

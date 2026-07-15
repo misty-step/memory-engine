@@ -412,6 +412,16 @@ impl StudyStorage {
             .snooze_review(account_id, store_path, review_unit_id)
     }
 
+    pub(crate) fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .snooze_concept_review(account_id, store_path, review_unit_id)
+    }
+
     pub(crate) fn delete_review(
         &self,
         account_id: &str,
@@ -652,6 +662,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
+    fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
     fn delete_review(
         &self,
         account_id: &str,
@@ -690,6 +706,31 @@ struct FileStudyStorage {
 impl FileStudyStorage {
     fn now_ms(&self) -> i64 {
         (self.now)()
+    }
+
+    #[cfg(test)]
+    fn generate_source_with_provider(
+        &self,
+        store_path: &FsPath,
+        source_id: &str,
+        provider: &dyn memory_engine_generation::DraftProvider,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        if !persisted_source_exists(store_path, source_id)? {
+            return Err(ApiFailure::not_found("Source not found."));
+        }
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        let view = crate::run_source_generation_with_provider(&mut study, source_id, provider)
+            .map_err(study_failure)?;
+        Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn with_locked_study<R>(
+        &self,
+        store_path: &FsPath,
+        operation: impl FnOnce(&mut BetaStudySession) -> Result<R, ApiFailure>,
+    ) -> Result<R, ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        operation(&mut study)
     }
 }
 
@@ -1162,17 +1203,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source: &SourceRecord,
     ) -> Result<(), ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        study
-            .add_source(BetaStudySourceInput {
-                id: source.source_id.clone(),
-                title: source.title.clone(),
-                body: source.body.clone(),
-                project_key: source.project_key.clone(),
-                ttl_expires_at: source.ttl_expires_at,
-            })
-            .map_err(study_failure)?;
-        Ok(())
+        self.with_locked_study(store_path, |study| {
+            study
+                .add_source(BetaStudySourceInput {
+                    id: source.source_id.clone(),
+                    title: source.title.clone(),
+                    body: source.body.clone(),
+                    project_key: source.project_key.clone(),
+                    ttl_expires_at: source.ttl_expires_at,
+                })
+                .map_err(study_failure)?;
+            Ok(())
+        })
     }
 
     fn list_sources(
@@ -1192,6 +1234,10 @@ impl StudyStorageAdapter for FileStudyStorage {
         if !persisted_source_exists(store_path, source_id)? {
             return Err(ApiFailure::not_found("Source not found."));
         }
+        // Provider/model work must stay outside the descriptor lock. The
+        // persistence store owns the atomic commit path; holding the account
+        // lock here would turn normal foreground approval or invalidation on
+        // the same account into a spurious 409 for the duration of generation.
         let mut study = crate::open_study_session(store_path, self.now)?;
         let view = run_source_generation(&mut study, source_id)?;
 
@@ -1204,13 +1250,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<(StudyViewResponse, usize), ApiFailure> {
-        if !persisted_source_exists(store_path, source_id)? {
-            return Err(ApiFailure::not_found("Source not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
+        self.with_locked_study(store_path, |study| {
+            if !persisted_source_exists(store_path, source_id)? {
+                return Err(ApiFailure::not_found("Source not found."));
+            }
+            let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
 
-        Ok((StudyViewResponse::from_view(view), archived_count))
+            Ok((StudyViewResponse::from_view(view), archived_count))
+        })
     }
 
     fn invalidate_project_deck(
@@ -1220,15 +1267,16 @@ impl StudyStorageAdapter for FileStudyStorage {
         deck_id: &str,
         invalidated_at: i64,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        if !persisted_project_deck_exists(store_path, deck_id)? {
-            return Err(ApiFailure::not_found("Project deck not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = study
-            .invalidate_project_deck(deck_id, invalidated_at)
-            .map_err(study_failure)?;
+        self.with_locked_study(store_path, |study| {
+            if !persisted_project_deck_exists(store_path, deck_id)? {
+                return Err(ApiFailure::not_found("Project deck not found."));
+            }
+            let view = study
+                .invalidate_project_deck(deck_id, invalidated_at)
+                .map_err(study_failure)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn approve_draft(
@@ -1237,10 +1285,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = study.approve_draft(draft_id).map_err(study_failure)?;
+        self.with_locked_study(store_path, |study| {
+            let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn next_review(
@@ -1284,11 +1333,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = run_reference_generation(&mut study)?;
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = run_reference_generation(study)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn skip_review(
@@ -1297,11 +1347,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.skip_current().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.skip_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn snooze_review(
@@ -1310,11 +1360,30 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.snooze_current().map_err(study_failure)?;
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.snooze_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
 
-        Ok(StudyViewResponse::from_view(view))
+    fn snooze_concept_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            let view = study.start().map_err(study_failure)?;
+            let Some(current) = view.current else {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            };
+            if current.review_unit_id.to_string() != review_unit_id {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            }
+            let view = study.snooze_current_concept().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn delete_review(
@@ -1323,11 +1392,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.archive_current().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.archive_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn bridge_review(
@@ -1336,11 +1405,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = run_bridge_generation(&mut study)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = run_bridge_generation(study)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn submit_review(
@@ -1352,13 +1421,13 @@ impl StudyStorageAdapter for FileStudyStorage {
         response_time_ms: u32,
         idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study
-            .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
-            .map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study
+                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
+                .map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn record_content_feedback(
@@ -1920,6 +1989,44 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         })
     }
 
+    fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account
+                    .snooze_current_review_unit_concept_until(
+                        review_unit_id,
+                        self.now_ms(),
+                        self.now_ms() + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+                    )
+                    .map_err(|error| {
+                        match error {
+                    memory_engine_persistence_postgres::PostgresStoreError::NoConceptKey => {
+                        ApiFailure::bad_request(
+                            "The active review unit must have a nonblank concept key.",
+                        )
+                    }
+                    memory_engine_persistence_postgres::PostgresStoreError::UnknownReviewUnit(
+                        _,
+                    ) => ApiFailure::not_found("Review unit not found."),
+                    error => postgres_failure(error),
+                }
+                    })?;
+                let mut study = BetaStudySession::from_store(account, self.now);
+                let view = study.start().map_err(study_failure)?;
+
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
+    }
+
     fn delete_review(
         &self,
         account_id: &str,
@@ -1999,6 +2106,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memory_engine_generation::{
+        DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
+    };
+    use memory_engine_persistence::GeneratedPromptModel;
+    use memory_engine_service::MemoryServiceStore;
     use std::{
         sync::{Arc, Barrier},
         thread,
@@ -2006,6 +2118,198 @@ mod tests {
 
     fn test_now() -> i64 {
         1_700_000_000_000
+    }
+
+    struct BlockingDraftProvider {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        delegate: StructuredBlockProvider,
+    }
+
+    impl DraftProvider for BlockingDraftProvider {
+        fn model(&self) -> GeneratedPromptModel {
+            self.delegate.model()
+        }
+
+        fn generate_drafts(
+            &self,
+            source: &memory_engine_persistence::SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            self.entered.wait();
+            self.release.wait();
+            self.delegate.generate_drafts(source)
+        }
+    }
+
+    #[test]
+    fn file_generation_releases_descriptor_before_provider_and_foreground_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-generation-foreground-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let store_path = root.join("acct").join("study.json");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+        };
+        storage
+            .save_source(
+                "acct",
+                &store_path,
+                &crate::SourceRecord {
+                    source_id: "source".to_owned(),
+                    title: "NATO notes".to_owned(),
+                    body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
+                    project_key: None,
+                    ttl_expires_at: None,
+                },
+            )
+            .expect("save source");
+        let first = storage
+            .generate_source("acct", &store_path, "source")
+            .expect("seed draft");
+        let draft_id = first.drafts.first().expect("generated draft").id.clone();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let provider = BlockingDraftProvider {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            delegate: StructuredBlockProvider,
+        };
+        let generation_storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+        };
+        let generation_store_path = store_path.clone();
+        let generation = thread::spawn(move || {
+            generation_storage.generate_source_with_provider(
+                &generation_store_path,
+                "source",
+                &provider,
+            )
+        });
+
+        entered.wait();
+        // This is the foreground operation that used to receive a spurious
+        // 409 while generation held the descriptor across provider work.
+        storage
+            .approve_draft("acct", &root.join("acct").join("study.json"), &draft_id)
+            .expect("foreground approval must commit while provider is running");
+        storage
+            .save_source(
+                "acct",
+                &store_path,
+                &crate::SourceRecord {
+                    source_id: "source-2".to_owned(),
+                    title: "Second source".to_owned(),
+                    body: "Concept: Unrelated\nActivity: quiz\nStage: recognition-1\nQuestion: What is unrelated?\nAnswer: UNRELATED".to_owned(),
+                    project_key: None,
+                    ttl_expires_at: None,
+                },
+            )
+            .expect("foreground source mutation must commit while provider is running");
+        release.wait();
+        generation
+            .join()
+            .expect("generation thread")
+            .expect("generation after foreground commit");
+
+        let reloaded = memory_engine_persistence::BetaPersistenceStore::open(&store_path)
+            .expect("reload persisted store");
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.source_documents.len(), 2);
+        assert!(
+            snapshot.generation_runs.len() >= 2,
+            "foreground and background generation runs must both persist"
+        );
+        assert!(snapshot
+            .generated_prompt_drafts
+            .iter()
+            .any(|draft| draft.id == draft_id));
+        assert!(
+            snapshot.review_units.iter().any(|unit| {
+                unit.generated_prompt_draft_id.as_deref() == Some(draft_id.as_str())
+            }),
+            "foreground approval must survive the later generation commit"
+        );
+        assert!(!reloaded.list_queue_candidates().expect("queue").is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_generation_keeps_foreground_commit_responsive_while_provider_waits() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-generation-responsive-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let store_path = root.join("acct").join("study.json");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+        };
+        storage
+            .save_source(
+                "acct",
+                &store_path,
+                &crate::SourceRecord {
+                    source_id: "source".to_owned(),
+                    title: "NATO notes".to_owned(),
+                    body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
+                    project_key: None,
+                    ttl_expires_at: None,
+                },
+            )
+            .expect("save source");
+        let first = storage
+            .generate_source("acct", &store_path, "source")
+            .expect("seed draft");
+        let draft_id = first.drafts.first().expect("generated draft").id.clone();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let provider = BlockingDraftProvider {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            delegate: StructuredBlockProvider,
+        };
+        let generation_storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+        };
+        let generation_store_path = store_path.clone();
+        let generation = thread::spawn(move || {
+            generation_storage.generate_source_with_provider(
+                &generation_store_path,
+                "source",
+                &provider,
+            )
+        });
+
+        entered.wait();
+        let approval_storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+        };
+        let approval_store_path = store_path.clone();
+        let approval = tokio::task::spawn_blocking(move || {
+            approval_storage.approve_draft("acct", &approval_store_path, &draft_id)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), approval)
+            .await
+            .expect("foreground approval must not wait for provider to release")
+            .expect("foreground approval task")
+            .expect("foreground approval");
+        release.wait();
+        generation
+            .join()
+            .expect("generation thread")
+            .expect("generation after foreground commit");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

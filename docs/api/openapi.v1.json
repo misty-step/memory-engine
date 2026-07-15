@@ -373,6 +373,71 @@
         }
       }
     },
+    "/v1/accounts/{account_id}/review/{review_unit_id}/snooze-concept": {
+      "post": {
+        "summary": "Snooze every review under the current concept without grading it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/ReviewUnitId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with every card under the current concept deferred and the next due item selected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The current review unit has a null or blank concept key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The account does not own the requested review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The requested review unit is stale or not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The account study store is busy; retry the request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/review/{review_unit_id}/bridge": {
       "post": {
         "summary": "Generate easier bridge material for the current review",
@@ -843,6 +908,7 @@
         "type": "object",
         "required": [
           "reviewUnitId",
+          "conceptKey",
           "promptId",
           "activityKind",
           "activityStage",
@@ -861,6 +927,17 @@
         "properties": {
           "reviewUnitId": {
             "type": "string"
+          },
+          "conceptKey": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Existing persisted concept grouping key, when this card belongs to one."
           },
           "promptId": {
             "type": "string"

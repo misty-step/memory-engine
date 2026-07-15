@@ -469,6 +469,10 @@ impl AccountRegistry {
             ttl_expires_at: None,
         };
 
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         storage.save_source(account_id, &account.store_path, &source)?;
         let mut data = self.lock_data();
@@ -507,6 +511,10 @@ impl AccountRegistry {
             ttl_expires_at: request.ttl_expires_at,
         };
 
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         storage.save_source(account_id, &account.store_path, &source)?;
         let mut data = self.lock_data();
@@ -540,6 +548,10 @@ impl AccountRegistry {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         normalize_required_text(&request.event, "Invalidation event")?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .invalidate_project_deck(account_id, &account.store_path, deck_id, self.now())
     }
@@ -593,16 +605,13 @@ impl AccountRegistry {
         account_id: &str,
         source_id: &str,
     ) -> Result<usize, ApiFailure> {
-        // Serialize generation per account: two captures otherwise read-modify-
-        // write the whole study store concurrently and clobber each other's
-        // cards (059). Held across the whole run; different accounts never block.
+        let storage = self.storage();
+        let store_path = storage.account_store_path(account_id);
+        storage.generate_source(account_id, &store_path, source_id)?;
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let storage = self.storage();
-        let store_path = storage.account_store_path(account_id);
-        storage.generate_source(account_id, &store_path, source_id)?;
         let view = storage.study_view(account_id, &store_path)?;
         let pending = view
             .drafts
@@ -662,6 +671,10 @@ impl AccountRegistry {
         source_id: &str,
     ) -> Result<(StudyViewResponse, usize), ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .archive_source(account_id, &account.store_path, source_id)
     }
@@ -678,6 +691,10 @@ impl AccountRegistry {
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .approve_draft(account_id, &account.store_path, draft_id)
     }
@@ -754,6 +771,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .skip_review(account_id, &account.store_path, review_unit_id)
     }
@@ -773,6 +794,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .delete_review(account_id, &account.store_path, review_unit_id)
     }
@@ -789,8 +814,32 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .snooze_review(account_id, &account.store_path, review_unit_id)
+    }
+
+    /// Runs an API registry operation for the active review's whole concept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
+    pub(crate) fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage()
+            .snooze_concept_review(account_id, &account.store_path, review_unit_id)
     }
 
     /// Runs an API registry operation.
@@ -805,6 +854,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .bridge_review(account_id, &account.store_path, review_unit_id)
     }
@@ -830,6 +883,10 @@ impl AccountRegistry {
         }
         let storage = self.storage();
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut data = self.lock_data();
         if let Some(response) = data
             .accounts
@@ -1036,6 +1093,10 @@ impl AccountRegistry {
                 sources: BTreeMap::new(),
                 submitted_reviews: BTreeMap::new(),
             });
+        }
+
+        if storage.account_exists(account_id)? {
+            return Err(ApiFailure::forbidden_account());
         }
 
         Err(ApiFailure::unknown_account())

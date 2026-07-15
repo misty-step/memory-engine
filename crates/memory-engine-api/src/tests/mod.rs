@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::Path as FsPath,
-    sync::{Arc, Barrier},
+    sync::{mpsc, Arc, Barrier},
     thread,
 };
 
@@ -1341,6 +1341,25 @@ async fn assert_review_mutations_require_csrf(
     assert_forbidden_form(
         app,
         cookie,
+        "/app/snooze-concept",
+        &[("reviewUnitId", review_unit_id)],
+        "concept snooze without csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
+        "/app/snooze-concept",
+        &[
+            ("csrfToken", "csrf-invalid-for-matrix"),
+            ("reviewUnitId", review_unit_id),
+        ],
+        "concept snooze with invalid csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
         "/app/bridge",
         &[("reviewUnitId", review_unit_id)],
         "bridge without csrf",
@@ -1445,6 +1464,67 @@ async fn workspace_html(app: &axum::Router, cookie: &str) -> String {
         .expect("workspace refresh");
     assert_eq!(response.status(), StatusCode::OK);
     response_text(response).await
+}
+
+async fn assert_html_concept_key_is_hidden(concept_key: &Value) {
+    let root = temp_store_root("concept_key_html");
+    let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app = router(state.clone());
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &shared_concept_body())],
+        ))
+        .await
+        .expect("start HTML session");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    let source_id = html_value(&started, "sourceId");
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let study_path = fs::read_dir(&root)
+        .expect("read HTML store root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("study.json"))
+        .find(|path| path.exists())
+        .expect("HTML study snapshot");
+    let mut snapshot: Value = serde_json::from_str(
+        &fs::read_to_string(&study_path).expect("read HTML concept-key snapshot"),
+    )
+    .expect("decode HTML concept-key snapshot");
+    for unit in snapshot["reviewUnits"]
+        .as_array_mut()
+        .expect("HTML review units")
+    {
+        unit["queue"]["conceptKey"] = concept_key.clone();
+    }
+    fs::write(
+        &study_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&snapshot).expect("encode HTML concept-key snapshot")
+        ),
+    )
+    .expect("write HTML concept-key snapshot");
+
+    let page = next_review_html(&app, &cookie, &csrf_token, "concept key").await;
+    assert!(!page.contains("Hide every card for this concept until tomorrow."));
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let rejected = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("concept-key HTML rejection");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn next_review_html(
@@ -1700,6 +1780,45 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
         ))
         .await
         .expect("expired session response");
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store_and_no_referrer(&expired);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Your session expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
+async fn expired_browser_session_renders_concept_snooze_recovery_instead_of_json() {
+    CONCEPT_SNOOZE_SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let state = ApiState::new(AccountRegistry::default().with_clock(concept_snooze_session_clock));
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    CONCEPT_SNOOZE_SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("expired concept snooze session response");
     assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
     assert_no_store_and_no_referrer(&expired);
     assert_eq!(
@@ -3339,6 +3458,48 @@ async fn source_routes_reject_cross_account_session_tokens() {
 }
 
 #[tokio::test]
+async fn cross_account_token_rejection_is_stable_after_registry_restart() {
+    let store_root = temp_store_root("cross-account-auth-parity");
+    let warm_app = router(ApiState::new(super::AccountRegistry::with_store_root(
+        &store_root,
+    )));
+    let first = create_account(&warm_app, "warm-first@example.com").await;
+    let second = create_account(&warm_app, "warm-second@example.com").await;
+
+    let warm = warm_app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            &format!("/accounts/{}/sources", second.account_id),
+            &first.session_token,
+        ))
+        .await
+        .expect("warm cross-account read");
+    assert_eq!(warm.status(), StatusCode::FORBIDDEN);
+
+    let cold_app = router(ApiState::new(super::AccountRegistry::with_store_root(
+        &store_root,
+    )));
+    let cold = cold_app
+        .oneshot(empty_request(
+            "GET",
+            &format!("/accounts/{}/sources", second.account_id),
+            &first.session_token,
+        ))
+        .await
+        .expect("cold cross-account read");
+    assert_eq!(cold.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(warm).await["error"],
+        json!("Session token does not match account.")
+    );
+    assert_eq!(
+        response_json(cold).await["error"],
+        json!("Session token does not match account.")
+    );
+}
+
+#[tokio::test]
 async fn recreating_account_rejects_email_replay_without_session() {
     let app = router(ApiState::default());
     let first = create_account(&app, "learner@example.com").await;
@@ -4027,6 +4188,101 @@ async fn postgres_backend_source_routes_are_account_scoped() {
     assert_eq!(cross_write.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic() {
+    let Some(database) = PostgresTestDatabase::new("v1_concept_snooze") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let first = create_account_v1(&app, "first-concept@example.com").await;
+    let second = create_account_v1(&app, "second-concept@example.com").await;
+
+    for account in [&first, &second] {
+        let source_id = create_source_v1(
+            &app,
+            account,
+            "Shared NATO concept notes",
+            &shared_and_other_concept_body(),
+        )
+        .await;
+        let draft_ids = generate_source_v1_draft_ids(&app, account, &source_id).await;
+        assert_eq!(draft_ids.len(), 3);
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, account, draft_id).await;
+        }
+    }
+
+    let first_before = postgres_account_snapshot(&database.scoped_url, &first.account_id);
+    let second_before = postgres_account_snapshot(&database.scoped_url, &second.account_id);
+    assert_eq!(first_before.review_units.len(), 3);
+    assert_eq!(second_before.review_units.len(), 3);
+    assert_eq!(
+        first_before
+            .review_units
+            .iter()
+            .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+            .count(),
+        2
+    );
+
+    let first_review_unit_id = next_review_v1(&app, &first).await;
+    let cross_account = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{first_review_unit_id}/snooze-concept",
+                second.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("cross-account concept snooze");
+    assert_eq!(cross_account.status(), StatusCode::FORBIDDEN);
+
+    let snoozed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{first_review_unit_id}/snooze-concept",
+                first.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("authenticated postgres concept snooze");
+    assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_json(snoozed).await;
+    assert_eq!(snoozed["current"]["conceptKey"], json!("nato-letter-b"));
+    assert_eq!(snoozed["dueCount"], json!(1));
+
+    let first_after = postgres_account_snapshot(&database.scoped_url, &first.account_id);
+    assert_eq!(first_after.attempts, first_before.attempts);
+    assert_eq!(first_after.schedules, first_before.schedules);
+    let first_shared = first_after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_shared.len(), 2);
+    assert!(first_shared.iter().all(|unit| unit.snoozed_until.is_some()));
+    assert_eq!(
+        first_after
+            .review_units
+            .iter()
+            .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-b"))
+            .filter_map(|unit| unit.snoozed_until)
+            .count(),
+        0
+    );
+
+    let second_after = postgres_account_snapshot(&database.scoped_url, &second.account_id);
+    assert_eq!(second_after, second_before);
+}
+
 #[tokio::test]
 async fn source_routes_reject_blank_source_material() {
     let app = router(ApiState::default());
@@ -4109,6 +4365,8 @@ async fn source_generation_approval_and_review_are_account_scoped() {
         .expect("review unit id");
     assert_eq!(approved["current"]["expectedAnswer"], json!(null));
 
+    assert_foreign_review_unit_is_not_found(&app, &first, &second).await;
+
     let revealed = app
         .clone()
         .oneshot(empty_request(
@@ -4157,6 +4415,38 @@ async fn source_generation_approval_and_review_are_account_scoped() {
         .await
         .expect("cross next");
     assert_eq!(cross_next.status(), StatusCode::FORBIDDEN);
+}
+
+async fn assert_foreign_review_unit_is_not_found(
+    app: &axum::Router,
+    first: &TestAccount,
+    second: &TestAccount,
+) {
+    let source_id =
+        create_source_v1(app, second, "Second account NATO notes", &source_body()).await;
+    let draft_id = generate_source_v1_draft_ids(app, second, &source_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("second account draft");
+    let foreign_review_unit_id = approve_draft_v1(app, second, &draft_id).await;
+    let foreign_review = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{foreign_review_unit_id}/reveal",
+                first.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("foreign review id");
+    assert_eq!(foreign_review.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(foreign_review).await["error"],
+        json!("Review unit not found.")
+    );
 }
 
 #[tokio::test]
@@ -4502,6 +4792,493 @@ async fn v1_json_api_returns_post_answer_feedback_and_concept_progress() {
 }
 
 #[tokio::test]
+async fn v1_json_concept_snooze_is_authenticated_and_defers_every_member() {
+    let app = router(ApiState::default());
+    let account = create_account_v1(&app, "concept-snooze@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    assert_eq!(draft_ids.len(), 2);
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+
+    let review_unit_id = next_review_v1(&app, &account).await;
+    let snoozed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("snooze concept");
+    assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_json(snoozed).await;
+    assert_eq!(snoozed["current"], json!(null));
+    assert_eq!(snoozed["dueCount"], json!(0));
+
+    let after = next_review_v1_body(&app, &account).await;
+    assert_eq!(after["current"], json!(null));
+    assert_eq!(after["dueCount"], json!(0));
+}
+
+#[tokio::test]
+async fn file_concept_snooze_rejects_stale_archived_id_without_resurrection() {
+    let root = temp_store_root("stale_concept_snooze");
+    let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app = router(state);
+    let account = create_account_v1(&app, "stale-file-concept@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+
+    let study_path = root.join(&account.account_id).join("study.json");
+    let mut snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(&study_path).expect("read file study snapshot"))
+            .expect("decode file study snapshot");
+    let units = snapshot["reviewUnits"]
+        .as_array_mut()
+        .expect("review units");
+    let archived = units
+        .iter_mut()
+        .find(|unit| unit["reviewUnitId"] == stale_id)
+        .expect("stale current unit");
+    archived["archivedAt"] = json!(1);
+    fs::write(
+        &study_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&snapshot).expect("encode snapshot")
+        ),
+    )
+    .expect("archive stale file unit");
+
+    let rejected = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{stale_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("stale file concept snooze");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let after: Value = serde_json::from_str(
+        &fs::read_to_string(&study_path).expect("read file snapshot after rejection"),
+    )
+    .expect("decode file snapshot after rejection");
+    assert_eq!(
+        after["reviewUnits"].as_array().expect("review units").len(),
+        3
+    );
+    assert!(after["reviewUnits"]
+        .as_array()
+        .expect("review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .all(|unit| unit["snoozedUntil"].is_null()));
+    assert_eq!(
+        after["reviewUnits"]
+            .as_array()
+            .expect("review units")
+            .iter()
+            .find(|unit| unit["reviewUnitId"] == stale_id)
+            .expect("archived stale unit")["archivedAt"],
+        json!(1)
+    );
+}
+
+#[tokio::test]
+async fn file_two_registries_share_account_lock_and_reject_stale_snooze() {
+    let root = temp_store_root("two_registry_concept_snooze");
+    let state_one = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let state_two = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app_one = router(state_one.clone());
+    let app_two = router(state_two);
+    let started = app_one
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &shared_and_other_concept_body())],
+        ))
+        .await
+        .expect("start first file registry");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    let source_id = html_value(&started, "sourceId");
+    generate_source_html(&app_one, &state_one, &cookie, &csrf_token, &source_id).await;
+    let page = next_review_html(&app_one, &cookie, &csrf_token, "first registry").await;
+    let stale_id = html_value(&page, "reviewUnitId");
+
+    let archived = app_one
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/delete",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("reviewUnitId", &stale_id)],
+        ))
+        .await
+        .expect("archive through first file registry");
+    assert_eq!(archived.status(), StatusCode::OK);
+
+    let rejected = app_two
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("reviewUnitId", &stale_id)],
+        ))
+        .await
+        .expect("stale snooze through second file registry");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let study_path = fs::read_dir(&root)
+        .expect("read two-registry root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("study.json"))
+        .find(|path| path.exists())
+        .expect("two-registry study snapshot");
+    let snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(study_path).expect("read two-registry snapshot"))
+            .expect("decode two-registry snapshot");
+    assert!(snapshot["reviewUnits"]
+        .as_array()
+        .expect("two-registry review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .all(|unit| unit["snoozedUntil"].is_null()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_update() {
+    let Some(database) = PostgresTestDatabase::new("stale_concept_snooze") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-postgres-concept@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+
+    tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database.scoped_url)
+                .expect("connect stale postgres store");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
+                    .expect("account scope"),
+            )
+            .archive_review_unit(
+                &memory_engine_core::ReviewUnitId::new(stale_id.clone()),
+                DEFAULT_BETA_STUDY_NOW,
+            )
+            .expect("archive stale postgres unit");
+    });
+
+    let rejected = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{stale_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("stale postgres concept snooze");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_none() || unit.review_unit_id.as_str() == stale_id));
+    assert!(after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == stale_id)
+        .expect("archived postgres stale unit")
+        .archived_at
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_two_connections_archive_requested_before_concept_snooze() {
+    let Some(database) = PostgresTestDatabase::new("stale_concept_two_connections") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-two-connection@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    let (first_ready_tx, first_ready_rx) = mpsc::channel();
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let first_url = database.scoped_url.clone();
+    let first_account_id = account.account_id.clone();
+    let first_stale_id = stale_id.clone();
+    let first = thread::spawn(move || {
+        hold_postgres_account_lock_and_archive(
+            &first_url,
+            &first_account_id,
+            &first_stale_id,
+            &first_ready_tx,
+            &release_first_rx,
+        );
+    });
+    tokio::task::block_in_place(|| first_ready_rx.recv().expect("first transaction ready"));
+
+    let (second_started_tx, second_started_rx) = mpsc::channel();
+    let database_url = database.scoped_url.clone();
+    let account_id = account.account_id.clone();
+    let stale_id_for_second = stale_id.clone();
+    let second = thread::spawn(move || {
+        second_started_tx
+            .send(())
+            .expect("signal second transaction start");
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database_url)
+                .expect("connect second concurrency client");
+        let mut account_store = store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id)
+                .expect("second account scope"),
+        );
+        let now = live_now_ms();
+        account_store.snooze_current_review_unit_concept_until(
+            &stale_id_for_second,
+            now,
+            now + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+        )
+    });
+    tokio::task::block_in_place(|| {
+        second_started_rx
+            .recv()
+            .expect("second transaction started");
+    });
+    release_first_tx
+        .send(())
+        .expect("release first archive transaction");
+    first.join().expect("join first transaction");
+    let second_result = second.join().expect("join second transaction");
+    assert!(
+        matches!(
+            &second_result,
+            Err(memory_engine_persistence_postgres::PostgresStoreError::UnknownReviewUnit(id))
+                if id.as_str() == stale_id
+        ),
+        "the requested id did not become stale: requested={stale_id}, result={second_result:?}"
+    );
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_none()));
+    assert!(after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == stale_id)
+        .expect("archived unit after two-connection race")
+        .archived_at
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
+    let Some(database) = PostgresTestDatabase::new("stale_full_record_save") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-full-record@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let requested_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+
+    let (stale_ready_tx, stale_ready_rx) = mpsc::channel::<()>();
+    let (allow_stale_save_tx, allow_stale_save_rx) = mpsc::channel();
+    let stale_url = database.scoped_url.clone();
+    let stale_account_id = account.account_id.clone();
+    let stale_account_id_for_thread = stale_account_id.clone();
+    let requested_id_for_stale = requested_id.clone();
+    let stale_writer = spawn_stale_postgres_record_writer(
+        stale_url,
+        stale_account_id,
+        stale_account_id_for_thread,
+        requested_id_for_stale,
+        stale_ready_tx,
+        allow_stale_save_rx,
+    );
+    tokio::task::block_in_place(|| {
+        stale_ready_rx
+            .recv()
+            .expect("receive stale record before concept commit");
+    });
+
+    let (latest_prompt, latest_lifecycle) = update_and_snooze_postgres_review_unit(
+        &database.scoped_url,
+        &account.account_id,
+        &requested_id,
+    );
+
+    allow_stale_save_tx
+        .send(())
+        .expect("allow stale full-record save");
+    stale_writer
+        .join()
+        .expect("stale writer did not panic")
+        .expect("stale full-record save");
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_some()));
+    let persisted_requested = after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == requested_id)
+        .expect("persisted requested record");
+    assert_eq!(persisted_requested.prompt, latest_prompt.prompt);
+    assert_eq!(
+        persisted_requested.queue.lifecycle,
+        latest_lifecycle.queue.lifecycle
+    );
+}
+
+#[tokio::test]
+async fn concept_snooze_null_and_blank_keys_are_json_400_and_hidden_from_html() {
+    for (label, concept_key) in [("null", json!(null)), ("blank", json!("   "))] {
+        let root = temp_store_root(&format!("concept_key_{label}"));
+        let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+        let app = router(state.clone());
+        let account = create_account_v1(&app, &format!("concept-key-{label}@example.com")).await;
+        let source_id = create_source_v1(
+            &app,
+            &account,
+            "One concept key edge case",
+            &shared_concept_body(),
+        )
+        .await;
+        let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, &account, draft_id).await;
+        }
+        let review_unit_id = next_review_v1(&app, &account).await;
+        let study_path = root.join(&account.account_id).join("study.json");
+        let mut snapshot: Value = serde_json::from_str(
+            &fs::read_to_string(&study_path).expect("read concept-key snapshot"),
+        )
+        .expect("decode concept-key snapshot");
+        for unit in snapshot["reviewUnits"]
+            .as_array_mut()
+            .expect("review units")
+        {
+            unit["queue"]["conceptKey"] = concept_key.clone();
+        }
+        fs::write(
+            &study_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&snapshot).expect("encode concept-key snapshot")
+            ),
+        )
+        .expect("write concept-key snapshot");
+
+        let rejected = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{review_unit_id}/snooze-concept",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("concept-key JSON rejection");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(rejected).await["error"],
+            json!("The active review unit must have a nonblank concept key.")
+        );
+
+        assert_html_concept_key_is_hidden(&concept_key).await;
+    }
+}
+
+#[tokio::test]
 async fn v1_json_api_exposes_review_escape_hatches() {
     let app = router(ApiState::default());
     let account = create_account_v1(&app, "bridge@example.com").await;
@@ -4637,6 +5414,14 @@ async fn v1_openapi_artifact_matches_registered_routes() {
         .iter()
         .map(|operation| (operation.method.to_owned(), operation.path.to_owned()))
         .collect::<std::collections::BTreeSet<_>>();
+    let concept_responses = &contract["paths"]
+        ["/v1/accounts/{account_id}/review/{review_unit_id}/snooze-concept"]["post"]["responses"];
+    for status in ["200", "400", "403", "404", "409"] {
+        assert!(
+            concept_responses[status].is_object(),
+            "concept snooze OpenAPI response {status} missing"
+        );
+    }
 
     assert_eq!(actual, expected);
     assert_schema_requires(
@@ -5723,6 +6508,23 @@ fn shared_concept_body() -> String {
     .join("\n")
 }
 
+fn shared_and_other_concept_body() -> String {
+    [
+        shared_concept_body(),
+        [
+            "Concept: NATO letter B",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for B?",
+            "Answer: BRAVO",
+            "Distractors: ALFA, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for B is BRAVO.",
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n")
+}
+
 fn expired_project_deck_body() -> String {
     [
         "Concept: NATO letter D",
@@ -5746,10 +6548,151 @@ fn temp_store_root(name: &str) -> std::path::PathBuf {
     root
 }
 
+fn live_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn spawn_stale_postgres_record_writer(
+    database_url: String,
+    read_account_id: String,
+    save_account_id: String,
+    requested_id: String,
+    ready: mpsc::Sender<()>,
+    allow_save: mpsc::Receiver<()>,
+) -> thread::JoinHandle<Result<(), String>> {
+    thread::spawn(move || {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database_url)
+                .expect("connect stale writer");
+        let mut stale_record = store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(read_account_id)
+                    .expect("stale writer account scope"),
+            )
+            .snapshot()
+            .expect("read stale writer snapshot")
+            .review_units
+            .into_iter()
+            .find(|unit| unit.review_unit_id.as_str() == requested_id)
+            .expect("stale requested record");
+        stale_record.snoozed_until = Some(live_now_ms());
+        ready.send(()).expect("signal stale read");
+        allow_save
+            .recv()
+            .expect("wait for concept commit before stale save");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(save_account_id)
+                    .expect("stale save account scope"),
+            )
+            .save_review_unit(&stale_record)
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn update_and_snooze_postgres_review_unit(
+    database_url: &str,
+    account_id: &str,
+    requested_id: &str,
+) -> (
+    memory_engine_persistence::BetaReviewUnitRecord,
+    memory_engine_persistence::BetaReviewUnitRecord,
+) {
+    tokio::task::block_in_place(|| {
+        let mut latest_store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect mutable writer");
+        let mut latest_account = latest_store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                .expect("mutable account scope"),
+        );
+        let requested_review_unit = memory_engine_core::ReviewUnitId::new(requested_id);
+        let latest_prompt = latest_account
+            .update_review_unit_prompt_text(&requested_review_unit, "Newer prompt wins", "ALFA")
+            .expect("newer prompt update");
+        let latest_lifecycle = latest_account
+            .set_review_unit_lifecycle(
+                &requested_review_unit,
+                memory_engine_core::ReviewUnitLifecycle::ttl_expires_at(live_now_ms() + 86_400_000),
+            )
+            .expect("newer lifecycle update");
+        let mut concept_store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect concept writer");
+        let now = live_now_ms();
+        concept_store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                    .expect("concept account scope"),
+            )
+            .snooze_current_review_unit_concept_until(
+                requested_id,
+                now,
+                now + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+            )
+            .expect("concept writer commit");
+        (latest_prompt, latest_lifecycle)
+    })
+}
+
+fn hold_postgres_account_lock_and_archive(
+    database_url: &str,
+    account_id: &str,
+    review_unit_id: &str,
+    ready: &mpsc::Sender<()>,
+    release: &mpsc::Receiver<()>,
+) {
+    let mut client = memory_engine_persistence_postgres::connect_client(database_url)
+        .expect("connect first concurrency client");
+    let mut transaction = client.transaction().expect("begin first transaction");
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&account_id],
+        )
+        .expect("lock account for first concurrency client");
+    transaction
+        .execute(
+            "UPDATE memory_engine_review_units
+             SET archived_at_ms = $3,
+                 record = jsonb_set(record, '{archivedAt}', to_jsonb($3::BIGINT), true)
+             WHERE account_id = $1 AND review_unit_id = $2",
+            &[&account_id, &review_unit_id, &DEFAULT_BETA_STUDY_NOW],
+        )
+        .expect("archive requested unit in first transaction");
+    ready.send(()).expect("signal first transaction ready");
+    release.recv().expect("wait to commit first transaction");
+    transaction
+        .commit()
+        .expect("commit first archive transaction");
+}
+
 struct PostgresTestDatabase {
     admin_url: String,
     schema: String,
     scoped_url: String,
+}
+
+fn postgres_account_snapshot(
+    database_url: &str,
+    account_id: &str,
+) -> memory_engine_persistence::BetaStoreSnapshot {
+    tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect postgres snapshot store");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                    .expect("account scope"),
+            )
+            .snapshot()
+            .expect("postgres snapshot")
+    })
 }
 
 impl PostgresTestDatabase {
@@ -5924,6 +6867,12 @@ static SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn session_clock() -> i64 {
     SESSION_CLOCK.load(Ordering::SeqCst)
+}
+
+static CONCEPT_SNOOZE_SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+fn concept_snooze_session_clock() -> i64 {
+    CONCEPT_SNOOZE_SESSION_CLOCK.load(Ordering::SeqCst)
 }
 
 #[test]
@@ -6852,6 +7801,7 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         "Show background reading for this card.",
         "Show later this session.",
         "Hide until tomorrow.",
+        "Hide every card for this concept until tomorrow.",
         "Generate easier warm-up cards, then revisit this one later.",
         "Remove this card from review for good.",
         "Capture new material without leaving review.",
@@ -6863,6 +7813,21 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
             "expected a truthful tooltip with a leading icon ({tooltip}): {page}"
         );
     }
+
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let concept_snoozed = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("snooze concept");
+    assert_eq!(concept_snoozed.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -569,6 +569,39 @@ impl ApiState {
         )
     }
 
+    /// Snooze every review card under the active card's persisted concept key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, review lookup, or persistence fails.
+    pub fn snooze_concept_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .snooze_concept_review(account_id, session_token, review_unit_id)
+    }
+
+    /// Snooze every review card under the browser-authenticated card's
+    /// persisted concept key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when review lookup or persistence fails.
+    pub fn snooze_concept_app_review(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.snooze_concept_review(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+        )
+    }
+
     /// Generate bridge material for a review.
     ///
     /// # Errors
@@ -1155,6 +1188,11 @@ pub struct ApiFailure {
 
 impl ApiFailure {
     #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
     pub fn bad_request(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -1230,11 +1268,6 @@ impl ApiFailure {
     #[must_use]
     pub fn is_session_expired(&self) -> bool {
         self.status == StatusCode::UNAUTHORIZED
-    }
-
-    #[must_use]
-    pub fn status(&self) -> StatusCode {
-        self.status
     }
 
     #[must_use]
@@ -1607,17 +1640,30 @@ where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    let ids = Some(vec![source_id.to_owned()]);
     match OpenRouterConfig::from_env() {
         Ok(config) => {
             let structured = StructuredBlockProvider;
             let model = OpenRouterProvider::new(config);
             let provider = FallbackProvider::new(&structured, &model);
-            study.generate_with_provider(ids, &provider)
+            run_source_generation_with_provider(study, source_id, &provider)
         }
-        Err(_) => study.generate(ids),
+        Err(_) => run_source_generation_with_provider(study, source_id, &StructuredBlockProvider),
     }
     .map_err(study_failure)
+}
+
+pub(crate) fn run_source_generation_with_provider<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    provider: &dyn memory_engine_generation::DraftProvider,
+) -> Result<
+    BetaStudyView,
+    memory_engine_study::BetaStudyError<<S as memory_engine_service::MemoryServiceStore>::Error>,
+>
+where
+    S: memory_engine_study::BetaStudyStore,
+{
+    study.generate_with_provider(Some(vec![source_id.to_owned()]), provider)
 }
 
 fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
@@ -1854,6 +1900,9 @@ fn persisted_project_deck_exists(path: &FsPath, deck_id: &str) -> Result<bool, A
 fn study_failure<E: std::fmt::Display>(
     error: memory_engine_study::BetaStudyError<E>,
 ) -> ApiFailure {
+    if matches!(&error, memory_engine_study::BetaStudyError::NoConceptKey) {
+        return ApiFailure::bad_request("The active review unit must have a nonblank concept key.");
+    }
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
