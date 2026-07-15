@@ -2432,14 +2432,23 @@ mod tests {
                 .into_iter()
                 .map(|handle| handle.join().expect("stale worker"))
                 .collect::<Vec<_>>();
-            assert!(
-                stale_results.iter().all(|result| matches!(
-                    result,
-                    Err(ContentFeedbackError::Store(
-                        super::PostgresStoreError::FeedbackSupersedesStale { .. }
+            assert_eq!(
+                stale_results.iter().filter(|result| result.is_ok()).count(),
+                1,
+                "exactly one concurrent child may win the locked head: {stale_results:?}"
+            );
+            assert_eq!(
+                stale_results
+                    .iter()
+                    .filter(|result| matches!(
+                        result,
+                        Err(ContentFeedbackError::Store(
+                            super::PostgresStoreError::FeedbackSupersedesStale { .. }
+                        ))
                     ))
-                )),
-                "stale concurrent results: {stale_results:?}"
+                    .count(),
+                1,
+                "the losing concurrent child must be a typed stale conflict: {stale_results:?}"
             );
             Ok(())
         })();
