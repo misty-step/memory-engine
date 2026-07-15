@@ -167,6 +167,24 @@ CREATE INDEX IF NOT EXISTS memory_engine_attempts_account_review_idx
     ON memory_engine_attempts(account_id, review_unit_id, occurred_at_ms);
 ";
 
+const CLAIM_RETURN_NOTIFICATION_SQL: &str = r"
+UPDATE memory_engine_return_notification_preferences
+ SET claim_id = $6,
+     claim_expires_at_ms = $7::BIGINT,
+     pending_delivery_key = COALESCE(pending_delivery_key, $8),
+     pending_due_count = COALESCE(pending_due_count, $3::BIGINT),
+     updated_at_ms = $2::BIGINT
+ WHERE account_id = $1
+   AND enabled
+   AND (pending_delivery_key IS NOT NULL OR
+        (($4 OR $3::BIGINT > 0) AND
+        (last_sent_at_ms IS NULL OR last_sent_at_ms <= $5::BIGINT)))
+   AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2::BIGINT)
+ RETURNING email_normalized,
+           pending_due_count,
+           pending_delivery_key
+";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountScope {
     account_id: String,
@@ -630,21 +648,7 @@ impl PostgresStudyStore {
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
         let row = transaction.query_opt(
-            "UPDATE memory_engine_return_notification_preferences
-             SET claim_id = $6,
-                 claim_expires_at_ms = $7,
-                 pending_delivery_key = COALESCE(pending_delivery_key, $8),
-                 pending_due_count = COALESCE(pending_due_count, $3),
-                 updated_at_ms = $2
-             WHERE account_id = $1
-               AND enabled
-               AND (pending_delivery_key IS NOT NULL OR
-                    (($4 OR $3 > 0) AND
-                    (last_sent_at_ms IS NULL OR last_sent_at_ms <= $5)))
-               AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2)
-             RETURNING email_normalized,
-                       pending_due_count,
-                       pending_delivery_key",
+            CLAIM_RETURN_NOTIFICATION_SQL,
             &[
                 &request.account_id,
                 &request.now_ms,
@@ -1868,7 +1872,7 @@ mod tests {
 
     use super::{
         applied_review_receipt_key, migration_sql, AccountScope, MemoryServiceStore,
-        PostgresStoreError, PostgresStudyStore,
+        PostgresStoreError, PostgresStudyStore, CLAIM_RETURN_NOTIFICATION_SQL,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -1904,6 +1908,16 @@ mod tests {
         assert!(sql.contains("rate_limit_key TEXT PRIMARY KEY"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
         assert!(sql.contains("ON DELETE CASCADE"));
+    }
+
+    #[test]
+    fn return_notification_claim_sql_declares_i64_parameters_as_bigint() {
+        for parameter in ["$2::BIGINT", "$3::BIGINT", "$5::BIGINT", "$7::BIGINT"] {
+            assert!(
+                CLAIM_RETURN_NOTIFICATION_SQL.contains(parameter),
+                "claim SQL must explicitly bind {parameter} as BIGINT"
+            );
+        }
     }
 
     #[test]
