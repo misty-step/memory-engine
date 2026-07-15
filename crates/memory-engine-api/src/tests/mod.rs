@@ -1797,6 +1797,45 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
 }
 
 #[tokio::test]
+async fn expired_browser_session_renders_concept_snooze_recovery_instead_of_json() {
+    CONCEPT_SNOOZE_SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let state = ApiState::new(AccountRegistry::default().with_clock(concept_snooze_session_clock));
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    CONCEPT_SNOOZE_SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("expired concept snooze session response");
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store_and_no_referrer(&expired);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Your session expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
 async fn installability_assets_are_valid_and_linked_from_the_shell() {
     let app = router(ApiState::default());
     let home = app
@@ -3419,6 +3458,48 @@ async fn source_routes_reject_cross_account_session_tokens() {
 }
 
 #[tokio::test]
+async fn cross_account_token_rejection_is_stable_after_registry_restart() {
+    let store_root = temp_store_root("cross-account-auth-parity");
+    let warm_app = router(ApiState::new(super::AccountRegistry::with_store_root(
+        &store_root,
+    )));
+    let first = create_account(&warm_app, "warm-first@example.com").await;
+    let second = create_account(&warm_app, "warm-second@example.com").await;
+
+    let warm = warm_app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            &format!("/accounts/{}/sources", second.account_id),
+            &first.session_token,
+        ))
+        .await
+        .expect("warm cross-account read");
+    assert_eq!(warm.status(), StatusCode::FORBIDDEN);
+
+    let cold_app = router(ApiState::new(super::AccountRegistry::with_store_root(
+        &store_root,
+    )));
+    let cold = cold_app
+        .oneshot(empty_request(
+            "GET",
+            &format!("/accounts/{}/sources", second.account_id),
+            &first.session_token,
+        ))
+        .await
+        .expect("cold cross-account read");
+    assert_eq!(cold.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(warm).await["error"],
+        json!("Session token does not match account.")
+    );
+    assert_eq!(
+        response_json(cold).await["error"],
+        json!("Session token does not match account.")
+    );
+}
+
+#[tokio::test]
 async fn recreating_account_rejects_email_replay_without_session() {
     let app = router(ApiState::default());
     let first = create_account(&app, "learner@example.com").await;
@@ -4284,6 +4365,8 @@ async fn source_generation_approval_and_review_are_account_scoped() {
         .expect("review unit id");
     assert_eq!(approved["current"]["expectedAnswer"], json!(null));
 
+    assert_foreign_review_unit_is_not_found(&app, &first, &second).await;
+
     let revealed = app
         .clone()
         .oneshot(empty_request(
@@ -4332,6 +4415,38 @@ async fn source_generation_approval_and_review_are_account_scoped() {
         .await
         .expect("cross next");
     assert_eq!(cross_next.status(), StatusCode::FORBIDDEN);
+}
+
+async fn assert_foreign_review_unit_is_not_found(
+    app: &axum::Router,
+    first: &TestAccount,
+    second: &TestAccount,
+) {
+    let source_id =
+        create_source_v1(app, second, "Second account NATO notes", &source_body()).await;
+    let draft_id = generate_source_v1_draft_ids(app, second, &source_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("second account draft");
+    let foreign_review_unit_id = approve_draft_v1(app, second, &draft_id).await;
+    let foreign_review = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{foreign_review_unit_id}/reveal",
+                first.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("foreign review id");
+    assert_eq!(foreign_review.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(foreign_review).await["error"],
+        json!("Review unit not found.")
+    );
 }
 
 #[tokio::test]
@@ -6752,6 +6867,12 @@ static SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn session_clock() -> i64 {
     SESSION_CLOCK.load(Ordering::SeqCst)
+}
+
+static CONCEPT_SNOOZE_SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+fn concept_snooze_session_clock() -> i64 {
+    CONCEPT_SNOOZE_SESSION_CLOCK.load(Ordering::SeqCst)
 }
 
 #[test]

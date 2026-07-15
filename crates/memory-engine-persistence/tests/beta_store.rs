@@ -871,14 +871,10 @@ fn dropped_local_only_source_is_redacted_and_fixture_preserves_activity_kind() {
     local.permission = SourcePermission::LocalOnly;
     store.save_source_document(local).expect("local source");
     let mut exercise = draft.clone();
-    exercise.id = "draft-exercise".to_owned();
     exercise.activity_kind = GeneratedLearningActivityKind::Exercise;
     store
         .save_generated_prompt_draft(exercise)
         .expect("exercise draft");
-    let mut unit = store.snapshot().review_units[0].clone();
-    unit.generated_prompt_draft_id = Some("draft-exercise".to_owned());
-    store.save_review_unit(unit).expect("exercise review unit");
     store
         .record_content_feedback(feedback(
             "feedback-private",
@@ -998,6 +994,45 @@ fn mcq_prompt_edit_keeps_new_answer_in_choices() {
         }
         prompt => panic!("expected edited MCQ prompt, got {prompt:?}"),
     }
+}
+
+#[test]
+fn boolean_prompt_edit_rejects_invalid_answer_without_mutation() {
+    let directory = TempDirectory::new("boolean-prompt-edit");
+    let path = directory.path().join("store.json");
+    let unit_id = review_unit_id("boolean-prompt-edit");
+    let prompt = Prompt::Boolean {
+        review_unit_id: unit_id.clone(),
+        prompt: "Is ALFA the NATO word for A?".to_owned(),
+        correct_answer: true,
+    };
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_review_unit(review_unit(
+            &unit_id,
+            "boolean-prompt-edit",
+            prompt,
+            queue_candidate(&unit_id, NOW - 60_000),
+        ))
+        .expect("save Boolean review unit");
+    let before = store.snapshot();
+
+    assert!(matches!(
+        store.update_review_unit_prompt_text(&unit_id, "Changed prompt", "maybe"),
+        Err(BetaStoreError::InvalidBooleanAnswer)
+    ));
+    assert_eq!(store.snapshot(), before);
+
+    let updated = store
+        .update_review_unit_prompt_text(&unit_id, "Changed prompt", "  FALSE ")
+        .expect("trimmed case-insensitive false");
+    assert!(matches!(
+        updated.prompt,
+        Prompt::Boolean {
+            correct_answer: false,
+            ..
+        }
+    ));
 }
 
 #[test]

@@ -1251,7 +1251,7 @@ async fn snooze_concept_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 

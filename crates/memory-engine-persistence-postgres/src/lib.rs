@@ -12,9 +12,9 @@ use memory_engine_core::{
 };
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
-    AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions, BetaReviewUnitRecord,
-    BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus,
-    GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
+    parse_strict_boolean_answer, AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions,
+    BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
+    GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -1158,7 +1158,7 @@ impl AccountStudyStore<'_> {
                 review_unit_from_transaction(transaction, &account_id, &review_unit_id)?;
             reject_archived(&review_unit)?;
             replace_prompt_text(&mut review_unit.prompt, &prompt_text);
-            replace_prompt_answer(&mut review_unit.prompt, &expected_answer);
+            replace_prompt_answer(&mut review_unit.prompt, &expected_answer)?;
             let prompt = serde_json::to_value(&review_unit.prompt)?;
             if let Some(draft_id) = &review_unit.generated_prompt_draft_id {
                 let mut draft: GeneratedPromptDraft = transaction
@@ -1177,7 +1177,7 @@ impl AccountStudyStore<'_> {
                         PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.clone())
                     })?;
                 replace_prompt_text(&mut draft.prompt, &prompt_text);
-                replace_prompt_answer(&mut draft.prompt, &expected_answer);
+                replace_prompt_answer(&mut draft.prompt, &expected_answer)?;
                 if !draft
                     .critique_notes
                     .iter()
@@ -2156,6 +2156,7 @@ fn current_review_unit_matches(
             .collect(),
         attempts,
         generation_runs: Vec::new(),
+        content_feedback: Vec::new(),
         applied_reviews: Vec::new(),
         concept_reference_notes: Vec::new(),
     };
@@ -2367,7 +2368,10 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 #[derive(Debug)]
 pub enum PostgresStoreError {
     BlankAccountId,
-    Blank { label: &'static str },
+    Blank {
+        label: &'static str,
+    },
+    InvalidBooleanAnswer,
     NoConceptKey,
     UnknownSourceDocument(String),
     UnknownReviewUnit(ReviewUnitId),
@@ -2398,6 +2402,9 @@ impl fmt::Display for PostgresStoreError {
         match self {
             Self::BlankAccountId => formatter.write_str("Account id must not be blank"),
             Self::Blank { label } => write!(formatter, "{label} must not be blank"),
+            Self::InvalidBooleanAnswer => {
+                formatter.write_str("Boolean answers must be true or false")
+            }
             Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
@@ -2459,6 +2466,7 @@ impl Error for PostgresStoreError {
             Self::Json(error) => Some(error),
             Self::BlankAccountId
             | Self::Blank { .. }
+            | Self::InvalidBooleanAnswer
             | Self::NoConceptKey
             | Self::UnknownSourceDocument(_)
             | Self::UnknownReviewUnit(_)
@@ -2557,7 +2565,7 @@ fn replace_prompt_text(prompt: &mut Prompt, text: &str) {
     }
 }
 
-fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) {
+fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) -> Result<(), PostgresStoreError> {
     match prompt {
         Prompt::Mcq {
             choices,
@@ -2570,15 +2578,14 @@ fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) {
             }
         }
         Prompt::Boolean { correct_answer, .. } => {
-            *correct_answer = matches!(
-                answer.trim().to_ascii_lowercase().as_str(),
-                "true" | "yes" | "1"
-            );
+            *correct_answer = parse_strict_boolean_answer(answer)
+                .ok_or(PostgresStoreError::InvalidBooleanAnswer)?;
         }
         Prompt::Exact(prompt) => {
             prompt.accepted_answers = vec![answer.to_owned()];
         }
     }
+    Ok(())
 }
 
 #[must_use]
@@ -2641,8 +2648,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::{
-        applied_review_receipt_key, migration_sql, AccountScope, MemoryServiceStore,
-        PostgresStoreError, PostgresStudyStore, CLAIM_RETURN_NOTIFICATION_SQL,
+        applied_review_receipt_key, migration_sql, AccountScope, AccountStudyStore,
+        MemoryServiceStore, PostgresStoreError, PostgresStudyStore, CLAIM_RETURN_NOTIFICATION_SQL,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -3432,7 +3439,7 @@ mod tests {
         assert_eq!(updated.prompt, {
             let mut expected = draft.prompt.clone();
             replace_prompt_text(&mut expected, "Edited prompt");
-            replace_prompt_answer(&mut expected, "Edited answer");
+            replace_prompt_answer(&mut expected, "Edited answer").expect("valid edited answer");
             expected
         });
         match &updated.prompt {
@@ -3446,13 +3453,20 @@ mod tests {
             }
             prompt => panic!("expected edited MCQ prompt, got {prompt:?}"),
         }
+
+        run_postgres_boolean_prompt_edit_contract(&mut account)?;
         let snapshot = account.snapshot()?;
-        let edited_prompt = match &snapshot.generated_prompt_drafts[0].prompt {
+        let edited_draft = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|draft| draft.id == "draft-live-prompt")
+            .expect("edited prompt draft");
+        let edited_prompt = match &edited_draft.prompt {
             Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt.as_str(),
             Prompt::Exact(prompt) => prompt.prompt.as_str(),
         };
         assert_eq!(edited_prompt, "Edited prompt");
-        assert!(snapshot.generated_prompt_drafts[0]
+        assert!(edited_draft
             .critique_notes
             .iter()
             .any(|note| note == "Learner edited approved wording."));
@@ -3492,6 +3506,55 @@ mod tests {
         assert!(account
             .export_content_feedback_json()?
             .contains("gen_ai.prompt.version"));
+        Ok(())
+    }
+
+    fn run_postgres_boolean_prompt_edit_contract(
+        account: &mut AccountStudyStore<'_>,
+    ) -> Result<(), PostgresStoreError> {
+        let review_unit_id = ReviewUnitId::new("unit-live-boolean-prompt");
+        let source = source_document("source-live-boolean-prompt");
+        let reference = reference_span("reference-live-boolean-prompt", &source.id);
+        let mut draft = accepted_draft(
+            "draft-live-boolean-prompt",
+            &review_unit_id,
+            &[&source.id],
+            &[&reference.id],
+            Some("run-live-boolean-prompt"),
+        );
+        draft.prompt = Prompt::Boolean {
+            review_unit_id: review_unit_id.clone(),
+            prompt: "Original Boolean prompt".to_owned(),
+            correct_answer: true,
+        };
+        let run = generation_run("run-live-boolean-prompt", &[&source.id], &[&draft.id]);
+        account.save_source_document(&source)?;
+        account.save_reference_span(&reference)?;
+        account.save_generation_run(&run)?;
+        account.save_generated_prompt_draft(&draft)?;
+        account.save_review_unit(&review_unit(&draft))?;
+        let before_invalid = account.snapshot()?;
+        assert!(matches!(
+            account.update_review_unit_prompt_text(
+                &review_unit_id,
+                "Changed Boolean prompt",
+                "maybe"
+            ),
+            Err(PostgresStoreError::InvalidBooleanAnswer)
+        ));
+        assert_eq!(account.snapshot()?, before_invalid);
+        let updated = account.update_review_unit_prompt_text(
+            &review_unit_id,
+            "Changed Boolean prompt",
+            "  FALSE ",
+        )?;
+        assert!(matches!(
+            updated.prompt,
+            Prompt::Boolean {
+                correct_answer: false,
+                ..
+            }
+        ));
         Ok(())
     }
 

@@ -14,9 +14,6 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-#[cfg(unix)]
-use std::{fs::OpenOptions, os::fd::AsRawFd};
-
 use axum::{
     http::{
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
@@ -1628,59 +1625,6 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-struct FileAccountLock {
-    _file: fs::File,
-}
-
-#[cfg(unix)]
-fn acquire_file_account_lock(store_path: &FsPath) -> Result<FileAccountLock, ApiFailure> {
-    let lock_path = store_path.with_extension("lock");
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-    // The descriptor owns the lock. It is never reclaimed from metadata and
-    // the lockfile is never deleted, so a delayed/drop path cannot affect a
-    // replacement owner. Contention is deliberately a prompt 409: callers
-    // are async route workers and must not sleep on a Tokio worker.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        return Ok(FileAccountLock { _file: file });
-    }
-    let error = std::io::Error::last_os_error();
-    if error
-        .raw_os_error()
-        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
-    {
-        return Err(ApiFailure::conflict(
-            "The account study store is busy; try again shortly.",
-        ));
-    }
-    Err(ApiFailure::internal(error.to_string()))
-}
-
-#[cfg(not(unix))]
-fn acquire_file_account_lock(_store_path: &FsPath) -> Result<(), ApiFailure> {
-    Err(ApiFailure::internal(
-        "File account locking is unsupported on this platform.",
-    ))
-}
-
-pub(crate) fn with_file_account_lock<R>(
-    store_path: &FsPath,
-    operation: impl FnOnce() -> Result<R, ApiFailure>,
-) -> Result<R, ApiFailure> {
-    let _lock = acquire_file_account_lock(store_path)?;
-    operation()
-}
-
 /// Generate drafts for one source using the configured provider.
 ///
 /// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
@@ -1696,17 +1640,30 @@ where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    let ids = Some(vec![source_id.to_owned()]);
     match OpenRouterConfig::from_env() {
         Ok(config) => {
             let structured = StructuredBlockProvider;
             let model = OpenRouterProvider::new(config);
             let provider = FallbackProvider::new(&structured, &model);
-            study.generate_with_provider(ids, &provider)
+            run_source_generation_with_provider(study, source_id, &provider)
         }
-        Err(_) => study.generate(ids),
+        Err(_) => run_source_generation_with_provider(study, source_id, &StructuredBlockProvider),
     }
     .map_err(study_failure)
+}
+
+pub(crate) fn run_source_generation_with_provider<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    provider: &dyn memory_engine_generation::DraftProvider,
+) -> Result<
+    BetaStudyView,
+    memory_engine_study::BetaStudyError<<S as memory_engine_service::MemoryServiceStore>::Error>,
+>
+where
+    S: memory_engine_study::BetaStudyStore,
+{
+    study.generate_with_provider(Some(vec![source_id.to_owned()]), provider)
 }
 
 fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
@@ -1984,23 +1941,6 @@ fn require_current_review_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn independent_file_store_owners_cannot_steal_a_live_descriptor_lock() {
-        let root = std::env::temp_dir().join(format!(
-            "memory-engine-file-lock-{}-{}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let store_path = root.join("study.json");
-        let first = acquire_file_account_lock(&store_path).expect("first descriptor lock");
-        let second = acquire_file_account_lock(&store_path);
-        assert!(matches!(second, Err(error) if error.status() == StatusCode::CONFLICT));
-        drop(first);
-        let replacement = acquire_file_account_lock(&store_path).expect("released lock");
-        drop(replacement);
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[test]
     fn client_rate_limit_key_prefers_digitalocean_client_ip() {
