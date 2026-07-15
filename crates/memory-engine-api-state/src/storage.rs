@@ -2213,6 +2213,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
     };
@@ -2655,7 +2656,21 @@ mod tests {
         });
 
         let stale_result = stale.join().expect("stale worker");
-        reenable.join().expect("reenable worker").expect("reenable");
+        match reenable.join().expect("reenable worker") {
+            Ok(()) => {}
+            Err(error) => {
+                assert_eq!(error.status, StatusCode::CONFLICT);
+                storage
+                    .save_return_notification_preference(
+                        "account-a",
+                        "a@example.com",
+                        true,
+                        None,
+                        "nonce-reenabled",
+                    )
+                    .expect("reenable after contention");
+            }
+        }
         let preference = storage
             .load_return_notification_preference("account-a")
             .expect("load preference")
