@@ -18,6 +18,7 @@ api="${RESEND_API_URL:-https://api.resend.com}"
 if [ -n "${MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL:-}" ]; then
     : "${MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT:?MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT is required}"
     : "${MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE:?MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE is required}"
+    : "${MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY:?MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY is required}"
     email="$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL"
     due_count="$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT"
     unsubscribe_url="${base}${MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE}"
@@ -28,6 +29,7 @@ if [ -n "${MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL:-}" ]; then
     curl -sf --max-time 10 "$api/emails" \
         -H "Authorization: Bearer $RESEND_API_KEY" \
         -H "Content-Type: application/json" \
+        -H "Idempotency-Key: $MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY" \
         -d "{\"from\":\"$from\",\"to\":[\"$email\"],\"subject\":\"$subject\",\"text\":\"$text\"}" \
         > /dev/null
     exit 0

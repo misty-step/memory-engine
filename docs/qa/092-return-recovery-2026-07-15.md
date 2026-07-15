@@ -19,6 +19,12 @@ Viewport: Chrome headless, 390 × 844, light mode
   GET rendered a confirmation without changing persisted state; its token POST
   disabled the channel and rendered “Reminders are off”; no second mail record
   was written.
+- The bundled `bin/send-magic-link` was exercised against a local mock Resend
+  HTTP surface with `cargo test -p memory-engine-qa --test send_magic_link`:
+  reminder mode failed closed without
+  `MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY`, sent that value as
+  Resend's `Idempotency-Key` header, and reused the identical header on retry;
+  magic-link mode remained successful without the header.
 
 ## Retained phone proof
 

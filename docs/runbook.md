@@ -203,6 +203,15 @@ setting `RESEND_API_KEY` and
 variables in the DigitalOcean app spec, updating the app, and rerunning the
 deployed smoke. Do not put the key in a shell command or checked-in spec.
 
+The bundled sender has two environment contracts. Magic-link mode uses
+`MEMORY_ENGINE_AUTH_EMAIL` and `MEMORY_ENGINE_AUTH_LINK` and does not require
+an idempotency key. Due-count reminder mode fails closed unless
+`MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY` is present; it sends that
+same value as Resend's `Idempotency-Key` HTTP header. Retries of one durable
+reminder claim must reuse both the key and the original payload so Resend can
+deduplicate the `POST /emails` request. The key is not shared with magic-link
+mail.
+
 While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in an
 instance-local outbox. That path is a temporary solo-dogfood fallback, not a
 durable delivery channel.
@@ -231,10 +240,12 @@ The command boundary receives these variables for a due-count message:
 `MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT`, and
 `MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE`; it also receives
 `MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY` so a retry can reuse the
-same durable delivery identity. The bundled sender supports both the magic-link
-and due-count envelopes. A file outbox line beginning with `due-count` is a
-local proof receipt; production proof still requires checking the provider send
-log and inbox placement.
+same durable delivery identity. The bundled sender requires that key in
+reminder mode and forwards it using Resend's supported `Idempotency-Key`
+contract; a missing key is an error before any provider request. The bundled
+sender supports both the magic-link and due-count envelopes. A file outbox line
+beginning with `due-count` is a local proof receipt; production proof still
+requires checking the provider send log and inbox placement.
 
 ### Deliverability (inbox, not spam)
 
