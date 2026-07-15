@@ -1,20 +1,25 @@
 use std::{
+    collections::HashSet,
     fmt, fs, io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use memory_engine_service::{
+    record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
+};
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, persisted_project_deck_exists, persisted_source_exists,
-    persisted_sources, postgres_failure, rate_limit_path, require_current_review,
-    require_current_review_postgres, run_bridge_generation, run_reference_generation,
-    run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
-    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
+    persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
+    postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
+    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
+    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
+    ApiFailure, BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -65,6 +70,43 @@ impl StudyStorageConfig {
 #[derive(Clone)]
 pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
+}
+
+fn order_content_feedback_for_copy(
+    feedback: Vec<ContentFeedback>,
+) -> Result<Vec<ContentFeedback>, String> {
+    let mut remaining = feedback;
+    let mut copied_ids = HashSet::with_capacity(remaining.len());
+    let mut ordered = Vec::with_capacity(remaining.len());
+
+    while !remaining.is_empty() {
+        let next_index = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, feedback)| {
+                feedback
+                    .supersedes_id
+                    .as_ref()
+                    .is_none_or(|parent_id| copied_ids.contains(parent_id))
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.review_unit_id
+                    .as_str()
+                    .cmp(right.review_unit_id.as_str())
+                    .then(left.occurred_at.cmp(&right.occurred_at))
+                    .then(left.id.cmp(&right.id))
+            })
+            .map(|(index, _)| index);
+
+        let Some(next_index) = next_index else {
+            return Err("content feedback ancestry is not a deterministic DAG".to_owned());
+        };
+        let next = remaining.swap_remove(next_index);
+        copied_ids.insert(next.id.clone());
+        ordered.push(next);
+    }
+
+    Ok(ordered)
 }
 
 impl fmt::Debug for StudyStorage {
@@ -408,6 +450,16 @@ impl StudyStorage {
             idempotency_key,
         )
     }
+
+    pub(crate) fn record_content_feedback(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        self.inner
+            .record_content_feedback(account_id, store_path, command)
+    }
 }
 
 struct FileReturnNotificationLock {
@@ -621,6 +673,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         response_time_ms: u32,
         idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure>;
+    fn record_content_feedback(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure>;
 }
 
 #[derive(Debug)]
@@ -1088,7 +1146,11 @@ impl StudyStorageAdapter for FileStudyStorage {
                 fs::create_dir_all(parent)
                     .map_err(|error| ApiFailure::internal(error.to_string()))?;
             }
-            fs::copy(source_store_path, target_store_path)
+            let source_store =
+                memory_engine_persistence::BetaPersistenceStore::open(source_store_path)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            source_store
+                .copy_for_account(target_store_path, target_account_id)
                 .map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
         Ok(())
@@ -1297,6 +1359,16 @@ impl StudyStorageAdapter for FileStudyStorage {
             .map_err(study_failure)?;
 
         Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn record_content_feedback(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        let mut store = crate::open_persistence_store(store_path)?;
+        record_content_feedback(&mut store, command).map_err(file_content_feedback_failure)
     }
 }
 
@@ -1614,6 +1686,14 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         .save_review_unit(&review_unit)
                         .map_err(postgres_failure)?;
                 }
+                let feedback = order_content_feedback_for_copy(snapshot.content_feedback)
+                    .map_err(ApiFailure::internal)?;
+                for mut feedback in feedback {
+                    target_account_id.clone_into(&mut feedback.account_id);
+                    account
+                        .record_content_feedback(&feedback)
+                        .map_err(postgres_failure)?;
+                }
                 for schedule in snapshot.schedules {
                     account
                         .set_schedule_state(
@@ -1896,6 +1976,23 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
             Ok(StudyViewResponse::from_view(view))
         })
+    }
+
+    fn record_content_feedback(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        command: RecordContentFeedbackCommand,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                record_content_feedback(&mut account, command)
+                    .map_err(postgres_content_feedback_failure)
+            },
+        )
     }
 }
 

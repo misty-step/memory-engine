@@ -5,8 +5,11 @@
 //! and service orchestration crates.
 
 use std::{
+    collections::BTreeSet,
     error::Error,
-    fmt, fs, io,
+    fmt, fs,
+    fs::OpenOptions,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -14,7 +17,10 @@ use memory_engine_core::{
     defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ReviewUnitLifecycle,
     ScheduleState,
 };
-use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
+use memory_engine_service::{
+    content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, ContentFeedbackVerdict,
+    MemoryServiceStore, ServiceAttemptRecord,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -242,6 +248,58 @@ pub struct AppliedReviewReceipt {
     pub schedule_state: ScheduleState,
 }
 
+/// A resolved feedback row for the bench calibration label contract.
+///
+/// The generation configuration fields are deliberately export-only. The
+/// append-only [`ContentFeedback`] row stores only the review-unit join key;
+/// provenance is resolved through draft and run records at export time.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContentFeedbackExport {
+    #[serde(alias = "feedbackId")]
+    pub feedback_id: String,
+    #[serde(alias = "reviewUnitId")]
+    pub review_unit_id: ReviewUnitId,
+    #[serde(alias = "judgeKeep")]
+    pub judge_keep: bool,
+    #[serde(alias = "humanKeep")]
+    pub human_keep: bool,
+    pub question: String,
+    pub rationale: Option<String>,
+    #[serde(rename = "gen_ai.system")]
+    pub gen_ai_system: String,
+    #[serde(rename = "gen_ai.request.model")]
+    pub gen_ai_request_model: String,
+    #[serde(rename = "gen_ai.prompt.version")]
+    pub gen_ai_prompt_version: String,
+    #[serde(rename = "gen_ai.evaluation.score.value")]
+    pub gen_ai_evaluation_score_value: f64,
+    #[serde(rename = "gen_ai.evaluation.explanation")]
+    pub gen_ai_evaluation_explanation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<ContentFeedbackFixture>,
+}
+
+/// A dropped-content row in the generation bench's corpus shape.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ContentFeedbackFixture {
+    pub id: String,
+    pub title: String,
+    pub category: String,
+    pub body: String,
+    pub expect: ContentFeedbackFixtureExpect,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContentFeedbackFixtureExpect {
+    pub min_drafts: usize,
+    pub max_drafts: usize,
+    pub key_terms: Vec<String>,
+    pub intent: String,
+    pub required_activity_kinds: Vec<String>,
+    pub required_activity_stage_terms: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BetaStoreSnapshot {
@@ -253,6 +311,8 @@ pub struct BetaStoreSnapshot {
     pub schedules: Vec<ScheduleRecord>,
     pub attempts: Vec<ServiceAttemptRecord>,
     pub generation_runs: Vec<GenerationRun>,
+    #[serde(default)]
+    pub content_feedback: Vec<ContentFeedback>,
     pub applied_reviews: Vec<AppliedReviewReceipt>,
     #[serde(default)]
     pub concept_reference_notes: Vec<ConceptReferenceNote>,
@@ -269,6 +329,7 @@ impl Default for BetaStoreSnapshot {
             schedules: Vec::new(),
             attempts: Vec::new(),
             generation_runs: Vec::new(),
+            content_feedback: Vec::new(),
             applied_reviews: Vec::new(),
             concept_reference_notes: Vec::new(),
         }
@@ -285,7 +346,9 @@ pub enum BetaStoreError {
     Io(io::Error),
     Json(serde_json::Error),
     UnsupportedVersion(u32),
-    Blank { label: &'static str },
+    Blank {
+        label: &'static str,
+    },
     UnknownSourceDocument(String),
     UnknownReferenceSpan(String),
     UnknownConceptReferenceNote(String),
@@ -302,6 +365,15 @@ pub enum BetaStoreError {
     AttemptResponseTimeNonPositive,
     ScheduleLastReviewMismatch,
     DuplicateAppliedReview(String),
+    DuplicateContentFeedback(String),
+    FeedbackSupersedesUnknown(String),
+    FeedbackSupersedesOtherReviewUnit(String),
+    FeedbackSupersedesOtherAccount(String),
+    FeedbackSupersedesStale {
+        expected_head: Option<String>,
+        supplied_parent: Option<String>,
+    },
+    MissingFeedbackProvenance(ReviewUnitId),
     StaleScheduleWrite(ReviewUnitId),
     InjectedCommitFailure,
 }
@@ -356,6 +428,30 @@ impl fmt::Display for BetaStoreError {
             Self::DuplicateAppliedReview(key) => {
                 write!(formatter, "Duplicate applied review: {key}")
             }
+            Self::DuplicateContentFeedback(id) => {
+                write!(formatter, "Duplicate content feedback id: {id}")
+            }
+            Self::FeedbackSupersedesUnknown(id) => {
+                write!(formatter, "Content feedback supersedes unknown id: {id}")
+            }
+            Self::FeedbackSupersedesOtherReviewUnit(id) => write!(
+                formatter,
+                "Content feedback supersedes a different review unit: {id}"
+            ),
+            Self::FeedbackSupersedesOtherAccount(id) => write!(
+                formatter,
+                "Content feedback supersedes another account's feedback: {id}"
+            ),
+            Self::FeedbackSupersedesStale {
+                expected_head,
+                supplied_parent,
+            } => write!(
+                formatter,
+                "Content feedback revision is stale: expected head {expected_head:?}, supplied parent {supplied_parent:?}"
+            ),
+            Self::MissingFeedbackProvenance(id) => {
+                write!(formatter, "No generation provenance for review unit: {id}")
+            }
             Self::StaleScheduleWrite(id) => {
                 write!(formatter, "Stale schedule write for review unit: {id}")
             }
@@ -387,12 +483,33 @@ impl PartialEq for BetaStoreError {
             | (Self::UnknownReferenceSpan(left), Self::UnknownReferenceSpan(right))
             | (Self::UnknownConceptReferenceNote(left), Self::UnknownConceptReferenceNote(right))
             | (Self::UnknownGeneratedPromptDraft(left), Self::UnknownGeneratedPromptDraft(right))
-            | (Self::DuplicateAppliedReview(left), Self::DuplicateAppliedReview(right)) => {
-                left == right
-            }
+            | (Self::DuplicateAppliedReview(left), Self::DuplicateAppliedReview(right))
+            | (Self::DuplicateContentFeedback(left), Self::DuplicateContentFeedback(right))
+            | (Self::FeedbackSupersedesUnknown(left), Self::FeedbackSupersedesUnknown(right))
+            | (
+                Self::FeedbackSupersedesOtherReviewUnit(left),
+                Self::FeedbackSupersedesOtherReviewUnit(right),
+            )
+            | (
+                Self::FeedbackSupersedesOtherAccount(left),
+                Self::FeedbackSupersedesOtherAccount(right),
+            ) => left == right,
+            (
+                Self::FeedbackSupersedesStale {
+                    expected_head: left_expected,
+                    supplied_parent: left_supplied,
+                },
+                Self::FeedbackSupersedesStale {
+                    expected_head: right_expected,
+                    supplied_parent: right_supplied,
+                },
+            ) => left_expected == right_expected && left_supplied == right_supplied,
             (Self::UnknownReviewUnit(left), Self::UnknownReviewUnit(right))
             | (Self::ReviewUnitArchived(left), Self::ReviewUnitArchived(right))
-            | (Self::StaleScheduleWrite(left), Self::StaleScheduleWrite(right)) => left == right,
+            | (Self::StaleScheduleWrite(left), Self::StaleScheduleWrite(right))
+            | (Self::MissingFeedbackProvenance(left), Self::MissingFeedbackProvenance(right)) => {
+                left == right
+            }
             (Self::RejectedGeneratedPromptDraft, Self::RejectedGeneratedPromptDraft)
             | (
                 Self::MissingGenerationRunForAcceptedDraft,
@@ -465,7 +582,37 @@ impl BetaPersistenceStore {
 
     #[must_use]
     pub fn snapshot(&self) -> BetaStoreSnapshot {
-        self.data.clone()
+        load_snapshot(&self.path).unwrap_or_else(|_| self.data.clone())
+    }
+
+    /// Copy this account's durable snapshot for a new account scope.
+    ///
+    /// Content feedback carries its account scope because it is also exported
+    /// independently of the account snapshot. Rewrite that field while
+    /// preserving every other persisted record and use the same atomic file
+    /// ownership boundary as ordinary store writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the source cannot be read or the target
+    /// cannot be locked and written.
+    pub fn copy_for_account(
+        &self,
+        target_path: impl Into<PathBuf>,
+        target_account_id: &str,
+    ) -> Result<(), BetaStoreError> {
+        assert_non_blank(target_account_id, "Target account id")?;
+        let mut snapshot = self.snapshot();
+        for feedback in &mut snapshot.content_feedback {
+            target_account_id.clone_into(&mut feedback.account_id);
+        }
+
+        let target_path = target_path.into();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _lock = StoreFileLock::acquire(&target_path)?;
+        persist_snapshot(&target_path, &snapshot)
     }
 
     pub fn fail_next_commit_for_test(&mut self) {
@@ -485,7 +632,7 @@ impl BetaPersistenceStore {
         assert_non_blank(&document.title, "Source document title")?;
         let mut next = self.data.clone();
         upsert_by_id(&mut next.source_documents, document.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(document)
     }
@@ -509,7 +656,7 @@ impl BetaPersistenceStore {
             .ok_or_else(|| BetaStoreError::UnknownSourceDocument(source_document_id.to_owned()))?;
         source.archived_at = Some(archived_at);
         let archived = source.clone();
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(archived)
     }
@@ -528,7 +675,7 @@ impl BetaPersistenceStore {
         assert_non_blank(&reference.text, "Reference span text")?;
         let mut next = self.data.clone();
         upsert_by_id(&mut next.reference_spans, reference.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(reference)
     }
@@ -548,9 +695,94 @@ impl BetaPersistenceStore {
         }
         let mut next = self.data.clone();
         upsert_by_id(&mut next.generation_runs, run.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(run)
+    }
+
+    /// Append one learner content judgment, preserving every prior revision.
+    /// Replaying an existing id returns the original row without adding a
+    /// duplicate; a new row may supersede an earlier id for latest-wins reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the review unit is unknown, a replay
+    /// conflicts with an existing id, or the snapshot cannot be committed.
+    pub fn record_content_feedback(
+        &mut self,
+        feedback: ContentFeedback,
+    ) -> Result<ContentFeedback, BetaStoreError> {
+        self.transact(|snapshot| {
+            assert_known_review_unit(snapshot, &feedback.review_unit_id)?;
+            if let Some(existing) = snapshot
+                .content_feedback
+                .iter()
+                .find(|existing| existing.id == feedback.id)
+            {
+                if content_feedback_replay_matches(existing, &feedback) {
+                    return Ok(existing.clone());
+                }
+                return Err(BetaStoreError::DuplicateContentFeedback(
+                    feedback.id.clone(),
+                ));
+            }
+
+            if let Some(supersedes_id) = &feedback.supersedes_id {
+                let superseded = snapshot
+                    .content_feedback
+                    .iter()
+                    .find(|existing| &existing.id == supersedes_id)
+                    .ok_or_else(|| {
+                        BetaStoreError::FeedbackSupersedesUnknown(supersedes_id.clone())
+                    })?;
+                if superseded.review_unit_id != feedback.review_unit_id {
+                    return Err(BetaStoreError::FeedbackSupersedesOtherReviewUnit(
+                        supersedes_id.clone(),
+                    ));
+                }
+                if superseded.account_id != feedback.account_id {
+                    return Err(BetaStoreError::FeedbackSupersedesOtherAccount(
+                        supersedes_id.clone(),
+                    ));
+                }
+            }
+            let current_head = current_feedback_head(
+                &snapshot.content_feedback,
+                &feedback.account_id,
+                &feedback.review_unit_id,
+            );
+            if feedback.supersedes_id != current_head.as_ref().map(|row| row.id.clone()) {
+                return Err(BetaStoreError::FeedbackSupersedesStale {
+                    expected_head: current_head.map(|row| row.id.clone()),
+                    supplied_parent: feedback.supersedes_id.clone(),
+                });
+            }
+
+            snapshot.content_feedback.push(feedback.clone());
+            Ok(feedback)
+        })
+    }
+
+    /// Resolve active feedback rows to the generation configuration that
+    /// produced each card and emit the bench calibration label shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when a feedback row cannot resolve its
+    /// review unit, draft, or generation run provenance.
+    pub fn export_content_feedback(&self) -> Result<Vec<ContentFeedbackExport>, BetaStoreError> {
+        export_content_feedback(&self.snapshot())
+    }
+
+    /// Serialize the active export so the output can be passed directly to
+    /// `memory-engine-bench calibrate --labels`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when provenance resolution or JSON
+    /// serialization fails.
+    pub fn export_content_feedback_json(&self) -> Result<String, BetaStoreError> {
+        serde_json::to_string_pretty(&self.export_content_feedback()?).map_err(BetaStoreError::Json)
     }
 
     /// Save or replace a generated concept-level reference note.
@@ -569,7 +801,7 @@ impl BetaPersistenceStore {
         assert_concept_reference_note_contract(&note)?;
         let mut next = self.data.clone();
         upsert_concept_reference_note(&mut next.concept_reference_notes, note.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(note)
     }
@@ -586,7 +818,7 @@ impl BetaPersistenceStore {
         assert_draft_contract(&self.data, &draft)?;
         let mut next = self.data.clone();
         upsert_by_id(&mut next.generated_prompt_drafts, draft.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(draft)
     }
@@ -633,7 +865,7 @@ impl BetaPersistenceStore {
             &draft.review_unit_id,
             options.initial_schedule_state,
         );
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(review_unit)
     }
@@ -684,7 +916,7 @@ impl BetaPersistenceStore {
         }
         let updated = review_unit.clone();
         assert_review_unit_contract(&next, &updated)?;
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(updated)
     }
@@ -707,7 +939,7 @@ impl BetaPersistenceStore {
             .ok_or_else(|| BetaStoreError::UnknownReviewUnit(review_unit_id.clone()))?;
         review_unit.archived_at = Some(archived_at);
         let archived = review_unit.clone();
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(archived)
     }
@@ -736,7 +968,7 @@ impl BetaPersistenceStore {
         }
         review_unit.snoozed_until = Some(snoozed_until);
         let snoozed = review_unit.clone();
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(snoozed)
     }
@@ -762,7 +994,7 @@ impl BetaPersistenceStore {
         }
         review_unit.queue.lifecycle = lifecycle;
         let updated = review_unit.clone();
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(updated)
     }
@@ -779,7 +1011,7 @@ impl BetaPersistenceStore {
         assert_review_unit_contract(&self.data, &review_unit)?;
         let mut next = self.data.clone();
         upsert_review_unit(&mut next.review_units, review_unit.clone());
-        self.commit(next)?;
+        self.commit(&next)?;
 
         Ok(review_unit)
     }
@@ -797,10 +1029,10 @@ impl BetaPersistenceStore {
         assert_known_review_unit(&self.data, review_unit_id)?;
         let mut next = self.data.clone();
         apply_schedule_record(&mut next, review_unit_id, schedule_state);
-        self.commit(next)
+        self.commit(&next)
     }
 
-    fn commit(&mut self, next: BetaStoreSnapshot) -> Result<(), BetaStoreError> {
+    fn commit(&mut self, next: &BetaStoreSnapshot) -> Result<(), BetaStoreError> {
         if self.fail_next_commit {
             self.fail_next_commit = false;
             return Err(BetaStoreError::InjectedCommitFailure);
@@ -809,13 +1041,32 @@ impl BetaPersistenceStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temporary_path = temporary_path(&self.path);
-        let encoded = serde_json::to_string_pretty(&next)?;
-        fs::write(&temporary_path, format!("{encoded}\n"))?;
-        fs::rename(&temporary_path, &self.path)?;
+        let _lock = StoreFileLock::acquire(&self.path)?;
+        let latest = load_snapshot(&self.path)?;
+        let next = merge_snapshot(&self.data, next, latest);
+        persist_snapshot(&self.path, &next)?;
         self.data = next;
 
         Ok(())
+    }
+
+    fn transact<T>(
+        &mut self,
+        operation: impl FnOnce(&mut BetaStoreSnapshot) -> Result<T, BetaStoreError>,
+    ) -> Result<T, BetaStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _lock = StoreFileLock::acquire(&self.path)?;
+        let mut snapshot = load_snapshot(&self.path)?;
+        let result = operation(&mut snapshot)?;
+        if self.fail_next_commit {
+            self.fail_next_commit = false;
+            return Err(BetaStoreError::InjectedCommitFailure);
+        }
+        persist_snapshot(&self.path, &snapshot)?;
+        self.data = snapshot;
+        Ok(result)
     }
 }
 
@@ -826,7 +1077,7 @@ impl MemoryServiceStore for BetaPersistenceStore {
         assert_attempt_contract(&self.data, &attempt)?;
         let mut next = self.data.clone();
         next.attempts.push(attempt);
-        self.commit(next)
+        self.commit(&next)
     }
 
     fn read_schedule_state(
@@ -845,8 +1096,6 @@ impl MemoryServiceStore for BetaPersistenceStore {
         schedule_state: ScheduleState,
         expected_prior_schedule_state: Option<ScheduleState>,
     ) -> Result<(), Self::Error> {
-        assert_known_review_unit(&self.data, review_unit_id)?;
-        assert_attempt_contract(&self.data, &attempt)?;
         if review_unit_id != &attempt.review_unit_id {
             return Err(BetaStoreError::ReviewUnitMismatch);
         }
@@ -855,31 +1104,33 @@ impl MemoryServiceStore for BetaPersistenceStore {
         }
 
         let key = applied_review_key(&attempt);
-        if self
-            .data
-            .applied_reviews
-            .iter()
-            .any(|receipt| receipt.key == key)
-        {
-            return Err(BetaStoreError::DuplicateAppliedReview(key));
-        }
+        self.transact(|snapshot| {
+            assert_known_review_unit(snapshot, review_unit_id)?;
+            assert_attempt_contract(snapshot, &attempt)?;
+            if snapshot
+                .applied_reviews
+                .iter()
+                .any(|receipt| receipt.key == key)
+            {
+                return Err(BetaStoreError::DuplicateAppliedReview(key));
+            }
 
-        let current_schedule =
-            find_schedule(&self.data, review_unit_id).map(|record| record.state.clone());
-        if current_schedule != expected_prior_schedule_state {
-            return Err(BetaStoreError::StaleScheduleWrite(review_unit_id.clone()));
-        }
+            let current_schedule =
+                find_schedule(snapshot, review_unit_id).map(|record| record.state.clone());
+            if current_schedule != expected_prior_schedule_state {
+                return Err(BetaStoreError::StaleScheduleWrite(review_unit_id.clone()));
+            }
 
-        let mut next = self.data.clone();
-        next.attempts.push(attempt.clone());
-        apply_schedule_record(&mut next, review_unit_id, Some(schedule_state.clone()));
-        next.applied_reviews.push(AppliedReviewReceipt {
-            key,
-            attempt,
-            expected_prior_schedule_state,
-            schedule_state,
-        });
-        self.commit(next)
+            snapshot.attempts.push(attempt.clone());
+            apply_schedule_record(snapshot, review_unit_id, Some(schedule_state.clone()));
+            snapshot.applied_reviews.push(AppliedReviewReceipt {
+                key,
+                attempt,
+                expected_prior_schedule_state,
+                schedule_state,
+            });
+            Ok(())
+        })
     }
 
     fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
@@ -901,6 +1152,181 @@ impl MemoryServiceStore for BetaPersistenceStore {
     }
 }
 
+/// Resolve a snapshot's active feedback rows to generation provenance and the
+/// bench calibration label contract.
+///
+/// # Errors
+///
+/// Returns [`BetaStoreError`] when a feedback row cannot resolve its review
+/// unit, draft, or generation run provenance.
+pub fn export_content_feedback(
+    snapshot: &BetaStoreSnapshot,
+) -> Result<Vec<ContentFeedbackExport>, BetaStoreError> {
+    snapshot
+        .content_feedback
+        .iter()
+        .filter(|feedback| {
+            current_feedback_head(
+                &snapshot.content_feedback,
+                &feedback.account_id,
+                &feedback.review_unit_id,
+            )
+            .is_some_and(|head| head.id == feedback.id)
+        })
+        .map(|feedback| resolve_content_feedback(snapshot, feedback))
+        .collect()
+}
+
+/// Serialize a snapshot's active feedback export for `bench calibrate`.
+///
+/// # Errors
+///
+/// Returns [`BetaStoreError`] when provenance resolution or JSON
+/// serialization fails.
+pub fn export_content_feedback_json(
+    snapshot: &BetaStoreSnapshot,
+) -> Result<String, BetaStoreError> {
+    serde_json::to_string_pretty(&export_content_feedback(snapshot)?).map_err(BetaStoreError::Json)
+}
+
+impl ContentFeedbackStore for BetaPersistenceStore {
+    type Error = BetaStoreError;
+
+    fn record_content_feedback(
+        &mut self,
+        feedback: ContentFeedback,
+    ) -> Result<ContentFeedback, Self::Error> {
+        BetaPersistenceStore::record_content_feedback(self, feedback)
+    }
+}
+
+fn resolve_content_feedback(
+    snapshot: &BetaStoreSnapshot,
+    feedback: &ContentFeedback,
+) -> Result<ContentFeedbackExport, BetaStoreError> {
+    let review_unit = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == feedback.review_unit_id)
+        .ok_or_else(|| {
+            BetaStoreError::MissingFeedbackProvenance(feedback.review_unit_id.clone())
+        })?;
+    let draft_id = review_unit
+        .generated_prompt_draft_id
+        .as_ref()
+        .ok_or_else(|| {
+            BetaStoreError::MissingFeedbackProvenance(feedback.review_unit_id.clone())
+        })?;
+    let draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| &draft.id == draft_id)
+        .ok_or_else(|| {
+            BetaStoreError::MissingFeedbackProvenance(feedback.review_unit_id.clone())
+        })?;
+    let run_id = draft.generation_run_id.as_ref().ok_or_else(|| {
+        BetaStoreError::MissingFeedbackProvenance(feedback.review_unit_id.clone())
+    })?;
+    let run = snapshot
+        .generation_runs
+        .iter()
+        .find(|run| &run.id == run_id)
+        .ok_or_else(|| {
+            BetaStoreError::MissingFeedbackProvenance(feedback.review_unit_id.clone())
+        })?;
+    let human_keep = feedback.verdict == ContentFeedbackVerdict::Kept;
+
+    Ok(ContentFeedbackExport {
+        feedback_id: feedback.id.clone(),
+        review_unit_id: feedback.review_unit_id.clone(),
+        judge_keep: draft.validation.status == GeneratedPromptValidationStatus::Accepted,
+        human_keep,
+        question: prompt_question(&review_unit.prompt),
+        rationale: feedback.rationale.clone(),
+        gen_ai_system: run.provider.clone(),
+        gen_ai_request_model: run.model.clone(),
+        gen_ai_prompt_version: draft.model.version.clone(),
+        gen_ai_evaluation_score_value: if human_keep { 1.0 } else { 0.0 },
+        gen_ai_evaluation_explanation: feedback.rationale.clone(),
+        fixture: (!human_keep).then(|| dropped_fixture(snapshot, review_unit, feedback)),
+    })
+}
+
+fn prompt_question(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt.clone(),
+        Prompt::Exact(prompt) => prompt.prompt.clone(),
+    }
+}
+
+fn dropped_fixture(
+    snapshot: &BetaStoreSnapshot,
+    review_unit: &BetaReviewUnitRecord,
+    feedback: &ContentFeedback,
+) -> ContentFeedbackFixture {
+    let source = review_unit
+        .reference_span_ids
+        .iter()
+        .filter_map(|span_id| {
+            snapshot
+                .reference_spans
+                .iter()
+                .find(|span| &span.id == span_id)
+        })
+        .find_map(|span| {
+            snapshot
+                .source_documents
+                .iter()
+                .find(|source| source.id == span.source_document_id)
+        })
+        .or_else(|| {
+            snapshot.source_documents.iter().find(|source| {
+                review_unit.reference_span_ids.iter().any(|span_id| {
+                    snapshot
+                        .reference_spans
+                        .iter()
+                        .any(|span| &span.id == span_id && span.source_document_id == source.id)
+                })
+            })
+        });
+    let question = prompt_question(&review_unit.prompt);
+    let (title, body) = match source {
+        Some(source) if matches!(source.permission, SourcePermission::ModelEligible) => (
+            source.title.clone(),
+            source.body.clone().unwrap_or_else(|| question.clone()),
+        ),
+        Some(_) => (
+            "[redacted local-only source]".to_owned(),
+            "[redacted local-only source]".to_owned(),
+        ),
+        None => (question.clone(), question.clone()),
+    };
+
+    let activity_kind = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| review_unit.generated_prompt_draft_id.as_ref() == Some(&draft.id))
+        .map_or("quiz", |draft| match draft.activity_kind {
+            GeneratedLearningActivityKind::Quiz => "quiz",
+            GeneratedLearningActivityKind::Exercise => "exercise",
+        });
+
+    ContentFeedbackFixture {
+        id: format!("feedback-dropped-{}", feedback.id),
+        title,
+        category: "content-feedback-dropped".to_owned(),
+        body,
+        expect: ContentFeedbackFixtureExpect {
+            min_drafts: 1,
+            max_drafts: 1,
+            key_terms: Vec::new(),
+            intent: "concept_understanding".to_owned(),
+            required_activity_kinds: vec![activity_kind.to_owned()],
+            required_activity_stage_terms: Vec::new(),
+        },
+    }
+}
+
 fn load_snapshot(path: &Path) -> Result<BetaStoreSnapshot, BetaStoreError> {
     if !path.exists() {
         return Ok(BetaStoreSnapshot::default());
@@ -912,6 +1338,190 @@ fn load_snapshot(path: &Path) -> Result<BetaStoreSnapshot, BetaStoreError> {
     }
 
     Ok(parsed)
+}
+
+fn persist_snapshot(path: &Path, snapshot: &BetaStoreSnapshot) -> Result<(), BetaStoreError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary_path = temporary_path(path);
+    let encoded = serde_json::to_string_pretty(snapshot)?;
+    fs::write(&temporary_path, format!("{encoded}\n"))?;
+    fs::rename(&temporary_path, path)?;
+    Ok(())
+}
+
+struct StoreFileLock {
+    file: fs::File,
+}
+
+impl StoreFileLock {
+    fn acquire(store_path: &Path) -> Result<Self, BetaStoreError> {
+        let path = store_path.with_extension("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        for _ in 0..5_000 {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(fs::TryLockError::Error(error))
+                    if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(fs::TryLockError::Error(error)) => return Err(BetaStoreError::Io(error)),
+            }
+        }
+        Err(BetaStoreError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out acquiring beta store lock",
+        )))
+    }
+}
+
+impl Drop for StoreFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn current_feedback_head<'a>(
+    feedback: &'a [ContentFeedback],
+    account_id: &str,
+    review_unit_id: &ReviewUnitId,
+) -> Option<&'a ContentFeedback> {
+    let superseded: BTreeSet<&str> = feedback
+        .iter()
+        .filter(|row| row.account_id == account_id && row.review_unit_id == *review_unit_id)
+        .filter_map(|row| row.supersedes_id.as_deref())
+        .collect();
+    feedback
+        .iter()
+        .filter(|row| {
+            row.account_id == account_id
+                && row.review_unit_id == *review_unit_id
+                && !superseded.contains(row.id.as_str())
+        })
+        .max_by_key(|row| (row.occurred_at, row.id.as_str()))
+}
+
+fn merge_snapshot(
+    base: &BetaStoreSnapshot,
+    proposed: &BetaStoreSnapshot,
+    mut latest: BetaStoreSnapshot,
+) -> BetaStoreSnapshot {
+    merge_upserted(
+        &mut latest.source_documents,
+        &base.source_documents,
+        &proposed.source_documents,
+        |row| row.id.clone(),
+    );
+    merge_upserted(
+        &mut latest.reference_spans,
+        &base.reference_spans,
+        &proposed.reference_spans,
+        |row| row.id.clone(),
+    );
+    merge_upserted(
+        &mut latest.generated_prompt_drafts,
+        &base.generated_prompt_drafts,
+        &proposed.generated_prompt_drafts,
+        |row| row.id.clone(),
+    );
+    merge_upserted(
+        &mut latest.review_units,
+        &base.review_units,
+        &proposed.review_units,
+        |row| row.review_unit_id.clone(),
+    );
+    merge_upserted(
+        &mut latest.generation_runs,
+        &base.generation_runs,
+        &proposed.generation_runs,
+        |row| row.id.clone(),
+    );
+    merge_upserted(
+        &mut latest.concept_reference_notes,
+        &base.concept_reference_notes,
+        &proposed.concept_reference_notes,
+        |row| row.concept_key.clone(),
+    );
+    merge_appended(&mut latest.attempts, &base.attempts, &proposed.attempts);
+    merge_appended(
+        &mut latest.content_feedback,
+        &base.content_feedback,
+        &proposed.content_feedback,
+    );
+    merge_appended(
+        &mut latest.applied_reviews,
+        &base.applied_reviews,
+        &proposed.applied_reviews,
+    );
+    merge_schedules(&mut latest.schedules, &base.schedules, &proposed.schedules);
+    latest
+}
+
+fn merge_upserted<T: Clone + PartialEq, K: Eq>(
+    latest: &mut Vec<T>,
+    base: &[T],
+    proposed: &[T],
+    key: impl Fn(&T) -> K,
+) {
+    for row in proposed {
+        let row_key = key(row);
+        let changed = base.iter().find(|old| key(old) == row_key) != Some(row);
+        if changed {
+            if let Some(existing) = latest.iter_mut().find(|old| key(old) == row_key) {
+                *existing = row.clone();
+            } else {
+                latest.push(row.clone());
+            }
+        }
+    }
+}
+
+fn merge_appended<T: Clone + PartialEq>(latest: &mut Vec<T>, base: &[T], proposed: &[T]) {
+    for row in proposed.iter().filter(|row| !base.contains(row)) {
+        if !latest.contains(row) {
+            latest.push(row.clone());
+        }
+    }
+}
+
+fn merge_schedules(
+    latest: &mut Vec<ScheduleRecord>,
+    base: &[ScheduleRecord],
+    proposed: &[ScheduleRecord],
+) {
+    for old in base {
+        let before = Some(old);
+        let after = proposed
+            .iter()
+            .find(|row| row.review_unit_id == old.review_unit_id);
+        if before != after {
+            latest.retain(|row| row.review_unit_id != old.review_unit_id);
+            if let Some(after) = after {
+                latest.push(after.clone());
+            }
+        }
+    }
+    for row in proposed.iter().filter(|row| {
+        !base
+            .iter()
+            .any(|old| old.review_unit_id == row.review_unit_id)
+    }) {
+        if let Some(existing) = latest
+            .iter_mut()
+            .find(|old| old.review_unit_id == row.review_unit_id)
+        {
+            *existing = row.clone();
+        } else {
+            latest.push(row.clone());
+        }
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

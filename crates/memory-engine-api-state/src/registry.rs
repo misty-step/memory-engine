@@ -3,17 +3,19 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
 use memory_engine_persistence::GeneratedPromptValidationStatus;
+use memory_engine_service::RecordContentFeedbackCommand;
 
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
     new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
     read_browser_session_id, require_account_session, secret_hash, session_csrf_token,
     source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
-    AuthConfig, AuthLinkDelivery, BrowserSessionRecord, CreateProjectDeckRequest,
-    CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
-    ReturnNotificationClaimRequest, SourceRecord, StudyStorage, StudyViewResponse,
-    SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
-    AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
+    CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
+    ProjectDeckRecord, ReturnNotificationClaimRequest, SourceRecord, StudyStorage,
+    StudyViewResponse, SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
+    APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -616,6 +618,36 @@ impl AccountRegistry {
             storage.approve_draft(account_id, &store_path, &draft_id)?;
         }
         Ok(card_count)
+    }
+
+    /// Runs the typed content-feedback command for one authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, validation, or persistence rejects the
+    /// append.
+    pub(crate) fn record_content_feedback(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: &ContentFeedbackRequest,
+    ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
+        let feedback_id = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
+        let account = self.require_account(account_id, session_token)?;
+        self.storage().record_content_feedback(
+            account_id,
+            &account.store_path,
+            RecordContentFeedbackCommand {
+                feedback_id,
+                review_unit_id: memory_engine_core::ReviewUnitId::new(review_unit_id),
+                verdict: request.verdict,
+                rationale: request.rationale.clone(),
+                account_id: account_id.to_owned(),
+                occurred_at: self.now(),
+                supersedes_id: request.supersedes_id.clone(),
+            },
+        )
     }
 
     /// Runs an API registry operation.

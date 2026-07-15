@@ -522,6 +522,10 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 }
 .me-graded-choice-correct::before { border-color: var(--lg-pine); color: var(--lg-pine); }
 .me-graded-choice-dim { opacity: 0.42; }
+
+.me-content-feedback { margin: 24px 0 0; padding-top: 18px; border-top: 1px solid var(--lg-rule); }
+.me-feedback-actions { display: flex; gap: 8px; margin: 10px 0 14px; }
+.me-content-feedback-rationale { width: 100%; min-height: 58px; resize: vertical; }
 .me-horizon { margin-left: auto; font: 600 11px/1 var(--lg-mono); color: var(--lg-pine); }
 
 .me-answer { display: flex; flex-direction: column; gap: 2px; margin: 0 0 16px; }

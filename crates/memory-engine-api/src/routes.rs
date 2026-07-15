@@ -29,9 +29,10 @@ use memory_engine_api_render::{
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
-    ApiFailure, ApiState, AppAccount, CreateAccountRequest, CreateProjectDeckRequest,
-    CreateSourceRequest, EnqueueOutcome, HealthResponse, InvalidateProjectDeckRequest,
-    ProjectDeckRecord, SourceList, SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
+    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
+    InvalidateProjectDeckRequest, ProjectDeckRecord, SourceList, SourceRecord, StudyViewResponse,
+    SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ enum V1Route {
     Source,
     ProjectDecks,
     ProjectDeckInvalidate,
+    ContentFeedback,
     Generate,
     Approve,
     Next,
@@ -77,6 +79,8 @@ const V1_SKIP_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/sk
 const V1_SNOOZE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/snooze";
 const V1_BRIDGE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/bridge";
 const V1_SUBMIT_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/submit";
+const V1_CONTENT_FEEDBACK_PATH: &str =
+    "/v1/accounts/{account_id}/review/{review_unit_id}/content-feedback";
 
 const V1_ROUTES: &[V1Route] = &[
     V1Route::OpenApi,
@@ -94,6 +98,7 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Snooze,
     V1Route::Bridge,
     V1Route::Submit,
+    V1Route::ContentFeedback,
 ];
 
 impl V1Route {
@@ -117,6 +122,7 @@ impl V1Route {
             Self::Snooze => router.route(V1_SNOOZE_PATH, post(snooze_review)),
             Self::Bridge => router.route(V1_BRIDGE_PATH, post(bridge_review)),
             Self::Submit => router.route(V1_SUBMIT_PATH, post(submit_review)),
+            Self::ContentFeedback => router.route(V1_CONTENT_FEEDBACK_PATH, post(content_feedback)),
         }
     }
 
@@ -189,6 +195,10 @@ impl V1Route {
                 method: "POST",
                 path: V1_SUBMIT_PATH,
             }],
+            Self::ContentFeedback => &[V1ContractOperation {
+                method: "POST",
+                path: V1_CONTENT_FEEDBACK_PATH,
+            }],
         }
     }
 }
@@ -247,6 +257,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
+        .route("/app/content-feedback", post(record_app_content_feedback))
         .route(
             "/accounts/{account_id}/sources",
             get(list_sources).post(create_source),
@@ -287,6 +298,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/submit",
             post(submit_review),
+        )
+        .route(
+            "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
+            post(content_feedback),
         )
         .with_state(state)
 }
@@ -558,6 +573,22 @@ async fn submit_review(
     )?))
 }
 
+async fn content_feedback(
+    State(state): State<ApiState>,
+    Path((account_id, review_unit_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ContentFeedbackRequest>,
+) -> Result<Json<memory_engine_service::ContentFeedback>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+
+    Ok(Json(state.record_content_feedback(
+        &account_id,
+        session_token,
+        &review_unit_id,
+        &request,
+    )?))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct AppAccountForm {
@@ -634,6 +665,17 @@ struct AppReviewSubmitForm {
     // `Easy`.
     response_time_ms: Option<String>,
     idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppContentFeedbackForm {
+    csrf_token: Option<String>,
+    review_unit_id: String,
+    verdict: memory_engine_service::ContentFeedbackVerdict,
+    rationale: Option<String>,
+    idempotency_key: String,
+    supersedes_id: Option<String>,
 }
 
 async fn create_app_account(
@@ -1229,4 +1271,36 @@ async fn submit_app_review(
     );
 
     Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+async fn record_app_content_feedback(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppContentFeedbackForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return error.into_response(),
+        };
+    let result = state.record_app_content_feedback(
+        &account,
+        &form.review_unit_id,
+        &ContentFeedbackRequest {
+            verdict: form.verdict,
+            rationale: form.rationale,
+            idempotency_key: form.idempotency_key,
+            supersedes_id: form.supersedes_id,
+        },
+    );
+    match result {
+        Ok(_) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some("Saved. This card will help improve future generation."),
+        ))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
 }

@@ -7,6 +7,7 @@ description = "State, auth, storage, and job adapters for the Memory Engine HTTP
 
 [dependencies]
 axum = "0.8.7"
+memory-engine-core = { path = "../memory-engine-core" }
 memory-engine-canary = { path = "../memory-engine-canary" }
 memory-engine-generation = { path = "../memory-engine-generation" }
 memory-engine-openrouter = { path = "../memory-engine-openrouter" }

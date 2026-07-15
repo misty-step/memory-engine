@@ -173,6 +173,7 @@ fn current(prompt: &str) -> BetaStudyCurrent {
         review_state: None,
         schedule_change: None,
         feedback: None,
+        content_feedback_head_id: None,
     }
 }
 

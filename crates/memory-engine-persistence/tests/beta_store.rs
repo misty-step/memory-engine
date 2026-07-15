@@ -10,7 +10,9 @@ use memory_engine_persistence::{
     SourcePermission,
 };
 use memory_engine_service::{
-    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
+    record_content_feedback, ContentFeedback, ContentFeedbackSource, ContentFeedbackVerdict,
+    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, RecordContentFeedbackCommand,
+    ServiceAttemptRecord, ServiceError,
 };
 
 const NOW: i64 = 1_779_989_400_000;
@@ -168,6 +170,95 @@ fn rejects_duplicate_reviews_and_failed_commits_without_corrupting_history() {
     let reloaded = BetaPersistenceStore::open(&path).expect("reload");
     assert_eq!(reloaded.snapshot().attempts, [first_review.attempt]);
     assert_eq!(reloaded.snapshot().schedules.len(), 1);
+}
+
+#[test]
+fn stale_store_review_write_loses_without_overwriting_the_winner() {
+    let directory = TempDirectory::new("same-row-review-race");
+    let path = directory.path().join("store.json");
+    let unit_id = review_unit_id("beta-same-row-review-race");
+    let prompt = short_answer_prompt(&unit_id, "Translate: Pater noster");
+    let prior_schedule = schedule_state(2, ScheduleStatus::Review);
+    let mut winner = BetaPersistenceStore::open(&path).expect("open winner");
+    winner
+        .save_review_unit(review_unit(
+            &unit_id,
+            "same-row-review-prompt",
+            prompt,
+            queue_candidate(&unit_id, NOW - 60_000),
+        ))
+        .expect("review unit");
+    winner
+        .set_schedule_state(&unit_id, Some(prior_schedule.clone()))
+        .expect("initial schedule");
+    let mut stale = BetaPersistenceStore::open(&path).expect("open stale writer");
+
+    let winning_attempt = attempt(&unit_id, NOW, "winner");
+    let mut winning_schedule = schedule_state(3, ScheduleStatus::Review);
+    winning_schedule.last_review = Some(NOW);
+    winner
+        .apply_review(
+            &unit_id,
+            winning_attempt.clone(),
+            winning_schedule.clone(),
+            Some(prior_schedule.clone()),
+        )
+        .expect("winner commits");
+
+    let stale_attempt = attempt(&unit_id, NOW + 1_000, "stale");
+    let mut stale_schedule = schedule_state(3, ScheduleStatus::Review);
+    stale_schedule.last_review = Some(NOW + 1_000);
+    assert_eq!(
+        stale.apply_review(
+            &unit_id,
+            stale_attempt,
+            stale_schedule,
+            Some(prior_schedule),
+        ),
+        Err(BetaStoreError::StaleScheduleWrite(unit_id.clone()))
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path)
+        .expect("reload")
+        .snapshot();
+    assert_eq!(snapshot.attempts, [winning_attempt]);
+    assert_eq!(snapshot.applied_reviews.len(), 1);
+    assert_eq!(snapshot.schedules[0].state, winning_schedule);
+}
+
+#[test]
+fn advisory_lock_handoff_ignores_the_orphaned_lock_file() {
+    use std::{fs::OpenOptions, sync::mpsc, thread, time::Duration};
+
+    let directory = TempDirectory::new("advisory-lock-handoff");
+    let path = directory.path().join("store.json");
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock file");
+    lock.lock().expect("hold advisory lock");
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let writer_path = path.clone();
+    let writer = thread::spawn(move || {
+        let mut store = BetaPersistenceStore::open(&writer_path).expect("open waiting store");
+        started_tx.send(()).expect("announce writer");
+        store.save_source_document(source_document("src-after-lock-handoff"))
+    });
+    started_rx.recv().expect("writer started");
+    thread::sleep(Duration::from_millis(25));
+    assert!(!writer.is_finished(), "writer must wait for the live owner");
+
+    lock.unlock().expect("release advisory lock");
+    writer
+        .join()
+        .expect("writer thread")
+        .expect("writer acquires released lock");
+    assert!(lock_path.exists(), "an unlocked lock file is harmless");
 }
 
 #[test]
@@ -428,6 +519,310 @@ fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history(
     );
 }
 
+#[test]
+fn content_feedback_is_append_only_latest_wins_and_resolves_generation_provenance() {
+    let directory = TempDirectory::new("content-feedback");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let first = record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: "feedback-first".to_owned(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Dropped,
+            rationale: Some("The prompt is ambiguous.".to_owned()),
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW,
+            supersedes_id: None,
+        },
+    )
+    .expect("first feedback");
+    let replay = record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: first.id.clone(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Dropped,
+            rationale: Some("The prompt is ambiguous.".to_owned()),
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW,
+            supersedes_id: None,
+        },
+    )
+    .expect("replay feedback");
+    assert_eq!(replay, first);
+
+    record_content_feedback(
+        &mut store,
+        RecordContentFeedbackCommand {
+            feedback_id: "feedback-revision".to_owned(),
+            review_unit_id: draft.review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Kept,
+            rationale: None,
+            account_id: "account-feedback".to_owned(),
+            occurred_at: NOW + 1_000,
+            supersedes_id: Some(first.id),
+        },
+    )
+    .expect("revision feedback");
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.content_feedback.len(), 2);
+    let exported = store.export_content_feedback().expect("export feedback");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].human_keep);
+    assert!(exported[0].judge_keep);
+    assert_eq!(exported[0].gen_ai_request_model, "deterministic-draft");
+    assert_eq!(exported[0].gen_ai_system, "fixture");
+    assert_eq!(exported[0].gen_ai_prompt_version, "v1");
+    assert_eq!(exported[0].question, "Translate: Pater noster");
+    assert!(exported[0].fixture.is_none());
+    assert!(store
+        .export_content_feedback_json()
+        .expect("export json")
+        .contains("gen_ai.prompt.version"));
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload store");
+    assert_eq!(reloaded.snapshot().content_feedback.len(), 2);
+}
+
+#[test]
+fn stale_store_commits_preserve_archives_schedule_and_new_foreground_output() {
+    let directory = TempDirectory::new("stale-merge");
+    let path = directory.path().join("store.json");
+    let (mut stale_store, draft) = lifecycle_store(&path);
+    let source_id = stale_store.snapshot().source_documents[0].id.clone();
+    let review_unit_id = draft.review_unit_id.clone();
+
+    let mut fresh_store = BetaPersistenceStore::open(&path).expect("open fresh store");
+    fresh_store
+        .archive_source_document(&source_id, NOW + 1_000)
+        .expect("archive source");
+    fresh_store
+        .archive_review_unit(&review_unit_id, NOW + 2_000)
+        .expect("archive review unit");
+    fresh_store
+        .set_schedule_state(&review_unit_id, None)
+        .expect("clear schedule");
+
+    let run = generation_run("run-stale-merge", &[source_id.as_str()], &[]);
+    stale_store
+        .save_generation_run(run.clone())
+        .expect("save generation run");
+    record_content_feedback(
+        &mut stale_store,
+        RecordContentFeedbackCommand {
+            feedback_id: "feedback-stale-merge".to_owned(),
+            review_unit_id: review_unit_id.clone(),
+            verdict: ContentFeedbackVerdict::Kept,
+            rationale: Some("Foreground output should survive stale merges.".to_owned()),
+            account_id: "account-stale-merge".to_owned(),
+            occurred_at: NOW + 3_000,
+            supersedes_id: None,
+        },
+    )
+    .expect("save content feedback");
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload store");
+    let snapshot = reloaded.snapshot();
+    assert_eq!(
+        snapshot
+            .source_documents
+            .iter()
+            .find(|source| source.id == source_id)
+            .and_then(|source| source.archived_at),
+        Some(NOW + 1_000)
+    );
+    assert_eq!(
+        snapshot
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == review_unit_id)
+            .and_then(|unit| unit.archived_at),
+        Some(NOW + 2_000)
+    );
+    assert!(
+        reloaded
+            .read_schedule_state(&review_unit_id)
+            .expect("read schedule")
+            .is_none(),
+        "stale commit must not resurrect a cleared schedule"
+    );
+    assert!(snapshot
+        .generation_runs
+        .iter()
+        .any(|item| item.id == run.id));
+    assert!(snapshot
+        .content_feedback
+        .iter()
+        .any(|item| item.id == "feedback-stale-merge"));
+}
+
+#[test]
+fn nested_store_commit_creates_parent_before_lock_acquisition() {
+    let directory = TempDirectory::new("nested-lock-parent");
+    let path = directory.path().join("nested").join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+
+    store
+        .save_source_document(source_document("src-nested-lock"))
+        .expect("save source");
+
+    assert!(path.parent().expect("nested dir").exists());
+    assert!(path.exists());
+    assert_eq!(
+        BetaPersistenceStore::open(&path)
+            .expect("reload store")
+            .snapshot()
+            .source_documents
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn file_feedback_rejects_forks_and_keeps_out_of_order_revision_as_the_head() {
+    let directory = TempDirectory::new("content-feedback-fork");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let first = feedback("feedback-fork-root", &draft.review_unit_id, NOW, None);
+    store.record_content_feedback(first.clone()).expect("root");
+    let second = feedback(
+        "feedback-fork-second",
+        &draft.review_unit_id,
+        NOW + 2_000,
+        Some(&first.id),
+    );
+    store
+        .record_content_feedback(second.clone())
+        .expect("second");
+
+    let fork = feedback(
+        "feedback-fork-third",
+        &draft.review_unit_id,
+        NOW + 3_000,
+        Some(&first.id),
+    );
+    assert_eq!(
+        store.record_content_feedback(fork),
+        Err(BetaStoreError::FeedbackSupersedesStale {
+            expected_head: Some(second.id.clone()),
+            supplied_parent: Some(first.id.clone()),
+        })
+    );
+
+    let late = feedback(
+        "feedback-fork-late",
+        &draft.review_unit_id,
+        NOW - 1_000,
+        Some(&second.id),
+    );
+    store
+        .record_content_feedback(late.clone())
+        .expect("late revision");
+    let exported = store.export_content_feedback().expect("export");
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].feedback_id, late.id);
+}
+
+#[test]
+fn file_feedback_concurrent_instances_are_idempotent_and_do_not_fork_heads() {
+    let directory = TempDirectory::new("content-feedback-race");
+    let path = directory.path().join("store.json");
+    let (mut setup, draft) = lifecycle_store(&path);
+    let root = feedback("feedback-race-root", &draft.review_unit_id, NOW, None);
+    setup.record_content_feedback(root.clone()).expect("root");
+    drop(setup);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let feedback = feedback(
+            "feedback-race-same-id",
+            &draft.review_unit_id,
+            NOW + 1_000,
+            Some(&root.id),
+        );
+        handles.push(std::thread::spawn(move || {
+            let mut store = BetaPersistenceStore::open(path).expect("open race store");
+            barrier.wait();
+            store.record_content_feedback(feedback)
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("race worker"))
+        .collect::<Vec<_>>();
+    assert!(
+        results.iter().all(Result::is_ok),
+        "same id must replay: {results:?}"
+    );
+
+    let final_store = BetaPersistenceStore::open(path).expect("reload race store");
+    assert_eq!(final_store.snapshot().content_feedback.len(), 2);
+    assert_eq!(
+        final_store.export_content_feedback().expect("export").len(),
+        1
+    );
+}
+
+#[test]
+fn dropped_local_only_source_is_redacted_and_fixture_preserves_activity_kind() {
+    let directory = TempDirectory::new("content-feedback-privacy");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let mut local = store.snapshot().source_documents[0].clone();
+    local.permission = SourcePermission::LocalOnly;
+    store.save_source_document(local).expect("local source");
+    let mut exercise = draft.clone();
+    exercise.id = "draft-exercise".to_owned();
+    exercise.activity_kind = GeneratedLearningActivityKind::Exercise;
+    store
+        .save_generated_prompt_draft(exercise)
+        .expect("exercise draft");
+    let mut unit = store.snapshot().review_units[0].clone();
+    unit.generated_prompt_draft_id = Some("draft-exercise".to_owned());
+    store.save_review_unit(unit).expect("exercise review unit");
+    store
+        .record_content_feedback(feedback(
+            "feedback-private",
+            &draft.review_unit_id,
+            NOW,
+            None,
+        ))
+        .expect("feedback");
+
+    let exported = store.export_content_feedback().expect("export");
+    let fixture = exported[0].fixture.as_ref().expect("fixture");
+    assert_eq!(fixture.expect.required_activity_kinds, ["exercise"]);
+    assert_eq!(fixture.title, "[redacted local-only source]");
+    assert_eq!(fixture.body, "[redacted local-only source]");
+    assert!(!store
+        .export_content_feedback_json()
+        .expect("json")
+        .contains("Pater noster means"));
+}
+
+fn feedback(
+    id: &str,
+    review_unit_id: &ReviewUnitId,
+    occurred_at: i64,
+    supersedes_id: Option<&str>,
+) -> ContentFeedback {
+    ContentFeedback {
+        id: id.to_owned(),
+        review_unit_id: review_unit_id.clone(),
+        verdict: ContentFeedbackVerdict::Dropped,
+        rationale: None,
+        source: ContentFeedbackSource::Human,
+        account_id: "account-feedback".to_owned(),
+        occurred_at,
+        supersedes_id: supersedes_id.map(str::to_owned),
+    }
+}
+
 fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {
     let mut store = BetaPersistenceStore::open(path).expect("open store");
     let source = store
@@ -475,6 +870,7 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
         schedules: Vec::new(),
         attempts: Vec::new(),
         generation_runs: Vec::new(),
+        content_feedback: Vec::new(),
         concept_reference_notes: Vec::new(),
         applied_reviews: Vec::new(),
     };
@@ -659,6 +1055,22 @@ fn short_answer_prompt(review_unit_id: &ReviewUnitId, prompt: &str) -> Prompt {
         equivalence_groups: Vec::new(),
         ignored_tokens: Vec::new(),
     })
+}
+
+fn attempt(
+    review_unit_id: &ReviewUnitId,
+    occurred_at: i64,
+    idempotency_key: &str,
+) -> ServiceAttemptRecord {
+    ServiceAttemptRecord {
+        review_unit_id: review_unit_id.clone(),
+        prompt_id: Some("same-row-review-prompt".to_owned()),
+        submitted_answer: "Our Father".to_owned(),
+        response_time_ms: 1_800,
+        occurred_at,
+        idempotency_key: Some(idempotency_key.to_owned()),
+        grade: None,
+    }
 }
 
 fn schedule_state(reps: u32, status: ScheduleStatus) -> ScheduleState {

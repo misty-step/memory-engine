@@ -25,8 +25,11 @@ use axum::{
 use hmac::Hmac;
 use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
-use memory_engine_persistence::BetaPersistenceStore;
-use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
+use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
+use memory_engine_persistence_postgres::{
+    AccountScope, AccountStudyStore, PostgresStoreError, PostgresStudyStore,
+};
+use memory_engine_service::{ContentFeedback, ContentFeedbackError, ContentFeedbackVerdict};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions,
     BetaStudySession, BetaStudySummary, BetaStudyView,
@@ -633,6 +636,43 @@ impl ApiState {
         )
     }
 
+    /// Record a learner's binary content-quality judgment for a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account session, feedback command, or
+    /// account-scoped persistence rejects the record.
+    pub fn record_content_feedback(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: &ContentFeedbackRequest,
+    ) -> Result<ContentFeedback, ApiFailure> {
+        self.accounts
+            .record_content_feedback(account_id, session_token, review_unit_id, request)
+    }
+
+    /// Record feedback for a browser-authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account session, feedback command, or
+    /// account-scoped persistence rejects the record.
+    pub fn record_app_content_feedback(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+        request: &ContentFeedbackRequest,
+    ) -> Result<ContentFeedback, ApiFailure> {
+        self.accounts.record_content_feedback(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+            request,
+        )
+    }
+
     /// Enqueue a background generation job, coalescing onto an existing
     /// queued/running job for the same account+source (082) instead of
     /// starting a duplicate.
@@ -1033,6 +1073,15 @@ pub struct SubmitReviewRequest {
     pub answer: String,
     pub response_time_ms: u32,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentFeedbackRequest {
+    pub verdict: ContentFeedbackVerdict,
+    pub rationale: Option<String>,
+    pub idempotency_key: String,
+    pub supersedes_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1722,6 +1771,51 @@ fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreErro
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
+}
+
+fn file_content_feedback_failure(error: ContentFeedbackError<BetaStoreError>) -> ApiFailure {
+    match error {
+        ContentFeedbackError::BlankFeedbackId | ContentFeedbackError::BlankAccountId => {
+            ApiFailure::bad_request("Content feedback request is invalid.")
+        }
+        ContentFeedbackError::Store(BetaStoreError::UnknownReviewUnit(_)) => {
+            ApiFailure::not_found("Review unit not found.")
+        }
+        ContentFeedbackError::Store(
+            BetaStoreError::FeedbackSupersedesUnknown(_)
+            | BetaStoreError::FeedbackSupersedesOtherReviewUnit(_)
+            | BetaStoreError::FeedbackSupersedesOtherAccount(_),
+        ) => ApiFailure::bad_request("Feedback supersedes an invalid revision."),
+        ContentFeedbackError::Store(
+            BetaStoreError::DuplicateContentFeedback(_)
+            | BetaStoreError::FeedbackSupersedesStale { .. },
+        ) => ApiFailure::conflict("Feedback conflicts with the current revision."),
+        ContentFeedbackError::Store(error) => ApiFailure::internal(error.to_string()),
+    }
+}
+
+fn postgres_content_feedback_failure(
+    error: ContentFeedbackError<PostgresStoreError>,
+) -> ApiFailure {
+    match error {
+        ContentFeedbackError::BlankFeedbackId | ContentFeedbackError::BlankAccountId => {
+            ApiFailure::bad_request("Content feedback request is invalid.")
+        }
+        ContentFeedbackError::Store(PostgresStoreError::UnknownReviewUnit(_)) => {
+            ApiFailure::not_found("Review unit not found.")
+        }
+        ContentFeedbackError::Store(
+            PostgresStoreError::FeedbackSupersedesUnknown(_)
+            | PostgresStoreError::FeedbackSupersedesOtherReviewUnit(_)
+            | PostgresStoreError::FeedbackSupersedesOtherAccount(_)
+            | PostgresStoreError::FeedbackAccountMismatch,
+        ) => ApiFailure::bad_request("Feedback supersedes an invalid revision."),
+        ContentFeedbackError::Store(
+            PostgresStoreError::DuplicateContentFeedback(_)
+            | PostgresStoreError::FeedbackSupersedesStale { .. },
+        ) => ApiFailure::conflict("Feedback conflicts with the current revision."),
+        ContentFeedbackError::Store(error) => ApiFailure::internal(error.to_string()),
+    }
 }
 
 fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
