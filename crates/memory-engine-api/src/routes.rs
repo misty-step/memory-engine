@@ -4,7 +4,7 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
     },
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -16,11 +16,15 @@ use axum::{
 use serde::Deserialize;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
+#[path = "icons.rs"]
+mod icons;
+
 use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
-    render_account_page, render_action_result_html, render_app_shell, render_login_requested,
-    LEDGER_CSS,
+    render_account_page, render_action_result_html, render_app_shell, render_auth_recovery,
+    render_login_requested, render_return_notification_confirmation,
+    render_return_notification_disabled, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -212,6 +216,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(app_home))
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
+        .route("/manifest.webmanifest", get(static_manifest))
+        .route("/favicon.png", get(static_favicon))
+        .route("/icon-192.png", get(static_icon_192))
+        .route("/icon-512.png", get(static_icon_512))
+        .route("/apple-touch-icon.png", get(static_apple_touch_icon))
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
@@ -219,6 +228,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/account", post(create_app_account))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
+        .route(
+            "/app/return-notifications",
+            get(return_notification_page).post(update_return_notifications),
+        )
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
         .route("/app/capture", post(capture_app_source))
@@ -295,6 +308,41 @@ async fn static_ledger_css() -> impl IntoResponse {
         ],
         LEDGER_CSS,
     )
+}
+
+async fn static_manifest() -> impl IntoResponse {
+    const MANIFEST: &str = r##"{
+  "name": "Memory Engine",
+  "short_name": "Memory Engine",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f2ea",
+  "theme_color": "#f6f2ea",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+]
+}"##;
+    ([(CONTENT_TYPE, "application/manifest+json")], MANIFEST)
+}
+
+use icons::{APPLE_TOUCH_ICON_PNG, APP_ICON_192_PNG, APP_ICON_512_PNG};
+
+async fn static_favicon() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_192_PNG)
+}
+
+async fn static_apple_touch_icon() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APPLE_TOUCH_ICON_PNG)
+}
+
+async fn static_icon_192() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_192_PNG)
+}
+
+async fn static_icon_512() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], APP_ICON_512_PNG)
 }
 
 async fn v1_openapi() -> impl IntoResponse {
@@ -595,10 +643,10 @@ async fn create_app_account(
 ) -> Response {
     let result = state.request_magic_link(&form.email, &client_rate_limit_key(&headers));
 
-    match result {
+    no_store_response(match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
-        Err(error) => error.into_response(),
-    }
+        Err(error) => app_failure_response(error),
+    })
 }
 
 async fn verify_app_login(
@@ -608,13 +656,104 @@ async fn verify_app_login(
     match state.verify_magic_link(&query.token) {
         Ok(account) => {
             let view = state.app_study_view(&account).ok();
-            html_with_browser_session(
+            no_store_response(html_with_browser_session(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
-            )
+            ))
         }
-        Err(error) => error.into_response(),
+        Err(error) if error.is_magic_link_recovery() => {
+            let status = error.status();
+            let mut response = Html(render_auth_recovery(
+                "Sign-in link expired",
+                "That link is no longer valid. Request a fresh link and return to your study space.",
+            ))
+            .into_response();
+            *response.status_mut() = status;
+            no_store_response(response)
+        }
+        Err(error) => no_store_response(app_failure_response(error)),
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppReturnNotificationForm {
+    csrf_token: Option<String>,
+    #[serde(rename = "unsubscribeToken")]
+    unsubscribe_token: Option<String>,
+    #[serde(rename = "reminderEmail")]
+    reminder_email: Option<String>,
+    enabled: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct AppReturnNotificationQuery {
+    token: Option<String>,
+}
+
+async fn return_notification_page(
+    State(state): State<ApiState>,
+    Query(query): Query<AppReturnNotificationQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(token) = query.token.as_deref() {
+        return match state.validate_return_notification_token(token) {
+            Ok(()) => no_store_response(
+                Html(render_return_notification_confirmation(token)).into_response(),
+            ),
+            Err(error) => no_store_response(app_failure_response(error)),
+        };
+    }
+    let account = match state.require_browser_session_readonly(&headers) {
+        Ok(account) => account,
+        Err(error) => return no_store_response(app_failure_response(error)),
+    };
+    no_store_response(Html(render_account_page(&state, &account, None, None)).into_response())
+}
+
+async fn update_return_notifications(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppReturnNotificationForm>,
+) -> Response {
+    if let Some(token) = form
+        .unsubscribe_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        return no_store_response(match state.disable_return_notification(token) {
+            Ok(()) => Html(render_return_notification_disabled()).into_response(),
+            Err(error) => app_failure_response(error),
+        });
+    }
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return no_store_response(app_failure_response(error)),
+        };
+    let enabled = form.enabled.as_deref() == Some("on");
+    let due_count = state
+        .app_study_view(&account)
+        .map_or(0, |view| view.due_count);
+    let result = state
+        .set_return_notification(&account, form.reminder_email.as_deref(), enabled)
+        .and_then(|()| {
+            if enabled {
+                state
+                    .maybe_send_due_count_notification(&account, due_count, true)
+                    .map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
+    let notice = match result {
+        Ok(()) if enabled => "Due-count reminders are on. One confirmation was sent; reminders stay to one per day and can be turned off below.",
+        Ok(()) => "Due-count reminders are off.",
+        Err(error) => return no_store_response(Html(render_account_page(&state, &account, None, Some(&error.message))).into_response()),
+    };
+    no_store_response(
+        Html(render_account_page(&state, &account, None, Some(notice))).into_response(),
+    )
 }
 
 async fn logout_app_session(
@@ -624,7 +763,7 @@ async fn logout_app_session(
 ) -> Response {
     match state.revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
         Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
-        Err(error) => error.into_response(),
+        Err(error) => app_failure_response(error),
     }
 }
 
@@ -636,7 +775,7 @@ async fn save_app_account(
     let source_account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let source_view = state.app_study_view(&source_account).ok();
     let result = normalize_email(&form.email)
@@ -647,7 +786,7 @@ async fn save_app_account(
         Ok(account) => {
             let account = match state.create_browser_session(&account) {
                 Ok(account) => account,
-                Err(error) => return error.into_response(),
+                Err(error) => return app_failure_response(error),
             };
             let view = state.app_study_view(&account).ok().or(source_view);
             html_with_browser_session(
@@ -679,7 +818,7 @@ async fn start_app_study(
     };
     let account = match state.create_browser_session(&account) {
         Ok(account) => account,
-        Err(error) => return error.into_response(),
+        Err(error) => return app_failure_response(error),
     };
     let result = state.save_app_source(
         &account,
@@ -700,7 +839,7 @@ async fn create_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.save_app_source(
         &account,
@@ -727,7 +866,7 @@ async fn capture_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let request = capture_request(form.title, form.body, form.capture);
     let notice = match state.save_app_source(&account, &request) {
@@ -796,7 +935,7 @@ async fn generate_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let title = state
         .list_app_sources(&account)
@@ -824,7 +963,7 @@ async fn archive_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.archive_app_source(&account, &form.source_id);
 
@@ -864,7 +1003,7 @@ async fn retry_app_job(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let notice = if state.retry_generation_job(&account, &form.job_id) {
         "Retrying. Generating again in the background."
@@ -881,7 +1020,7 @@ async fn retry_app_job(
 async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
-        Err(error) => return error.into_response(),
+        Err(error) => return app_failure_response(error),
     };
     let account_id = account.account_id().to_owned();
     // `tokio_stream::StreamExt::filter_map` is synchronous: the closure returns
@@ -926,11 +1065,35 @@ async fn next_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.next_app_review(&account);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
+}
+
+fn app_failure_response(error: ApiFailure) -> Response {
+    if error.is_session_expired() {
+        let status = error.status();
+        let mut response = Html(render_auth_recovery(
+            "Your session expired",
+            "Your study data is safe. Sign in again to continue where you left off.",
+        ))
+        .into_response();
+        *response.status_mut() = status;
+        return no_store_response(response);
+    }
+    error.into_response()
+}
+
+fn no_store_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn reveal_app_review(
@@ -941,7 +1104,7 @@ async fn reveal_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.reveal_app_review(&account, &form.review_unit_id);
 
@@ -956,7 +1119,7 @@ async fn reference_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.learn_more_app_review(&account, &form.review_unit_id);
 
@@ -971,7 +1134,7 @@ async fn skip_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
 
@@ -986,7 +1149,7 @@ async fn delete_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.delete_app_review(&account, &form.review_unit_id);
 
@@ -1001,7 +1164,7 @@ async fn snooze_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
 
@@ -1016,7 +1179,7 @@ async fn bridge_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.bridge_app_review(&account, &form.review_unit_id);
 
@@ -1053,7 +1216,7 @@ async fn submit_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
     let result = state.submit_app_review(
         &account,

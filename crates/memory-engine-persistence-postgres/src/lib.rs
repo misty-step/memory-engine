@@ -58,6 +58,22 @@ CREATE TABLE IF NOT EXISTS memory_engine_auth_challenges (
     consumed_at_ms BIGINT
 );
 
+CREATE TABLE IF NOT EXISTS memory_engine_return_notification_preferences (
+    account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    email_normalized TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    last_sent_at_ms BIGINT,
+    unsubscribe_nonce TEXT NOT NULL DEFAULT '',
+    updated_at_ms BIGINT NOT NULL
+);
+ALTER TABLE memory_engine_return_notification_preferences
+    ADD COLUMN IF NOT EXISTS claim_id TEXT,
+    ADD COLUMN IF NOT EXISTS claim_expires_at_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS pending_delivery_key TEXT,
+    ADD COLUMN IF NOT EXISTS pending_due_count BIGINT,
+    ADD COLUMN IF NOT EXISTS pending_unsubscribe_expires_at_ms BIGINT,
+    ADD COLUMN IF NOT EXISTS unsubscribe_nonce TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS memory_engine_source_documents (
     account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
     source_document_id TEXT NOT NULL,
@@ -154,6 +170,28 @@ CREATE INDEX IF NOT EXISTS memory_engine_attempts_account_review_idx
     ON memory_engine_attempts(account_id, review_unit_id, occurred_at_ms);
 ";
 
+const CLAIM_RETURN_NOTIFICATION_SQL: &str = r"
+UPDATE memory_engine_return_notification_preferences
+ SET claim_id = $6,
+     claim_expires_at_ms = $7::BIGINT,
+     pending_delivery_key = COALESCE(pending_delivery_key, $8),
+     pending_due_count = COALESCE(pending_due_count, $3::BIGINT),
+     pending_unsubscribe_expires_at_ms = COALESCE(pending_unsubscribe_expires_at_ms, $10::BIGINT),
+     unsubscribe_nonce = COALESCE(NULLIF(unsubscribe_nonce, ''), $9),
+     updated_at_ms = $2::BIGINT
+ WHERE account_id = $1
+   AND enabled
+   AND (pending_delivery_key IS NOT NULL OR
+        (($4 OR $3::BIGINT > 0) AND
+        (last_sent_at_ms IS NULL OR last_sent_at_ms <= $5::BIGINT)))
+   AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2::BIGINT)
+ RETURNING email_normalized,
+           pending_due_count,
+           pending_delivery_key,
+           unsubscribe_nonce,
+           pending_unsubscribe_expires_at_ms
+";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountScope {
     account_id: String,
@@ -190,6 +228,38 @@ pub struct BrowserSession {
     pub session_token: String,
     pub csrf_token_hash: String,
     pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationPreference {
+    pub email: String,
+    pub enabled: bool,
+    pub last_sent_at_ms: Option<i64>,
+    pub unsubscribe_nonce: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationClaim {
+    pub email: String,
+    pub due_count: i64,
+    pub delivery_key: String,
+    pub unsubscribe_nonce: String,
+    pub unsubscribe_expires_at_ms: i64,
+    pub claim_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReturnNotificationClaimRequest {
+    pub account_id: String,
+    pub now_ms: i64,
+    pub due_count: i64,
+    pub force_confirmation: bool,
+    pub interval_ms: i64,
+    pub claim_id: String,
+    pub delivery_key: String,
+    pub claim_expires_at_ms: i64,
+    pub unsubscribe_nonce: String,
+    pub unsubscribe_expires_at_ms: i64,
 }
 
 /// TLS connector for Postgres, with Mozilla's compiled-in roots.
@@ -535,6 +605,248 @@ impl PostgresStudyStore {
         )?;
 
         Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Persist the learner's explicit due-count reminder choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the upsert.
+    pub fn save_return_notification_preference(
+        &mut self,
+        account_id: &str,
+        email_normalized: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        updated_at_ms: i64,
+        unsubscribe_nonce: &str,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "INSERT INTO memory_engine_return_notification_preferences
+                (account_id, email_normalized, enabled, last_sent_at_ms, updated_at_ms, unsubscribe_nonce)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (account_id) DO UPDATE
+             SET email_normalized = EXCLUDED.email_normalized,
+                 enabled = EXCLUDED.enabled,
+                 last_sent_at_ms = EXCLUDED.last_sent_at_ms,
+                 unsubscribe_nonce = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.unsubscribe_nonce
+                     ELSE EXCLUDED.unsubscribe_nonce
+                 END,
+                 claim_id = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.claim_id
+                     ELSE NULL
+                 END,
+                 claim_expires_at_ms = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.claim_expires_at_ms
+                     ELSE NULL
+                 END,
+                 pending_delivery_key = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_delivery_key
+                     ELSE NULL
+                 END,
+                 pending_due_count = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_due_count
+                     ELSE NULL
+                 END,
+                 pending_unsubscribe_expires_at_ms = CASE
+                     WHEN memory_engine_return_notification_preferences.enabled
+                          AND EXCLUDED.enabled
+                          AND memory_engine_return_notification_preferences.email_normalized = EXCLUDED.email_normalized
+                          AND memory_engine_return_notification_preferences.pending_delivery_key IS NOT NULL
+                     THEN memory_engine_return_notification_preferences.pending_unsubscribe_expires_at_ms
+                     ELSE NULL
+                 END,
+                 updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &account_id,
+                &email_normalized,
+                &enabled,
+                &last_sent_at_ms,
+                &updated_at_ms,
+                &unsubscribe_nonce,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically fence one reminder delivery before the external mailer runs.
+    /// The transaction is limited to this claim; callers must send mail after
+    /// this method returns and finalize it with the claim id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the claim transaction cannot be
+    /// committed or the database rejects the request.
+    pub fn claim_return_notification(
+        &mut self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, PostgresStoreError> {
+        let threshold_ms = request.now_ms.saturating_sub(request.interval_ms);
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let row = transaction.query_opt(
+            CLAIM_RETURN_NOTIFICATION_SQL,
+            &[
+                &request.account_id,
+                &request.now_ms,
+                &request.due_count,
+                &request.force_confirmation,
+                &threshold_ms,
+                &request.claim_id,
+                &request.claim_expires_at_ms,
+                &request.delivery_key,
+                &request.unsubscribe_nonce,
+                &request.unsubscribe_expires_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        row.map(|row| {
+            let due_count: i64 = row.get(1);
+            let delivery_key: String = row.get(2);
+            let unsubscribe_nonce: String = row.get(3);
+            let unsubscribe_expires_at_ms: i64 = row.get(4);
+            Ok(ReturnNotificationClaim {
+                email: row.get(0),
+                due_count,
+                delivery_key,
+                unsubscribe_nonce,
+                unsubscribe_expires_at_ms,
+                claim_id: request.claim_id.clone(),
+            })
+        })
+        .transpose()
+    }
+
+    /// Finalize only the currently fenced claim. A stale worker cannot mark a
+    /// newer claim sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn complete_return_notification(
+        &mut self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let changed = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_return_notification_preferences
+             SET last_sent_at_ms = $3,
+                 claim_id = NULL,
+                 claim_expires_at_ms = NULL,
+                 pending_delivery_key = NULL,
+                 pending_due_count = NULL,
+                 pending_unsubscribe_expires_at_ms = NULL,
+                 updated_at_ms = $3
+             WHERE account_id = $1 AND claim_id = $2",
+            &[&account_id, &claim_id, &sent_at_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Release a failed claim while preserving its idempotency key for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn release_return_notification(
+        &mut self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "UPDATE memory_engine_return_notification_preferences
+             SET claim_id = NULL, claim_expires_at_ms = NULL
+             WHERE account_id = $1 AND claim_id = $2",
+            &[&account_id, &claim_id],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically consume a current unsubscribe token and rotate its nonce.
+    ///
+    /// The conditional update makes token consumption and nonce rotation one
+    /// database operation, so a stale token cannot overwrite a concurrent
+    /// authenticated re-enable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn disable_return_notification(
+        &mut self,
+        account_id: &str,
+        email_normalized: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let changed = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_return_notification_preferences
+             SET enabled = FALSE,
+                 unsubscribe_nonce = $4,
+                 claim_id = NULL,
+                 claim_expires_at_ms = NULL,
+                 pending_delivery_key = NULL,
+                 pending_due_count = NULL,
+                 pending_unsubscribe_expires_at_ms = NULL,
+                 updated_at_ms = $5
+             WHERE account_id = $1
+               AND email_normalized = $2
+               AND enabled
+               AND unsubscribe_nonce = $3",
+            &[
+                &account_id,
+                &email_normalized,
+                &current_nonce,
+                &next_nonce,
+                &updated_at_ms,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Load the learner's due-count reminder choice, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the query.
+    pub fn return_notification_preference(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT email_normalized, enabled, last_sent_at_ms, unsubscribe_nonce
+             FROM memory_engine_return_notification_preferences
+             WHERE account_id = $1",
+            &[&account_id],
+        )?;
+        Ok(row.map(|row| ReturnNotificationPreference {
+            email: row.get(0),
+            enabled: row.get(1),
+            last_sent_at_ms: row.get(2),
+            unsubscribe_nonce: row.get(3),
+        }))
     }
 
     /// Scope all following operations to one already-authenticated account.
@@ -1664,10 +1976,11 @@ mod tests {
     };
     use memory_engine_service::ServiceAttemptRecord;
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
+    use std::sync::{Arc, Barrier};
 
     use super::{
         applied_review_receipt_key, migration_sql, AccountScope, MemoryServiceStore,
-        PostgresStoreError, PostgresStudyStore,
+        PostgresStoreError, PostgresStudyStore, CLAIM_RETURN_NOTIFICATION_SQL,
     };
 
     const NOW: i64 = 1_779_465_600_000;
@@ -1697,10 +2010,30 @@ mod tests {
         assert!(sql.contains("memory_engine_auth_challenges"));
         assert!(sql.contains("challenge_hash TEXT PRIMARY KEY"));
         assert!(sql.contains("consumed_at_ms BIGINT"));
+        assert!(sql.contains("claim_id TEXT"));
+        assert!(sql.contains("pending_delivery_key TEXT"));
+        assert!(sql.contains("pending_unsubscribe_expires_at_ms BIGINT"));
+        assert!(sql.contains("unsubscribe_nonce TEXT NOT NULL DEFAULT ''"));
         assert!(sql.contains("memory_engine_rate_limits"));
         assert!(sql.contains("rate_limit_key TEXT PRIMARY KEY"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
         assert!(sql.contains("ON DELETE CASCADE"));
+    }
+
+    #[test]
+    fn return_notification_claim_sql_declares_i64_parameters_as_bigint() {
+        for parameter in [
+            "$2::BIGINT",
+            "$3::BIGINT",
+            "$5::BIGINT",
+            "$7::BIGINT",
+            "$10::BIGINT",
+        ] {
+            assert!(
+                CLAIM_RETURN_NOTIFICATION_SQL.contains(parameter),
+                "claim SQL must explicitly bind {parameter} as BIGINT"
+            );
+        }
     }
 
     #[test]
@@ -1778,6 +2111,285 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres rate limit contract");
+    }
+
+    #[test]
+    fn live_postgres_return_notification_claim_is_atomic_and_fenced() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_return_claim_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            {
+                let scope = super::AccountScope::new("acct-claim")?;
+                let mut account = setup.for_account(scope);
+                account.ensure_account(NOW)?;
+            }
+            setup.save_return_notification_preference(
+                "acct-claim",
+                "claim@example.com",
+                true,
+                None,
+                NOW,
+                "claim-nonce",
+            )?;
+            drop(setup);
+
+            let barrier = Arc::new(Barrier::new(16));
+            let workers = (0..16)
+                .map(|index| {
+                    let barrier = Arc::clone(&barrier);
+                    let scoped_url = scoped_url.clone();
+                    std::thread::spawn(move || {
+                        let mut store = super::PostgresStudyStore::connect(&scoped_url)
+                            .expect("claim connection");
+                        barrier.wait();
+                        store
+                            .claim_return_notification(&super::ReturnNotificationClaimRequest {
+                                account_id: "acct-claim".to_owned(),
+                                now_ms: NOW,
+                                due_count: 4,
+                                force_confirmation: true,
+                                interval_ms: 86_400_000,
+                                claim_id: format!("claim-{index}"),
+                                delivery_key: "delivery-claim".to_owned(),
+                                claim_expires_at_ms: NOW + 300_000,
+                                unsubscribe_nonce: "claim-nonce".to_owned(),
+                                unsubscribe_expires_at_ms: NOW + 604_800_000,
+                            })
+                            .expect("claim")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let claims = workers
+                .into_iter()
+                .filter_map(|worker| worker.join().expect("claim worker"))
+                .collect::<Vec<_>>();
+            assert_eq!(claims.len(), 1, "exactly one Postgres worker may claim");
+            let winner = &claims[0];
+            assert_eq!(winner.unsubscribe_expires_at_ms, NOW + 604_800_000);
+            let mut finalize = super::PostgresStudyStore::connect(&scoped_url)?;
+            assert!(finalize.complete_return_notification(
+                "acct-claim",
+                &winner.claim_id,
+                NOW + 1,
+            )?);
+            assert!(!finalize.complete_return_notification(
+                "acct-claim",
+                &winner.claim_id,
+                NOW + 2,
+            )?);
+
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live Postgres return claim contract");
+    }
+
+    #[test]
+    fn live_postgres_return_notification_retry_persists_expiry_across_stale_claims() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_return_retry_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = super::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut retry = super::PostgresStudyStore::connect(&scoped_url)?;
+            retry.migrate()?;
+            {
+                let scope = super::AccountScope::new("acct-claim-retry")?;
+                let mut account = retry.for_account(scope);
+                account.ensure_account(NOW)?;
+            }
+            retry.save_return_notification_preference(
+                "acct-claim-retry",
+                "retry@example.com",
+                true,
+                None,
+                NOW,
+                "retry-nonce",
+            )?;
+            let first = retry
+                .claim_return_notification(&super::ReturnNotificationClaimRequest {
+                    account_id: "acct-claim-retry".to_owned(),
+                    now_ms: NOW,
+                    due_count: 2,
+                    force_confirmation: true,
+                    interval_ms: 86_400_000,
+                    claim_id: "retry-stale-1".to_owned(),
+                    delivery_key: "retry-delivery-1".to_owned(),
+                    claim_expires_at_ms: NOW + 100,
+                    unsubscribe_nonce: "retry-nonce-request".to_owned(),
+                    unsubscribe_expires_at_ms: NOW + 604_800_000,
+                })?
+                .expect("first retry claim");
+            retry.save_return_notification_preference(
+                "acct-claim-retry",
+                "retry@example.com",
+                true,
+                None,
+                NOW + 1,
+                "retry-nonce-request-rotated",
+            )?;
+            let second = retry
+                .claim_return_notification(&super::ReturnNotificationClaimRequest {
+                    account_id: "acct-claim-retry".to_owned(),
+                    now_ms: NOW + 200,
+                    due_count: 1,
+                    force_confirmation: false,
+                    interval_ms: 86_400_000,
+                    claim_id: "retry-stale-2".to_owned(),
+                    delivery_key: "retry-delivery-2".to_owned(),
+                    claim_expires_at_ms: NOW + 300,
+                    unsubscribe_nonce: "retry-nonce-request-2".to_owned(),
+                    unsubscribe_expires_at_ms: NOW + 604_800_200,
+                })?
+                .expect("stale retry claim");
+            assert_eq!(second.delivery_key, first.delivery_key);
+            assert_eq!(second.unsubscribe_nonce, first.unsubscribe_nonce);
+            assert_eq!(
+                second.unsubscribe_expires_at_ms,
+                first.unsubscribe_expires_at_ms
+            );
+            assert!(!retry.complete_return_notification(
+                "acct-claim-retry",
+                &first.claim_id,
+                NOW + 201,
+            )?);
+            assert!(retry.complete_return_notification(
+                "acct-claim-retry",
+                &second.claim_id,
+                NOW + 202,
+            )?);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live Postgres return retry contract");
+    }
+
+    #[test]
+    fn live_postgres_return_notification_unsubscribe_nonce_race_is_atomic() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_return_unsubscribe_race_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            {
+                let scope = super::AccountScope::new("acct-unsubscribe-race")?;
+                let mut account = setup.for_account(scope);
+                account.ensure_account(NOW)?;
+            }
+            setup.save_return_notification_preference(
+                "acct-unsubscribe-race",
+                "race@example.com",
+                true,
+                None,
+                NOW,
+                "nonce-before",
+            )?;
+            drop(setup);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let reenable_barrier = Arc::clone(&barrier);
+            let reenable_url = scoped_url.clone();
+            let reenable = std::thread::spawn(move || {
+                let mut store =
+                    super::PostgresStudyStore::connect(&reenable_url).expect("reenable connection");
+                reenable_barrier.wait();
+                store
+                    .save_return_notification_preference(
+                        "acct-unsubscribe-race",
+                        "race@example.com",
+                        true,
+                        None,
+                        NOW + 2,
+                        "nonce-reenabled",
+                    )
+                    .expect("reenable preference");
+            });
+            let stale_barrier = Arc::clone(&barrier);
+            let stale_url = scoped_url.clone();
+            let stale = std::thread::spawn(move || {
+                let mut store =
+                    super::PostgresStudyStore::connect(&stale_url).expect("stale connection");
+                stale_barrier.wait();
+                store
+                    .disable_return_notification(
+                        "acct-unsubscribe-race",
+                        "race@example.com",
+                        "nonce-before",
+                        "nonce-stale",
+                        NOW + 2,
+                    )
+                    .expect("stale token operation")
+            });
+            reenable.join().expect("reenable worker");
+            let stale_changed = stale.join().expect("stale worker");
+
+            let mut verify = super::PostgresStudyStore::connect(&scoped_url)?;
+            let preference = verify
+                .return_notification_preference("acct-unsubscribe-race")?
+                .expect("race preference");
+            assert!(preference.enabled);
+            assert_eq!(preference.unsubscribe_nonce, "nonce-reenabled");
+            let _ = stale_changed;
+            assert!(verify.disable_return_notification(
+                "acct-unsubscribe-race",
+                "race@example.com",
+                "nonce-reenabled",
+                "nonce-after",
+                NOW + 3,
+            )?);
+            assert!(!verify.disable_return_notification(
+                "acct-unsubscribe-race",
+                "race@example.com",
+                "nonce-before",
+                "nonce-replayed",
+                NOW + 4,
+            )?);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live Postgres return unsubscribe race contract");
     }
 
     fn run_live_postgres_store_contract(database_url: &str) -> Result<(), PostgresStoreError> {

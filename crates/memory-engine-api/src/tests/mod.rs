@@ -1,9 +1,12 @@
 use std::{
     fs,
+    path::Path as FsPath,
     sync::{Arc, Barrier},
     thread,
     time::Instant,
 };
+
+use std::os::unix::fs::PermissionsExt;
 
 use axum::{
     body::{to_bytes, Body},
@@ -16,7 +19,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
-use super::{router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS};
+use super::{
+    router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+};
+use memory_engine_api_state::RETURN_NOTIFICATION_INTERVAL_MS;
 
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
@@ -202,6 +209,210 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
         "the home Start review CTA must open a review: {review}"
     );
     assert!(!review.contains("CSRF token does not match"));
+}
+
+#[tokio::test]
+async fn home_get_does_not_send_or_mutate_return_notification_state() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("home-read-only-return-notifications");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
+    );
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let saved = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("email", "learner@example.com")],
+        ))
+        .await
+        .expect("save account");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let csrf_token = html_value(&saved, "csrfToken");
+
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("enable return notifications");
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let outbox_before = fs::read_to_string(&outbox_path).expect("outbox after explicit enable");
+    let preference_before = read_return_notification_preference(&store_root);
+    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let home = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_eq!(home.status(), StatusCode::OK);
+    assert!(!response_text(home).await.contains("Get started"));
+    assert_eq!(
+        fs::read_to_string(&outbox_path).expect("outbox after home GET"),
+        outbox_before,
+        "home GET must not send a return notification"
+    );
+    assert_eq!(
+        read_return_notification_preference(&store_root),
+        preference_before,
+        "home GET must not mutate return notification persistence"
+    );
+}
+
+#[tokio::test]
+async fn return_notification_enable_route_retries_the_same_provider_envelope_after_restart() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-route-retry");
+    fs::create_dir_all(&store_root).expect("retry store root");
+    let mailer_command = retry_provider_script(&store_root);
+    let auth_config = || {
+        AuthConfig::default()
+            .with_unsubscribe_secret("claim-secret")
+            .with_mailer_command(&mailer_command)
+    };
+    let first_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let first_app = router(first_state);
+    let (cookie, csrf_token, _) = start_app_session_for_csrf(&first_app).await;
+    let saved = first_app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("email", "retry@example.com")],
+        ))
+        .await
+        .expect("save account");
+    let cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let csrf_token = html_value(&saved, "csrfToken");
+    let first_attempt = post_return_notification_enable(&first_app, &cookie, &csrf_token).await;
+    assert!(first_attempt.contains("return notification mailer command exited"));
+    let first_payload =
+        fs::read_to_string(store_root.join("retry-provider.tsv")).expect("failed payload");
+    assert_eq!(first_payload.lines().count(), 1);
+    let failed_preference: Value =
+        serde_json::from_str(&read_return_notification_preference(&store_root))
+            .expect("failed preference");
+    assert!(failed_preference["pendingDeliveryKey"].is_string());
+    assert!(failed_preference["pendingUnsubscribeExpiresAtMs"].is_number());
+    assert!(failed_preference["claimId"].is_null());
+
+    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    let recovery_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let recovery_app = router(recovery_state);
+    let second_attempt = post_return_notification_enable(&recovery_app, &cookie, &csrf_token).await;
+    assert!(second_attempt.contains("Due-count reminders are on"));
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        payloads[0], payloads[1],
+        "route retry payload must be identical"
+    );
+    assert_eq!(payloads[0].split('\t').count(), 4);
+    assert_eq!(
+        payloads[0].split('\t').nth(3),
+        payloads[1].split('\t').nth(3),
+        "route retry must preserve the idempotency key"
+    );
+    let completed_preference: Value =
+        serde_json::from_str(&read_return_notification_preference(&store_root))
+            .expect("completed preference");
+    for field in [
+        "claimId",
+        "pendingDeliveryKey",
+        "pendingDueCount",
+        "pendingUnsubscribeExpiresAtMs",
+    ] {
+        assert!(
+            completed_preference[field].is_null(),
+            "{field} must clear on success"
+        );
+    }
+}
+
+#[test]
+fn return_notification_new_envelopes_at_one_clock_tick_have_distinct_keys() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-random-envelope");
+    fs::create_dir_all(&store_root).expect("envelope store root");
+    let mailer_command = retry_provider_script(&store_root);
+    fs::write(store_root.join("retry-provider.failed"), "").expect("successful provider marker");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::default()
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(mailer_command),
+            ),
+    );
+    let account = state.create_account("random@example.com").expect("account");
+    let account = state.create_browser_session(&account).expect("session");
+    state
+        .set_return_notification(&account, Some("random@example.com"), true)
+        .expect("enable");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 1, true)
+        .expect("first envelope"));
+    state
+        .set_return_notification(&account, None, false)
+        .expect("disable");
+    state
+        .set_return_notification(&account, Some("random@example.com"), true)
+        .expect("re-enable");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 1, true)
+        .expect("second envelope"));
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_ne!(
+        payloads[0].split('\t').nth(3),
+        payloads[1].split('\t').nth(3),
+        "new envelopes at one clock tick must not collide"
+    );
 }
 
 #[tokio::test]
@@ -1207,6 +1418,7 @@ async fn auth_magic_link_cross_device_resume() {
         .await
         .expect("verify magic link");
     assert_eq!(verified.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&verified);
     let cookie = session_cookie(&verified);
     let verified = response_text(verified).await;
     assert!(verified.contains("NATO practice notes"));
@@ -1245,6 +1457,7 @@ async fn auth_rejects_magic_link_replay() {
         .await
         .expect("first verify");
     assert_eq!(first.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&first);
 
     let replay = app
         .oneshot(
@@ -1257,6 +1470,718 @@ async fn auth_rejects_magic_link_replay() {
         .await
         .expect("replay verify");
     assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&replay);
+}
+
+#[tokio::test]
+async fn token_bearing_login_request_response_is_not_cached() {
+    let app = router(ApiState::new(
+        AccountRegistry::default().with_auth_config(AuthConfig::default().with_debug_links(true)),
+    ));
+    let requested = app
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    assert_eq!(requested.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&requested);
+}
+
+#[tokio::test]
+async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let app = router(ApiState::new(
+        AccountRegistry::default()
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
+            ),
+    ));
+    let requested = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    let verify_path = debug_sign_in_path(&response_text(requested).await);
+    EXPIRY_CLOCK.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(verify_path)
+                .body(Body::empty())
+                .expect("expired verify request"),
+        )
+        .await
+        .expect("expired verify response");
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&expired);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Sign-in link expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(body.contains("Request a new link"));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
+async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
+    SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let app = router(ApiState::new(
+        AccountRegistry::default().with_clock(session_clock),
+    ));
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", "session expiry proof")],
+        ))
+        .await
+        .expect("start");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/next",
+            &cookie,
+            &[("csrfToken", &csrf_token)],
+        ))
+        .await
+        .expect("expired session response");
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store_and_no_referrer(&expired);
+    assert_eq!(
+        expired
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let body = response_text(expired).await;
+    assert!(body.contains("Your session expired"));
+    assert!(body.contains(r#"<form action="/app/account" method="post">"#));
+    assert!(!body.contains(r#"{"error""#));
+}
+
+#[tokio::test]
+async fn installability_assets_are_valid_and_linked_from_the_shell() {
+    let app = router(ApiState::default());
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    let home = response_text(home).await;
+    assert!(home.contains(r#"rel="manifest" href="/manifest.webmanifest""#));
+    assert!(home.contains(r#"rel="icon" href="/favicon.png""#));
+    assert!(home.contains(r#"rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180""#));
+    assert!(home.contains(r#"name="theme-color""#));
+
+    let manifest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/manifest.webmanifest")
+                .body(Body::empty())
+                .expect("manifest request"),
+        )
+        .await
+        .expect("manifest response");
+    assert_eq!(manifest.status(), StatusCode::OK);
+    let manifest = response_json(manifest).await;
+    assert_eq!(manifest["name"], json!("Memory Engine"));
+    assert_eq!(manifest["display"], json!("standalone"));
+    assert_eq!(manifest["start_url"], json!("/"));
+    assert_eq!(manifest["icons"][0]["src"], json!("/icon-192.png"));
+    assert_eq!(manifest["icons"][0]["sizes"], json!("192x192"));
+    assert_eq!(manifest["icons"][0]["type"], json!("image/png"));
+    assert_eq!(manifest["icons"][1]["src"], json!("/icon-512.png"));
+    assert_eq!(manifest["icons"][1]["sizes"], json!("512x512"));
+    assert_eq!(manifest["icons"][1]["type"], json!("image/png"));
+
+    for (path, width, height) in [
+        ("/favicon.png", 192_u32, 192_u32),
+        ("/icon-192.png", 192, 192),
+        ("/icon-512.png", 512, 512),
+        ("/apple-touch-icon.png", 180, 180),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("icon request"),
+            )
+            .await
+            .expect("icon response");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("icon bytes");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(
+            u32::from_be_bytes(bytes[16..20].try_into().expect("width")),
+            width
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[20..24].try_into().expect("height")),
+            height
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
+    let store_root = temp_store_root("return-notifications");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails(["learner@example.com".to_owned()])
+                .with_link_outbox(&outbox_path),
+        ),
+    ));
+    let requested = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    let verify_path = fs::read_to_string(&outbox_path)
+        .expect("auth outbox")
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').nth(1))
+        .map(str::to_owned)
+        .expect("magic link");
+    drop(requested);
+    let verified = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&verify_path)
+                .body(Body::empty())
+                .expect("verify request"),
+        )
+        .await
+        .expect("verify");
+    let cookie = session_cookie(&verified);
+    let verified = response_text(verified).await;
+    let csrf_token = html_value(&verified, "csrfToken");
+
+    let enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("enable return channel");
+    assert_eq!(enabled.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&enabled);
+    let enabled = response_text(enabled).await;
+    assert!(enabled.contains("Due-count reminders are on"));
+    let after_enable = fs::read_to_string(&outbox_path).expect("outbox after enable");
+    assert!(after_enable.contains("due-count\tlearner@example.com\t"));
+
+    let settings = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/return-notifications")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("settings request"),
+        )
+        .await
+        .expect("settings response");
+    assert_eq!(settings.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&settings);
+
+    let unsubscribe_link = after_enable
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("signed unsubscribe link")
+        .to_owned();
+    let confirmation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&unsubscribe_link)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("unsubscribe request"),
+        )
+        .await
+        .expect("unsubscribe response");
+    assert_eq!(confirmation.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&confirmation);
+    assert!(response_text(confirmation)
+        .await
+        .contains("Turn off due-count reminders"));
+    let preference_after_get = fs::read_dir(&store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| fs::read_to_string(entry.path().join("return-notifications.json")).ok())
+        .expect("preference after GET");
+    assert!(preference_after_get.contains("\"enabled\":true"));
+
+    let disabled = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[(
+                "unsubscribeToken",
+                unsubscribe_link.split("token=").nth(1).expect("token"),
+            )],
+        ))
+        .await
+        .expect("disable return channel");
+    assert_eq!(disabled.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&disabled);
+    let disabled_body = response_text(disabled).await;
+    assert!(
+        disabled_body.contains("Reminders are off"),
+        "unexpected token unsubscribe response: {disabled_body}"
+    );
+    let after_disable = fs::read_to_string(&outbox_path).expect("outbox after disable");
+    assert_eq!(after_disable, after_enable);
+
+    let re_enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("re-enable return channel");
+    assert_eq!(re_enabled.status(), StatusCode::OK);
+    let after_reenable = fs::read_to_string(&outbox_path).expect("outbox after re-enable");
+    let current_unsubscribe_link = after_reenable
+        .lines()
+        .rfind(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("current signed unsubscribe link")
+        .to_owned();
+    assert_ne!(current_unsubscribe_link, unsubscribe_link);
+
+    let stale_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&unsubscribe_link)
+                .body(Body::empty())
+                .expect("stale unsubscribe GET"),
+        )
+        .await
+        .expect("stale unsubscribe GET response");
+    assert_eq!(stale_get.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&stale_get);
+    let stale_post = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[(
+                "unsubscribeToken",
+                unsubscribe_link
+                    .split("token=")
+                    .nth(1)
+                    .expect("stale token"),
+            )],
+        ))
+        .await
+        .expect("stale unsubscribe POST response");
+    assert_eq!(stale_post.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&stale_post);
+
+    let current_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&current_unsubscribe_link)
+                .body(Body::empty())
+                .expect("current unsubscribe GET"),
+        )
+        .await
+        .expect("current unsubscribe GET response");
+    assert_eq!(current_get.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&current_get);
+    let current_post = app
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[(
+                "unsubscribeToken",
+                current_unsubscribe_link
+                    .split("token=")
+                    .nth(1)
+                    .expect("current token"),
+            )],
+        ))
+        .await
+        .expect("current unsubscribe POST response");
+    assert_eq!(current_post.status(), StatusCode::OK);
+}
+
+#[test]
+fn return_notification_email_must_belong_to_authenticated_account() {
+    let store_root = temp_store_root("return-notification-account-scope");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails([
+                "account-a@example.com".to_owned(),
+                "account-b@example.com".to_owned(),
+            ])
+            .with_unsubscribe_secret("test-unsubscribe-secret"),
+        ),
+    );
+    let account_a = state
+        .create_account("account-a@example.com")
+        .expect("account A");
+    let account_b = state
+        .create_account("account-b@example.com")
+        .expect("account B");
+    let session_a = state
+        .create_browser_session(&account_a)
+        .expect("account A session");
+    let session_b = state
+        .create_browser_session(&account_b)
+        .expect("account B session");
+
+    assert_ne!(session_a.account_id(), session_b.account_id());
+    let error = state
+        .set_return_notification(&session_a, Some("account-b@example.com"), true)
+        .expect_err("account A must not configure account B's allowlisted email");
+    assert_eq!(
+        error.message,
+        "That reminder email must belong to the authenticated account."
+    );
+    state
+        .set_return_notification(&session_a, Some("account-a@example.com"), true)
+        .expect("account A's own allowlisted email");
+    state
+        .set_return_notification(&session_b, Some("account-b@example.com"), true)
+        .expect("account B's own allowlisted email");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_return_notification_nonce_invalidates_replayed_tokens() {
+    let Some(database) = PostgresTestDatabase::new("return_unsubscribe_nonce") else {
+        eprintln!(
+            "skipping live Postgres unsubscribe nonce test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+        );
+        return;
+    };
+    let outbox_path = temp_store_root("postgres-return-unsubscribe-nonce").join("outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(&database.scoped_url).with_auth_config(
+            AuthConfig::allow_emails(["postgres@example.com".to_owned()])
+                .with_unsubscribe_secret("test-unsubscribe-secret")
+                .with_link_outbox(&outbox_path),
+        ),
+    );
+    let created = state
+        .create_account("postgres@example.com")
+        .expect("Postgres account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("Postgres browser session");
+    state
+        .set_return_notification(&account, Some("postgres@example.com"), true)
+        .expect("enable Postgres reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 2, true)
+        .expect("send initial Postgres reminder"));
+    let first_token = fs::read_to_string(&outbox_path)
+        .expect("initial Postgres reminder outbox")
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .and_then(|link| link.split("token=").nth(1))
+        .expect("initial Postgres unsubscribe token")
+        .to_owned();
+
+    state
+        .disable_return_notification(&first_token)
+        .expect("disable Postgres reminders");
+    state
+        .set_return_notification(&account, Some("postgres@example.com"), true)
+        .expect("re-enable Postgres reminders");
+    assert!(state
+        .maybe_send_due_count_notification(&account, 2, true)
+        .expect("send current Postgres reminder"));
+    let current_token = fs::read_to_string(&outbox_path)
+        .expect("current Postgres reminder outbox")
+        .lines()
+        .rfind(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .and_then(|link| link.split("token=").nth(1))
+        .expect("current Postgres unsubscribe token")
+        .to_owned();
+    assert_ne!(first_token, current_token);
+    assert!(state
+        .validate_return_notification_token(&first_token)
+        .is_err());
+    assert!(state.disable_return_notification(&first_token).is_err());
+    assert!(state
+        .validate_return_notification_token(&current_token)
+        .is_ok());
+    state
+        .disable_return_notification(&current_token)
+        .expect("current Postgres unsubscribe token");
+}
+
+#[tokio::test]
+async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("unsubscribe-token-security");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let registry = AccountRegistry::with_store_root(&store_root)
+        .with_clock(expiry_clock)
+        .with_auth_config(
+            AuthConfig::allow_emails([
+                "owner@example.com".to_owned(),
+                "other@example.com".to_owned(),
+            ])
+            .with_unsubscribe_secret("test-unsubscribe-secret")
+            .with_link_outbox(&outbox_path),
+        );
+    let state = ApiState::new(registry);
+    let owner = state.create_account("owner@example.com").expect("owner");
+    let owner = state.create_browser_session(&owner).expect("owner session");
+    state
+        .set_return_notification(&owner, Some("owner@example.com"), true)
+        .expect("enable owner");
+    assert!(state
+        .maybe_send_due_count_notification(&owner, 2, true)
+        .expect("send owner"));
+    let link = fs::read_to_string(&outbox_path)
+        .expect("outbox")
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("unsubscribe link")
+        .to_owned();
+    let token = link.split("token=").nth(1).expect("token");
+    assert!(state.validate_return_notification_token(token).is_ok());
+
+    let mut tampered = token.to_owned();
+    let index = tampered.find('.').expect("signature separator") + 1;
+    tampered.replace_range(
+        index..=index,
+        if &tampered[index..=index] == "0" {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    assert!(
+        state.validate_return_notification_token(&tampered).is_err(),
+        "signature tampering must fail"
+    );
+
+    let mut wrong_scope = token.to_owned();
+    let replacement = if &wrong_scope[..1] == "0" { "1" } else { "0" };
+    wrong_scope.replace_range(..1, replacement);
+    assert!(
+        state
+            .validate_return_notification_token(&wrong_scope)
+            .is_err(),
+        "account-scope tampering must fail"
+    );
+
+    let other = state.create_account("other@example.com").expect("other");
+    let other = state.create_browser_session(&other).expect("other session");
+    state
+        .set_return_notification(&other, Some("other@example.com"), true)
+        .expect("enable other");
+    state
+        .disable_return_notification(token)
+        .expect("disable owner");
+    assert!(!state
+        .maybe_send_due_count_notification(&owner, 1, true)
+        .expect("owner remains disabled"));
+    assert!(state
+        .maybe_send_due_count_notification(&other, 1, true)
+        .expect("other remains independently enabled"));
+
+    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS + 1, Ordering::SeqCst);
+    assert!(
+        state.validate_return_notification_token(token).is_err(),
+        "expired unsubscribe links must fail"
+    );
+}
+
+#[test]
+fn file_return_notification_claim_allows_one_concurrent_sender() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-claim");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let registry = AccountRegistry::with_store_root(&store_root).with_auth_config(
+        AuthConfig::allow_emails(["claim@example.com".to_owned()])
+            .with_unsubscribe_secret("claim-secret")
+            .with_link_outbox(&outbox_path),
+    );
+    let state = ApiState::new(registry.clone());
+    let created = state.create_account("claim@example.com").expect("account");
+    let account = state.create_browser_session(&created).expect("session");
+    state
+        .set_return_notification(&account, Some("claim@example.com"), true)
+        .expect("enable");
+
+    let barrier = Arc::new(Barrier::new(32));
+    let workers = (0..32)
+        .map(|_| {
+            let state = state.clone();
+            let account = account.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                state
+                    .maybe_send_due_count_notification(&account, 3, true)
+                    .expect("claim send")
+            })
+        })
+        .collect::<Vec<_>>();
+    let sent = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker"))
+        .filter(|sent| *sent)
+        .count();
+    assert_eq!(sent, 1, "one durable claim may send");
+    let outbox = fs::read_to_string(&outbox_path).expect("outbox");
+    assert_eq!(
+        outbox
+            .lines()
+            .filter(|line| line.starts_with("due-count\t"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn file_return_notification_retry_reuses_the_failed_provider_payload() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-retry");
+    fs::create_dir_all(&store_root).expect("retry store root");
+    let failing_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(retry_provider_script(&store_root)),
+            ),
+    );
+    let retry_account = failing_state
+        .create_account("retry@example.com")
+        .expect("retry account");
+    let retry_account = failing_state
+        .create_browser_session(&retry_account)
+        .expect("retry session");
+    failing_state
+        .set_return_notification(&retry_account, Some("retry@example.com"), true)
+        .expect("enable retry");
+    assert!(failing_state
+        .maybe_send_due_count_notification(&retry_account, 1, true)
+        .is_err());
+    let first_payload =
+        fs::read_to_string(store_root.join("retry-provider.tsv")).expect("failed provider payload");
+    assert_eq!(first_payload.lines().count(), 1);
+    let retry_path = fs::read_dir(&store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path().join("return-notifications.json");
+            fs::read_to_string(path)
+                .ok()
+                .filter(|body| body.contains("retry@example.com"))
+        })
+        .expect("failed claim persisted");
+    assert!(retry_path.contains("pendingDeliveryKey"));
+    let recovery_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(retry_provider_script(&store_root)),
+            ),
+    );
+    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    assert!(recovery_state
+        .maybe_send_due_count_notification(&retry_account, 1, true)
+        .expect("retry send"));
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        payloads[0], payloads[1],
+        "retry payload must be byte-identical"
+    );
+    let first_fields = payloads[0].split('\t').collect::<Vec<_>>();
+    let second_fields = payloads[1].split('\t').collect::<Vec<_>>();
+    assert_eq!(first_fields.len(), 4);
+    assert_eq!(second_fields.len(), 4);
+    assert_eq!(
+        first_fields[3], second_fields[3],
+        "retry idempotency key must persist"
+    );
 }
 
 #[tokio::test]
@@ -3935,6 +4860,29 @@ fn form_request_with_cookie(
         .expect("request")
 }
 
+async fn post_return_notification_enable(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            cookie,
+            &[
+                ("csrfToken", csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "retry@example.com"),
+            ],
+        ))
+        .await
+        .expect("return notification enable");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
 fn session_cookie(response: &axum::response::Response) -> String {
     let set_cookie = response
         .headers()
@@ -4107,6 +5055,50 @@ fn assert_not_contains_any(body: &str, needles: &[&str]) {
             "body unexpectedly contained {needle:?}"
         );
     }
+}
+
+fn retry_provider_script(store_root: &FsPath) -> String {
+    let script_path = store_root.join("retry-provider.sh");
+    let capture_path = store_root.join("retry-provider.tsv");
+    let marker_path = store_root.join("retry-provider.failed");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY\" >> \"{}\"\nif [ ! -e \"{}\" ]; then\n  touch \"{}\"\n  exit 1\nfi\nexit 0\n",
+        capture_path.display(),
+        marker_path.display(),
+        marker_path.display(),
+    );
+    fs::write(&script_path, script).expect("retry provider script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("retry provider metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("retry provider permissions");
+    script_path.to_string_lossy().into_owned()
+}
+
+fn assert_no_store_and_no_referrer(response: &axum::response::Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+}
+
+fn read_return_notification_preference(store_root: &FsPath) -> String {
+    fs::read_dir(store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| fs::read_to_string(entry.path().join("return-notifications.json")).ok())
+        .expect("return notification preference")
 }
 
 async fn save_source(app: &axum::Router, account: &TestAccount, title: &str, body: &str) -> Value {

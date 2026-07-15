@@ -17,7 +17,8 @@ only current application runtime; rollback stays within DigitalOcean plus git.
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
 - Auth contract: allowlist plus magic links; production account creation and
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
-  `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path.
+  `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
+  `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
 - Smoke contract: every DigitalOcean deployment runs the health, home-page,
   and anonymous mutation boundary checks below before it can be called live.
 
@@ -39,6 +40,11 @@ test "$status" = "200"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w "%{http_code}" -X POST "$base/app/generate")
 case "$status" in 4??) ;; *) echo "expected 4xx, got $status"; exit 1;; esac
+
+curl -fsS --max-time 15 "$base/manifest.webmanifest" | jq -e \
+  '.display == "standalone" and (.icons | length >= 2)' >/dev/null
+curl -fsS --max-time 15 "$base/favicon.png" | file - | grep -q 'PNG image data, 192 x 192'
+curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG image data, 180 x 180'
 ```
 
 ## Production generation latency
@@ -155,6 +161,7 @@ an encrypted App Platform variable and never copy its value into this repo.
 | --- | --- |
 | `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
+| `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` | Stable secret for HMAC-signed, seven-day, account/email-scoped reminder unsubscribe links. |
 | `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Magic-link outbox file (no email provider wired yet; see Login). |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
 | `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.5-flash`; see docs/evals/). |
@@ -196,6 +203,15 @@ setting `RESEND_API_KEY` and
 variables in the DigitalOcean app spec, updating the app, and rerunning the
 deployed smoke. Do not put the key in a shell command or checked-in spec.
 
+The bundled sender has two environment contracts. Magic-link mode uses
+`MEMORY_ENGINE_AUTH_EMAIL` and `MEMORY_ENGINE_AUTH_LINK` and does not require
+an idempotency key. Due-count reminder mode fails closed unless
+`MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY` is present; it sends that
+same value as Resend's `Idempotency-Key` HTTP header. Retries of one durable
+reminder claim must reuse both the key and the original payload so Resend can
+deduplicate the `POST /emails` request. The key is not shared with magic-link
+mail.
+
 While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in an
 instance-local outbox. That path is a temporary solo-dogfood fallback, not a
 durable delivery channel.
@@ -204,6 +220,42 @@ A failed send surfaces as a 500 and therefore lands in Canary. The sender
 address is the `MEMORY_ENGINE_MAIL_FROM` secret (default
 `Memory Engine <onboarding@resend.dev>`); switching it is a secret change, not
 a code edit — see Deliverability below.
+
+### Due-count return channel
+
+The signed-in workspace offers one explicit, optional return channel: “Enable
+due-count reminders.” It stores the normalized, allowlisted reminder address in
+the account store and sends one confirmation through the same
+`MEMORY_ENGINE_AUTH_MAILER_COMMAND` / `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH`
+boundary. Subsequent authenticated home renders may send a reminder only when
+reviews are due and the persisted last-send time is at least 24 hours old. The
+policy is deterministic, has no streaks or promotional content, and a learner
+can disable it from the workspace or the signed unsubscribe link in the
+plain-text message. The email GET only renders a confirmation; its POST carries
+the scoped token and performs the mutation without requiring a browser session.
+Disable is persisted and never sends mail.
+
+Each unsubscribe link is a seven-day HMAC token bound to the account, normalized
+email, and a persisted unsubscribe nonce. The GET remains read-only; the POST
+atomically compares the current nonce and rotates it while disabling the
+preference, so a replayed or concurrent stale bearer cannot win against an
+authenticated re-enable. The nonce column is an additive migration with an
+empty default for existing Postgres rows, and legacy file JSON defaults the
+same way. Legacy v1 links are intentionally rejected because they cannot carry
+the nonce; the next authenticated enable or reminder delivery backfills the
+nonce and issues only v2 links.
+
+The command boundary receives these variables for a due-count message:
+`MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL`,
+`MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT`, and
+`MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE`; it also receives
+`MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY` so a retry can reuse the
+same durable delivery identity. The bundled sender requires that key in
+reminder mode and forwards it using Resend's supported `Idempotency-Key`
+contract; a missing key is an error before any provider request. The bundled
+sender supports both the magic-link and due-count envelopes. A file outbox line
+beginning with `due-count` is a local proof receipt; production proof still
+requires checking the provider send log and inbox placement.
 
 ### Deliverability (inbox, not spam)
 

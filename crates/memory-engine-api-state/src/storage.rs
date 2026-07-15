@@ -2,6 +2,7 @@ use std::{
     fmt, fs, io,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
@@ -12,8 +13,8 @@ use crate::{
     persisted_sources, postgres_failure, rate_limit_path, require_current_review,
     require_current_review_postgres, run_bridge_generation, run_reference_generation,
     run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, SourceRecord,
-    StudyViewResponse,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
+    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -160,6 +161,72 @@ impl StudyStorage {
         now_ms: i64,
     ) -> Result<Option<String>, ApiFailure> {
         self.inner.consume_auth_challenge(challenge_hash, now_ms)
+    }
+
+    pub(crate) fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
+    ) -> Result<(), ApiFailure> {
+        self.inner.save_return_notification_preference(
+            account_id,
+            email,
+            enabled,
+            last_sent_at_ms,
+            unsubscribe_nonce,
+        )
+    }
+
+    pub(crate) fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        self.inner.load_return_notification_preference(account_id)
+    }
+
+    pub(crate) fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.disable_return_notification(
+            account_id,
+            email,
+            current_nonce,
+            next_nonce,
+            updated_at_ms,
+        )
+    }
+
+    pub(crate) fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        self.inner.claim_return_notification(request)
+    }
+
+    pub(crate) fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner
+            .complete_return_notification(account_id, claim_id, sent_at_ms)
+    }
+
+    pub(crate) fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        self.inner.release_return_notification(account_id, claim_id)
     }
 
     pub(crate) fn record_rate_limit_attempts(
@@ -343,6 +410,47 @@ impl StudyStorage {
     }
 }
 
+struct FileReturnNotificationLock {
+    path: PathBuf,
+}
+
+const RETURN_NOTIFICATION_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
+
+impl FileReturnNotificationLock {
+    fn acquire(path: PathBuf) -> Result<Self, ApiFailure> {
+        for _ in 0..5_000 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > RETURN_NOTIFICATION_LOCK_STALE_AFTER)
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(ApiFailure::internal(error.to_string())),
+            }
+        }
+        Err(ApiFailure::internal(
+            "timed out acquiring return notification claim lock".to_owned(),
+        ))
+    }
+}
+
+impl Drop for FileReturnNotificationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 trait StudyStorageAdapter: fmt::Debug + Send + Sync {
     fn account_store_path(&self, account_id: &str) -> PathBuf;
     fn save_account_session(&self, account_id: &str, session_token: &str)
@@ -373,6 +481,41 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         challenge_hash: &str,
         now_ms: i64,
     ) -> Result<Option<String>, ApiFailure>;
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
+    ) -> Result<(), ApiFailure>;
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure>;
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure>;
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure>;
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure>;
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure>;
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -635,6 +778,260 @@ impl StudyStorageAdapter for FileStudyStorage {
         .map_err(|error| ApiFailure::internal(error.to_string()))?;
 
         Ok(Some(email.to_owned()))
+    }
+
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
+    ) -> Result<(), ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let existing = match fs::read(&path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<ReturnNotificationPreference>(&bytes)
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ApiFailure::internal(error.to_string())),
+        };
+        let preserve_pending = existing.as_ref().is_some_and(|preference| {
+            preference.enabled
+                && enabled
+                && preference.email == email
+                && preference.pending_delivery_key.is_some()
+        });
+        let preference = ReturnNotificationPreference {
+            email: email.to_owned(),
+            enabled,
+            last_sent_at_ms,
+            unsubscribe_nonce: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .map(|preference| preference.unsubscribe_nonce.clone())
+                })
+                .flatten()
+                .unwrap_or_else(|| unsubscribe_nonce.to_owned()),
+            claim_id: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.claim_id.clone())
+                })
+                .flatten(),
+            claim_expires_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.claim_expires_at_ms)
+                })
+                .flatten(),
+            pending_delivery_key: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_delivery_key.clone())
+                })
+                .flatten(),
+            pending_due_count: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_due_count)
+                })
+                .flatten(),
+            pending_unsubscribe_expires_at_ms: preserve_pending
+                .then(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|preference| preference.pending_unsubscribe_expires_at_ms)
+                })
+                .flatten(),
+        };
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        let path = self
+            .store_root
+            .join(account_id)
+            .join("return-notifications.json");
+        let Ok(bytes) = fs::read(path) else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        _updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(false);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if !preference.enabled
+            || preference.email != email
+            || preference.unsubscribe_nonce != current_nonce
+        {
+            return Ok(false);
+        }
+        preference.enabled = false;
+        next_nonce.clone_into(&mut preference.unsubscribe_nonce);
+        preference.claim_id = None;
+        preference.claim_expires_at_ms = None;
+        preference.pending_delivery_key = None;
+        preference.pending_due_count = None;
+        preference.pending_unsubscribe_expires_at_ms = None;
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes)
+            .map(|()| true)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        let account_dir = self.store_root.join(&request.account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(None);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let interval_elapsed = preference
+            .last_sent_at_ms
+            .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
+        let eligible = preference.pending_delivery_key.is_some()
+            || (interval_elapsed && (request.force_confirmation || request.due_count > 0));
+        if !preference.enabled
+            || !eligible
+            || preference
+                .claim_expires_at_ms
+                .is_some_and(|expires| expires > request.now_ms)
+        {
+            return Ok(None);
+        }
+        let delivery_key = preference
+            .pending_delivery_key
+            .clone()
+            .unwrap_or_else(|| request.delivery_key.clone());
+        let unsubscribe_nonce = if preference.unsubscribe_nonce.is_empty() {
+            request.unsubscribe_nonce.clone()
+        } else {
+            preference.unsubscribe_nonce.clone()
+        };
+        let due_count = preference.pending_due_count.unwrap_or(request.due_count);
+        let unsubscribe_expires_at_ms = preference
+            .pending_unsubscribe_expires_at_ms
+            .unwrap_or(request.unsubscribe_expires_at_ms);
+        preference.claim_id = Some(request.claim_id.clone());
+        preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
+        preference.pending_delivery_key = Some(delivery_key.clone());
+        preference.pending_due_count = Some(due_count);
+        preference.pending_unsubscribe_expires_at_ms = Some(unsubscribe_expires_at_ms);
+        preference.unsubscribe_nonce.clone_from(&unsubscribe_nonce);
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(Some(ReturnNotificationClaim {
+            email: preference.email,
+            due_count,
+            delivery_key,
+            unsubscribe_nonce,
+            unsubscribe_expires_at_ms,
+            claim_id: request.claim_id.clone(),
+        }))
+    }
+
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(false);
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if preference.claim_id.as_deref() != Some(claim_id) {
+            return Ok(false);
+        }
+        preference.last_sent_at_ms = Some(sent_at_ms);
+        preference.claim_id = None;
+        preference.claim_expires_at_ms = None;
+        preference.pending_delivery_key = None;
+        preference.pending_due_count = None;
+        preference.pending_unsubscribe_expires_at_ms = None;
+        let bytes = serde_json::to_vec(&preference)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        let account_dir = self.store_root.join(account_id);
+        fs::create_dir_all(&account_dir)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let _lock =
+            FileReturnNotificationLock::acquire(account_dir.join("return-notifications.lock"))?;
+        let path = account_dir.join("return-notifications.json");
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(());
+        };
+        let mut preference: ReturnNotificationPreference = serde_json::from_slice(&bytes)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        if preference.claim_id.as_deref() == Some(claim_id) {
+            preference.claim_id = None;
+            preference.claim_expires_at_ms = None;
+            let bytes = serde_json::to_vec(&preference)
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn record_rate_limit_attempts(
@@ -1020,6 +1417,133 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         })
     }
 
+    fn save_return_notification_preference(
+        &self,
+        account_id: &str,
+        email: &str,
+        enabled: bool,
+        last_sent_at_ms: Option<i64>,
+        unsubscribe_nonce: &str,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .save_return_notification_preference(
+                    account_id,
+                    email,
+                    enabled,
+                    last_sent_at_ms,
+                    self.now_ms(),
+                    unsubscribe_nonce,
+                )
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn load_return_notification_preference(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .return_notification_preference(account_id)
+                .map(|preference| {
+                    preference.map(|preference| ReturnNotificationPreference {
+                        email: preference.email,
+                        enabled: preference.enabled,
+                        last_sent_at_ms: preference.last_sent_at_ms,
+                        unsubscribe_nonce: preference.unsubscribe_nonce,
+                        claim_id: None,
+                        claim_expires_at_ms: None,
+                        pending_delivery_key: None,
+                        pending_due_count: None,
+                        pending_unsubscribe_expires_at_ms: None,
+                    })
+                })
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn disable_return_notification(
+        &self,
+        account_id: &str,
+        email: &str,
+        current_nonce: &str,
+        next_nonce: &str,
+        updated_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .disable_return_notification(
+                    account_id,
+                    email,
+                    current_nonce,
+                    next_nonce,
+                    updated_at_ms,
+                )
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn claim_return_notification(
+        &self,
+        request: &ReturnNotificationClaimRequest,
+    ) -> Result<Option<ReturnNotificationClaim>, ApiFailure> {
+        let due_count = i64::try_from(request.due_count)
+            .map_err(|_| ApiFailure::internal("due count exceeds postgres range".to_owned()))?;
+        with_postgres_store(&self.database_url, |store| {
+            let request = memory_engine_persistence_postgres::ReturnNotificationClaimRequest {
+                account_id: request.account_id.clone(),
+                now_ms: request.now_ms,
+                due_count,
+                force_confirmation: request.force_confirmation,
+                interval_ms: request.interval_ms,
+                claim_id: request.claim_id.clone(),
+                delivery_key: request.delivery_key.clone(),
+                claim_expires_at_ms: request.claim_expires_at_ms,
+                unsubscribe_nonce: request.unsubscribe_nonce.clone(),
+                unsubscribe_expires_at_ms: request.unsubscribe_expires_at_ms,
+            };
+            store
+                .claim_return_notification(&request)
+                .map(|claim| {
+                    claim.map(|claim| ReturnNotificationClaim {
+                        email: claim.email,
+                        due_count: usize::try_from(claim.due_count).unwrap_or(usize::MAX),
+                        delivery_key: claim.delivery_key,
+                        unsubscribe_nonce: claim.unsubscribe_nonce,
+                        unsubscribe_expires_at_ms: claim.unsubscribe_expires_at_ms,
+                        claim_id: claim.claim_id,
+                    })
+                })
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn complete_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+        sent_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .complete_return_notification(account_id, claim_id, sent_at_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn release_return_notification(
+        &self,
+        account_id: &str,
+        claim_id: &str,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .release_return_notification(account_id, claim_id)
+                .map_err(postgres_failure)
+        })
+    }
+
     fn record_rate_limit_attempts(
         &self,
         keys: &[String],
@@ -1372,5 +1896,222 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
             Ok(StudyViewResponse::from_view(view))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    fn test_now() -> i64 {
+        1_700_000_000_000
+    }
+
+    #[test]
+    fn file_unsubscribe_race_cannot_leave_stale_token_disabled_after_reenable() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-race-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-a",
+                "a@example.com",
+                true,
+                None,
+                "nonce-before",
+            )
+            .expect("initial preference");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let stale_storage = storage.clone();
+        let stale_barrier = Arc::clone(&barrier);
+        let stale = thread::spawn(move || {
+            stale_barrier.wait();
+            stale_storage.disable_return_notification(
+                "account-a",
+                "a@example.com",
+                "nonce-before",
+                "nonce-stale",
+                test_now(),
+            )
+        });
+        let reenable_storage = storage.clone();
+        let reenable_barrier = Arc::clone(&barrier);
+        let reenable = thread::spawn(move || {
+            reenable_barrier.wait();
+            reenable_storage.save_return_notification_preference(
+                "account-a",
+                "a@example.com",
+                true,
+                None,
+                "nonce-reenabled",
+            )
+        });
+
+        let stale_result = stale.join().expect("stale worker");
+        reenable.join().expect("reenable worker").expect("reenable");
+        let preference = storage
+            .load_return_notification_preference("account-a")
+            .expect("load preference")
+            .expect("preference");
+        assert!(preference.enabled, "stale result: {stale_result:?}");
+        assert_eq!(preference.unsubscribe_nonce, "nonce-reenabled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_same_enabled_email_preserves_retry_envelope_but_policy_changes_clear_it() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-save-policy-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                true,
+                None,
+                "nonce-same",
+            )
+            .expect("initial preference");
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-policy".to_owned(),
+                now_ms: test_now(),
+                due_count: 2,
+                force_confirmation: true,
+                interval_ms: 86_400_000,
+                claim_id: "claim-policy".to_owned(),
+                delivery_key: "envelope-policy".to_owned(),
+                claim_expires_at_ms: test_now() + 100,
+                unsubscribe_nonce: "nonce-request".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("claim policy envelope")
+            .expect("claim available");
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                true,
+                None,
+                "nonce-new",
+            )
+            .expect("same enabled save");
+        let preserved = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-policy".to_owned(),
+                now_ms: test_now() + 200,
+                due_count: 1,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-policy-retry".to_owned(),
+                delivery_key: "envelope-new".to_owned(),
+                claim_expires_at_ms: test_now() + 300,
+                unsubscribe_nonce: "nonce-request-2".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_200,
+            })
+            .expect("retry claim")
+            .expect("retry available");
+        assert_eq!(preserved.delivery_key, first.delivery_key);
+        assert_eq!(preserved.unsubscribe_nonce, first.unsubscribe_nonce);
+        assert_eq!(
+            preserved.unsubscribe_expires_at_ms,
+            first.unsubscribe_expires_at_ms
+        );
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "same@example.com",
+                false,
+                None,
+                "nonce-disabled",
+            )
+            .expect("disable");
+        storage
+            .save_return_notification_preference(
+                "account-policy",
+                "changed@example.com",
+                true,
+                None,
+                "nonce-changed",
+            )
+            .expect("email change and re-enable");
+        let changed = storage
+            .load_return_notification_preference("account-policy")
+            .expect("load changed")
+            .expect("changed preference");
+        assert!(changed.claim_id.is_none());
+        assert!(changed.pending_delivery_key.is_none());
+        assert!(changed.pending_unsubscribe_expires_at_ms.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_claim_backfills_unsubscribe_expiry_for_old_schema_rows_and_fences_stale_claims() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-old-schema-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_dir = root.join("account-old");
+        fs::create_dir_all(&account_dir).expect("account directory");
+        fs::write(
+            account_dir.join("return-notifications.json"),
+            r#"{"email":"old@example.com","enabled":true,"lastSentAtMs":null,"unsubscribeNonce":"nonce-old","pendingDeliveryKey":"delivery-old","pendingDueCount":2}"#,
+        )
+        .expect("old schema preference");
+        let storage = StudyStorage::file(&root, test_now);
+        let first_expiry = test_now() + 604_800_000;
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-old".to_owned(),
+                now_ms: test_now(),
+                due_count: 9,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-old".to_owned(),
+                delivery_key: "delivery-new".to_owned(),
+                claim_expires_at_ms: test_now() + 100,
+                unsubscribe_nonce: "nonce-request".to_owned(),
+                unsubscribe_expires_at_ms: first_expiry,
+            })
+            .expect("old schema claim")
+            .expect("claim available");
+        assert_eq!(first.delivery_key, "delivery-old");
+        assert_eq!(first.unsubscribe_expires_at_ms, first_expiry);
+        let second = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-old".to_owned(),
+                now_ms: test_now() + 200,
+                due_count: 1,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-stale-retry".to_owned(),
+                delivery_key: "delivery-retry".to_owned(),
+                claim_expires_at_ms: test_now() + 300,
+                unsubscribe_nonce: "nonce-request-2".to_owned(),
+                unsubscribe_expires_at_ms: first_expiry + 200,
+            })
+            .expect("stale retry claim")
+            .expect("retry available");
+        assert_eq!(second.delivery_key, first.delivery_key);
+        assert_eq!(second.unsubscribe_expires_at_ms, first_expiry);
+        assert!(!storage
+            .complete_return_notification("account-old", "claim-old", test_now() + 201)
+            .expect("stale completion"));
+        assert!(storage
+            .complete_return_notification("account-old", "claim-stale-retry", test_now() + 202,)
+            .expect("retry completion"));
+        let _ = fs::remove_dir_all(root);
     }
 }
