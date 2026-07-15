@@ -740,6 +740,8 @@ pub struct ReturnNotificationPreference {
     pub pending_delivery_key: Option<String>,
     #[serde(default)]
     pub pending_due_count: Option<usize>,
+    #[serde(default)]
+    pub pending_unsubscribe_expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -748,6 +750,7 @@ pub(crate) struct ReturnNotificationClaim {
     pub due_count: usize,
     pub delivery_key: String,
     pub unsubscribe_nonce: String,
+    pub unsubscribe_expires_at_ms: i64,
     pub claim_id: String,
 }
 
@@ -762,6 +765,7 @@ pub(crate) struct ReturnNotificationClaimRequest {
     pub delivery_key: String,
     pub claim_expires_at_ms: i64,
     pub unsubscribe_nonce: String,
+    pub unsubscribe_expires_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -6,6 +6,8 @@ use std::{
     time::Instant,
 };
 
+use std::os::unix::fs::PermissionsExt;
+
 use axum::{
     body::{to_bytes, Body},
     http::{header::SET_COOKIE, Request, StatusCode},
@@ -1933,7 +1935,8 @@ async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
 }
 
 #[test]
-fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after_failure() {
+fn file_return_notification_claim_allows_one_concurrent_sender() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
     let store_root = temp_store_root("return-notification-claim");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let registry = AccountRegistry::with_store_root(&store_root).with_auth_config(
@@ -1976,13 +1979,21 @@ fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after
             .count(),
         1
     );
+}
 
+#[test]
+fn file_return_notification_retry_reuses_the_failed_provider_payload() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-retry");
+    fs::create_dir_all(&store_root).expect("retry store root");
     let failing_state = ApiState::new(
-        AccountRegistry::with_store_root(&store_root).with_auth_config(
-            AuthConfig::allow_emails(["retry@example.com".to_owned()])
-                .with_unsubscribe_secret("claim-secret")
-                .with_mailer_command("/bin/false"),
-        ),
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(retry_provider_script(&store_root)),
+            ),
     );
     let retry_account = failing_state
         .create_account("retry@example.com")
@@ -1996,6 +2007,9 @@ fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after
     assert!(failing_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .is_err());
+    let first_payload =
+        fs::read_to_string(store_root.join("retry-provider.tsv")).expect("failed provider payload");
+    assert_eq!(first_payload.lines().count(), 1);
     let retry_path = fs::read_dir(&store_root)
         .expect("store root")
         .flatten()
@@ -2008,22 +2022,35 @@ fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after
         .expect("failed claim persisted");
     assert!(retry_path.contains("pendingDeliveryKey"));
     let recovery_state = ApiState::new(
-        AccountRegistry::with_store_root(&store_root).with_auth_config(
-            AuthConfig::allow_emails(["retry@example.com".to_owned()])
-                .with_unsubscribe_secret("claim-secret")
-                .with_link_outbox(&outbox_path),
-        ),
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                    .with_unsubscribe_secret("claim-secret")
+                    .with_mailer_command(retry_provider_script(&store_root)),
+            ),
     );
+    EXPIRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
     assert!(recovery_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .expect("retry send"));
-    let outbox = fs::read_to_string(&outbox_path).expect("retry outbox");
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("provider payloads")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
     assert_eq!(
-        outbox
-            .lines()
-            .filter(|line| line.starts_with("due-count\t"))
-            .count(),
-        2
+        payloads[0], payloads[1],
+        "retry payload must be byte-identical"
+    );
+    let first_fields = payloads[0].split('\t').collect::<Vec<_>>();
+    let second_fields = payloads[1].split('\t').collect::<Vec<_>>();
+    assert_eq!(first_fields.len(), 4);
+    assert_eq!(second_fields.len(), 4);
+    assert_eq!(
+        first_fields[3], second_fields[3],
+        "retry idempotency key must persist"
     );
 }
 
@@ -4875,6 +4902,25 @@ fn assert_not_contains_any(body: &str, needles: &[&str]) {
             "body unexpectedly contained {needle:?}"
         );
     }
+}
+
+fn retry_provider_script(store_root: &FsPath) -> String {
+    let script_path = store_root.join("retry-provider.sh");
+    let capture_path = store_root.join("retry-provider.tsv");
+    let marker_path = store_root.join("retry-provider.failed");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY\" >> \"{}\"\nif [ ! -e \"{}\" ]; then\n  touch \"{}\"\n  exit 1\nfi\nexit 0\n",
+        capture_path.display(),
+        marker_path.display(),
+        marker_path.display(),
+    );
+    fs::write(&script_path, script).expect("retry provider script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("retry provider metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("retry provider permissions");
+    script_path.to_string_lossy().into_owned()
 }
 
 fn assert_no_store_and_no_referrer(response: &axum::response::Response) {

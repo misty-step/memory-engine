@@ -803,6 +803,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             claim_expires_at_ms: None,
             pending_delivery_key: None,
             pending_due_count: None,
+            pending_unsubscribe_expires_at_ms: None,
         };
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -856,6 +857,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.claim_expires_at_ms = None;
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
+        preference.pending_unsubscribe_expires_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes)
@@ -901,10 +903,14 @@ impl StudyStorageAdapter for FileStudyStorage {
             preference.unsubscribe_nonce.clone()
         };
         let due_count = preference.pending_due_count.unwrap_or(request.due_count);
+        let unsubscribe_expires_at_ms = preference
+            .pending_unsubscribe_expires_at_ms
+            .unwrap_or(request.unsubscribe_expires_at_ms);
         preference.claim_id = Some(request.claim_id.clone());
         preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
         preference.pending_delivery_key = Some(delivery_key.clone());
         preference.pending_due_count = Some(due_count);
+        preference.pending_unsubscribe_expires_at_ms = Some(unsubscribe_expires_at_ms);
         preference.unsubscribe_nonce.clone_from(&unsubscribe_nonce);
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -914,6 +920,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             due_count,
             delivery_key,
             unsubscribe_nonce,
+            unsubscribe_expires_at_ms,
             claim_id: request.claim_id.clone(),
         }))
     }
@@ -943,6 +950,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         preference.claim_expires_at_ms = None;
         preference.pending_delivery_key = None;
         preference.pending_due_count = None;
+        preference.pending_unsubscribe_expires_at_ms = None;
         let bytes = serde_json::to_vec(&preference)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         write_atomic(&path, &bytes).map_err(|error| ApiFailure::internal(error.to_string()))?;
@@ -1397,6 +1405,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         claim_expires_at_ms: None,
                         pending_delivery_key: None,
                         pending_due_count: None,
+                        pending_unsubscribe_expires_at_ms: None,
                     })
                 })
                 .map_err(postgres_failure)
@@ -1441,6 +1450,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 delivery_key: request.delivery_key.clone(),
                 claim_expires_at_ms: request.claim_expires_at_ms,
                 unsubscribe_nonce: request.unsubscribe_nonce.clone(),
+                unsubscribe_expires_at_ms: request.unsubscribe_expires_at_ms,
             };
             store
                 .claim_return_notification(&request)
@@ -1450,6 +1460,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         due_count: usize::try_from(claim.due_count).unwrap_or(usize::MAX),
                         delivery_key: claim.delivery_key,
                         unsubscribe_nonce: claim.unsubscribe_nonce,
+                        unsubscribe_expires_at_ms: claim.unsubscribe_expires_at_ms,
                         claim_id: claim.claim_id,
                     })
                 })
@@ -1901,6 +1912,65 @@ mod tests {
             .expect("preference");
         assert!(preference.enabled, "stale result: {stale_result:?}");
         assert_eq!(preference.unsubscribe_nonce, "nonce-reenabled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_claim_backfills_unsubscribe_expiry_for_old_schema_rows_and_fences_stale_claims() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-return-old-schema-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_dir = root.join("account-old");
+        fs::create_dir_all(&account_dir).expect("account directory");
+        fs::write(
+            account_dir.join("return-notifications.json"),
+            r#"{"email":"old@example.com","enabled":true,"lastSentAtMs":null,"unsubscribeNonce":"nonce-old","pendingDeliveryKey":"delivery-old","pendingDueCount":2}"#,
+        )
+        .expect("old schema preference");
+        let storage = StudyStorage::file(&root, test_now);
+        let first_expiry = test_now() + 604_800_000;
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-old".to_owned(),
+                now_ms: test_now(),
+                due_count: 9,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-old".to_owned(),
+                delivery_key: "delivery-new".to_owned(),
+                claim_expires_at_ms: test_now() + 100,
+                unsubscribe_nonce: "nonce-request".to_owned(),
+                unsubscribe_expires_at_ms: first_expiry,
+            })
+            .expect("old schema claim")
+            .expect("claim available");
+        assert_eq!(first.delivery_key, "delivery-old");
+        assert_eq!(first.unsubscribe_expires_at_ms, first_expiry);
+        let second = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-old".to_owned(),
+                now_ms: test_now() + 200,
+                due_count: 1,
+                force_confirmation: false,
+                interval_ms: 86_400_000,
+                claim_id: "claim-stale-retry".to_owned(),
+                delivery_key: "delivery-retry".to_owned(),
+                claim_expires_at_ms: test_now() + 300,
+                unsubscribe_nonce: "nonce-request-2".to_owned(),
+                unsubscribe_expires_at_ms: first_expiry + 200,
+            })
+            .expect("stale retry claim")
+            .expect("retry available");
+        assert_eq!(second.delivery_key, first.delivery_key);
+        assert_eq!(second.unsubscribe_expires_at_ms, first_expiry);
+        assert!(!storage
+            .complete_return_notification("account-old", "claim-old", test_now() + 201)
+            .expect("stale completion"));
+        assert!(storage
+            .complete_return_notification("account-old", "claim-stale-retry", test_now() + 202,)
+            .expect("retry completion"));
         let _ = fs::remove_dir_all(root);
     }
 }

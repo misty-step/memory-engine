@@ -262,6 +262,7 @@ impl AccountRegistry {
             delivery_key,
             claim_expires_at_ms: now.saturating_add(RETURN_NOTIFICATION_CLAIM_TTL_MS),
             unsubscribe_nonce: new_unsubscribe_nonce(),
+            unsubscribe_expires_at_ms: now.saturating_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS),
         };
         let Some(claim) = storage.claim_return_notification(&claim_request)? else {
             return Ok(false);
@@ -271,7 +272,7 @@ impl AccountRegistry {
             account_id,
             &claim.email,
             &claim.unsubscribe_nonce,
-            now.saturating_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS),
+            claim.unsubscribe_expires_at_ms,
         );
         let unsubscribe_link = format!("/app/return-notifications?token={token}");
         if let Err(error) = auth_config.deliver_due_count_notification(
