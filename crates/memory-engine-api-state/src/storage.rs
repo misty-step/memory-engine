@@ -18,8 +18,8 @@ use crate::{
     run_bridge_generation, run_reference_generation, run_source_generation,
     run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
     with_postgres_store, with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord,
-    ReturnNotificationClaim, ReturnNotificationClaimRequest,
-    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    ReturnNotificationClaim, ReturnNotificationClaimRequest, ReturnNotificationPreference,
+    SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -2475,7 +2475,12 @@ mod tests {
         // This is the foreground operation that used to receive a spurious
         // 409 while generation held the descriptor across provider work.
         storage
-            .approve_draft("acct", &root.join("acct").join("study.json"), &draft_id, None)
+            .approve_draft(
+                "acct",
+                &root.join("acct").join("study.json"),
+                &draft_id,
+                None,
+            )
             .expect("foreground approval must commit while provider is running");
         storage
             .save_source(

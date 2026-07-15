@@ -1009,6 +1009,19 @@ impl ApiState {
         self.jobs.run_pending_blocking();
     }
 
+    /// Enqueue a generation job by account id, coalescing like production
+    /// enqueue. Test helper for production-shaped (queued) route coverage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn enqueue_generation_job_for_account_id(
+        &self,
+        account_id: &str,
+        source_id: &str,
+        title: &str,
+    ) -> EnqueueOutcome {
+        self.jobs.enqueue_or_coalesce(account_id, source_id, title)
+    }
+
     /// Read durable reminder state for boundary tests and operator receipts.
     #[doc(hidden)]
     pub fn load_return_notification_preference_for_test(
