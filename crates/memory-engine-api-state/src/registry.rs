@@ -374,9 +374,10 @@ impl AccountRegistry {
         }
         let completed_at_ms = self.now();
         if !storage.complete_return_notification(account_id, &claim.claim_id, completed_at_ms)? {
-            return Err(ApiFailure::internal(
-                "return notification claim was fenced before completion".to_owned(),
-            ));
+            // A contended completion or an expired lease is a fenced send,
+            // not a scheduler failure. The durable delivery key makes the
+            // next reclaim idempotent while the persisted claim is recovered.
+            return Ok(false);
         }
         Ok(true)
     }
