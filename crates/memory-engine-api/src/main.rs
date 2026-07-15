@@ -59,11 +59,23 @@ async fn main() {
     // Start the background generation worker before serving so captures run
     // asynchronously instead of blocking the request thread.
     state.start_worker();
-    state.start_return_notification_scheduler();
+    let scheduler = state.start_return_notification_scheduler();
 
-    if let Err(error) = axum::serve(listener, router(state)).await {
+    let serve_result = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    if let Err(error) = &serve_result {
         eprintln!("{error}");
+    }
+    scheduler.shutdown().await;
+    if serve_result.is_err() {
         process::exit(1);
+    }
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("failed to install shutdown signal: {error}");
     }
 }
 

@@ -257,6 +257,21 @@ current implementation deliberately uses one synchronous worker per instance;
 Postgres/file claims provide the cross-instance concurrency bound and provider
 idempotency prevents duplicate logical sends.
 
+The file adapter's per-account notification lock is a persistent path with an
+OS descriptor lock acquired nonblockingly. It is never deleted as part of
+ownership release, so stale paths are harmless; a process crash releases the
+descriptor and a contending scheduler skips that account until it can acquire
+the lock. The same libc-backed helper protects the repository-owned file
+outbox: it scans durable delivery keys while holding the descriptor lock and
+does not append a duplicate after a lease-expiry reclaim.
+
+The scheduler returns an owned lifecycle handle. The production binary joins
+that handle during graceful shutdown, including any in-flight blocking
+provider call, before exiting. Manual and interactive reminder routes run
+storage and provider work on blocking workers; health requests remain
+responsive while a provider is slow. `lastRunAtMs` records every sweep, while
+`lastSuccessAtMs` advances only for a sweep with zero failed accounts.
+
 The liveness counters are included in `/healthz` under
 `returnNotificationScheduler`. A bounded manual/backfill run is available only
 with the operator token:

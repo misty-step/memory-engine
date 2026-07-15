@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 
 type UnsubscribeHmac = Hmac<Sha256>;
 
+mod file_lock;
 mod jobs;
 mod registry;
 mod storage;
@@ -65,6 +66,31 @@ struct SchedulerRuntime {
     last_run_at_ms: AtomicI64,
     last_success_at_ms: AtomicI64,
     failure_count: AtomicU64,
+}
+
+/// Owns the scheduler task and joins it after signalling shutdown.
+pub struct SchedulerHandle {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SchedulerHandle {
+    fn disabled() -> Self {
+        Self {
+            shutdown: None,
+            task: None,
+        }
+    }
+
+    /// Stop the scheduler and wait for any in-flight blocking sweep to finish.
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 impl Default for SchedulerRuntime {
@@ -462,9 +488,11 @@ impl ApiState {
                 self.scheduler
                     .last_run_at_ms
                     .store(report.finished_at_ms, Ordering::Relaxed);
-                self.scheduler
-                    .last_success_at_ms
-                    .store(report.finished_at_ms, Ordering::Relaxed);
+                if report.failed == 0 {
+                    self.scheduler
+                        .last_success_at_ms
+                        .store(report.finished_at_ms, Ordering::Relaxed);
+                }
                 self.scheduler
                     .failure_count
                     .fetch_add(report.failed as u64, Ordering::Relaxed);
@@ -478,23 +506,57 @@ impl ApiState {
 
     /// Start the production scheduled trigger. Multiple API instances are
     /// safe because durable storage owns the per-account claim/fence.
-    pub fn start_return_notification_scheduler(&self) {
+    #[must_use]
+    pub fn start_return_notification_scheduler(&self) -> SchedulerHandle {
         let interval_ms = scheduler_interval_ms();
         let config = ReturnNotificationSchedulerConfig::from_env();
         if !scheduler_enabled() {
-            return;
+            return SchedulerHandle::disabled();
         }
+        self.start_return_notification_scheduler_with_config(interval_ms, config)
+    }
+
+    /// Start a scheduler with explicit timing and batch controls.
+    ///
+    /// This is also the lifecycle seam used by deterministic boundary tests;
+    /// production hosts should use [`Self::start_return_notification_scheduler`].
+    #[must_use]
+    pub fn start_return_notification_scheduler_with_interval(
+        &self,
+        interval: Duration,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> SchedulerHandle {
+        let interval_ms =
+            u64::try_from(interval.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+        self.start_return_notification_scheduler_with_config(interval_ms, config)
+    }
+
+    fn start_return_notification_scheduler_with_config(
+        &self,
+        interval_ms: u64,
+        config: ReturnNotificationSchedulerConfig,
+    ) -> SchedulerHandle {
         self.scheduler.enabled.store(true, Ordering::Relaxed);
         let state = self.clone();
-        tokio::spawn(async move {
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
             loop {
                 state.scheduler.running.store(true, Ordering::Relaxed);
                 let run_state = state.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let mut run = std::pin::pin!(tokio::task::spawn_blocking(move || {
                     run_state.run_scheduled_return_notifications_with_config(config)
-                })
-                .await;
+                }));
+                let result = tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = &mut shutdown_rx => {
+                        let _ = (&mut run).await;
+                        None
+                    }
+                };
                 state.scheduler.running.store(false, Ordering::Relaxed);
+                let Some(result) = result else {
+                    break;
+                };
                 match result {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
@@ -508,9 +570,18 @@ impl ApiState {
                         eprintln!("return notification scheduler worker failed: {error}");
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                    _ = &mut shutdown_rx => break,
+                }
             }
+            state.scheduler.enabled.store(false, Ordering::Relaxed);
+            state.scheduler.running.store(false, Ordering::Relaxed);
         });
+        SchedulerHandle {
+            shutdown: Some(shutdown),
+            task: Some(task),
+        }
     }
 
     /// Run the bounded scheduler through the operator-only manual token.
@@ -912,6 +983,17 @@ impl ApiState {
     #[doc(hidden)]
     pub fn run_pending_jobs_blocking(&self) {
         self.jobs.run_pending_blocking();
+    }
+
+    /// Read durable reminder state for boundary tests and operator receipts.
+    #[doc(hidden)]
+    pub fn load_return_notification_preference_for_test(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ReturnNotificationPreference>, ApiFailure> {
+        self.accounts
+            .storage()
+            .load_return_notification_preference(account_id)
     }
 
     /// Return one job by id. Test helper for route coverage.
@@ -2181,5 +2263,26 @@ mod tests {
         );
 
         assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
+    }
+
+    #[tokio::test]
+    async fn scheduler_handle_shutdown_stops_and_joins_the_owned_task() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-scheduler-lifecycle-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        fs::create_dir_all(&root).expect("scheduler store root");
+        let state = ApiState::new(AccountRegistry::with_store_root(&root));
+        let handle = state.start_return_notification_scheduler_with_interval(
+            Duration::from_millis(1),
+            ReturnNotificationSchedulerConfig { batch_size: 1 },
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.shutdown().await;
+        let health = state.scheduler_health();
+        assert!(!health.enabled);
+        assert!(!health.running);
+        let _ = fs::remove_dir_all(root);
     }
 }

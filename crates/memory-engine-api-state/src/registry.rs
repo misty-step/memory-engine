@@ -368,10 +368,12 @@ impl AccountRegistry {
             &unsubscribe_link,
             &claim.delivery_key,
         ) {
-            storage.release_return_notification(account_id, &claim.claim_id, now)?;
+            let release_at_ms = self.now();
+            storage.release_return_notification(account_id, &claim.claim_id, release_at_ms)?;
             return Err(error);
         }
-        if !storage.complete_return_notification(account_id, &claim.claim_id, now)? {
+        let completed_at_ms = self.now();
+        if !storage.complete_return_notification(account_id, &claim.claim_id, completed_at_ms)? {
             return Err(ApiFailure::internal(
                 "return notification claim was fenced before completion".to_owned(),
             ));
@@ -1134,7 +1136,7 @@ impl AccountRegistry {
         Ok(())
     }
 
-    fn storage(&self) -> StudyStorage {
+    pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
         data.storage.storage(data.now_fn)
     }
@@ -1268,6 +1270,16 @@ impl AuthConfig {
                     fs::create_dir_all(parent)
                         .map_err(|error| ApiFailure::internal(error.to_string()))?;
                 }
+                let lock_path = path.with_extension("lock");
+                let _lock = crate::file_lock::acquire(&lock_path)?;
+                let already_recorded = fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("due-count\t"))
+                    .any(|line| line.split('\t').nth(3) == Some(delivery_key));
+                if already_recorded {
+                    return Ok(());
+                }
                 let mut outbox = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1305,5 +1317,102 @@ impl AuthConfig {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, thread, time::Duration};
+
+    fn test_now() -> i64 {
+        1_700_000_000_000
+    }
+
+    #[test]
+    fn file_outbox_deduplicates_a_reclaimed_slow_send_by_delivery_key() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-outbox-reclaim-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let outbox = root.join("reminders.tsv");
+        let storage = StudyStorage::file(&root, test_now);
+        storage
+            .save_return_notification_preference(
+                "account-slow-send",
+                "slow@example.com",
+                true,
+                None,
+                "slow-nonce",
+            )
+            .expect("preference");
+        let first = storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-slow-send".to_owned(),
+                now_ms: test_now(),
+                due_count: 3,
+                force_confirmation: true,
+                interval_ms: RETURN_NOTIFICATION_INTERVAL_MS,
+                claim_id: "slow-claim-1".to_owned(),
+                delivery_key: "slow-delivery-key".to_owned(),
+                claim_expires_at_ms: test_now() + 50,
+                unsubscribe_nonce: "slow-nonce".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("first claim")
+            .expect("first claim available");
+        let second_storage = storage.clone();
+        let first_auth = AuthConfig::default().with_link_outbox(&outbox);
+        let second_auth = first_auth.clone();
+        let first = Arc::new(first);
+        let first_for_thread = Arc::clone(&first);
+        let slow_sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            first_auth
+                .deliver_due_count_notification(
+                    &first_for_thread.email,
+                    first_for_thread.due_count,
+                    "/unsubscribe/slow",
+                    &first_for_thread.delivery_key,
+                )
+                .expect("slow sender outbox");
+        });
+
+        thread::sleep(Duration::from_millis(75));
+        let second = second_storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "account-slow-send".to_owned(),
+                now_ms: test_now() + 100,
+                due_count: 4,
+                force_confirmation: false,
+                interval_ms: RETURN_NOTIFICATION_INTERVAL_MS,
+                claim_id: "slow-claim-2".to_owned(),
+                delivery_key: "new-delivery-key-must-not-replace-pending".to_owned(),
+                claim_expires_at_ms: test_now() + 1_000,
+                unsubscribe_nonce: "new-nonce-must-not-replace-pending".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_100,
+            })
+            .expect("reclaim")
+            .expect("expired claim is reclaimable");
+        assert_eq!(second.delivery_key, first.delivery_key);
+        second_auth
+            .deliver_due_count_notification(
+                &second.email,
+                second.due_count,
+                "/unsubscribe/slow",
+                &second.delivery_key,
+            )
+            .expect("reclaimed sender outbox");
+        slow_sender.join().expect("slow sender");
+
+        let lines = fs::read_to_string(&outbox)
+            .expect("outbox")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "one delivery key produces one durable send");
+        assert!(lines[0].contains("slow-delivery-key"));
+        let _ = fs::remove_dir_all(root);
     }
 }

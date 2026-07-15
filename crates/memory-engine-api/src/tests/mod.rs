@@ -3,6 +3,7 @@ use std::{
     path::Path as FsPath,
     sync::{mpsc, Arc, Barrier},
     thread,
+    time::{Duration, Instant},
 };
 
 use std::os::unix::fs::PermissionsExt;
@@ -95,6 +96,33 @@ async fn manual_return_scheduler_requires_operator_token_and_reports_health() {
         health["returnNotificationScheduler"]["failureCount"],
         json!(0)
     );
+}
+
+#[test]
+fn scheduler_health_retains_last_success_when_a_report_has_failures() {
+    let store_root = temp_store_root("scheduler-health-failure");
+    fs::create_dir_all(&store_root).expect("health failure root");
+    let state = ApiState::new(AccountRegistry::with_store_root(&store_root));
+    let first = state
+        .run_scheduled_return_notifications()
+        .expect("empty scheduler run");
+    assert_eq!(first.failed, 0);
+    let last_success = state.scheduler_health().last_success_at_ms;
+
+    let account_dir = store_root.join("account-malformed-study");
+    fs::create_dir_all(&account_dir).expect("health failure account");
+    fs::write(
+        account_dir.join("return-notifications.json"),
+        r#"{"email":"health@example.com","enabled":true,"lastSentAtMs":null,"unsubscribeNonce":"health-nonce"}"#,
+    )
+    .expect("health failure preference");
+    fs::write(account_dir.join("study.json"), b"not-json").expect("health failure study");
+    let second = state
+        .run_scheduled_return_notifications()
+        .expect("scheduler report with account failure");
+    assert_eq!(second.failed, 1);
+    assert_eq!(state.scheduler_health().last_success_at_ms, last_success);
+    let _ = fs::remove_dir_all(store_root);
 }
 
 #[tokio::test]
@@ -714,6 +742,74 @@ async fn return_notification_enable_route_retries_the_same_provider_envelope_aft
             "{field} must clear on success"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_return_sender_does_not_block_health_requests() {
+    let store_root = temp_store_root("return-notification-blocked-sender");
+    fs::create_dir_all(&store_root).expect("blocked sender root");
+    let slow_command = slow_provider_script(&store_root);
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::default()
+                .with_unsubscribe_secret("blocked-sender-secret")
+                .with_mailer_command(&slow_command),
+        ),
+    );
+    let app = router(state);
+    let (cookie, csrf_token, _) = start_app_session_for_csrf(&app).await;
+    let saved = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("email", "retry@example.com")],
+        ))
+        .await
+        .expect("save blocked sender account");
+    let cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let csrf_token = html_value(&saved, "csrfToken");
+    let request_app = app.clone();
+    let request = tokio::spawn(async move {
+        request_app
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/return-notifications",
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("enabled", "on"),
+                    ("reminderEmail", "retry@example.com"),
+                ],
+            ))
+            .await
+            .expect("blocked sender request")
+    });
+
+    let started = Instant::now();
+    while !store_root.join("slow-provider.tsv").exists() {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let health_started = Instant::now();
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("health request"),
+        )
+        .await
+        .expect("health response");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(
+        health_started.elapsed() < Duration::from_millis(250),
+        "health request waited on the blocked sender"
+    );
+    assert_eq!(request.await.expect("sender task").status(), StatusCode::OK);
+    let _ = fs::remove_dir_all(store_root);
 }
 
 #[test]
@@ -2658,6 +2754,83 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
             && message.contains(&format!("\t{}\t", view.due_count))));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_scheduler_retries_after_restart_and_contends_across_instances() {
+    let Some(database) = PostgresTestDatabase::new("scheduled_return_notification_recovery") else {
+        eprintln!(
+            "skipping live Postgres scheduler recovery test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+        );
+        return;
+    };
+    POSTGRES_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("postgres-scheduler-recovery");
+    fs::create_dir_all(&store_root).expect("Postgres recovery root");
+    let retry_command = retry_provider_script(&store_root);
+    let auth_config = || {
+        AuthConfig::allow_emails(["recovery@example.com".to_owned()])
+            .with_unsubscribe_secret("postgres-recovery-secret")
+            .with_mailer_command(&retry_command)
+    };
+    let first_state = ApiState::new(
+        AccountRegistry::with_postgres_url(&database.scoped_url)
+            .with_clock(postgres_retry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let account = prepare_postgres_due_account(&first_state, "recovery@example.com");
+    first_state
+        .set_return_notification(&account, Some("recovery@example.com"), true)
+        .expect("Postgres recovery opt-in");
+    let failed = first_state
+        .run_scheduled_return_notifications()
+        .expect("Postgres failed scheduler run");
+    assert_eq!(failed.failed, 1);
+    assert_eq!(failed.sent, 0);
+    let failed_preference = first_state
+        .load_return_notification_preference_for_test(account.account_id())
+        .expect("failed preference read")
+        .expect("failed preference");
+    assert!(failed_preference.pending_delivery_key.is_some());
+    assert!(failed_preference.next_retry_at_ms.is_some());
+
+    POSTGRES_RETRY_CLOCK.fetch_add(60_001, Ordering::SeqCst);
+    let restarted_state = ApiState::new(
+        AccountRegistry::with_postgres_url(&database.scoped_url)
+            .with_clock(postgres_retry_clock)
+            .with_auth_config(auth_config()),
+    );
+    let recovered = restarted_state
+        .run_scheduled_return_notifications()
+        .expect("Postgres restarted scheduler run");
+    assert_eq!(
+        recovered.sent, 1,
+        "retry survives a new state/store adapter"
+    );
+    let payloads = fs::read_to_string(store_root.join("retry-provider.tsv"))
+        .expect("retry provider capture")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0], payloads[1], "retry envelope remains stable");
+
+    let slow_command = slow_provider_script(&store_root);
+    POSTGRES_RETRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    let reports = run_postgres_scheduler_contenders(&database.scoped_url, &slow_command);
+    assert_eq!(
+        reports.iter().sum::<usize>(),
+        1,
+        "two Postgres instances produce one logical send"
+    );
+    assert_eq!(
+        fs::read_to_string(store_root.join("slow-provider.tsv"))
+            .expect("slow provider capture")
+            .lines()
+            .count(),
+        1,
+        "the durable claim fences the second instance"
+    );
+}
+
 #[tokio::test]
 async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
     EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
@@ -2857,6 +3030,78 @@ fn file_return_notification_retry_reuses_the_failed_provider_payload() {
         first_fields[3], second_fields[3],
         "retry idempotency key must persist"
     );
+}
+
+#[test]
+fn notification_retry_and_success_timestamps_sample_after_slow_provider_returns() {
+    FILE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-provider-clock");
+    fs::create_dir_all(&store_root).expect("provider clock root");
+    let failing_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(file_retry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["clock@example.com".to_owned()])
+                    .with_unsubscribe_secret("clock-secret")
+                    .with_mailer_command(slow_failing_provider_script(&store_root)),
+            ),
+    );
+    let created = failing_state
+        .create_account("clock@example.com")
+        .expect("clock account");
+    let account = failing_state
+        .create_browser_session(&created)
+        .expect("clock session");
+    failing_state
+        .set_return_notification(&account, Some("clock@example.com"), true)
+        .expect("clock opt-in");
+    let failing_state_for_thread = failing_state.clone();
+    let account_for_thread = account.clone();
+    let send = thread::spawn(move || {
+        failing_state_for_thread.maybe_send_due_count_notification(&account_for_thread, 1, true)
+    });
+    while !store_root.join("slow-failing-provider.started").exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let after_provider_started = DEFAULT_BETA_STUDY_NOW + 123_456;
+    FILE_RETRY_CLOCK.store(after_provider_started, Ordering::SeqCst);
+    assert!(send.join().expect("slow failing sender").is_err());
+    let failed = failing_state
+        .load_return_notification_preference_for_test(account.account_id())
+        .expect("failed preference")
+        .expect("failed preference row");
+    assert!(failed.next_retry_at_ms.expect("retry time") > after_provider_started);
+
+    let success_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(file_retry_clock)
+            .with_auth_config(
+                AuthConfig::allow_emails(["clock@example.com".to_owned()])
+                    .with_unsubscribe_secret("clock-secret")
+                    .with_mailer_command(slow_provider_script(&store_root)),
+            ),
+    );
+    FILE_RETRY_CLOCK.store(
+        failed.next_retry_at_ms.expect("retry time") + 1,
+        Ordering::SeqCst,
+    );
+    let success_state_for_thread = success_state.clone();
+    let account_for_thread = account.clone();
+    let send = thread::spawn(move || {
+        success_state_for_thread.maybe_send_due_count_notification(&account_for_thread, 1, true)
+    });
+    while !store_root.join("slow-provider.tsv").exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let completed_at = FILE_RETRY_CLOCK.load(Ordering::SeqCst) + 222_222;
+    FILE_RETRY_CLOCK.store(completed_at, Ordering::SeqCst);
+    assert!(send.join().expect("slow success sender").is_ok());
+    let completed = success_state
+        .load_return_notification_preference_for_test(account.account_id())
+        .expect("completed preference")
+        .expect("completed preference row");
+    assert_eq!(completed.last_sent_at_ms, Some(completed_at));
+    let _ = fs::remove_dir_all(store_root);
 }
 
 #[tokio::test]
@@ -6751,6 +6996,107 @@ fn retry_provider_script(store_root: &FsPath) -> String {
     script_path.to_string_lossy().into_owned()
 }
 
+fn slow_provider_script(store_root: &FsPath) -> String {
+    let script_path = store_root.join("slow-provider.sh");
+    let capture_path = store_root.join("slow-provider.tsv");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE\" \"$MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY\" >> \"{}\"\nsleep 1\nexit 0\n",
+        capture_path.display(),
+    );
+    fs::write(&script_path, script).expect("slow provider script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("slow provider metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("slow provider permissions");
+    script_path.to_string_lossy().into_owned()
+}
+
+fn slow_failing_provider_script(store_root: &FsPath) -> String {
+    let script_path = store_root.join("slow-failing-provider.sh");
+    let marker_path = store_root.join("slow-failing-provider.started");
+    let script = format!(
+        "#!/bin/sh\ntouch \"{}\"\nsleep 1\nexit 1\n",
+        marker_path.display()
+    );
+    fs::write(&script_path, script).expect("slow failing provider script");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("slow failing provider metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("slow failing provider permissions");
+    script_path.to_string_lossy().into_owned()
+}
+
+fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAccount {
+    let created = state
+        .create_account(email)
+        .expect("Postgres recovery account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("Postgres recovery session");
+    let source = state
+        .save_source(
+            account.account_id(),
+            account.session_token(),
+            &CreateSourceRequest {
+                title: "Postgres recovery source".to_owned(),
+                body: source_body(),
+            },
+        )
+        .expect("Postgres recovery source");
+    let generated = state
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("Postgres recovery generation");
+    for draft in &generated.drafts {
+        state
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("Postgres recovery approval");
+    }
+    account
+}
+
+fn run_postgres_scheduler_contenders(database_url: &str, mailer_command: &str) -> Vec<usize> {
+    let make_state = || {
+        ApiState::new(
+            AccountRegistry::with_postgres_url(database_url)
+                .with_clock(postgres_retry_clock)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["recovery@example.com".to_owned()])
+                        .with_unsubscribe_secret("postgres-recovery-secret")
+                        .with_mailer_command(mailer_command),
+                ),
+        )
+    };
+    let contender_a = make_state();
+    let contender_b = make_state();
+    let barrier = Arc::new(Barrier::new(2));
+    let a_barrier = Arc::clone(&barrier);
+    let b_barrier = Arc::clone(&barrier);
+    let a = thread::spawn(move || {
+        a_barrier.wait();
+        contender_a
+            .run_scheduled_return_notifications()
+            .expect("Postgres contender A")
+            .sent
+    });
+    let b = thread::spawn(move || {
+        b_barrier.wait();
+        contender_b
+            .run_scheduled_return_notifications()
+            .expect("Postgres contender B")
+            .sent
+    });
+    vec![
+        a.join().expect("Postgres contender A join"),
+        b.join().expect("Postgres contender B join"),
+    ]
+}
+
 fn assert_no_store_and_no_referrer(response: &axum::response::Response) {
     assert_eq!(
         response
@@ -7217,6 +7563,7 @@ static QUOTA_CLOCK: AtomicI64 = AtomicI64::new(0);
 static CONCURRENT_SCHEDULER_CLOCK: AtomicI64 = AtomicI64::new(0);
 static ROUTE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
 static FILE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
+static POSTGRES_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn expiry_clock() -> i64 {
     EXPIRY_CLOCK.load(Ordering::SeqCst)
@@ -7244,6 +7591,10 @@ fn route_retry_clock() -> i64 {
 
 fn file_retry_clock() -> i64 {
     FILE_RETRY_CLOCK.load(Ordering::SeqCst)
+}
+
+fn postgres_retry_clock() -> i64 {
+    POSTGRES_RETRY_CLOCK.load(Ordering::SeqCst)
 }
 
 #[test]

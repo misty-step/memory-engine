@@ -814,10 +814,12 @@ impl PostgresStudyStore {
             "SELECT account_id
              FROM memory_engine_return_notification_preferences
              WHERE enabled
+               AND (claim_expires_at_ms IS NULL OR claim_expires_at_ms <= $2::BIGINT)
                AND ((pending_delivery_key IS NOT NULL
                      AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= $2::BIGINT))
-                    OR (last_sent_at_ms IS NULL
-                        OR last_sent_at_ms <= $2::BIGINT - $3::BIGINT))
+                    OR (pending_delivery_key IS NULL
+                        AND (last_sent_at_ms IS NULL
+                            OR last_sent_at_ms <= $2::BIGINT - $3::BIGINT)))
              ORDER BY account_id
              LIMIT $1",
             &[&limit, &now_ms, &interval_ms],
@@ -877,7 +879,7 @@ impl PostgresStudyStore {
                  retry_attempts = retry_attempts + 1,
                  next_retry_at_ms = $3::BIGINT + LEAST(
                      21600000::BIGINT,
-                     60000::BIGINT * power(2::NUMERIC, LEAST(retry_attempts, 8))::BIGINT
+                     60000::BIGINT * power(2::NUMERIC, LEAST(retry_attempts, 9))::BIGINT
                  )
              WHERE account_id = $1 AND claim_id = $2",
             &[&account_id, &claim_id, &now_ms],
@@ -3152,11 +3154,7 @@ mod tests {
         let result = (|| -> Result<(), super::PostgresStoreError> {
             let mut retry = super::PostgresStudyStore::connect(&scoped_url)?;
             retry.migrate()?;
-            {
-                let scope = super::AccountScope::new("acct-claim-retry")?;
-                let mut account = retry.for_account(scope);
-                account.ensure_account(NOW)?;
-            }
+            ensure_live_account(&mut retry, "acct-claim-retry")?;
             retry.save_return_notification_preference(
                 "acct-claim-retry",
                 "retry@example.com",
@@ -3164,6 +3162,15 @@ mod tests {
                 None,
                 NOW,
                 "retry-nonce",
+            )?;
+            ensure_live_account(&mut retry, "acct-claim-retry-ready")?;
+            retry.save_return_notification_preference(
+                "acct-claim-retry-ready",
+                "ready@example.com",
+                true,
+                None,
+                NOW,
+                "ready-nonce",
             )?;
             let first = retry
                 .claim_return_notification(&super::ReturnNotificationClaimRequest {
@@ -3188,6 +3195,7 @@ mod tests {
                 "retry-nonce-request-rotated",
             )?;
             assert_retry_backoff_gate(&mut retry, "acct-claim-retry", &first.claim_id)?;
+            assert_ready_retry_account_is_not_starved(&mut retry)?;
             let second = retry
                 .claim_return_notification(&super::ReturnNotificationClaimRequest {
                     account_id: "acct-claim-retry".to_owned(),
@@ -3246,6 +3254,30 @@ mod tests {
                 unsubscribe_expires_at_ms: NOW + 604_800_003,
             })?
             .is_none());
+        Ok(())
+    }
+
+    fn ensure_live_account(
+        store: &mut super::PostgresStudyStore,
+        account_id: &str,
+    ) -> Result<(), super::PostgresStoreError> {
+        let scope = super::AccountScope::new(account_id)?;
+        let mut account = store.for_account(scope);
+        account.ensure_account(NOW)
+    }
+
+    fn assert_ready_retry_account_is_not_starved(
+        retry: &mut super::PostgresStudyStore,
+    ) -> Result<(), super::PostgresStoreError> {
+        let eligible = retry.enabled_return_notification_accounts(1, NOW + 3, 86_400_000)?;
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|account| account.account_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acct-claim-retry-ready"],
+            "a future retry must not consume the scheduler batch before a ready account"
+        );
         Ok(())
     }
 
