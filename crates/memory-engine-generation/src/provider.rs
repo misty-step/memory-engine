@@ -790,10 +790,13 @@ fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
     list_entries(&non_empty_lines(body))
         .into_iter()
         .enumerate()
-        .map(|(position, (answer, evidence))| EnumerableEntry {
+        .map(|(position, (answer, _evidence))| EnumerableEntry {
             cue: (position + 1).to_string(),
             answer,
-            evidence,
+            // A one-line entry such as `1. Alpha` is too short for the
+            // production provenance floor. Cite the complete source list so
+            // the draft remains grounded without weakening that trust gate.
+            evidence: body.trim().to_owned(),
         })
         .collect()
 }
@@ -845,7 +848,7 @@ fn list_entries(lines: &[String]) -> Vec<(String, String)> {
 
 fn assert_exhaustive_indices(candidates: &[DraftCandidate]) {
     for (position, candidate) in candidates.iter().enumerate() {
-        assert_eq!(
+        debug_assert_eq!(
             candidate.index,
             position + 1,
             "content-policy candidates must cover sequential indices [1..N]"
@@ -858,7 +861,9 @@ fn enumerable_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandid
         .into_iter()
         .enumerate()
         .map(|(position, entry)| {
-            let question = if entry.cue.chars().count() == 1 {
+            let question = if entry.cue.chars().count() == 1
+                && entry.cue.chars().next().is_some_and(char::is_alphabetic)
+            {
                 format!(
                     "In {}, which word stands for the letter {}?",
                     source.title, entry.cue

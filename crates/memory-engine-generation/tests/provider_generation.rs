@@ -299,7 +299,22 @@ fn enumerable_numbered_lists_preserve_order_and_source_evidence() {
     );
     assert_eq!(drafts.candidates[0].index, 1);
     assert_eq!(drafts.candidates[2].index, 3);
-    assert_eq!(drafts.candidates[1].evidence.as_deref(), Some("2. Beta"));
+    assert_eq!(
+        drafts.candidates[1].evidence.as_deref(),
+        Some("1. Alpha\n2. Beta\n3. Gamma")
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("letter")));
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
 }
 
 #[test]

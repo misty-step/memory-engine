@@ -128,6 +128,52 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
 }
 
 #[test]
+fn short_enumerable_entries_are_promoted_with_substantive_evidence() {
+    let directory = TempDirectory::new("short-enumerable-evidence");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-short-list".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Ordered terms".to_owned(),
+            project_key: None,
+            body: Some("1. Alpha\n2. Beta\n3. Gamma".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        BetaGenerationRequest {
+            run_id: "run-short-list".to_owned(),
+            source_document_ids: vec!["src-short-list".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 3);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+    let snapshot = store.snapshot();
+    assert!(snapshot.generated_prompt_drafts.iter().all(|draft| {
+        draft.validation.status == GeneratedPromptValidationStatus::Accepted
+            && !draft.reference_span_ids.is_empty()
+    }));
+}
+
+#[test]
 fn browser_form_line_endings_preserve_multiple_structured_blocks() {
     let directory = TempDirectory::new("browser-line-endings");
     let path = directory.path().join("store.json");
