@@ -30,6 +30,8 @@ pub struct BetaAppConfig {
 /// non-positive, and implausibly large values therefore take the slow path so
 /// they can never manufacture the fast-answer `Easy` rating.
 const MAX_PLAUSIBLE_RESPONSE_TIME_MS: u32 = 600_000;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
 const HONEST_TIMING_SCRIPT: &str = r#"<script>
 (function () {
@@ -122,19 +124,30 @@ fn handle_stream(
 ) -> Result<(), BetaAppError> {
     let request = match HttpRequest::read_from(stream) {
         Ok(request) => request,
-        Err(error) if is_ignorable_client_error(&error) => return Ok(()),
-        Err(error) => return Err(error.into()),
+        Err(HttpRequestError::ClientDisconnected) => return Ok(()),
+        Err(HttpRequestError::Malformed(message)) => {
+            return write_response(stream, &HttpResponse::bad_request(&message));
+        }
+        Err(HttpRequestError::Io(error)) => return Err(error.into()),
     };
     let response = route(session, &request);
-    response.write_to(stream)?;
-
-    Ok(())
+    write_response(stream, &response)
 }
 
-fn is_ignorable_client_error(error: &io::Error) -> bool {
+fn write_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<(), BetaAppError> {
+    match response.write_to(stream) {
+        Ok(()) => Ok(()),
+        Err(error) if is_client_disconnect_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_client_disconnect_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::ConnectionReset | io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
     )
 }
 
@@ -228,78 +241,88 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+enum HttpRequestError {
+    ClientDisconnected,
+    Malformed(String),
+    Io(io::Error),
+}
+
 impl HttpRequest {
-    fn read_from(stream: &mut TcpStream) -> io::Result<Self> {
+    fn read_from(stream: &mut TcpStream) -> Result<Self, HttpRequestError> {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 8192];
         let header_end;
         loop {
-            let read = stream.read(&mut buffer)?;
+            let read = stream.read(&mut buffer).map_err(|error| {
+                if is_client_disconnect_error(&error) {
+                    HttpRequestError::ClientDisconnected
+                } else {
+                    HttpRequestError::Io(error)
+                }
+            })?;
             if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before headers",
-                ));
+                return Err(HttpRequestError::ClientDisconnected);
             }
             bytes.extend_from_slice(&buffer[..read]);
             if let Some(index) = find_header_end(&bytes) {
+                if index > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestError::Malformed(
+                        "request headers exceed the size limit".to_owned(),
+                    ));
+                }
                 header_end = index;
                 break;
             }
+            if bytes.len() > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestError::Malformed(
+                    "request headers exceed the size limit".to_owned(),
+                ));
+            }
         }
 
-        let header_text = std::str::from_utf8(&bytes[..header_end]).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid headers: {error}"),
-            )
-        })?;
+        let header_text = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| HttpRequestError::Malformed(format!("invalid headers: {error}")))?;
         let mut lines = header_text.split("\r\n");
         let request_line = lines
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing request line"))?;
+            .ok_or_else(|| HttpRequestError::Malformed("missing request line".to_owned()))?;
         let mut request_parts = request_line.split_whitespace();
         let method = request_parts
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing method"))?
+            .ok_or_else(|| HttpRequestError::Malformed("missing method".to_owned()))?
             .to_owned();
         let target = request_parts
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing path"))?;
-        let path = target.split('?').next().unwrap_or(target).to_owned();
-        let headers = lines
-            .filter_map(|line| line.split_once(':'))
-            .collect::<Vec<_>>();
-        let content_type = headers.iter().find_map(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type")
-                .then(|| value.trim().to_owned())
-        });
-        let content_length = headers
-            .iter()
-            .find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-
-        let body_start = header_end + 4;
-        while bytes.len() < body_start + content_length {
-            let read = stream.read(&mut buffer)?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed before body",
-                ));
-            }
-            bytes.extend_from_slice(&buffer[..read]);
+            .ok_or_else(|| HttpRequestError::Malformed("missing path".to_owned()))?;
+        let version = request_parts
+            .next()
+            .ok_or_else(|| HttpRequestError::Malformed("missing HTTP version".to_owned()))?;
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+            return Err(HttpRequestError::Malformed(
+                "unsupported HTTP version".to_owned(),
+            ));
         }
+        if request_parts.next().is_some() {
+            return Err(HttpRequestError::Malformed(
+                "request line has too many fields".to_owned(),
+            ));
+        }
+        let path = target.split('?').next().unwrap_or(target).to_owned();
+        let (content_type, content_length) = parse_header_fields(lines)?;
+
+        let body_start = header_end
+            .checked_add(4)
+            .ok_or_else(|| HttpRequestError::Malformed("request is too large".to_owned()))?;
+        let body_end = body_start
+            .checked_add(content_length)
+            .ok_or_else(|| HttpRequestError::Malformed("request is too large".to_owned()))?;
+        read_body(stream, &mut bytes, body_end)?;
 
         Ok(Self {
             method,
             path,
             content_type,
-            body: bytes[body_start..body_start + content_length].to_vec(),
+            body: bytes[body_start..body_end].to_vec(),
         })
     }
 
@@ -312,6 +335,78 @@ impl HttpRequest {
                     .is_some_and(|value| value.trim() == "application/x-www-form-urlencoded")
             })
     }
+}
+
+fn read_body(
+    stream: &mut TcpStream,
+    bytes: &mut Vec<u8>,
+    body_end: usize,
+) -> Result<(), HttpRequestError> {
+    let mut buffer = [0_u8; 8192];
+    while bytes.len() < body_end {
+        let read = stream.read(&mut buffer).map_err(|error| {
+            if is_client_disconnect_error(&error) {
+                HttpRequestError::ClientDisconnected
+            } else {
+                HttpRequestError::Io(error)
+            }
+        })?;
+        if read == 0 {
+            return Err(HttpRequestError::ClientDisconnected);
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(())
+}
+
+fn is_valid_header_field_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_http_token_byte)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn parse_header_fields<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<(Option<String>, usize), HttpRequestError> {
+    let mut content_type = None;
+    let mut content_length = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| HttpRequestError::Malformed("malformed request header".to_owned()))?;
+        if !is_valid_header_field_name(name) {
+            return Err(HttpRequestError::Malformed(
+                "invalid HTTP header field-name".to_owned(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpRequestError::Malformed(
+                "transfer-encoding is unsupported".to_owned(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
+            content_type = Some(value.trim().to_owned());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(HttpRequestError::Malformed(
+                    "duplicate content-length header".to_owned(),
+                ));
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                HttpRequestError::Malformed(format!("invalid content-length: {error}"))
+            })?);
+        }
+    }
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(HttpRequestError::Malformed(
+            "request body exceeds the size limit".to_owned(),
+        ));
+    }
+    Ok((content_type, content_length))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -857,8 +952,9 @@ fn reason_phrase(status: u16) -> &'static str {
 mod tests {
     use std::{
         fs,
-        io::{Read, Write},
+        io::{self, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
+        os::fd::AsRawFd,
         path::PathBuf,
         thread,
     };
@@ -866,8 +962,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        looks_like_json, render_page, route, serve_connections, BetaStudyOptions, BetaStudySession,
-        HttpRequest,
+        is_client_disconnect_error, looks_like_json, render_page, route, serve_connections,
+        write_response, BetaStudyOptions, BetaStudySession, HttpRequest, HttpResponse,
     };
 
     const NOW: i64 = 1_779_984_000_000;
@@ -1299,6 +1395,234 @@ mod tests {
         server.join().expect("server completes");
     }
 
+    #[test]
+    fn rejects_malformed_wire_then_serves_a_following_request() {
+        let directory = TempDirectory::new("malformed-wire");
+        let study_path = directory.path().join("study.json");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut session =
+                BetaStudySession::open(BetaStudyOptions::new(study_path).with_clock(now))
+                    .expect("open");
+            session.start().expect("start");
+            serve_connections(&listener, &mut session, Some(2))
+        });
+
+        let mut malformed = TcpStream::connect(address).expect("malformed connection");
+        malformed
+            .write_all(b"\xff\xfe\r\n\r\n")
+            .expect("write malformed wire request");
+        malformed
+            .shutdown(Shutdown::Write)
+            .expect("finish malformed request");
+        let mut malformed_response = String::new();
+        malformed
+            .read_to_string(&mut malformed_response)
+            .expect("read malformed response");
+        assert!(malformed_response.starts_with("HTTP/1.1 400 Bad Request"));
+        drop(malformed);
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write valid request");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish valid request");
+        let mut response = String::new();
+        valid
+            .read_to_string(&mut response)
+            .expect("read valid response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve connections");
+    }
+
+    #[test]
+    fn rejects_unsafe_content_length_then_serves_a_following_request() {
+        let directory = TempDirectory::new("unsafe-content-length");
+        let study_path = directory.path().join("study.json");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut session =
+                BetaStudySession::open(BetaStudyOptions::new(study_path).with_clock(now))
+                    .expect("open");
+            session.start().expect("start");
+            serve_connections(&listener, &mut session, Some(4))
+        });
+
+        let mut oversized_header = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        oversized_header.extend(std::iter::repeat_n(b'x', 65 * 1024));
+        oversized_header.extend_from_slice(b"\r\n\r\n");
+        let malformed_requests = vec![
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n".to_vec(),
+            oversized_header,
+        ];
+        for wire in malformed_requests {
+            let mut malformed = TcpStream::connect(address).expect("malformed connection");
+            malformed.write_all(&wire).expect("write malformed request");
+            malformed
+                .shutdown(Shutdown::Write)
+                .expect("finish malformed request");
+            let mut response = String::new();
+            malformed
+                .read_to_string(&mut response)
+                .expect("read response");
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        }
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write valid request");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish valid request");
+        let mut response = String::new();
+        valid
+            .read_to_string(&mut response)
+            .expect("read valid response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve connections");
+    }
+
+    #[test]
+    fn rejects_ambiguous_http_headers_then_serves_a_following_request() {
+        let directory = TempDirectory::new("ambiguous-http-headers");
+        let study_path = directory.path().join("study.json");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut session =
+                BetaStudySession::open(BetaStudyOptions::new(study_path).with_clock(now))
+                    .expect("open");
+            session.start().expect("start");
+            serve_connections(&listener, &mut session, Some(8))
+        });
+
+        let malformed_requests = [
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length : 10\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent@Length: 0\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"GET / NOTHTTP\r\nHost: localhost\r\n\r\n".to_vec(),
+        ];
+        for wire in malformed_requests {
+            let mut malformed = TcpStream::connect(address).expect("malformed connection");
+            malformed.write_all(&wire).expect("write malformed request");
+            malformed
+                .shutdown(Shutdown::Write)
+                .expect("finish malformed request");
+            let mut response = String::new();
+            malformed
+                .read_to_string(&mut response)
+                .expect("read response");
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        }
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write valid request");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish valid request");
+        let mut response = String::new();
+        valid
+            .read_to_string(&mut response)
+            .expect("read valid response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve connections");
+    }
+
+    #[test]
+    fn ignores_response_disconnect_then_serves_a_following_request() {
+        let directory = TempDirectory::new("response-disconnect");
+        let study_path = directory.path().join("study.json");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut session =
+                BetaStudySession::open(BetaStudyOptions::new(study_path).with_clock(now))
+                    .expect("open");
+            session.start().expect("start");
+            serve_connections(&listener, &mut session, Some(2))
+        });
+
+        let mut disconnected = TcpStream::connect(address).expect("disconnecting connection");
+        disconnected
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write request");
+        reset_connection(&disconnected);
+        drop(disconnected);
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write valid request");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish valid request");
+        let mut response = String::new();
+        valid
+            .read_to_string(&mut response)
+            .expect("read valid response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve connections");
+    }
+
+    #[test]
+    fn isolates_peer_reset_during_response_write() {
+        let mut raw_stream = accepted_stream_after_peer_reset();
+        let raw_error = HttpResponse::html(&"x".repeat(8 * 1024 * 1024))
+            .write_to(&mut raw_stream)
+            .expect_err("reset peer must fail the raw response write");
+        eprintln!("raw response write after peer reset: {raw_error:?}");
+        assert!(is_client_disconnect_error(&raw_error));
+
+        let mut handled_stream = accepted_stream_after_peer_reset();
+        write_response(
+            &mut handled_stream,
+            &HttpResponse::html(&"x".repeat(8 * 1024 * 1024)),
+        )
+        .expect("peer reset is isolated to the client connection");
+    }
+
+    #[test]
+    fn classifies_only_peer_disconnect_errors_as_ignorable() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(is_client_disconnect_error(&io::Error::new(kind, "peer")));
+        }
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(!is_client_disconnect_error(&io::Error::new(kind, "server")));
+        }
+    }
+
     fn request(method: &str, path: &str, body: &str) -> HttpRequest {
         HttpRequest {
             method: method.to_owned(),
@@ -1354,6 +1678,34 @@ mod tests {
 
     fn now() -> i64 {
         NOW
+    }
+
+    fn reset_connection(stream: &TcpStream) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&raw const linger).cast(),
+                libc::socklen_t::try_from(std::mem::size_of::<libc::linger>())
+                    .expect("linger size fits socklen_t"),
+            )
+        };
+        assert_eq!(result, 0, "setsockopt(SO_LINGER) failed: {result}");
+    }
+
+    fn accepted_stream_after_peer_reset() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = TcpStream::connect(address).expect("client");
+        let (server, _) = listener.accept().expect("accepted stream");
+        reset_connection(&client);
+        drop(client);
+        server
     }
 
     fn source_body() -> String {

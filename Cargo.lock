@@ -894,6 +894,7 @@ dependencies = [
 name = "memory-engine-beta-app"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memory-engine-generation",
  "memory-engine-study",
  "serde",
@@ -1050,6 +1051,7 @@ dependencies = [
 name = "memory-engine-web-shell"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memory-engine-core",
  "memory-engine-import",
  "memory-engine-service",
