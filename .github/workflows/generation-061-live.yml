@@ -1,0 +1,373 @@
+name: Generation 061 trusted live comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: Full commit SHA of a same-repository branch head to evaluate
+        required: true
+        type: string
+
+# This workflow is deliberately manual and trusted-branch-only. Never add a
+# pull_request or pull_request_target trigger: the provisioning secret must not
+# reach fork or otherwise untrusted workflow code.
+permissions:
+  contents: read
+
+concurrency:
+  group: generation-061-live
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    if: github.repository == 'misty-step/memory-engine' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out the trusted default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout has no GitHub credentials
+        run: |
+          set -euo pipefail
+          # actions/checkout must not leave an auth extraheader in the local
+          # config that Cerberus's detached worktree could share.
+          if git config --get-regexp 'http\..*extraheader' >/dev/null 2>&1; then
+            echo 'trusted checkout contains a GitHub auth extraheader; refusing to run' >&2
+            exit 1
+          fi
+
+      - name: Validate immutable same-repository target
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          test "$(git rev-parse HEAD)" = "$(git rev-parse refs/remotes/origin/master)"
+          git cat-file -e "$HEAD_SHA^{commit}"
+          if ! git for-each-ref --format='%(objectname)' refs/remotes/origin/ | grep -Fxq "$HEAD_SHA"; then
+            echo 'target SHA is not a head of any branch in the trusted repository' >&2
+            exit 1
+          fi
+          echo "validated same-repository immutable target $HEAD_SHA"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # reviewed stable action commit
+
+      - name: Install pinned Cerberus
+        # Cerberus must remain a reviewed immutable dependency of this lane.
+        run: cargo install --locked --git https://github.com/misty-step/cerberus.git --rev b10bffb6ddb14ec553fbcf4f5e687aee13424717 --bin cerberus
+
+      - name: Prepare non-secret runtime environment
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          cargo_bin="$(command -v cargo)"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          cache_dir="$RUNNER_TEMP/generation-061-live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container_name="memory-engine-061-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container_label="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'CARGO_HOME=%s\n' "$cargo_home" >> "$GITHUB_ENV"
+          printf 'RUSTUP_HOME=%s\n' "$rustup_home" >> "$GITHUB_ENV"
+          printf 'GENERATION_HEAD_SHA=%s\n' "$HEAD_SHA" >> "$GITHUB_ENV"
+          printf 'GENERATION_CACHE_DIR=%s\n' "$cache_dir" >> "$GITHUB_ENV"
+          printf 'GENERATION_CONTAINER_NAME=%s\n' "$container_name" >> "$GITHUB_ENV"
+          printf 'GENERATION_CONTAINER_LABEL=%s\n' "$container_label" >> "$GITHUB_ENV"
+          printf 'GENERATION_CONTAINER_IMAGE=%s\n' 'rust:1.88-bookworm@sha256:4727898c104ecd2e22d780925832502faee9fe4e70581b8572af081370b315a0' >> "$GITHUB_ENV"
+          printf 'GENERATION_TRUSTED_HELPER=%s\n' "$GITHUB_WORKSPACE/scripts/generation-061-live-comparison.sh" >> "$GITHUB_ENV"
+          printf 'GENERATION_TRUSTED_VALIDATOR=%s\n' "$GITHUB_WORKSPACE/scripts/generation-061-validate-receipt.sh" >> "$GITHUB_ENV"
+          test -x "$cargo_bin"
+
+      - name: Build the exact live-generation request
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/generation-061-live
+          cerberus request git-range \
+            --repo-path . \
+            --base origin/master \
+            --head "$HEAD_SHA" \
+            --local-runtime-command "$GITHUB_WORKSPACE/scripts/generation-061-live-comparison.sh" \
+            --allow-local-runtime \
+            --allow-env OPENROUTER_API_KEY \
+            --allow-env CARGO_HOME \
+            --allow-env RUSTUP_HOME \
+            --allow-env GENERATION_HEAD_SHA \
+            --allow-env GENERATION_CONTAINER_IMAGE \
+            --allow-env GENERATION_CONTAINER_LABEL \
+            --allow-env GENERATION_CACHE_DIR \
+            --allow-env GENERATION_TRUSTED_HELPER \
+            --allow-env GENERATION_TRUSTED_VALIDATOR \
+            --allow-env GENERATION_CONTAINER_NAME \
+            --out target/generation-061-live/request.json
+
+      - name: Pin the Cerberus fixture substrate
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-tags https://github.com/misty-step/cerberus.git target/cerberus-source
+          git -C target/cerberus-source fetch --quiet --depth 1 origin b10bffb6ddb14ec553fbcf4f5e687aee13424717
+          git -C target/cerberus-source checkout --quiet b10bffb6ddb14ec553fbcf4f5e687aee13424717
+          printf 'CERBERUS_SOURCE_DIR=%s\n' "$GITHUB_WORKSPACE/target/cerberus-source" >> "$GITHUB_ENV"
+
+      - name: Mint bounded key in short-lived process
+        id: mint_key
+        env:
+          CERBERUS_OPENROUTER_PROVISIONING_KEY: ${{ secrets.CERBERUS_OPENROUTER_PROVISIONING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CERBERUS_OPENROUTER_PROVISIONING_KEY" ]]; then
+            echo 'CERBERUS_OPENROUTER_PROVISIONING_KEY is required; refusing to run live generation' >&2
+            exit 1
+          fi
+          state_dir="$RUNNER_TEMP/generation-061-live-key-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          umask 077
+          mkdir -p "$state_dir"
+          printf 'SCOPED_KEY_STATE_DIR=%s\n' "$state_dir" >> "$GITHUB_ENV"
+          printf 'SCOPED_KEY_FILE=%s/scoped-key\n' "$state_dir" >> "$GITHUB_ENV"
+          printf 'SCOPED_KEY_HASH_FILE=%s/scoped-hash\n' "$state_dir" >> "$GITHUB_ENV"
+          printf 'CERBERUS_KEY_TAG=generation-061-live-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          scripts/generation-061-cerberus-key.sh mint "$state_dir" "generation-061-live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test -s "$state_dir/scoped-key"
+          test -s "$state_dir/scoped-hash"
+
+      - name: Run exact benchmark with scoped key only
+        id: run_benchmark
+        run: |
+          set -euo pipefail
+          test -s "$SCOPED_KEY_FILE"
+          scoped_key="$(< "$SCOPED_KEY_FILE")"
+          rm -f -- "$SCOPED_KEY_FILE"
+          # env -i prevents GITHUB_TOKEN, command-file paths, provisioning
+          # authority, and unrelated runner variables from entering Cerberus.
+          # The target itself receives only the bounded provider key plus the
+          # non-secret paths needed by the trusted container wrapper.
+          env -i \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            CARGO_HOME="$CARGO_HOME" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            OPENROUTER_API_KEY="$scoped_key" \
+            GENERATION_HEAD_SHA="$GENERATION_HEAD_SHA" \
+            GENERATION_CONTAINER_IMAGE="$GENERATION_CONTAINER_IMAGE" \
+            GENERATION_CONTAINER_LABEL="$GENERATION_CONTAINER_LABEL" \
+            GENERATION_CACHE_DIR="$GENERATION_CACHE_DIR" \
+            GENERATION_TRUSTED_HELPER="$GENERATION_TRUSTED_HELPER" \
+            GENERATION_TRUSTED_VALIDATOR="$GENERATION_TRUSTED_VALIDATOR" \
+            GENERATION_CONTAINER_NAME="$GENERATION_CONTAINER_NAME" \
+            cerberus review \
+              --request target/generation-061-live/request.json \
+              --harness fixture \
+              --fixture-output target/cerberus-source/fixtures/harness/valid-review.txt \
+              --out target/generation-061-live/artifact.json \
+              --transcript target/generation-061-live/transcript.txt \
+              --receipt-bundle target/generation-061-live/cerberus-receipt.json \
+              --allow-env OPENROUTER_API_KEY \
+              --timeout-seconds 1800
+          unset scoped_key OPENROUTER_API_KEY || true
+
+      - name: Stop every disposable target container before staging
+        id: stop_target
+        if: always()
+        run: |
+          set -euo pipefail
+          docker_bin="$(command -v docker)"
+          if [[ -z "${GENERATION_CONTAINER_LABEL:-}" ]]; then
+            printf 'stopped=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t containers < <("$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}")
+          for container in "${containers[@]}"; do
+            [[ -z "$container" ]] && continue
+            "$docker_bin" container rm -f "$container"
+          done
+          if "$docker_bin" container ls -aq --filter "label=memory-engine.generation-061=${GENERATION_CONTAINER_LABEL}" | grep -q .; then
+            echo 'a target container remained alive; refusing trusted staging' >&2
+            exit 1
+          fi
+          printf 'stopped=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Revoke scoped key (always)
+        id: revoke_key
+        if: always()
+        env:
+          CERBERUS_OPENROUTER_PROVISIONING_KEY: ${{ secrets.CERBERUS_OPENROUTER_PROVISIONING_KEY }}
+        run: |
+          set -euo pipefail
+          hash_file="${SCOPED_KEY_HASH_FILE:-}"
+          cleanup_key_state() {
+            rm -f -- "${SCOPED_KEY_FILE:-}" "${SCOPED_KEY_HASH_FILE:-}"
+            if [[ -n "${SCOPED_KEY_STATE_DIR:-}" ]]; then
+              rmdir --ignore-fail-on-non-empty -- "$SCOPED_KEY_STATE_DIR" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_key_state EXIT INT TERM
+          if [[ -z "$hash_file" || ! -s "$hash_file" ]]; then
+            printf 'revoked=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "${CERBERUS_OPENROUTER_PROVISIONING_KEY:-}" ]]; then
+            echo 'the scoped key exists but provisioning authority is missing; refusing to claim cleanup' >&2
+            exit 1
+          fi
+          scripts/generation-061-cerberus-key.sh revoke "$SCOPED_KEY_STATE_DIR" "${CERBERUS_KEY_TAG:-generation-061-live}"
+          printf 'revoked=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Audit command files and runner state
+        id: audit_transport
+        if: always()
+        run: |
+          set -euo pipefail
+          cleanup_sensitive_state() {
+            rm -f -- "${SCOPED_KEY_FILE:-}" "${SCOPED_KEY_HASH_FILE:-}"
+            if [[ -n "${SCOPED_KEY_STATE_DIR:-}" ]]; then
+              rmdir --ignore-fail-on-non-empty -- "$SCOPED_KEY_STATE_DIR" 2>/dev/null || true
+            fi
+            if [[ -n "${GENERATION_CACHE_DIR:-}" && -d "$GENERATION_CACHE_DIR" ]]; then
+              find "$GENERATION_CACHE_DIR" -type f -name 'container-env.*' -delete
+            fi
+          }
+          trap cleanup_sensitive_state EXIT INT TERM
+          if ! rg_bin="$(command -v rg)"; then
+            echo 'credential scanner rg is missing; refusing to upload evidence' >&2
+            exit 1
+          fi
+          for command_file in "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"; do
+            [[ -f "$command_file" ]] || continue
+            set +e
+            "$rg_bin" -n --hidden -F \
+              -e 'CERBERUS_OPENROUTER_PROVISIONING_KEY' \
+              -e 'OPENROUTER_API_KEY=' \
+              -e 'sk-or-v1-' \
+              -- "$command_file" >/dev/null 2>&1
+            status=$?
+            set -e
+            case "$status" in
+              0) echo "credential-shaped bytes found in $command_file" >&2; exit 1 ;;
+              1) ;;
+              *) echo "credential scanner failed on $command_file (rg exit $status)" >&2; exit 1 ;;
+            esac
+          done
+          if [[ -n "${SCOPED_KEY_FILE:-}" && -e "$SCOPED_KEY_FILE" ]]; then
+            echo 'scoped key state remained after target cleanup' >&2
+            exit 1
+          fi
+          if [[ -n "${SCOPED_KEY_HASH_FILE:-}" && -e "$SCOPED_KEY_HASH_FILE" ]]; then
+            echo 'scoped key hash state remained after revocation' >&2
+            exit 1
+          fi
+          if [[ -n "${GENERATION_CACHE_DIR:-}" ]] && find "$GENERATION_CACHE_DIR" -type f -name 'container-env.*' -print -quit | grep -q .; then
+            echo 'container environment file remained after target cleanup' >&2
+            exit 1
+          fi
+          printf 'clean=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Publish a dated redacted eval receipt
+        id: publish_receipt
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          date_utc="$(date -u +%F)"
+          receipt="docs/evals/generation-061-live-comparison-${date_utc}.md"
+          raw_receipt="$RUNNER_TEMP/generation-061-live-receipt.md"
+          awk '
+            /^--- GENERATION_061_RECEIPT_BEGIN ---$/ { found=1; next }
+            /^--- GENERATION_061_RECEIPT_END ---$/ { found=0; exit }
+            found { print }
+          ' target/generation-061-live/transcript.txt > "$raw_receipt"
+          scripts/generation-061-validate-receipt.sh "$raw_receipt"
+          scan_no_credentials() {
+            set +e
+            rg -n --hidden -F \
+              -e 'CERBERUS_OPENROUTER_PROVISIONING_KEY' \
+              -e 'OPENROUTER_API_KEY=' \
+              -e 'sk-or-v1-' \
+              -- "$@" >/dev/null 2>&1
+            status=$?
+            set -e
+            case "$status" in
+              0) echo 'credential-shaped bytes found in receipt/transcript' >&2; return 1 ;;
+              1) return 0 ;;
+              *) echo "credential scanner failed (rg exit $status)" >&2; return 1 ;;
+            esac
+          }
+          command -v rg >/dev/null 2>&1 || { echo 'credential scanner rg is missing' >&2; exit 1; }
+          scan_no_credentials "$raw_receipt" target/generation-061-live/transcript.txt
+          {
+            printf '# Generation 061 trusted live comparison receipt — %s\n\n' "$date_utc"
+            printf 'Immutable evaluated head: `%s`\n\n' "$HEAD_SHA"
+            printf 'Provider: OpenRouter through a Cerberus-scoped key; maximum spend cap: USD 2. The provisioning key was not passed to the benchmark subprocess.\n\n'
+            cat "$raw_receipt"
+          } > "$receipt"
+          rm -f -- "$raw_receipt"
+          test -s "$receipt"
+          printf 'receipt_path=%s\n' "$receipt" >> "$GITHUB_OUTPUT"
+
+      - name: Stage only scanned live evidence
+        id: sanitize_evidence
+        if: always() && steps.run_benchmark.outcome == 'success' && steps.publish_receipt.outcome == 'success' && steps.stop_target.outputs.stopped == 'true' && steps.revoke_key.outputs.revoked == 'true' && steps.audit_transport.outputs.clean == 'true'
+        env:
+          RECEIPT_PATH: ${{ steps.publish_receipt.outputs.receipt_path }}
+        run: |
+          set -euo pipefail
+          candidates="target/generation-061-live-candidates"
+          rm -rf -- "$candidates"
+          mkdir -p "$candidates"
+          for path in \
+            target/generation-061-live/artifact.json \
+            target/generation-061-live/cerberus-receipt.json \
+            target/generation-061-live/transcript.txt; do
+            [[ -f "$path" ]] && cp -- "$path" "$candidates/$(basename "$path")"
+          done
+          test -n "$RECEIPT_PATH"
+          test -f "$RECEIPT_PATH"
+          cp -- "$RECEIPT_PATH" "$candidates/$(basename "$RECEIPT_PATH")"
+          scripts/generation-061-scan-safe.sh "$candidates" target/generation-061-live-safe
+          printf 'safe=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Recheck safe package immediately before upload
+        id: package
+        if: always() && steps.sanitize_evidence.outputs.safe == 'true'
+        run: |
+          set -euo pipefail
+          safe_dir="target/generation-061-live-safe"
+          (cd "$safe_dir" && sha256sum -c SHA256SUMS)
+          if ! rg_bin="$(command -v rg)"; then
+            echo 'credential scanner rg is missing; refusing upload' >&2
+            exit 1
+          fi
+          for path in "$safe_dir"/*; do
+            [[ "$(basename "$path")" == SHA256SUMS ]] && continue
+            set +e
+            "$rg_bin" -n --hidden -F \
+              -e 'CERBERUS_OPENROUTER_PROVISIONING_KEY' \
+              -e 'OPENROUTER_API_KEY=' \
+              -e 'sk-or-v1-' \
+              -- "$path" >/dev/null 2>&1
+            status=$?
+            set -e
+            case "$status" in
+              0) echo 'safe package changed to contain credential-shaped bytes' >&2; exit 1 ;;
+              1) ;;
+              *) echo "credential scanner failed before upload (rg exit $status)" >&2; exit 1 ;;
+            esac
+          done
+          printf 'verified=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Upload dated live evidence
+        if: always() && steps.package.outputs.verified == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: generation-061-live-${{ inputs.head_sha }}
+          path: |
+            target/generation-061-live-safe/**
+          if-no-files-found: error
+          retention-days: 14
