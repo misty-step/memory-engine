@@ -231,7 +231,8 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
     let approved = study
         .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
         .expect("approve");
-    assert_eq!(approved.concept_progress, Vec::new());
+    assert_eq!(approved.concept_progress.len(), 1);
+    assert_eq!(approved.concept_progress[0].health, "untried");
 
     let reviewed = study.submit_answer("BRAVO", 1_800).expect("submit");
     let current = reviewed.current.expect("current");
@@ -486,6 +487,32 @@ fn concept_progress_lists_weakest_concepts_first() {
     assert_eq!(concepts[0].success_rate, "0 of 1 correct (0.0%)");
     assert_eq!(concepts[1].health, "solid");
     assert_eq!(concepts[1].success_rate, "1 of 1 correct (100.0%)");
+}
+
+#[test]
+fn concept_progress_includes_active_approved_untried_concepts_and_excludes_archived_sources() {
+    let directory = TempDirectory::new("untried-concept-progress");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(shared_concept_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-shared-1-nato-letter-a")
+        .expect("approve first");
+    let reviewed = study
+        .approve_draft("study-run-1-draft-src-shared-2-nato-letter-a")
+        .expect("approve second");
+
+    assert_eq!(reviewed.concept_progress.len(), 1);
+    assert_eq!(reviewed.concept_progress[0].concept_key, "nato-letter-a");
+    assert_eq!(reviewed.concept_progress[0].health, "untried");
+    assert_eq!(reviewed.concept_progress[0].attempts, 0);
+    assert_eq!(reviewed.concept_progress[0].correct, 0);
+
+    let (archived, archived_count) = study.archive_source("src-shared").expect("archive");
+    assert_eq!(archived_count, 2);
+    assert!(archived.concept_progress.is_empty());
 }
 
 #[test]

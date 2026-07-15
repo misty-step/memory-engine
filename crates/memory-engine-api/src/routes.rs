@@ -22,9 +22,10 @@ mod icons;
 use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
-    render_account_page, render_action_result_html, render_app_shell, render_auth_recovery,
-    render_edit_review_html, render_login_requested, render_return_notification_confirmation,
-    render_return_notification_disabled, LEDGER_CSS,
+    render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
+    render_auth_recovery, render_edit_review_html, render_login_requested,
+    render_return_notification_confirmation, render_return_notification_disabled,
+    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -104,6 +105,34 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Submit,
     V1Route::ContentFeedback,
 ];
+
+#[derive(Debug, Default, Deserialize)]
+struct AnalyticsQuery {
+    filter: Option<String>,
+    sort: Option<String>,
+    page: Option<usize>,
+}
+
+impl AnalyticsQuery {
+    fn options(self) -> AnalyticsViewOptions {
+        AnalyticsViewOptions {
+            filter: match self.filter.as_deref() {
+                Some("at-risk") => AnalyticsConceptFilter::AtRisk,
+                Some("struggling") => AnalyticsConceptFilter::Struggling,
+                Some("mixed") => AnalyticsConceptFilter::Mixed,
+                Some("solid") => AnalyticsConceptFilter::Solid,
+                Some("untried") => AnalyticsConceptFilter::Untried,
+                _ => AnalyticsConceptFilter::All,
+            },
+            sort: match self.sort.as_deref() {
+                Some("name") => AnalyticsConceptSort::Name,
+                Some("success") => AnalyticsConceptSort::Success,
+                _ => AnalyticsConceptSort::Health,
+            },
+            page: self.page.unwrap_or(1),
+        }
+    }
+}
 
 impl V1Route {
     fn mount(self, router: Router<ApiState>) -> Router<ApiState> {
@@ -250,6 +279,7 @@ pub fn router(state: ApiState) -> Router {
 
     mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
+        .route("/app/analytics", get(app_analytics))
         .route("/app/account", post(create_app_account))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
@@ -412,6 +442,25 @@ async fn app_home(State(state): State<ApiState>, headers: HeaderMap) -> Html<Str
     // signed-out cover. Read-only session check — a GET carries no CSRF token.
     match state.require_browser_session_readonly(&headers) {
         Ok(account) => Html(render_account_page(&state, &account, None, None)),
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
+}
+
+async fn app_analytics(
+    State(state): State<ApiState>,
+    Query(query): Query<AnalyticsQuery>,
+    headers: HeaderMap,
+) -> Html<String> {
+    match state.require_browser_session_readonly(&headers) {
+        Ok(account) => match state.app_study_view(&account) {
+            Ok(view) => Html(render_analytics_page(&account, &view, query.options())),
+            Err(error) => Html(render_account_page(
+                &state,
+                &account,
+                None,
+                Some(&error.message),
+            )),
+        },
         Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
     }
 }
