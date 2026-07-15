@@ -585,7 +585,18 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
         return String::new();
     }
     let reps = current.review_state.as_ref().map_or(0, |state| state.reps);
-    let feedback_id = format!("feedback-{}-{reps}", current.review_unit_id);
+    let head_id = current.content_feedback_head_id.as_deref().unwrap_or("new");
+    let feedback_id = format!("feedback-{}-{reps}-{head_id}", current.review_unit_id);
+    let supersedes = current
+        .content_feedback_head_id
+        .as_ref()
+        .map(|head_id| {
+            format!(
+                r#"<input type="hidden" name="supersedesId" value="{}">"#,
+                escape_html(head_id)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<section class="me-content-feedback" aria-labelledby="me-content-feedback-title">
 <h2 class="ae-h" id="me-content-feedback-title">This item:</h2>
@@ -593,6 +604,7 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
 <form action="/app/content-feedback" method="post">
 {csrf}<input type="hidden" name="reviewUnitId" value="{review_unit_id}">
 <input type="hidden" name="idempotencyKey" value="{feedback_id}">
+{supersedes}
 <div class="me-feedback-actions">
 <button class="ae-button ae-button-quiet" type="submit" name="verdict" value="kept" aria-label="Keep this card">👍 Keep</button>
 <button class="ae-button ae-button-quiet" type="submit" name="verdict" value="dropped" aria-label="Drop this card">👎 Drop</button>
@@ -604,6 +616,7 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
         csrf = hidden_csrf_input(account),
         review_unit_id = escape_html(&current.review_unit_id.to_string()),
         feedback_id = escape_html(&feedback_id),
+        supersedes = supersedes,
     )
 }
 

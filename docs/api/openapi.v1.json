@@ -855,7 +855,8 @@
           "grade",
           "reviewState",
           "scheduleChange",
-          "feedback"
+          "feedback",
+          "contentFeedbackHeadId"
         ],
         "properties": {
           "reviewUnitId": {
@@ -946,6 +947,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/StudyFeedback"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contentFeedbackHeadId": {
+            "anyOf": [
+              {
+                "type": "string"
               },
               {
                 "type": "null"

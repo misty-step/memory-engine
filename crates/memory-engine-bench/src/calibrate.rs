@@ -27,8 +27,10 @@ struct Label {
     #[serde(default)]
     #[allow(dead_code)]
     question: String,
+    #[serde(alias = "judgeKeep")]
     judge_keep: bool,
     /// `null`/absent until a human has labeled this draft; such rows are skipped.
+    #[serde(alias = "humanKeep")]
     human_keep: Option<bool>,
 }
 
@@ -243,6 +245,56 @@ mod tests {
         assert!(
             result.is_ok(),
             "calibrate must consume feedback export: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_accepts_bytes_serialized_from_content_feedback_export() {
+        let export: memory_engine_persistence::ContentFeedbackExport =
+            serde_json::from_value(serde_json::json!({
+                "feedbackId": "f-keep",
+                "reviewUnitId": "unit-keep",
+                "judgeKeep": true,
+                "humanKeep": true,
+                "question": "Keep?",
+                "rationale": null,
+                "gen_ai.system": "test",
+                "gen_ai.request.model": "test-model",
+                "gen_ai.prompt.version": "v1",
+                "gen_ai.evaluation.score.value": 1.0,
+                "gen_ai.evaluation.explanation": null
+            }))
+            .expect("construct actual export shape");
+        let path = std::env::temp_dir().join(format!(
+            "me-content-feedback-real-export-{}.json",
+            std::process::id()
+        ));
+        let bytes = serde_json::to_vec(&vec![export]).expect("serialize actual export");
+        let serialized = String::from_utf8(bytes.clone()).expect("export is UTF-8 JSON");
+        assert!(serialized.contains("\"feedback_id\""), "{serialized}");
+        assert!(serialized.contains("\"judge_keep\""), "{serialized}");
+        std::fs::write(&path, bytes).expect("write actual export");
+        let result = run(&["--labels".to_owned(), path.display().to_string()]);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "calibrate must consume bytes from ContentFeedbackExport: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_accepts_legacy_camel_case_feedback_labels() {
+        let path = std::env::temp_dir().join(format!(
+            "me-content-feedback-legacy-export-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"[{"judgeKeep":true,"humanKeep":true}]"#)
+            .expect("write legacy export");
+        let result = run(&["--labels".to_owned(), path.display().to_string()]);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_ok(),
+            "legacy export must remain readable: {result:?}"
         );
     }
 }

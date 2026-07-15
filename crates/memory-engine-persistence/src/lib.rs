@@ -254,11 +254,15 @@ pub struct AppliedReviewReceipt {
 /// append-only [`ContentFeedback`] row stores only the review-unit join key;
 /// provenance is resolved through draft and run records at export time.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ContentFeedbackExport {
+    #[serde(alias = "feedbackId")]
     pub feedback_id: String,
+    #[serde(alias = "reviewUnitId")]
     pub review_unit_id: ReviewUnitId,
+    #[serde(alias = "judgeKeep")]
     pub judge_keep: bool,
+    #[serde(alias = "humanKeep")]
     pub human_keep: bool,
     pub question: String,
     pub rationale: Option<String>,
@@ -579,6 +583,36 @@ impl BetaPersistenceStore {
     #[must_use]
     pub fn snapshot(&self) -> BetaStoreSnapshot {
         load_snapshot(&self.path).unwrap_or_else(|_| self.data.clone())
+    }
+
+    /// Copy this account's durable snapshot for a new account scope.
+    ///
+    /// Content feedback carries its account scope because it is also exported
+    /// independently of the account snapshot. Rewrite that field while
+    /// preserving every other persisted record and use the same atomic file
+    /// ownership boundary as ordinary store writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] when the source cannot be read or the target
+    /// cannot be locked and written.
+    pub fn copy_for_account(
+        &self,
+        target_path: impl Into<PathBuf>,
+        target_account_id: &str,
+    ) -> Result<(), BetaStoreError> {
+        assert_non_blank(target_account_id, "Target account id")?;
+        let mut snapshot = self.snapshot();
+        for feedback in &mut snapshot.content_feedback {
+            target_account_id.clone_into(&mut feedback.account_id);
+        }
+
+        let target_path = target_path.into();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _lock = StoreFileLock::acquire(&target_path)?;
+        persist_snapshot(&target_path, &snapshot)
     }
 
     pub fn fail_next_commit_for_test(&mut self) {
@@ -1004,6 +1038,9 @@ impl BetaPersistenceStore {
             return Err(BetaStoreError::InjectedCommitFailure);
         }
 
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let _lock = StoreFileLock::acquire(&self.path)?;
         let latest = load_snapshot(&self.path)?;
         let next = merge_snapshot(&self.data, next, latest);
@@ -1059,8 +1096,6 @@ impl MemoryServiceStore for BetaPersistenceStore {
         schedule_state: ScheduleState,
         expected_prior_schedule_state: Option<ScheduleState>,
     ) -> Result<(), Self::Error> {
-        assert_known_review_unit(&self.data, review_unit_id)?;
-        assert_attempt_contract(&self.data, &attempt)?;
         if review_unit_id != &attempt.review_unit_id {
             return Err(BetaStoreError::ReviewUnitMismatch);
         }
@@ -1069,31 +1104,33 @@ impl MemoryServiceStore for BetaPersistenceStore {
         }
 
         let key = applied_review_key(&attempt);
-        if self
-            .data
-            .applied_reviews
-            .iter()
-            .any(|receipt| receipt.key == key)
-        {
-            return Err(BetaStoreError::DuplicateAppliedReview(key));
-        }
+        self.transact(|snapshot| {
+            assert_known_review_unit(snapshot, review_unit_id)?;
+            assert_attempt_contract(snapshot, &attempt)?;
+            if snapshot
+                .applied_reviews
+                .iter()
+                .any(|receipt| receipt.key == key)
+            {
+                return Err(BetaStoreError::DuplicateAppliedReview(key));
+            }
 
-        let current_schedule =
-            find_schedule(&self.data, review_unit_id).map(|record| record.state.clone());
-        if current_schedule != expected_prior_schedule_state {
-            return Err(BetaStoreError::StaleScheduleWrite(review_unit_id.clone()));
-        }
+            let current_schedule =
+                find_schedule(snapshot, review_unit_id).map(|record| record.state.clone());
+            if current_schedule != expected_prior_schedule_state {
+                return Err(BetaStoreError::StaleScheduleWrite(review_unit_id.clone()));
+            }
 
-        let mut next = self.data.clone();
-        next.attempts.push(attempt.clone());
-        apply_schedule_record(&mut next, review_unit_id, Some(schedule_state.clone()));
-        next.applied_reviews.push(AppliedReviewReceipt {
-            key,
-            attempt,
-            expected_prior_schedule_state,
-            schedule_state,
-        });
-        self.commit(&next)
+            snapshot.attempts.push(attempt.clone());
+            apply_schedule_record(snapshot, review_unit_id, Some(schedule_state.clone()));
+            snapshot.applied_reviews.push(AppliedReviewReceipt {
+                key,
+                attempt,
+                expected_prior_schedule_state,
+                schedule_state,
+            });
+            Ok(())
+        })
     }
 
     fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
@@ -1315,27 +1352,27 @@ fn persist_snapshot(path: &Path, snapshot: &BetaStoreSnapshot) -> Result<(), Bet
 }
 
 struct StoreFileLock {
-    path: PathBuf,
+    file: fs::File,
 }
 
 impl StoreFileLock {
     fn acquire(store_path: &Path) -> Result<Self, BetaStoreError> {
         let path = store_path.with_extension("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         for _ in 0..5_000 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > std::time::Duration::from_secs(60))
-                    {
-                        let _ = fs::remove_file(&path);
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                Err(error) => return Err(BetaStoreError::Io(error)),
+                Err(fs::TryLockError::Error(error))
+                    if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(fs::TryLockError::Error(error)) => return Err(BetaStoreError::Io(error)),
             }
         }
         Err(BetaStoreError::Io(io::Error::new(
@@ -1347,7 +1384,7 @@ impl StoreFileLock {
 
 impl Drop for StoreFileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 

@@ -3,7 +3,6 @@ use std::{
     path::Path as FsPath,
     sync::{Arc, Barrier},
     thread,
-    time::Instant,
 };
 
 use std::os::unix::fs::PermissionsExt;
@@ -826,6 +825,101 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
         .await
         .expect("replay content feedback");
     assert_eq!(replay.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempotency_key() {
+    CONTENT_FEEDBACK_REVISION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let registry = AccountRegistry::default().with_clock(content_feedback_revision_clock);
+    let state = ApiState::new(registry);
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let first_prompt =
+        advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
+    let first_review_key = html_value(&first_prompt, "idempotencyKey");
+    let first_graded = submit_review_ok(
+        &app,
+        &cookie,
+        &csrf_token,
+        &first_review_unit_id,
+        "not the answer",
+        &first_review_key,
+    )
+    .await;
+    let first_feedback_key = content_feedback_value(&first_graded, "idempotencyKey");
+
+    submit_content_feedback_ok(
+        &app,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &first_review_unit_id),
+            ("verdict", "dropped"),
+            ("rationale", "The card is misleading on the first pass."),
+            ("idempotencyKey", &first_feedback_key),
+        ],
+    )
+    .await;
+
+    CONTENT_FEEDBACK_REVISION_CLOCK.fetch_add(86_400_000, Ordering::SeqCst);
+
+    let second_prompt =
+        advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
+    let second_review_unit_id = html_value(&second_prompt, "reviewUnitId");
+    let second_review_key = html_value(&second_prompt, "idempotencyKey");
+    assert_eq!(second_review_unit_id, first_review_unit_id);
+
+    let second_graded = submit_review_ok(
+        &app,
+        &cookie,
+        &csrf_token,
+        &second_review_unit_id,
+        "CHARLIE ALFA TANGO",
+        &second_review_key,
+    )
+    .await;
+    let second_feedback_key = content_feedback_value(&second_graded, "idempotencyKey");
+    let second_head = content_feedback_value(&second_graded, "supersedesId");
+    assert_ne!(
+        first_feedback_key, second_feedback_key,
+        "a revised feedback render must not reuse the first idempotency key"
+    );
+
+    let conflicting_replay = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &second_review_unit_id),
+                ("verdict", "kept"),
+                ("rationale", "The card is useful after all."),
+                ("idempotencyKey", &first_feedback_key),
+            ],
+        ))
+        .await
+        .expect("changed replay with old key");
+    assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
+
+    let revised_page = submit_content_feedback_ok(
+        &app,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &second_review_unit_id),
+            ("verdict", "kept"),
+            ("rationale", "The card is useful after all."),
+            ("idempotencyKey", &second_feedback_key),
+            ("supersedesId", &second_head),
+        ],
+    )
+    .await;
+    assert!(revised_page.contains("Saved. This card will help improve future generation."));
 }
 
 #[tokio::test]
@@ -3712,6 +3806,9 @@ async fn file_save_account_preserves_content_feedback_for_copy_parity() {
     let target = state
         .save_account(&browser, "file-copy-target@example.com")
         .expect("copy account");
+    let target_browser = state
+        .create_browser_session(&target)
+        .expect("target browser session");
     let target_store = memory_engine_persistence::BetaPersistenceStore::open(
         store_root.join(&target.account_id).join("study.json"),
     )
@@ -3721,6 +3818,28 @@ async fn file_save_account_preserves_content_feedback_for_copy_parity() {
         target_store.snapshot().content_feedback[0].id,
         "file-copy-feedback-a"
     );
+    assert_eq!(
+        target_store.snapshot().content_feedback[0].account_id,
+        target.account_id
+    );
+
+    let child = app
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/content-feedback",
+                target.account_id
+            ),
+            target_browser.session_token(),
+            &json!({
+                "verdict": "kept",
+                "idempotencyKey": "file-copy-feedback-child",
+                "supersedesId": "file-copy-feedback-a"
+            }),
+        ))
+        .await
+        .expect("target child feedback");
+    assert_eq!(child.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3736,16 +3855,10 @@ async fn postgres_review_actions_emit_latency_receipt() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
-    let next_started = Instant::now();
     let page = next_review_html(&app, &cookie, &csrf_token, "latency next").await;
-    println!(
-        "latency /app/next = {:.3}s",
-        next_started.elapsed().as_secs_f64()
-    );
 
     let review_unit_id = html_value(&page, "reviewUnitId");
     let idempotency_key = html_value(&page, "idempotencyKey");
-    let submit_started = Instant::now();
     let submitted = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -3767,10 +3880,6 @@ async fn postgres_review_actions_emit_latency_receipt() {
     assert!(
         submitted.contains("me-verdict"),
         "latency receipt submit must render graded feedback: {submitted}"
-    );
-    println!(
-        "latency /app/submit = {:.3}s",
-        submit_started.elapsed().as_secs_f64()
     );
 }
 
@@ -4530,7 +4639,11 @@ async fn v1_openapi_artifact_matches_registered_routes() {
         .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(actual, expected);
-    assert_schema_requires(&contract, "StudyCurrent", &["choices"]);
+    assert_schema_requires(
+        &contract,
+        "StudyCurrent",
+        &["choices", "contentFeedbackHeadId"],
+    );
     assert_schema_requires(
         &contract,
         "StudyItemHistory",
@@ -5228,6 +5341,70 @@ fn html_value(html: &str, name: &str) -> String {
     html[start..end].to_owned()
 }
 
+fn content_feedback_value(html: &str, name: &str) -> String {
+    let section_start = html
+        .find(r#"<section class="me-content-feedback""#)
+        .expect("content feedback section");
+    let section = &html[section_start..];
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = section
+        .find(&marker)
+        .expect("content feedback field marker")
+        + marker.len();
+    let end = section[start..]
+        .find('"')
+        .expect("content feedback field end")
+        + start;
+    section[start..end].to_owned()
+}
+
+async fn submit_review_ok(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+    answer: &str,
+    idempotency_key: &str,
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            cookie,
+            &[
+                ("csrfToken", csrf_token),
+                ("reviewUnitId", review_unit_id),
+                ("answer", answer),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", idempotency_key),
+            ],
+        ))
+        .await
+        .expect("review submit");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+async fn submit_content_feedback_ok(
+    app: &axum::Router,
+    cookie: &str,
+    fields: &[(&str, &str)],
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            cookie,
+            fields,
+        ))
+        .await
+        .expect("content feedback submit");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
 /// The async-model successor to `assert_keep_flow_html`: after a job drains,
 /// the workspace shows a finished activity-log row (a succeeded job with a
 /// card count, already scheduled for review) rather than a manual keep gate.
@@ -5872,6 +6049,12 @@ static RESUBMIT_CLOCK: AtomicI64 = AtomicI64::new(0);
 
 fn resubmit_clock() -> i64 {
     RESUBMIT_CLOCK.load(Ordering::SeqCst)
+}
+
+static CONTENT_FEEDBACK_REVISION_CLOCK: AtomicI64 = AtomicI64::new(0);
+
+fn content_feedback_revision_clock() -> i64 {
+    CONTENT_FEEDBACK_REVISION_CLOCK.load(Ordering::SeqCst)
 }
 
 #[tokio::test]

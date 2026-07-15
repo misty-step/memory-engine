@@ -168,6 +168,7 @@ pub struct BetaStudyCurrent {
     pub review_state: Option<ReviewStateProjection>,
     pub schedule_change: Option<ScheduleChange>,
     pub feedback: Option<BetaStudyFeedback>,
+    pub content_feedback_head_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1555,6 +1556,7 @@ fn current_view(parts: CurrentViewParts<'_>) -> BetaStudyCurrent {
         review_state: project_schedule(schedule),
         schedule_change,
         feedback,
+        content_feedback_head_id: current_feedback_head_id(snapshot, &draft.review_unit_id),
     }
 }
 
@@ -1579,6 +1581,24 @@ fn feedback_for_current(
         item_history,
         concept_progress,
     }
+}
+
+fn current_feedback_head_id(
+    snapshot: &BetaStoreSnapshot,
+    review_unit_id: &ReviewUnitId,
+) -> Option<String> {
+    snapshot
+        .content_feedback
+        .iter()
+        .filter(|feedback| feedback.review_unit_id == *review_unit_id)
+        .filter(|feedback| {
+            !snapshot.content_feedback.iter().any(|other| {
+                other.review_unit_id == *review_unit_id
+                    && other.supersedes_id.as_deref() == Some(feedback.id.as_str())
+            })
+        })
+        .max_by_key(|feedback| (feedback.occurred_at, feedback.id.as_str()))
+        .map(|feedback| feedback.id.clone())
 }
 
 fn item_history(
