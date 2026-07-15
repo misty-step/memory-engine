@@ -150,13 +150,19 @@ supporting target behavior; the provider attestation is the acceptance oracle.
 
 ## Dispatch
 
-From a checked-out repository, after the final card061 commit is present on
-`master`:
+From a checked-out repository, after the final card061 pull request is
+squash-merged so its merge commit is the current `master` tip:
 
 ```sh
-gh workflow run generation-061-live.yml --ref master -f head_sha="$(git rev-parse refs/remotes/origin/master)"
+gh workflow run generation-061-live.yml --ref master \
+  -f head_sha="$(git rev-parse refs/remotes/origin/master)" \
+  -f pull_request_number=<merged card061 PR number>
 gh run watch
 ```
+
+The pull request number is required: the workflow refuses to run unless that
+PR is merged, its squash commit is exactly `head_sha`, and the reviewed PR
+head tree equals the `head_sha` tree.
 
 The live receipt is the required proof for memory-engine-061. Card 098 does not
 claim a live receipt while this workflow is still draft; successful live
@@ -181,11 +187,22 @@ the enforceable protected-master trust model is therefore explicit:
   enforcement, and no force pushes or deletions. Every change to a trusted
   file passes those gates and the QA regression suite that pins this lane's
   security contract before it can become the trusted revision.
-- The workflow does not assume protection was applied: before any provider
-  authority exists it requires at least one successful `ci` and one
-  successful `review` check run recorded on the exact evaluated SHA, and it
-  prints the SHA-256 digest of every trusted file into the run log so the
-  trusted-file set of any run is auditable after the fact.
+- The workflow does not assume protection was applied, and it does not
+  accept a bare check run on the master commit as review proof: a squash
+  merge mints a fresh master SHA while Cerberus `review` runs on the
+  reviewed PR head, and a `workflow_dispatch` of the review workflow against
+  master could plant a green `review` on master while reviewing an unrelated
+  diff. Before any provider authority exists, the workflow instead binds the
+  evaluated commit to the exact merged pull request named in the dispatch:
+  the PR must be merged into `master` of this repository, its
+  `merge_commit_sha` must equal the evaluated SHA, the reviewed PR head tree
+  must equal the evaluated commit's tree (protected master requires
+  up-to-date branches and linear history, so a faithful squash preserves the
+  tree), a successful Cerberus `review` check run must exist on that exact
+  PR head SHA, and a successful `ci` check run must exist on the evaluated
+  master SHA itself. It then prints the SHA-256 digest of every trusted file
+  into the run log so the trusted-file set of any run is auditable after the
+  fact.
 - The residual trust statement is deliberate: an attacker who can land a
   malicious commit on protected `master` — passing hosted CI, Cerberus
   review, and the QA contract tests — already owns the repository's release

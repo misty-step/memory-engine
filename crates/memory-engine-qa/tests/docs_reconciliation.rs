@@ -436,19 +436,50 @@ fn trusted_live_lane_verifies_protected_master_gates_before_any_secret() {
         .nth(1)
         .and_then(|rest| rest.split("\n      - name:").next())
         .expect("gate verification step body");
+    // A squash merge mints a fresh master SHA while Cerberus review check
+    // runs land on the reviewed PR head, and a workflow_dispatch of the
+    // review workflow against master could plant a green `review` on master
+    // while reviewing an unrelated diff. The trust anchor must therefore
+    // bind the evaluated master commit to the exact merged pull request:
+    // merged, merge_commit_sha equality, reviewed-head tree equality, a
+    // successful review check on that exact PR head, and a successful ci
+    // check on the master commit itself.
     assert_contains_all(
         "protected-master gate verification",
         section,
         &[
-            "for gate in ci review; do",
-            "check-runs?check_name=",
+            "[[ \"$PR_NUMBER\" =~ ^[0-9]+$ ]]",
+            "test \"$merged\" = true",
+            "test \"$base_repo\" = \"$GITHUB_REPOSITORY\"",
+            "test \"$base_ref\" = master",
+            "test \"$merge_commit_sha\" = \"$HEAD_SHA\"",
+            "[[ \"$pr_head_sha\" =~ ^[0-9a-f]{40}$ ]]",
+            "test \"$head_tree\" = \"$master_tree\"",
+            "commits/${pr_head_sha}/check-runs?check_name=review",
+            "commits/${HEAD_SHA}/check-runs?check_name=ci",
             "refusing to expose provider authority",
             "sha256sum",
         ],
     );
     assert!(
-        workflow.contains("permissions:\n  contents: read\n  checks: read\n\nconcurrency:"),
-        "the workflow may hold only read authority: repository contents and check runs"
+        !section.contains("commits/${HEAD_SHA}/check-runs?check_name=review")
+            && !section.contains("for gate in ci review"),
+        "a review check run on the master commit is forgeable via workflow_dispatch; the review gate must be checked on the merged PR head SHA"
+    );
+    assert!(
+        workflow.contains("pull_request_number:")
+            && workflow
+                .split("pull_request_number:")
+                .nth(1)
+                .and_then(|rest| rest.split("type:").next())
+                .is_some_and(|input| input.contains("required: true")),
+        "the dispatch must require the merged pull request number that produced the evaluated commit"
+    );
+    assert!(
+        workflow.contains(
+            "permissions:\n  contents: read\n  checks: read\n  pull-requests: read\n\nconcurrency:"
+        ),
+        "the workflow may hold only read authority: repository contents, check runs, and pull requests"
     );
 }
 
@@ -550,8 +581,7 @@ fn trusted_staging_is_descriptor_based_exclusive_and_mode_preserving() {
     let honest = root.join("honest.md");
     fs::write(&honest, "honest evidence\n").expect("write honest evidence");
     fs::create_dir_all(&planted).expect("create planted destination");
-    symlink(root.join("outside.md"), planted.join("honest.md"))
-        .expect("plant destination symlink");
+    symlink(root.join("outside.md"), planted.join("honest.md")).expect("plant destination symlink");
     let symlinked = std::process::Command::new("bash")
         .arg(&staging)
         .arg(&planted)
@@ -615,10 +645,7 @@ fn trusted_staging_and_scanning_are_descriptor_based_and_scan_the_safe_copy() {
 #[test]
 fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
     let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
-    let key_helper = read_repo_file("scripts/generation-061-cerberus-key.sh");
     let comparison = read_repo_file("scripts/generation-061-live-comparison.sh");
-    let scanner = read_repo_file("scripts/generation-061-scan-safe.sh");
-    let validator = read_repo_file("scripts/generation-061-validate-receipt.sh");
 
     let target = workflow
         .split("- name: Run exact benchmark with scoped key only")
@@ -687,6 +714,14 @@ fn trusted_live_lane_isolates_target_lifecycle_and_audits_transport() {
         workflow.contains("GITHUB_ENV") && workflow.contains("GITHUB_OUTPUT"),
         "command files must be explicitly audited"
     );
+}
+
+#[test]
+fn trusted_live_helpers_enforce_key_lifecycle_redaction_and_validation() {
+    let key_helper = read_repo_file("scripts/generation-061-cerberus-key.sh");
+    let comparison = read_repo_file("scripts/generation-061-live-comparison.sh");
+    let scanner = read_repo_file("scripts/generation-061-scan-safe.sh");
+    let validator = read_repo_file("scripts/generation-061-validate-receipt.sh");
     assert!(
         key_helper.contains("b10bffb6ddb14ec553fbcf4f5e687aee13424717")
             && key_helper.contains("mint_review_key")
@@ -763,7 +798,9 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
     let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
     let comparison = read_repo_file("scripts/generation-061-live-comparison.sh");
     assert!(
-        workflow.contains("permissions:\n  contents: read\n  checks: read\n\nconcurrency:"),
+        workflow.contains(
+            "permissions:\n  contents: read\n  checks: read\n  pull-requests: read\n\nconcurrency:"
+        ),
         "the workflow must have the exact top-level read-only permissions block"
     );
     assert!(
@@ -1511,11 +1548,7 @@ fn real_trusted_proxy_source_declares_redirect_schema_and_budget_guards() {
 fn run_honest_wrapper(
     label: &str,
     before_run: impl FnOnce(&std::path::Path),
-) -> (
-    std::process::Output,
-    std::path::PathBuf,
-    std::path::PathBuf,
-) {
+) -> (std::process::Output, std::path::PathBuf, std::path::PathBuf) {
     let (root, scripts, fake_bin, original_cache, _target_receipt, _stale) =
         prepare_stale_receipt_fixture();
     let cache = std::path::PathBuf::from(format!("/tmp/me098-{label}-{}", std::process::id()));
@@ -1618,8 +1651,11 @@ fn trusted_live_honest_path_prebuilds_before_network_disabled_execution() {
 #[test]
 fn trusted_live_wrapper_rejects_prepared_directory_with_extra_entries() {
     let (result, cache, root) = run_honest_wrapper("prepared-extra", |cache| {
-        fs::write(cache.join("fixture-extra-entry"), "plant an extra artifact\n")
-            .expect("request an extra prepared entry");
+        fs::write(
+            cache.join("fixture-extra-entry"),
+            "plant an extra artifact\n",
+        )
+        .expect("request an extra prepared entry");
     });
     assert!(
         !result.status.success(),

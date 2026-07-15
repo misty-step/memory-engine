@@ -7,6 +7,10 @@ on:
         description: Full commit SHA of the final card061 commit on origin/master
         required: true
         type: string
+      pull_request_number:
+        description: Number of the merged pull request whose squash produced head_sha
+        required: true
+        type: string
 
 # This workflow is deliberately manual and trusted-branch-only. Never add a
 # pull_request or pull_request_target trigger: the provisioning secret must not
@@ -14,6 +18,7 @@ on:
 permissions:
   contents: read
   checks: read
+  pull-requests: read
 
 concurrency:
   group: generation-061-live
@@ -59,22 +64,54 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
         run: |
           set -euo pipefail
           # Trust anchor enforcement: the trusted helpers, proxy, and
           # validators execute from this exact origin/master commit. "It is
           # on master" is not assumed to imply the protected-branch gates
-          # ran — require a successful `ci` and Cerberus `review` check run
-          # on this exact SHA before any provider authority exists.
-          for gate in ci review; do
-            successful="$(gh api \
-              "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?check_name=${gate}&per_page=100" \
-              --jq '[.check_runs[] | select(.conclusion == "success")] | length')"
-            if [[ "$successful" -lt 1 ]]; then
-              echo "required protected-branch gate ${gate} has no successful check run on ${HEAD_SHA}; refusing to expose provider authority" >&2
-              exit 1
-            fi
-          done
+          # ran. A squash merge mints a fresh master SHA while the Cerberus
+          # `review` check runs on the reviewed PR head — and a
+          # workflow_dispatch of the review workflow against master could
+          # plant a green `review` on master while reviewing an unrelated
+          # diff. Bind the evaluated commit to the exact merged pull
+          # request instead: the PR must be merged, its squash commit must
+          # be exactly HEAD_SHA, the reviewed PR head tree must equal the
+          # HEAD_SHA tree (protected master requires up-to-date branches
+          # and linear history, so a faithful squash preserves the tree),
+          # `review` must have succeeded on that exact PR head, and `ci`
+          # must have succeeded on HEAD_SHA itself. Every mismatch fails
+          # closed before any provider authority exists.
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          merged="$(jq -r '.merged' <<<"$pr")"
+          merge_commit_sha="$(jq -r '.merge_commit_sha' <<<"$pr")"
+          base_repo="$(jq -r '.base.repo.full_name' <<<"$pr")"
+          base_ref="$(jq -r '.base.ref' <<<"$pr")"
+          pr_head_sha="$(jq -r '.head.sha' <<<"$pr")"
+          test "$merged" = true
+          test "$base_repo" = "$GITHUB_REPOSITORY"
+          test "$base_ref" = master
+          test "$merge_commit_sha" = "$HEAD_SHA"
+          [[ "$pr_head_sha" =~ ^[0-9a-f]{40}$ ]]
+          head_tree="$(gh api "repos/${GITHUB_REPOSITORY}/git/commits/${pr_head_sha}" --jq '.tree.sha')"
+          master_tree="$(git rev-parse "${HEAD_SHA}^{tree}")"
+          [[ "$head_tree" =~ ^[0-9a-f]{40}$ ]]
+          test "$head_tree" = "$master_tree"
+          review_successes="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${pr_head_sha}/check-runs?check_name=review&per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion == "success")] | length')"
+          if [[ "$review_successes" -lt 1 ]]; then
+            echo "Cerberus review has no successful check run on the merged PR head ${pr_head_sha}; refusing to expose provider authority" >&2
+            exit 1
+          fi
+          ci_successes="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?check_name=ci&per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion == "success")] | length')"
+          if [[ "$ci_successes" -lt 1 ]]; then
+            echo "required protected-branch gate ci has no successful check run on ${HEAD_SHA}; refusing to expose provider authority" >&2
+            exit 1
+          fi
           # Pin the trusted-file set for the run log: reviewers can compare
           # these digests against the evaluated commit.
           sha256sum \
