@@ -1,10 +1,13 @@
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 
 use memory_engine_core::ReviewUnitId;
 use memory_engine_generation::{
@@ -15,6 +18,59 @@ use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVaria
 use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
 
 const NOW: i64 = 1_780_162_400_000;
+
+#[cfg(unix)]
+#[test]
+fn trusted_proxy_path_uses_only_the_one_run_capability() {
+    let socket = std::env::temp_dir().join(format!(
+        "memory-engine-openrouter-proxy-{}-{}.sock",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let listener = UnixListener::bind(&socket).expect("bind proxy fixture");
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept proxy request");
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().expect("clone proxy stream"))
+            .read_line(&mut request)
+            .expect("read proxy request");
+        let request: serde_json::Value = serde_json::from_str(&request).expect("proxy JSON");
+        assert_eq!(request["token"], "one-run-capability");
+        assert!(request["payload"]["messages"].is_array());
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "{\"ok\":true}"}}]
+        });
+        let response = serde_json::json!({"status": 200, "body": body.to_string()});
+        let mut stream = stream;
+        stream
+            .write_all(
+                serde_json::to_string(&response)
+                    .expect("encode proxy response")
+                    .as_bytes(),
+            )
+            .expect("write proxy response");
+        stream.write_all(b"\n").expect("terminate proxy response");
+    });
+    let provider = OpenRouterProvider::new(OpenRouterConfig {
+        api_key: "one-run-capability".to_owned(),
+        model: "fixture-model".to_owned(),
+        base_url: "http://unused.invalid/v1".to_owned(),
+        proxy_socket: Some(socket.clone()),
+        timeout: Duration::from_secs(5),
+        prompt: PromptVariant::Minimal,
+        max_drafts: 8,
+    });
+    let response = provider
+        .complete_structured(
+            "fixture prompt",
+            "fixture",
+            &serde_json::json!({"type":"object"}),
+        )
+        .expect("proxy response");
+    assert_eq!(response.content, "{\"ok\":true}");
+    server.join().expect("proxy fixture thread");
+    std::fs::remove_file(socket).expect("remove proxy fixture socket");
+}
 
 #[test]
 fn maps_model_json_to_grounded_draft_candidates_with_usage() {
@@ -60,6 +116,7 @@ fn maps_model_json_to_grounded_draft_candidates_with_usage() {
         api_key: "test-key".to_owned(),
         model: "deepseek/deepseek-v4-flash".to_owned(),
         base_url,
+        proxy_socket: None,
         timeout: Duration::from_secs(5),
         prompt: PromptVariant::Principled,
         max_drafts: 8,
@@ -154,6 +211,7 @@ fn expands_a_bare_topic_into_standalone_cards_without_requiring_quotes() {
         api_key: "test-key".to_owned(),
         model: "google/gemini-3.5-flash".to_owned(),
         base_url,
+        proxy_socket: None,
         timeout: Duration::from_secs(5),
         prompt: PromptVariant::Principled,
         max_drafts: 5,
@@ -215,6 +273,7 @@ fn sends_repair_feedback_and_parses_repaired_drafts_with_usage() {
         api_key: "test-key".to_owned(),
         model: "deepseek/deepseek-v4-flash".to_owned(),
         base_url,
+        proxy_socket: None,
         timeout: Duration::from_secs(5),
         prompt: PromptVariant::Principled,
         max_drafts: 8,
@@ -522,6 +581,7 @@ fn test_config(base_url: String) -> OpenRouterConfig {
         api_key: "test-key".to_owned(),
         model: "deepseek/deepseek-v4-flash".to_owned(),
         base_url,
+        proxy_socket: None,
         timeout: Duration::from_secs(5),
         prompt: PromptVariant::Minimal,
         max_drafts: 8,

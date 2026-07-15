@@ -9,7 +9,14 @@
 //! Failure messages are written for learners: transport errors, HTTP
 //! rejections, and unreadable model payloads each map to one human sentence.
 
-use std::time::{Duration, Instant};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider,
@@ -23,6 +30,8 @@ use serde::Deserialize;
 
 /// Environment variable holding the `OpenRouter` API key.
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+/// One-run bearer capability for the trusted hosted-eval provider proxy.
+pub const PROXY_TOKEN_ENV: &str = "OPENROUTER_PROXY_TOKEN";
 /// Environment variable overriding the generation model id.
 pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
 /// Default model, chosen from the 2026-06-11 field run in
@@ -34,6 +43,13 @@ pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
 /// ~$0.0004/source.
 pub const DEFAULT_MODEL: &str = "google/gemini-3.5-flash";
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// Trusted hosted evaluation may replace the upstream with a local provider
+/// proxy. The proxy owns the real key; target code receives only a one-run
+/// capability token as `OPENROUTER_PROXY_TOKEN`.
+pub const BASE_URL_ENV: &str = "OPENROUTER_BASE_URL";
+/// Unix socket for the trusted hosted-eval proxy. The target gets a bounded
+/// capability token, never the provider key or general network access.
+pub const PROXY_SOCKET_ENV: &str = "OPENROUTER_PROXY_SOCKET";
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 /// Per-generation card ceiling. High enough that a finite enumerable set (an
 /// alphabet, the 50 US states) is covered completely; the prompt restrains
@@ -73,6 +89,7 @@ pub struct OpenRouterConfig {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
+    pub proxy_socket: Option<PathBuf>,
     pub timeout: Duration,
     pub prompt: PromptVariant,
     pub max_drafts: usize,
@@ -85,13 +102,15 @@ impl OpenRouterConfig {
     ///
     /// Returns a human-readable message when `OPENROUTER_API_KEY` is unset.
     pub fn from_env() -> Result<Self, String> {
-        let api_key = std::env::var(API_KEY_ENV)
+        let api_key = std::env::var(PROXY_TOKEN_ENV)
+            .or_else(|_| std::env::var(API_KEY_ENV))
             .map_err(|_| format!("{API_KEY_ENV} is not set; model generation is unavailable"))?;
 
         Ok(Self {
             api_key,
             model: std::env::var(MODEL_ENV).unwrap_or_else(|_| DEFAULT_MODEL.to_owned()),
-            base_url: DEFAULT_BASE_URL.to_owned(),
+            base_url: std::env::var(BASE_URL_ENV).unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            proxy_socket: std::env::var_os(PROXY_SOCKET_ENV).map(PathBuf::from),
             timeout: DEFAULT_TIMEOUT,
             prompt: PromptVariant::Principled,
             max_drafts: DEFAULT_MAX_DRAFTS,
@@ -140,7 +159,6 @@ impl OpenRouterProvider {
         schema_name: &str,
         schema: &serde_json::Value,
     ) -> Result<StructuredResponse, ProviderFailure> {
-        let url = format!("{}/chat/completions", self.config.base_url);
         let payload = serde_json::json!({
             "model": self.config.model,
             "messages": [{ "role": "user", "content": prompt }],
@@ -165,7 +183,23 @@ impl OpenRouterProvider {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.attempt_structured(&url, &payload) {
+            let result = if let Some(proxy_socket) = &self.config.proxy_socket {
+                #[cfg(unix)]
+                {
+                    self.attempt_proxy_structured(proxy_socket, &payload)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = proxy_socket;
+                    Err(ProviderFailure::new(
+                        "The trusted provider proxy is unavailable on this platform.",
+                    ))
+                }
+            } else {
+                let url = format!("{}/chat/completions", self.config.base_url);
+                self.attempt_structured(&url, &payload)
+            };
+            match result {
                 Ok(response) => return Ok(response),
                 Err(failure) if failure.is_transient() && attempt < MAX_REQUEST_ATTEMPTS => {
                     std::thread::sleep(RETRY_BACKOFF);
@@ -219,6 +253,75 @@ impl OpenRouterProvider {
             }),
         })
     }
+
+    #[cfg(unix)]
+    fn attempt_proxy_structured(
+        &self,
+        socket: &PathBuf,
+        payload: &serde_json::Value,
+    ) -> Result<StructuredResponse, ProviderFailure> {
+        let started = Instant::now();
+        let mut stream = UnixStream::connect(socket).map_err(|_| {
+            ProviderFailure::transient("The trusted provider proxy could not be reached.")
+        })?;
+        let request = serde_json::json!({ "token": self.config.api_key, "payload": payload });
+        let mut encoded = serde_json::to_vec(&request).map_err(|_| {
+            ProviderFailure::new("The trusted provider request could not be encoded.")
+        })?;
+        encoded.push(b'\n');
+        stream.write_all(&encoded).map_err(|_| {
+            ProviderFailure::transient("The trusted provider proxy could not be reached.")
+        })?;
+        let mut line = String::new();
+        BufReader::new(stream)
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_line(&mut line)
+            .map_err(|_| {
+                ProviderFailure::transient("The trusted provider proxy response could not be read.")
+            })?;
+        if line.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(ProviderFailure::new(
+                "The trusted provider proxy response was too large.",
+            ));
+        }
+        let response: ProxyResponse = serde_json::from_str(&line).map_err(|_| {
+            ProviderFailure::new("The trusted provider proxy response was invalid.")
+        })?;
+        if !(200..300).contains(&response.status) {
+            let failure = ProviderFailure::new(format!(
+                "The model provider rejected the request (HTTP {}).",
+                response.status
+            ));
+            return if response.status >= 500 || response.status == 429 {
+                Err(ProviderFailure::transient(failure.to_string()))
+            } else {
+                Err(failure)
+            };
+        }
+        let completion: Completion = serde_json::from_str(&response.body).map_err(|_| {
+            ProviderFailure::new("The model provider's response could not be read.")
+        })?;
+        let content = completion
+            .choices
+            .first()
+            .map(|choice| choice.message.content.as_str())
+            .unwrap_or_default();
+        Ok(StructuredResponse {
+            content: extract_json_object(content).to_owned(),
+            usage: completion.usage.map(|usage| ProviderUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cost_usd_micros: usage.cost.map(cost_to_micros),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyResponse {
+    status: u16,
+    body: String,
 }
 
 impl DraftProvider for OpenRouterProvider {
