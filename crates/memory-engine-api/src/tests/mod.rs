@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::Path as FsPath,
     sync::{Arc, Barrier},
     thread,
     time::Instant,
@@ -20,6 +21,7 @@ use super::{
     router, routes, AccountRegistry, ApiState, AuthConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
+use memory_engine_api_state::RETURN_NOTIFICATION_INTERVAL_MS;
 
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
@@ -205,6 +207,80 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
         "the home Start review CTA must open a review: {review}"
     );
     assert!(!review.contains("CSRF token does not match"));
+}
+
+#[tokio::test]
+async fn home_get_does_not_send_or_mutate_return_notification_state() {
+    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("home-read-only-return-notifications");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_clock)
+            .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
+    );
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let saved = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/save-account",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("email", "learner@example.com")],
+        ))
+        .await
+        .expect("save account");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let cookie = session_cookie(&saved);
+    let saved = response_text(saved).await;
+    let csrf_token = html_value(&saved, "csrfToken");
+
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let enabled = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("enable return notifications");
+    assert_eq!(enabled.status(), StatusCode::OK);
+    let outbox_before = fs::read_to_string(&outbox_path).expect("outbox after explicit enable");
+    let preference_before = read_return_notification_preference(&store_root);
+    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+
+    let home = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_eq!(home.status(), StatusCode::OK);
+    assert!(!response_text(home).await.contains("Get started"));
+    assert_eq!(
+        fs::read_to_string(&outbox_path).expect("outbox after home GET"),
+        outbox_before,
+        "home GET must not send a return notification"
+    );
+    assert_eq!(
+        read_return_notification_preference(&store_root),
+        preference_before,
+        "home GET must not mutate return notification persistence"
+    );
 }
 
 #[tokio::test]
@@ -1210,6 +1286,7 @@ async fn auth_magic_link_cross_device_resume() {
         .await
         .expect("verify magic link");
     assert_eq!(verified.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&verified);
     let cookie = session_cookie(&verified);
     let verified = response_text(verified).await;
     assert!(verified.contains("NATO practice notes"));
@@ -1248,6 +1325,7 @@ async fn auth_rejects_magic_link_replay() {
         .await
         .expect("first verify");
     assert_eq!(first.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&first);
 
     let replay = app
         .oneshot(
@@ -1260,6 +1338,24 @@ async fn auth_rejects_magic_link_replay() {
         .await
         .expect("replay verify");
     assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&replay);
+}
+
+#[tokio::test]
+async fn token_bearing_login_request_response_is_not_cached() {
+    let app = router(ApiState::new(
+        AccountRegistry::default().with_auth_config(AuthConfig::default().with_debug_links(true)),
+    ));
+    let requested = app
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    assert_eq!(requested.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&requested);
 }
 
 #[tokio::test]
@@ -1295,6 +1391,7 @@ async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
         .await
         .expect("expired verify response");
     assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&expired);
     assert_eq!(
         expired
             .headers()
@@ -1340,6 +1437,7 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
         .await
         .expect("expired session response");
     assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    assert_no_store_and_no_referrer(&expired);
     assert_eq!(
         expired
             .headers()
@@ -1491,10 +1589,25 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("enable return channel");
     assert_eq!(enabled.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&enabled);
     let enabled = response_text(enabled).await;
     assert!(enabled.contains("Due-count reminders are on"));
     let after_enable = fs::read_to_string(&outbox_path).expect("outbox after enable");
     assert!(after_enable.contains("due-count\tlearner@example.com\t"));
+
+    let settings = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/return-notifications")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("settings request"),
+        )
+        .await
+        .expect("settings response");
+    assert_eq!(settings.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&settings);
 
     let unsubscribe_link = after_enable
         .lines()
@@ -1514,20 +1627,7 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("unsubscribe response");
     assert_eq!(confirmation.status(), StatusCode::OK);
-    assert_eq!(
-        confirmation
-            .headers()
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("no-store")
-    );
-    assert_eq!(
-        confirmation
-            .headers()
-            .get("referrer-policy")
-            .and_then(|value| value.to_str().ok()),
-        Some("no-referrer")
-    );
+    assert_no_store_and_no_referrer(&confirmation);
     assert!(response_text(confirmation)
         .await
         .contains("Turn off due-count reminders"));
@@ -1551,6 +1651,7 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("disable return channel");
     assert_eq!(disabled.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&disabled);
     let disabled_body = response_text(disabled).await;
     assert!(
         disabled_body.contains("Reminders are off"),
@@ -1594,6 +1695,7 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("stale unsubscribe GET response");
     assert_eq!(stale_get.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&stale_get);
     let stale_post = app
         .clone()
         .oneshot(form_request(
@@ -1610,6 +1712,7 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("stale unsubscribe POST response");
     assert_eq!(stale_post.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&stale_post);
 
     let current_get = app
         .clone()
@@ -1622,6 +1725,7 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("current unsubscribe GET response");
     assert_eq!(current_get.status(), StatusCode::OK);
+    assert_no_store_and_no_referrer(&current_get);
     let current_post = app
         .oneshot(form_request(
             "POST",
@@ -1873,22 +1977,23 @@ fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after
         1
     );
 
-    let failing = registry.clone().with_auth_config(
-        AuthConfig::allow_emails(["retry@example.com".to_owned()])
-            .with_unsubscribe_secret("claim-secret")
-            .with_mailer_command("/bin/false"),
+    let failing_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                .with_unsubscribe_secret("claim-secret")
+                .with_mailer_command("/bin/false"),
+        ),
     );
-    drop(failing);
-    let retry_account = state
+    let retry_account = failing_state
         .create_account("retry@example.com")
         .expect("retry account");
-    let retry_account = state
+    let retry_account = failing_state
         .create_browser_session(&retry_account)
         .expect("retry session");
-    state
+    failing_state
         .set_return_notification(&retry_account, Some("retry@example.com"), true)
         .expect("enable retry");
-    assert!(state
+    assert!(failing_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .is_err());
     let retry_path = fs::read_dir(&store_root)
@@ -1902,12 +2007,14 @@ fn file_return_notification_claim_allows_one_concurrent_sender_and_retries_after
         })
         .expect("failed claim persisted");
     assert!(retry_path.contains("pendingDeliveryKey"));
-    let _ = registry.clone().with_auth_config(
-        AuthConfig::allow_emails(["retry@example.com".to_owned()])
-            .with_unsubscribe_secret("claim-secret")
-            .with_link_outbox(&outbox_path),
+    let recovery_state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails(["retry@example.com".to_owned()])
+                .with_unsubscribe_secret("claim-secret")
+                .with_link_outbox(&outbox_path),
+        ),
     );
-    assert!(state
+    assert!(recovery_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .expect("retry send"));
     let outbox = fs::read_to_string(&outbox_path).expect("retry outbox");
@@ -4768,6 +4875,31 @@ fn assert_not_contains_any(body: &str, needles: &[&str]) {
             "body unexpectedly contained {needle:?}"
         );
     }
+}
+
+fn assert_no_store_and_no_referrer(response: &axum::response::Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+}
+
+fn read_return_notification_preference(store_root: &FsPath) -> String {
+    fs::read_dir(store_root)
+        .expect("store root")
+        .flatten()
+        .find_map(|entry| fs::read_to_string(entry.path().join("return-notifications.json")).ok())
+        .expect("return notification preference")
 }
 
 async fn save_source(app: &axum::Router, account: &TestAccount, title: &str, body: &str) -> Value {

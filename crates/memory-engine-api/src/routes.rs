@@ -355,12 +355,7 @@ async fn app_home(State(state): State<ApiState>, headers: HeaderMap) -> Html<Str
     // workspace (with the live due count and Start review CTA), not the
     // signed-out cover. Read-only session check — a GET carries no CSRF token.
     match state.require_browser_session_readonly(&headers) {
-        Ok(account) => {
-            if let Ok(view) = state.app_study_view(&account) {
-                let _ = state.maybe_send_due_count_notification(&account, view.due_count, false);
-            }
-            Html(render_account_page(&state, &account, None, None))
-        }
+        Ok(account) => Html(render_account_page(&state, &account, None, None)),
         Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
     }
 }
@@ -648,10 +643,10 @@ async fn create_app_account(
 ) -> Response {
     let result = state.request_magic_link(&form.email, &client_rate_limit_key(&headers));
 
-    match result {
+    no_store_response(match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
         Err(error) => app_failure_response(error),
-    }
+    })
 }
 
 async fn verify_app_login(
@@ -661,10 +656,10 @@ async fn verify_app_login(
     match state.verify_magic_link(&query.token) {
         Ok(account) => {
             let view = state.app_study_view(&account).ok();
-            html_with_browser_session(
+            no_store_response(html_with_browser_session(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
-            )
+            ))
         }
         Err(error) if error.is_magic_link_recovery() => {
             let status = error.status();
@@ -674,9 +669,9 @@ async fn verify_app_login(
             ))
             .into_response();
             *response.status_mut() = status;
-            response
+            no_store_response(response)
         }
-        Err(error) => app_failure_response(error),
+        Err(error) => no_store_response(app_failure_response(error)),
     }
 }
 
@@ -703,25 +698,17 @@ async fn return_notification_page(
 ) -> Response {
     if let Some(token) = query.token.as_deref() {
         return match state.validate_return_notification_token(token) {
-            Ok(()) => {
-                let mut response =
-                    Html(render_return_notification_confirmation(token)).into_response();
-                response
-                    .headers_mut()
-                    .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                response
-                    .headers_mut()
-                    .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-                response
-            }
-            Err(error) => app_failure_response(error),
+            Ok(()) => no_store_response(
+                Html(render_return_notification_confirmation(token)).into_response(),
+            ),
+            Err(error) => no_store_response(app_failure_response(error)),
         };
     }
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
-        Err(error) => return app_failure_response(error),
+        Err(error) => return no_store_response(app_failure_response(error)),
     };
-    Html(render_account_page(&state, &account, None, None)).into_response()
+    no_store_response(Html(render_account_page(&state, &account, None, None)).into_response())
 }
 
 async fn update_return_notifications(
@@ -734,15 +721,15 @@ async fn update_return_notifications(
         .as_deref()
         .filter(|token| !token.trim().is_empty())
     {
-        return match state.disable_return_notification(token) {
+        return no_store_response(match state.disable_return_notification(token) {
             Ok(()) => Html(render_return_notification_disabled()).into_response(),
             Err(error) => app_failure_response(error),
-        };
+        });
     }
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return no_store_response(app_failure_response(error)),
         };
     let enabled = form.enabled.as_deref() == Some("on");
     let due_count = state
@@ -762,9 +749,11 @@ async fn update_return_notifications(
     let notice = match result {
         Ok(()) if enabled => "Due-count reminders are on. One confirmation was sent; reminders stay to one per day and can be turned off below.",
         Ok(()) => "Due-count reminders are off.",
-        Err(error) => return Html(render_account_page(&state, &account, None, Some(&error.message))).into_response(),
+        Err(error) => return no_store_response(Html(render_account_page(&state, &account, None, Some(&error.message))).into_response()),
     };
-    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+    no_store_response(
+        Html(render_account_page(&state, &account, None, Some(notice))).into_response(),
+    )
 }
 
 async fn logout_app_session(
@@ -1092,9 +1081,19 @@ fn app_failure_response(error: ApiFailure) -> Response {
         ))
         .into_response();
         *response.status_mut() = status;
-        return response;
+        return no_store_response(response);
     }
     error.into_response()
+}
+
+fn no_store_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn reveal_app_review(
