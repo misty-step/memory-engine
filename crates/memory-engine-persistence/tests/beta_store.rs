@@ -10,8 +10,9 @@ use memory_engine_persistence::{
     SourcePermission,
 };
 use memory_engine_service::{
-    record_content_feedback, ContentFeedbackVerdict, GradeApplyReviewCommand, MemoryService,
-    MemoryServiceStore, RecordContentFeedbackCommand, ServiceError,
+    record_content_feedback, ContentFeedback, ContentFeedbackSource, ContentFeedbackVerdict,
+    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, RecordContentFeedbackCommand,
+    ServiceError,
 };
 
 const NOW: i64 = 1_779_989_400_000;
@@ -494,6 +495,149 @@ fn content_feedback_is_append_only_latest_wins_and_resolves_generation_provenanc
 
     let reloaded = BetaPersistenceStore::open(&path).expect("reload store");
     assert_eq!(reloaded.snapshot().content_feedback.len(), 2);
+}
+
+#[test]
+fn file_feedback_rejects_forks_and_keeps_out_of_order_revision_as_the_head() {
+    let directory = TempDirectory::new("content-feedback-fork");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let first = feedback("feedback-fork-root", &draft.review_unit_id, NOW, None);
+    store.record_content_feedback(first.clone()).expect("root");
+    let second = feedback(
+        "feedback-fork-second",
+        &draft.review_unit_id,
+        NOW + 2_000,
+        Some(&first.id),
+    );
+    store
+        .record_content_feedback(second.clone())
+        .expect("second");
+
+    let fork = feedback(
+        "feedback-fork-third",
+        &draft.review_unit_id,
+        NOW + 3_000,
+        Some(&first.id),
+    );
+    assert_eq!(
+        store.record_content_feedback(fork),
+        Err(BetaStoreError::FeedbackSupersedesStale {
+            expected_head: Some(second.id.clone()),
+            supplied_parent: Some(first.id.clone()),
+        })
+    );
+
+    let late = feedback(
+        "feedback-fork-late",
+        &draft.review_unit_id,
+        NOW - 1_000,
+        Some(&second.id),
+    );
+    store
+        .record_content_feedback(late.clone())
+        .expect("late revision");
+    let exported = store.export_content_feedback().expect("export");
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].feedback_id, late.id);
+}
+
+#[test]
+fn file_feedback_concurrent_instances_are_idempotent_and_do_not_fork_heads() {
+    let directory = TempDirectory::new("content-feedback-race");
+    let path = directory.path().join("store.json");
+    let (mut setup, draft) = lifecycle_store(&path);
+    let root = feedback("feedback-race-root", &draft.review_unit_id, NOW, None);
+    setup.record_content_feedback(root.clone()).expect("root");
+    drop(setup);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        let feedback = feedback(
+            "feedback-race-same-id",
+            &draft.review_unit_id,
+            NOW + 1_000,
+            Some(&root.id),
+        );
+        handles.push(std::thread::spawn(move || {
+            let mut store = BetaPersistenceStore::open(path).expect("open race store");
+            barrier.wait();
+            store.record_content_feedback(feedback)
+        }));
+    }
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("race worker"))
+        .collect::<Vec<_>>();
+    assert!(
+        results.iter().all(Result::is_ok),
+        "same id must replay: {results:?}"
+    );
+
+    let final_store = BetaPersistenceStore::open(path).expect("reload race store");
+    assert_eq!(final_store.snapshot().content_feedback.len(), 2);
+    assert_eq!(
+        final_store.export_content_feedback().expect("export").len(),
+        1
+    );
+}
+
+#[test]
+fn dropped_local_only_source_is_redacted_and_fixture_preserves_activity_kind() {
+    let directory = TempDirectory::new("content-feedback-privacy");
+    let path = directory.path().join("store.json");
+    let (mut store, draft) = lifecycle_store(&path);
+    let mut local = store.snapshot().source_documents[0].clone();
+    local.permission = SourcePermission::LocalOnly;
+    store.save_source_document(local).expect("local source");
+    let mut exercise = draft.clone();
+    exercise.id = "draft-exercise".to_owned();
+    exercise.activity_kind = GeneratedLearningActivityKind::Exercise;
+    store
+        .save_generated_prompt_draft(exercise)
+        .expect("exercise draft");
+    let mut unit = store.snapshot().review_units[0].clone();
+    unit.generated_prompt_draft_id = Some("draft-exercise".to_owned());
+    store.save_review_unit(unit).expect("exercise review unit");
+    store
+        .record_content_feedback(feedback(
+            "feedback-private",
+            &draft.review_unit_id,
+            NOW,
+            None,
+        ))
+        .expect("feedback");
+
+    let exported = store.export_content_feedback().expect("export");
+    let fixture = exported[0].fixture.as_ref().expect("fixture");
+    assert_eq!(fixture.expect.required_activity_kinds, ["exercise"]);
+    assert_eq!(fixture.title, "[redacted local-only source]");
+    assert_eq!(fixture.body, "[redacted local-only source]");
+    assert!(!store
+        .export_content_feedback_json()
+        .expect("json")
+        .contains("Pater noster means"));
+}
+
+fn feedback(
+    id: &str,
+    review_unit_id: &ReviewUnitId,
+    occurred_at: i64,
+    supersedes_id: Option<&str>,
+) -> ContentFeedback {
+    ContentFeedback {
+        id: id.to_owned(),
+        review_unit_id: review_unit_id.clone(),
+        verdict: ContentFeedbackVerdict::Dropped,
+        rationale: None,
+        source: ContentFeedbackSource::Human,
+        account_id: "account-feedback".to_owned(),
+        occurred_at,
+        supersedes_id: supersedes_id.map(str::to_owned),
+    }
 }
 
 fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPromptDraft) {

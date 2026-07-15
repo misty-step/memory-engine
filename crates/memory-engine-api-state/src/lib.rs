@@ -25,9 +25,11 @@ use axum::{
 use hmac::Hmac;
 use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
-use memory_engine_persistence::BetaPersistenceStore;
-use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore, PostgresStudyStore};
-use memory_engine_service::{ContentFeedback, ContentFeedbackVerdict};
+use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
+use memory_engine_persistence_postgres::{
+    AccountScope, AccountStudyStore, PostgresStoreError, PostgresStudyStore,
+};
+use memory_engine_service::{ContentFeedback, ContentFeedbackError, ContentFeedbackVerdict};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions,
     BetaStudySession, BetaStudySummary, BetaStudyView,
@@ -1769,6 +1771,51 @@ fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreErro
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
+}
+
+fn file_content_feedback_failure(error: ContentFeedbackError<BetaStoreError>) -> ApiFailure {
+    match error {
+        ContentFeedbackError::BlankFeedbackId | ContentFeedbackError::BlankAccountId => {
+            ApiFailure::bad_request("Content feedback request is invalid.")
+        }
+        ContentFeedbackError::Store(BetaStoreError::UnknownReviewUnit(_)) => {
+            ApiFailure::not_found("Review unit not found.")
+        }
+        ContentFeedbackError::Store(
+            BetaStoreError::FeedbackSupersedesUnknown(_)
+            | BetaStoreError::FeedbackSupersedesOtherReviewUnit(_)
+            | BetaStoreError::FeedbackSupersedesOtherAccount(_),
+        ) => ApiFailure::bad_request("Feedback supersedes an invalid revision."),
+        ContentFeedbackError::Store(
+            BetaStoreError::DuplicateContentFeedback(_)
+            | BetaStoreError::FeedbackSupersedesStale { .. },
+        ) => ApiFailure::conflict("Feedback conflicts with the current revision."),
+        ContentFeedbackError::Store(error) => ApiFailure::internal(error.to_string()),
+    }
+}
+
+fn postgres_content_feedback_failure(
+    error: ContentFeedbackError<PostgresStoreError>,
+) -> ApiFailure {
+    match error {
+        ContentFeedbackError::BlankFeedbackId | ContentFeedbackError::BlankAccountId => {
+            ApiFailure::bad_request("Content feedback request is invalid.")
+        }
+        ContentFeedbackError::Store(PostgresStoreError::UnknownReviewUnit(_)) => {
+            ApiFailure::not_found("Review unit not found.")
+        }
+        ContentFeedbackError::Store(
+            PostgresStoreError::FeedbackSupersedesUnknown(_)
+            | PostgresStoreError::FeedbackSupersedesOtherReviewUnit(_)
+            | PostgresStoreError::FeedbackSupersedesOtherAccount(_)
+            | PostgresStoreError::FeedbackAccountMismatch,
+        ) => ApiFailure::bad_request("Feedback supersedes an invalid revision."),
+        ContentFeedbackError::Store(
+            PostgresStoreError::DuplicateContentFeedback(_)
+            | PostgresStoreError::FeedbackSupersedesStale { .. },
+        ) => ApiFailure::conflict("Feedback conflicts with the current revision."),
+        ContentFeedbackError::Store(error) => ApiFailure::internal(error.to_string()),
+    }
 }
 
 fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {

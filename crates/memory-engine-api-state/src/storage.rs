@@ -10,12 +10,13 @@ use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, persisted_project_deck_exists, persisted_source_exists,
-    persisted_sources, postgres_failure, rate_limit_path, require_current_review,
-    require_current_review_postgres, run_bridge_generation, run_reference_generation,
-    run_source_generation, secret_hash, study_failure, with_postgres_account, with_postgres_store,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
-    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
+    persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
+    postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
+    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
+    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
+    ApiFailure, BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -1323,8 +1324,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         command: RecordContentFeedbackCommand,
     ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
         let mut store = crate::open_persistence_store(store_path)?;
-        record_content_feedback(&mut store, command)
-            .map_err(|error| ApiFailure::internal(error.to_string()))
+        record_content_feedback(&mut store, command).map_err(file_content_feedback_failure)
     }
 }
 
@@ -1642,6 +1642,12 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         .save_review_unit(&review_unit)
                         .map_err(postgres_failure)?;
                 }
+                for mut feedback in snapshot.content_feedback {
+                    target_account_id.clone_into(&mut feedback.account_id);
+                    account
+                        .record_content_feedback(&feedback)
+                        .map_err(postgres_failure)?;
+                }
                 for schedule in snapshot.schedules {
                     account
                         .set_schedule_state(
@@ -1938,7 +1944,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             self.now_ms(),
             |mut account| {
                 record_content_feedback(&mut account, command)
-                    .map_err(|error| ApiFailure::internal(error.to_string()))
+                    .map_err(postgres_content_feedback_failure)
             },
         )
     }

@@ -3551,6 +3551,114 @@ async fn postgres_backend_routes_drive_source_to_review() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_save_account_copies_content_feedback_with_target_scope() {
+    let Some(database) = PostgresTestDatabase::new("account_copy_feedback") else {
+        return;
+    };
+    let state = ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    ));
+    let created = state
+        .create_account("copy-source@example.com")
+        .expect("source account");
+    let browser = state
+        .create_browser_session(&created)
+        .expect("source browser session");
+    let app = router(state.clone());
+    let source_account = TestAccount {
+        account_id: browser.account_id().to_owned(),
+        session_token: browser.session_token().to_owned(),
+    };
+    let source_id = create_source_v1(&app, &source_account, "Copy source", &source_body()).await;
+    let draft_id = generate_source_v1(&app, &source_account, &source_id).await;
+    let review_unit_id = approve_draft_v1(&app, &source_account, &draft_id).await;
+    let _ = submit_review_v1(&app, &source_account, &review_unit_id, "ALFA").await;
+    let feedback = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/accounts/{}/review/{review_unit_id}/content-feedback",
+                source_account.account_id
+            ),
+            &source_account.session_token,
+            &json!({
+                "verdict": "dropped",
+                "idempotencyKey": "copy-feedback-a"
+            }),
+        ))
+        .await
+        .expect("source feedback");
+    assert_eq!(feedback.status(), StatusCode::OK);
+
+    let target = state
+        .save_account(&browser, "copy-target@example.com")
+        .expect("copy account");
+    let mut store =
+        memory_engine_persistence_postgres::PostgresStudyStore::connect(&database.scoped_url)
+            .expect("verify copied account");
+    let account = store.for_account(
+        memory_engine_persistence_postgres::AccountScope::new(target.account_id.clone())
+            .expect("target scope"),
+    );
+    let snapshot = account.snapshot().expect("target snapshot");
+    assert_eq!(snapshot.content_feedback.len(), 1);
+    assert_eq!(snapshot.content_feedback[0].id, "copy-feedback-a");
+    assert_eq!(snapshot.content_feedback[0].account_id, target.account_id);
+}
+
+#[tokio::test]
+async fn file_save_account_preserves_content_feedback_for_copy_parity() {
+    let store_root = temp_store_root("account-copy-feedback-file");
+    let state = ApiState::new(AccountRegistry::with_store_root(&store_root));
+    let created = state
+        .create_account("file-copy-source@example.com")
+        .expect("source account");
+    let browser = state
+        .create_browser_session(&created)
+        .expect("source browser session");
+    let app = router(state.clone());
+    let source_account = TestAccount {
+        account_id: browser.account_id().to_owned(),
+        session_token: browser.session_token().to_owned(),
+    };
+    let source_id = create_source_v1(&app, &source_account, "Copy source", &source_body()).await;
+    let draft_id = generate_source_v1(&app, &source_account, &source_id).await;
+    let review_unit_id = approve_draft_v1(&app, &source_account, &draft_id).await;
+    let _ = submit_review_v1(&app, &source_account, &review_unit_id, "ALFA").await;
+    let feedback = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/content-feedback",
+                source_account.account_id
+            ),
+            &source_account.session_token,
+            &json!({
+                "verdict": "dropped",
+                "idempotencyKey": "file-copy-feedback-a"
+            }),
+        ))
+        .await
+        .expect("source feedback");
+    assert_eq!(feedback.status(), StatusCode::OK);
+
+    let target = state
+        .save_account(&browser, "file-copy-target@example.com")
+        .expect("copy account");
+    let target_store = memory_engine_persistence::BetaPersistenceStore::open(
+        store_root.join(&target.account_id).join("study.json"),
+    )
+    .expect("verify copied account");
+    assert_eq!(target_store.snapshot().content_feedback.len(), 1);
+    assert_eq!(
+        target_store.snapshot().content_feedback[0].id,
+        "file-copy-feedback-a"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "manual Postgres latency receipt"]
 async fn postgres_review_actions_emit_latency_receipt() {
     let Some(database) = PostgresTestDatabase::new("latency_receipt") else {
@@ -3920,6 +4028,61 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
     assert_eq!(feedback["verdict"], "kept");
     assert_eq!(feedback["source"], "human");
     assert_eq!(feedback["accountId"], account.account_id);
+
+    let unknown = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/unknown-review-unit/content-feedback",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "verdict": "kept",
+                "idempotencyKey": "v1-content-feedback-unknown"
+            }),
+        ))
+        .await
+        .expect("unknown review unit feedback");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let invalid_parent = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/content-feedback",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "verdict": "kept",
+                "supersedesId": "missing-feedback",
+                "idempotencyKey": "v1-content-feedback-invalid-parent"
+            }),
+        ))
+        .await
+        .expect("invalid feedback parent");
+    assert_eq!(invalid_parent.status(), StatusCode::BAD_REQUEST);
+
+    let conflicting_replay = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/content-feedback",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "verdict": "dropped",
+                "idempotencyKey": "v1-content-feedback-scry-a"
+            }),
+        ))
+        .await
+        .expect("conflicting feedback replay");
+    assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
 
     archive_source_v1(&app, &account, &source_id).await;
 }

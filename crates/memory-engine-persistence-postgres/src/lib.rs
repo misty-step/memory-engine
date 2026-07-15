@@ -1298,7 +1298,6 @@ impl AccountStudyStore<'_> {
         &mut self,
         feedback: &ContentFeedback,
     ) -> Result<ContentFeedback, PostgresStoreError> {
-        self.assert_known_review_unit(&feedback.review_unit_id)?;
         if feedback.account_id != self.scope.account_id {
             return Err(PostgresStoreError::FeedbackAccountMismatch);
         }
@@ -1306,6 +1305,17 @@ impl AccountStudyStore<'_> {
         let value = serde_json::to_value(feedback)?;
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        let known = transaction.query_opt(
+            "SELECT 1 FROM memory_engine_review_units
+             WHERE account_id = $1 AND review_unit_id = $2
+             FOR UPDATE",
+            &[&self.scope.account_id, &feedback.review_unit_id.as_str()],
+        )?;
+        if known.is_none() {
+            return Err(PostgresStoreError::UnknownReviewUnit(
+                feedback.review_unit_id.clone(),
+            ));
+        }
         if let Some(row) = transaction.query_opt(
             "SELECT feedback FROM memory_engine_content_feedback
              WHERE account_id = $1 AND feedback_id = $2",
@@ -1338,6 +1348,30 @@ impl AccountStudyStore<'_> {
                     supersedes_id.clone(),
                 ));
             }
+        }
+        let current_head: Option<String> = transaction
+            .query_opt(
+                "SELECT candidate.feedback_id
+                 FROM memory_engine_content_feedback AS candidate
+                 WHERE candidate.account_id = $1
+                   AND candidate.review_unit_id = $2
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM memory_engine_content_feedback AS child
+                       WHERE child.account_id = candidate.account_id
+                         AND child.review_unit_id = candidate.review_unit_id
+                         AND child.feedback::jsonb->>'supersedesId' = candidate.feedback_id
+                   )
+                 ORDER BY candidate.occurred_at_ms DESC, candidate.feedback_id DESC
+                 LIMIT 1",
+                &[&self.scope.account_id, &feedback.review_unit_id.as_str()],
+            )?
+            .map(|row| row.get(0));
+        if feedback.supersedes_id.as_deref() != current_head.as_deref() {
+            return Err(PostgresStoreError::FeedbackSupersedesStale {
+                expected_head: current_head,
+                supplied_parent: feedback.supersedes_id.clone(),
+            });
         }
 
         transaction.execute(
@@ -1916,6 +1950,11 @@ pub enum PostgresStoreError {
     DuplicateContentFeedback(String),
     FeedbackSupersedesUnknown(String),
     FeedbackSupersedesOtherReviewUnit(String),
+    FeedbackSupersedesOtherAccount(String),
+    FeedbackSupersedesStale {
+        expected_head: Option<String>,
+        supplied_parent: Option<String>,
+    },
     StudySession(String),
     Postgres(postgres::Error),
     Json(serde_json::Error),
@@ -1959,6 +1998,17 @@ impl fmt::Display for PostgresStoreError {
                 formatter,
                 "Content feedback supersedes a different review unit: {id}"
             ),
+            Self::FeedbackSupersedesOtherAccount(id) => write!(
+                formatter,
+                "Content feedback supersedes another account's feedback: {id}"
+            ),
+            Self::FeedbackSupersedesStale {
+                expected_head,
+                supplied_parent,
+            } => write!(
+                formatter,
+                "Content feedback revision is stale: expected head {expected_head:?}, supplied parent {supplied_parent:?}"
+            ),
             Self::StudySession(error) => write!(formatter, "Study session error: {error}"),
             Self::Postgres(error) => write!(formatter, "Postgres error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
@@ -1985,6 +2035,8 @@ impl Error for PostgresStoreError {
             | Self::DuplicateContentFeedback(_)
             | Self::FeedbackSupersedesUnknown(_)
             | Self::FeedbackSupersedesOtherReviewUnit(_)
+            | Self::FeedbackSupersedesOtherAccount(_)
+            | Self::FeedbackSupersedesStale { .. }
             | Self::StudySession(_) => None,
         }
     }
@@ -2119,8 +2171,8 @@ mod tests {
         SourceDocument, SourceDocumentKind, SourcePermission,
     };
     use memory_engine_service::{
-        record_content_feedback, ContentFeedbackVerdict, RecordContentFeedbackCommand,
-        ServiceAttemptRecord,
+        record_content_feedback, ContentFeedbackError, ContentFeedbackVerdict,
+        RecordContentFeedbackCommand, ServiceAttemptRecord,
     };
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
     use std::sync::{Arc, Barrier};
@@ -2236,6 +2288,162 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres store contract");
+    }
+
+    #[test]
+    // This intentionally keeps the two database race scenarios together so
+    // their shared setup and cleanup are visible in one acceptance oracle.
+    #[allow(clippy::too_many_lines)]
+    fn live_postgres_feedback_concurrency_is_idempotent_and_single_head() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_feedback_race_{}_{}",
+            std::process::id(),
+            NOW + 1
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let unit = ReviewUnitId::new("unit-live-feedback-race");
+            let source = source_document("source-live-feedback-race");
+            let reference = reference_span("reference-live-feedback-race", &source.id);
+            let draft = accepted_draft(
+                "draft-live-feedback-race",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("run-live-feedback-race"),
+            );
+            let run = generation_run("run-live-feedback-race", &[&source.id], &[&draft.id]);
+            let record = review_unit(&draft);
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-feedback-race")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+                account.save_review_unit(&record)?;
+                record_content_feedback(
+                    &mut account,
+                    RecordContentFeedbackCommand {
+                        feedback_id: "feedback-live-race-root".to_owned(),
+                        review_unit_id: unit.clone(),
+                        verdict: ContentFeedbackVerdict::Dropped,
+                        rationale: None,
+                        account_id: "acct-feedback-race".to_owned(),
+                        occurred_at: NOW,
+                        supersedes_id: None,
+                    },
+                )
+                .map_err(|error| super::PostgresStoreError::StudySession(error.to_string()))?;
+            }
+            drop(setup);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let mut same_id_handles = Vec::new();
+            for _ in 0..2 {
+                let barrier = Arc::clone(&barrier);
+                let url = scoped_url.clone();
+                same_id_handles.push(std::thread::spawn(move || {
+                    let mut store = super::PostgresStudyStore::connect(&url).expect("race connect");
+                    let mut account =
+                        store.for_account(AccountScope::new("acct-feedback-race").expect("scope"));
+                    barrier.wait();
+                    record_content_feedback(
+                        &mut account,
+                        RecordContentFeedbackCommand {
+                            feedback_id: "feedback-live-race-same-id".to_owned(),
+                            review_unit_id: ReviewUnitId::new("unit-live-feedback-race"),
+                            verdict: ContentFeedbackVerdict::Kept,
+                            rationale: Some("same payload".to_owned()),
+                            account_id: "acct-feedback-race".to_owned(),
+                            occurred_at: NOW + 1_000,
+                            supersedes_id: Some("feedback-live-race-root".to_owned()),
+                        },
+                    )
+                }));
+            }
+            let same_id_results = same_id_handles
+                .into_iter()
+                .map(|handle| handle.join().expect("same-id worker"))
+                .collect::<Vec<_>>();
+            assert!(
+                same_id_results.iter().all(Result::is_ok),
+                "same-id replay must be idempotent: {same_id_results:?}"
+            );
+
+            let stale_unit = ReviewUnitId::new("unit-live-feedback-stale");
+            let mut stale_record = record.clone();
+            stale_record.review_unit_id = stale_unit.clone();
+            stale_record.queue.review_unit_id = stale_unit.clone();
+            {
+                let mut store = super::PostgresStudyStore::connect(&scoped_url)?;
+                let mut account = store.for_account(AccountScope::new("acct-feedback-race")?);
+                account.save_review_unit(&stale_record)?;
+                record_content_feedback(
+                    &mut account,
+                    RecordContentFeedbackCommand {
+                        feedback_id: "feedback-live-stale-root".to_owned(),
+                        review_unit_id: stale_unit.clone(),
+                        verdict: ContentFeedbackVerdict::Dropped,
+                        rationale: None,
+                        account_id: "acct-feedback-race".to_owned(),
+                        occurred_at: NOW,
+                        supersedes_id: None,
+                    },
+                )
+                .map_err(|error| super::PostgresStoreError::StudySession(error.to_string()))?;
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let mut stale_handles = Vec::new();
+            for id in ["feedback-live-stale-a", "feedback-live-stale-b"] {
+                let barrier = Arc::clone(&barrier);
+                let url = scoped_url.clone();
+                stale_handles.push(std::thread::spawn(move || {
+                    let mut store =
+                        super::PostgresStudyStore::connect(&url).expect("stale connect");
+                    let mut account =
+                        store.for_account(AccountScope::new("acct-feedback-race").expect("scope"));
+                    barrier.wait();
+                    record_content_feedback(
+                        &mut account,
+                        RecordContentFeedbackCommand {
+                            feedback_id: id.to_owned(),
+                            review_unit_id: ReviewUnitId::new("unit-live-feedback-stale"),
+                            verdict: ContentFeedbackVerdict::Kept,
+                            rationale: None,
+                            account_id: "acct-feedback-race".to_owned(),
+                            occurred_at: NOW + 2_000,
+                            supersedes_id: Some("feedback-live-stale-root".to_owned()),
+                        },
+                    )
+                }));
+            }
+            let stale_results = stale_handles
+                .into_iter()
+                .map(|handle| handle.join().expect("stale worker"))
+                .collect::<Vec<_>>();
+            assert!(stale_results.iter().all(|result| matches!(
+                result,
+                Err(ContentFeedbackError::Store(
+                    super::PostgresStoreError::FeedbackSupersedesStale { .. }
+                ))
+            )));
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live Postgres feedback race contract");
     }
 
     #[test]
