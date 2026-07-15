@@ -4114,7 +4114,7 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
         .expect("authenticated postgres concept snooze");
     assert_eq!(snoozed.status(), StatusCode::OK);
     let snoozed = response_json(snoozed).await;
-    assert_eq!(snoozed["current"], json!(null));
+    assert_eq!(snoozed["current"]["conceptKey"], json!("nato-letter-b"));
     assert_eq!(snoozed["dueCount"], json!(1));
 
     let first_after = postgres_account_snapshot(&database.scoped_url, &first.account_id);
@@ -5927,15 +5927,18 @@ fn postgres_account_snapshot(
     database_url: &str,
     account_id: &str,
 ) -> memory_engine_persistence::BetaStoreSnapshot {
-    let mut store = memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
-        .expect("connect postgres snapshot store");
-    store
-        .for_account(
-            memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
-                .expect("account scope"),
-        )
-        .snapshot()
-        .expect("postgres snapshot")
+    tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+                .expect("connect postgres snapshot store");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                    .expect("account scope"),
+            )
+            .snapshot()
+            .expect("postgres snapshot")
+    })
 }
 
 impl PostgresTestDatabase {
