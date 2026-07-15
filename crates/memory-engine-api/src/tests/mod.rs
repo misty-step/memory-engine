@@ -1341,6 +1341,25 @@ async fn assert_review_mutations_require_csrf(
     assert_forbidden_form(
         app,
         cookie,
+        "/app/snooze-concept",
+        &[("reviewUnitId", review_unit_id)],
+        "concept snooze without csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
+        "/app/snooze-concept",
+        &[
+            ("csrfToken", "csrf-invalid-for-matrix"),
+            ("reviewUnitId", review_unit_id),
+        ],
+        "concept snooze with invalid csrf",
+    )
+    .await;
+    assert_forbidden_form(
+        app,
+        cookie,
         "/app/bridge",
         &[("reviewUnitId", review_unit_id)],
         "bridge without csrf",
@@ -4027,6 +4046,101 @@ async fn postgres_backend_source_routes_are_account_scoped() {
     assert_eq!(cross_write.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic() {
+    let Some(database) = PostgresTestDatabase::new("v1_concept_snooze") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let first = create_account_v1(&app, "first-concept@example.com").await;
+    let second = create_account_v1(&app, "second-concept@example.com").await;
+
+    for account in [&first, &second] {
+        let source_id = create_source_v1(
+            &app,
+            account,
+            "Shared NATO concept notes",
+            &shared_and_other_concept_body(),
+        )
+        .await;
+        let draft_ids = generate_source_v1_draft_ids(&app, account, &source_id).await;
+        assert_eq!(draft_ids.len(), 3);
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, account, draft_id).await;
+        }
+    }
+
+    let first_before = postgres_account_snapshot(&database.scoped_url, &first.account_id);
+    let second_before = postgres_account_snapshot(&database.scoped_url, &second.account_id);
+    assert_eq!(first_before.review_units.len(), 3);
+    assert_eq!(second_before.review_units.len(), 3);
+    assert_eq!(
+        first_before
+            .review_units
+            .iter()
+            .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+            .count(),
+        2
+    );
+
+    let first_review_unit_id = next_review_v1(&app, &first).await;
+    let cross_account = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{first_review_unit_id}/snooze-concept",
+                second.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("cross-account concept snooze");
+    assert_eq!(cross_account.status(), StatusCode::FORBIDDEN);
+
+    let snoozed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{first_review_unit_id}/snooze-concept",
+                first.account_id
+            ),
+            &first.session_token,
+        ))
+        .await
+        .expect("authenticated postgres concept snooze");
+    assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_json(snoozed).await;
+    assert_eq!(snoozed["current"], json!(null));
+    assert_eq!(snoozed["dueCount"], json!(1));
+
+    let first_after = postgres_account_snapshot(&database.scoped_url, &first.account_id);
+    assert_eq!(first_after.attempts, first_before.attempts);
+    assert_eq!(first_after.schedules, first_before.schedules);
+    let first_shared = first_after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_shared.len(), 2);
+    assert!(first_shared.iter().all(|unit| unit.snoozed_until.is_some()));
+    assert_eq!(
+        first_after
+            .review_units
+            .iter()
+            .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-b"))
+            .filter_map(|unit| unit.snoozed_until)
+            .count(),
+        0
+    );
+
+    let second_after = postgres_account_snapshot(&database.scoped_url, &second.account_id);
+    assert_eq!(second_after, second_before);
+}
+
 #[tokio::test]
 async fn source_routes_reject_blank_source_material() {
     let app = router(ApiState::default());
@@ -5763,6 +5877,23 @@ fn shared_concept_body() -> String {
     .join("\n")
 }
 
+fn shared_and_other_concept_body() -> String {
+    [
+        shared_concept_body(),
+        [
+            "Concept: NATO letter B",
+            "Activity: quiz",
+            "Stage: recognition-3",
+            "Question: What is the NATO phonetic alphabet word for B?",
+            "Answer: BRAVO",
+            "Distractors: ALFA, CHARLIE",
+            "Reference: The NATO phonetic alphabet word for B is BRAVO.",
+        ]
+        .join("\n"),
+    ]
+    .join("\n\n")
+}
+
 fn expired_project_deck_body() -> String {
     [
         "Concept: NATO letter D",
@@ -5790,6 +5921,21 @@ struct PostgresTestDatabase {
     admin_url: String,
     schema: String,
     scoped_url: String,
+}
+
+fn postgres_account_snapshot(
+    database_url: &str,
+    account_id: &str,
+) -> memory_engine_persistence::BetaStoreSnapshot {
+    let mut store = memory_engine_persistence_postgres::PostgresStudyStore::connect(database_url)
+        .expect("connect postgres snapshot store");
+    store
+        .for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id.to_owned())
+                .expect("account scope"),
+        )
+        .snapshot()
+        .expect("postgres snapshot")
 }
 
 impl PostgresTestDatabase {
