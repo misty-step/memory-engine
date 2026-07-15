@@ -643,42 +643,21 @@ impl HttpRequest {
         let target = request_parts
             .next()
             .ok_or_else(|| HttpRequestError::Malformed("missing path".to_owned()))?;
-        request_parts
+        let version = request_parts
             .next()
             .ok_or_else(|| HttpRequestError::Malformed("missing HTTP version".to_owned()))?;
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+            return Err(HttpRequestError::Malformed(
+                "unsupported HTTP version".to_owned(),
+            ));
+        }
         if request_parts.next().is_some() {
             return Err(HttpRequestError::Malformed(
                 "request line has too many fields".to_owned(),
             ));
         }
         let path = target.split('?').next().unwrap_or(target).to_owned();
-        let headers = lines
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                line.split_once(':').ok_or_else(|| {
-                    HttpRequestError::Malformed("malformed request header".to_owned())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let content_type = headers.iter().find_map(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type")
-                .then(|| value.trim().to_owned())
-        });
-        let content_length = headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| {
-                value.trim().parse::<usize>().map_err(|error| {
-                    HttpRequestError::Malformed(format!("invalid content-length: {error}"))
-                })
-            })
-            .transpose()?
-            .unwrap_or(0);
-        if content_length > MAX_HTTP_BODY_BYTES {
-            return Err(HttpRequestError::Malformed(
-                "request body exceeds the size limit".to_owned(),
-            ));
-        }
+        let (content_type, content_length) = parse_header_fields(lines)?;
 
         let body_start = header_end
             .checked_add(4)
@@ -733,6 +712,56 @@ enum HttpRequestError {
     ClientDisconnected,
     Malformed(String),
     Io(io::Error),
+}
+
+fn is_valid_header_field_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_http_token_byte)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn parse_header_fields<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<(Option<String>, usize), HttpRequestError> {
+    let mut content_type = None;
+    let mut content_length = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| HttpRequestError::Malformed("malformed request header".to_owned()))?;
+        if !is_valid_header_field_name(name) {
+            return Err(HttpRequestError::Malformed(
+                "invalid HTTP header field-name".to_owned(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpRequestError::Malformed(
+                "transfer-encoding is unsupported".to_owned(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-type") && content_type.is_none() {
+            content_type = Some(value.trim().to_owned());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(HttpRequestError::Malformed(
+                    "duplicate content-length header".to_owned(),
+                ));
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|error| {
+                HttpRequestError::Malformed(format!("invalid content-length: {error}"))
+            })?);
+        }
+    }
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(HttpRequestError::Malformed(
+            "request body exceeds the size limit".to_owned(),
+        ));
+    }
+    Ok((content_type, content_length))
 }
 
 impl HttpResponse {
@@ -1471,6 +1500,56 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n".to_vec(),
             b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n".to_vec(),
             oversized_header,
+        ];
+        for wire in malformed_requests {
+            let mut malformed = TcpStream::connect(address).expect("malformed connection");
+            malformed.write_all(&wire).expect("write malformed request");
+            malformed
+                .shutdown(Shutdown::Write)
+                .expect("finish malformed request");
+            let mut response = String::new();
+            malformed
+                .read_to_string(&mut response)
+                .expect("read response");
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        }
+
+        let mut valid = TcpStream::connect(address).expect("valid connection");
+        valid
+            .write_all(b"GET /state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("write valid request");
+        valid
+            .shutdown(Shutdown::Write)
+            .expect("finish valid request");
+        let mut response = String::new();
+        valid
+            .read_to_string(&mut response)
+            .expect("read valid response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve connections");
+    }
+
+    #[test]
+    fn rejects_ambiguous_http_headers_then_serves_a_following_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut shell = WebShellSession::new();
+            shell.start().expect("start");
+            serve_connections(&listener, &mut shell, Some(8))
+        });
+
+        let malformed_requests = [
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length : 10\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent@Length: 0\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"GET / NOTHTTP\r\nHost: localhost\r\n\r\n".to_vec(),
         ];
         for wire in malformed_requests {
             let mut malformed = TcpStream::connect(address).expect("malformed connection");
