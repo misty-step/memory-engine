@@ -637,7 +637,12 @@ where
 {
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
-    let source_documents = parent_source_documents::<S::Error>(&snapshot, &context.parent)?;
+    let source_documents =
+        parent_source_documents::<S::Error>(&snapshot, &context.parent, enforce_source_permission)?;
+    let source_document_ids = source_documents
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
     let source_permissions = source_permission_receipts(&source_documents);
     let authorization = SourceAuthorizationContext::from_sources(&source_documents).map_err(
         |error| match error {
@@ -660,7 +665,7 @@ where
     let (note, note_body, reference_note_created) =
         bridge_reference_note(&context, &material, &model, request.started_at);
 
-    let run_request = bridge_run_request(&request);
+    let run_request = bridge_run_request(&request, &source_document_ids);
     store
         .save_generation_run(run_receipt(
             &run_request,
@@ -687,6 +692,8 @@ where
             parent_review_unit_id: &context.parent.review_unit_id,
             parent_progression: context.parent.queue.progression.as_ref(),
             parent_stage_order: context.parent_stage_order,
+            source_document_ids: &source_document_ids,
+            source_key: context.parent.queue.source_key.as_ref(),
         },
     )?;
 
@@ -822,6 +829,8 @@ struct BridgeDraftBaseContext<'a> {
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
     parent_stage_order: u32,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 struct BridgeDraftPersistence {
@@ -869,6 +878,8 @@ where
                 easier,
                 parent_review_unit_id: base.parent_review_unit_id,
                 parent_progression: base.parent_progression,
+                source_document_ids: base.source_document_ids,
+                source_key: base.source_key,
             },
         );
         drafts.push(draft);
@@ -926,10 +937,13 @@ fn record_bridge_draft(result: &mut BridgeDraftPersistence, draft: &GeneratedPro
     result.draft_ids.push(draft.id.clone());
 }
 
-fn bridge_run_request(request: &BridgeGenerationRequest) -> BetaGenerationRequest {
+fn bridge_run_request(
+    request: &BridgeGenerationRequest,
+    source_document_ids: &[String],
+) -> BetaGenerationRequest {
     BetaGenerationRequest {
         run_id: request.run_id.clone(),
-        source_document_ids: Vec::new(),
+        source_document_ids: source_document_ids.to_vec(),
         parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
         started_at: request.started_at,
         completed_at: request.completed_at,
@@ -1094,6 +1108,7 @@ fn ensure_model_eligible_receipts<E>(
 fn parent_source_documents<E>(
     snapshot: &BetaStoreSnapshot,
     parent: &BetaReviewUnitRecord,
+    require_provenance: bool,
 ) -> Result<Vec<SourceDocument>, BetaGenerationError<E>> {
     let draft = snapshot
         .generated_prompt_drafts
@@ -1106,6 +1121,11 @@ fn parent_source_documents<E>(
         if !source_ids.iter().any(|id| id == source_key) {
             source_ids.push(source_key.clone());
         }
+    }
+    if require_provenance && source_ids.is_empty() {
+        return Err(BetaGenerationError::UnknownSourceDocument(
+            parent.review_unit_id.to_string(),
+        ));
     }
     let mut sources = Vec::with_capacity(source_ids.len());
     for source_id in &source_ids {
@@ -1323,6 +1343,8 @@ struct BridgeDraftContext<'a> {
     easier: bool,
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 fn bridge_draft(
@@ -1365,7 +1387,7 @@ fn bridge_draft(
             context.parent_review_unit_id,
             candidate,
         ),
-        source_document_ids: Vec::new(),
+        source_document_ids: context.source_document_ids.to_vec(),
         reference_span_ids: Vec::new(),
         concept_reference_note_key: Some(context.concept_key.to_owned()),
         generation_run_id: Some(context.run_id.to_owned()),
@@ -1383,7 +1405,10 @@ fn bridge_draft(
                 supersedes: vec![context.parent_review_unit_id.clone()],
             }),
             concept_key: Some(context.concept_key.to_owned()),
-            source_key: None,
+            source_key: context
+                .source_key
+                .cloned()
+                .or_else(|| context.source_document_ids.first().cloned()),
             domain_key: Some("bridge".to_owned()),
         },
         activity_kind: candidate.activity_kind.clone(),

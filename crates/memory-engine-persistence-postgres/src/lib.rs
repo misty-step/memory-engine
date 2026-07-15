@@ -2818,7 +2818,7 @@ impl AccountStudyStore<'_> {
                 source_document_from_transaction(transaction, &account_id, &source_document_id)?;
             if document.archived_at.is_some() {
                 return Err(PostgresStoreError::SourceDocumentArchived(
-                    source_document_id.to_owned(),
+                    source_document_id.clone(),
                 ));
             }
             document.permission = permission;

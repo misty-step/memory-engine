@@ -1356,7 +1356,8 @@ impl AccountRegistry {
 
     pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
-        data.storage.storage(data.now_fn)
+        data.storage
+            .storage(data.now_fn, data.generation_provider_config.clone())
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {

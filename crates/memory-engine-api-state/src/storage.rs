@@ -62,15 +62,21 @@ impl StudyStorageConfig {
         }
     }
 
-    pub(crate) fn storage(&self, now: fn() -> i64) -> StudyStorage {
+    pub(crate) fn storage(
+        &self,
+        now: fn() -> i64,
+        generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
+    ) -> StudyStorage {
         match self {
             Self::File { store_root } => StudyStorage::new(FileStudyStorage {
                 store_root: store_root.clone(),
                 now,
+                generation_provider_config: generation_provider_config.clone(),
             }),
             Self::Postgres { database_url } => StudyStorage::new(PostgresStudyStorage {
                 database_url: database_url.clone(),
                 now,
+                generation_provider_config,
             }),
         }
     }
@@ -161,6 +167,7 @@ impl StudyStorage {
         Self::new(FileStudyStorage {
             store_root: store_root.into(),
             now,
+            generation_provider_config: None,
         })
     }
 
@@ -860,6 +867,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
 struct FileStudyStorage {
     store_root: PathBuf,
     now: fn() -> i64,
+    generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
 }
 
 impl FileStudyStorage {
@@ -1518,7 +1526,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         // lock here would turn normal foreground approval or invalidation on
         // the same account into a spurious 409 for the duration of generation.
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = run_source_generation(&mut study, source_id)?;
+        let view = run_source_generation(
+            &mut study,
+            source_id,
+            self.generation_provider_config.clone(),
+        )?;
 
         Ok(StudyViewResponse::from_view(view))
     }
@@ -1534,7 +1546,12 @@ impl StudyStorageAdapter for FileStudyStorage {
             return Err(ApiFailure::not_found("Source not found."));
         }
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = run_source_generation_with_run_id(&mut study, source_id, run_id)?;
+        let view = run_source_generation_with_run_id(
+            &mut study,
+            source_id,
+            run_id,
+            self.generation_provider_config.clone(),
+        )?;
         Ok(StudyViewResponse::from_view(view))
     }
 
@@ -1629,9 +1646,10 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let provider_config = self.generation_provider_config.clone();
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
-            let view = run_reference_generation(study)?;
+            let view = run_reference_generation(study, provider_config)?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -1718,9 +1736,10 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let provider_config = self.generation_provider_config.clone();
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
-            let view = run_bridge_generation(study)?;
+            let view = run_bridge_generation(study, provider_config)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -1775,6 +1794,7 @@ impl StudyStorageAdapter for FileStudyStorage {
 struct PostgresStudyStorage {
     database_url: String,
     now: fn() -> i64,
+    generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
 }
 
 impl PostgresStudyStorage {
@@ -2268,7 +2288,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 return Err(ApiFailure::not_found("Source not found."));
             }
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation(&mut study, source_id)?;
+            let view = run_source_generation(
+                &mut study,
+                source_id,
+                self.generation_provider_config.clone(),
+            )?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -2292,7 +2316,12 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 return Err(ApiFailure::not_found("Source not found."));
             }
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation_with_run_id(&mut study, source_id, run_id)?;
+            let view = run_source_generation_with_run_id(
+                &mut study,
+                source_id,
+                run_id,
+                self.generation_provider_config.clone(),
+            )?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2465,7 +2494,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
-            let view = run_reference_generation(study)?;
+            let view = run_reference_generation(study, self.generation_provider_config.clone())?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -2577,7 +2606,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
-            let view = run_bridge_generation(study)?;
+            let view = run_bridge_generation(study, self.generation_provider_config.clone())?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -2715,6 +2744,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: notification_now,
+            generation_provider_config: None,
         };
         storage
             .save_return_notification_preference(
@@ -2742,6 +2772,7 @@ mod tests {
         let contender = FileStudyStorage {
             store_root: root.clone(),
             now: notification_now,
+            generation_provider_config: None,
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
@@ -2817,6 +2848,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: completion_now,
+            generation_provider_config: None,
         };
         storage
             .save_return_notification_preference(
@@ -2848,6 +2880,7 @@ mod tests {
         let contender = FileStudyStorage {
             store_root: root.clone(),
             now: completion_now,
+            generation_provider_config: None,
         };
         let (started_tx, started_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
@@ -2896,6 +2929,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         storage
             .save_source(
@@ -2926,6 +2960,7 @@ mod tests {
         let generation_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let generation_store_path = store_path.clone();
         let generation = thread::spawn(move || {
@@ -3001,6 +3036,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         storage
             .save_source(
@@ -3031,6 +3067,7 @@ mod tests {
         let generation_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let generation_store_path = store_path.clone();
         let generation = thread::spawn(move || {
@@ -3045,6 +3082,7 @@ mod tests {
         let approval_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let approval_store_path = store_path.clone();
         let approval = tokio::task::spawn_blocking(move || {

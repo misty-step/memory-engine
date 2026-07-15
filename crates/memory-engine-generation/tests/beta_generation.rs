@@ -973,6 +973,143 @@ fn archived_manual_parent_source_fails_before_any_bridge_provider_invocation() {
 }
 
 #[test]
+fn bridge_descendants_preserve_full_provenance_and_fail_closed_once_provider_is_enabled() {
+    let (_directory, path, parent_review_unit_id) = seed_bridge_descendants_provenance_fixture();
+    let mut store = BetaPersistenceStore::open(&path).expect("reopen store");
+
+    let child_generation = run_bridge_generation(
+        &mut store,
+        BridgeGenerationRequest {
+            run_id: "bridge-descendants-child-run".to_owned(),
+            parent_review_unit_id: parent_review_unit_id.clone(),
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("child generation");
+    let child_review_unit_id = store
+        .approve_generated_prompt_draft(
+            &child_generation.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("child")
+        .review_unit_id;
+    let child_snapshot = store.snapshot();
+    let child_draft = child_snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == child_review_unit_id)
+        .expect("child draft");
+    assert_eq!(
+        child_draft.source_document_ids,
+        vec![
+            "src-local-only-bridge".to_owned(),
+            "src-secondary-bridge".to_owned()
+        ]
+    );
+    assert_eq!(
+        child_draft.queue.source_key.as_deref(),
+        Some("src-local-only-bridge")
+    );
+
+    let provider = CountingBridgeProvider::default();
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "bridge-descendants-provider-run".to_owned(),
+            parent_review_unit_id: child_review_unit_id.clone(),
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("local-only provenance must fail once provider is enabled");
+    assert_eq!(
+        error,
+        BetaGenerationError::LocalOnlySource("src-local-only-bridge".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+}
+
+fn seed_bridge_descendants_provenance_fixture() -> (TempDirectory, PathBuf, ReviewUnitId) {
+    let directory = TempDirectory::new("bridge-descendants-provenance");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-local-only-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Private bridge notes".to_owned(),
+            project_key: None,
+            body: Some(source_body()),
+            uri: None,
+            permission: SourcePermission::LocalOnly,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("local-only source");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-secondary-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Secondary bridge notes".to_owned(),
+            project_key: None,
+            body: Some("Secondary bridge provenance note.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("secondary source");
+
+    let parent_generation = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "bridge-descendants-parent-run".to_owned(),
+            source_document_ids: vec!["src-local-only-bridge".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("parent generation");
+    let parent_review_unit_id = store
+        .approve_generated_prompt_draft(
+            &parent_generation.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("parent")
+        .review_unit_id;
+
+    let mut snapshot = store.snapshot();
+    let parent_draft = snapshot
+        .generated_prompt_drafts
+        .iter_mut()
+        .find(|draft| draft.review_unit_id == parent_review_unit_id)
+        .expect("parent draft");
+    parent_draft
+        .source_document_ids
+        .push("src-secondary-bridge".to_owned());
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("persist multi-source provenance");
+
+    (directory, path, parent_review_unit_id)
+}
+
+#[test]
 fn authored_block_without_a_reference_is_a_world_knowledge_card() {
     let directory = TempDirectory::new("no-reference");
     let path = directory.path().join("store.json");

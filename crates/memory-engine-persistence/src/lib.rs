@@ -1602,13 +1602,18 @@ fn assert_draft_contract(
     assert_non_blank(&draft.model.version, "Generated prompt draft model version")?;
     let cites_concept_note = draft.concept_reference_note_key.is_some();
     let provider_generated = draft.generation_run_id.is_some();
+    let bridge_draft = draft.queue.domain_key.as_deref() == Some("bridge");
     if provider_generated && draft.source_document_ids.is_empty() && !cites_concept_note {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresSource);
     }
     if provider_generated && !cites_concept_note && draft.reference_span_ids.is_empty() {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresReference);
     }
-    if provider_generated && cites_concept_note && !draft.source_document_ids.is_empty() {
+    if provider_generated
+        && !bridge_draft
+        && cites_concept_note
+        && !draft.source_document_ids.is_empty()
+    {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresReference);
     }
     if prompt_review_unit_id(&draft.prompt) != &draft.review_unit_id

@@ -1070,6 +1070,60 @@ fn bridge_material_creates_easier_due_items_before_the_parent() {
 }
 
 #[test]
+fn bridge_descendants_keep_local_only_provenance_and_block_provider_calls() {
+    let directory = TempDirectory::new("bridge-local-only-descendant");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz sibling");
+    let _parent_id = approved.current.expect("parent").review_unit_id;
+
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+    drop(store);
+
+    study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("reopen");
+    study.start().expect("start");
+    let bridged = study.generate_bridge_material().expect("bridge");
+    assert!(
+        bridged.current.is_some(),
+        "bridge generation should keep a current item"
+    );
+
+    let provider = CountingBridgeProvider::default();
+    let error = study
+        .generate_bridge_material_with_provider(&provider)
+        .expect_err("local-only bridge descendant must not reach provider");
+    assert!(matches!(
+        error,
+        memory_engine_study::BetaStudyError::Generation(
+            memory_engine_generation::BetaGenerationError::LocalOnlySource(id)
+        ) if id == "src-nato"
+    ));
+    assert_eq!(provider.calls.get(), 0);
+    assert_eq!(
+        study
+            .view()
+            .expect("view")
+            .current
+            .expect("current")
+            .review_unit_id,
+        bridged.current.expect("bridge current").review_unit_id
+    );
+}
+
+#[test]
 fn local_only_source_blocks_model_bridge_generation() {
     let directory = TempDirectory::new("local-only-bridge");
     let path = directory.path().join("study.json");
@@ -1666,6 +1720,11 @@ impl ReferenceNoteProvider for PanicReferenceProvider {
 
 struct RejectedBridgeProvider;
 
+#[derive(Default)]
+struct CountingBridgeProvider {
+    calls: Cell<usize>,
+}
+
 impl ReferenceNoteProvider for RejectedBridgeProvider {
     fn model(&self) -> GeneratedPromptModel {
         GeneratedPromptModel {
@@ -1715,6 +1774,38 @@ impl BridgeMaterialProvider for RejectedBridgeProvider {
             }],
             usage: None,
         })
+    }
+}
+
+impl ReferenceNoteProvider for CountingBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "counting-bridge".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ProviderFailure::new(
+            "bridge provider must not receive a local-only descendant",
+        ))
+    }
+}
+
+impl BridgeMaterialProvider for CountingBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        _request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ProviderFailure::new(
+            "bridge provider must not receive a local-only descendant",
+        ))
     }
 }
 

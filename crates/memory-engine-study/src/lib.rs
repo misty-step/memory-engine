@@ -944,6 +944,31 @@ where
         self.learn_more_internal(provider, true)
     }
 
+    /// Return the active review unit's source authorization context.
+    ///
+    /// This lets higher layers choose the local deterministic path whenever a
+    /// `LocalOnly` source is active, without reimplementing source lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError::NoActiveReviewUnit`] when nothing is active,
+    /// or a generation/store error when source resolution fails.
+    pub fn current_source_authorization(
+        &mut self,
+    ) -> Result<SourceAuthorizationContext, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let current = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        let draft = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|draft| draft.review_unit_id == current.review_unit_id)
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        ensure_active_source_model_eligible(&snapshot, draft, false)
+    }
+
     fn learn_more_internal(
         &mut self,
         provider: &dyn ReferenceNoteProvider,
@@ -1689,6 +1714,11 @@ fn ensure_active_source_model_eligible<E>(
     draft: &GeneratedPromptDraft,
     enforce_source_permission: bool,
 ) -> Result<SourceAuthorizationContext, BetaStudyError<E>> {
+    if enforce_source_permission && draft.source_document_ids.is_empty() {
+        return Err(BetaStudyError::Generation(
+            BetaGenerationError::UnknownSourceDocument(draft.review_unit_id.to_string()),
+        ));
+    }
     let mut sources = Vec::with_capacity(draft.source_document_ids.len());
     for source_id in &draft.source_document_ids {
         let source = snapshot
