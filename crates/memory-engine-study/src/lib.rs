@@ -16,8 +16,9 @@ use std::{
 };
 
 use memory_engine_core::{
-    reviewable_queue_candidates, GradeResult, Prompt, QueueCandidate, QueueSelectionOptions,
-    ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus, Verdict,
+    pick_next_queue_candidate, reviewable_queue_candidates, GradeResult, Prompt, QueueCandidate,
+    QueueSelectionOptions, ReviewUnitId, ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
+    Verdict,
 };
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
@@ -31,8 +32,7 @@ use memory_engine_persistence::{
     GeneratedPromptValidationStatus, SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use memory_engine_service::{
-    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, NextQueueCommand, NextQueueOptions,
-    ServiceError,
+    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -961,13 +961,18 @@ where
         &mut self,
         snoozed_until: i64,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let concept_key = self
+        let review_unit_id = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?
-            .queue
-            .concept_key
-            .as_deref()
+            .review_unit_id
+            .clone();
+        let concept_key = self
+            .snapshot()?
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == review_unit_id)
+            .and_then(|unit| unit.queue.concept_key.as_deref())
             .filter(|key| !key.trim().is_empty())
             .map(str::to_owned)
             .ok_or(BetaStudyError::NoConceptKey)?;
@@ -1334,54 +1339,19 @@ where
     }
 
     fn select_next(&mut self) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        let selected = {
-            let mut service =
-                MemoryService::with_clock(&mut self.store, mastered_after_three_reviews, self.now);
-            service.next_queue(NextQueueCommand {
-                options: NextQueueOptions::default(),
-            })?
-        };
         let snapshot = self.snapshot()?;
-        let active_source_ids = active_source_ids(&snapshot);
+        let candidates = self
+            .store
+            .list_queue_candidates()
+            .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
         let now = (self.now)();
-        self.current = select_due_variant(
-            &snapshot,
-            &self
-                .store
-                .list_queue_candidates()
-                .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?,
-            &active_source_ids,
-            now,
-            selected.candidate.as_ref(),
-        );
-        if self.current.is_none() {
-            self.current = selected
-                .candidate
-                .as_ref()
-                .filter(|candidate| candidate.due <= now)
-                .and_then(|candidate| find_approved_draft(&snapshot, candidate));
-        }
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|draft| !draft_has_active_source(draft, &active_source_ids))
-        {
-            self.current = None;
-        }
-        if self.current.is_none() {
-            let mut queue = self
-                .store
-                .list_queue_candidates()
-                .map_err(|error| BetaStudyError::Service(ServiceError::Store(error)))?;
-            queue.sort_by_key(|candidate| candidate.due);
-            self.current = queue
-                .iter()
-                .filter(|candidate| candidate.lifecycle.is_schedulable(now) && candidate.due <= now)
-                .find_map(|candidate| {
-                    find_approved_draft(&snapshot, candidate)
-                        .filter(|draft| draft_has_active_source(draft, &active_source_ids))
-                });
-        }
+        self.current =
+            select_current_review_unit(&snapshot, &candidates, now).and_then(|review_unit_id| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.review_unit_id == review_unit_id)
+                    .and_then(|candidate| find_approved_draft(&snapshot, candidate))
+            });
         self.status = if self.current.is_some() {
             BetaStudyStatus::Answering
         } else {
@@ -1426,6 +1396,56 @@ where
     fn invalidate_snapshot(&self) {
         *self.cached_snapshot.borrow_mut() = None;
     }
+}
+
+/// Resolve the same current due review unit that [`BetaStudySession::start`]
+/// uses, from one consistent persisted snapshot.
+#[must_use]
+pub fn select_current_review_unit(
+    snapshot: &BetaStoreSnapshot,
+    candidates: &[QueueCandidate],
+    now: i64,
+) -> Option<ReviewUnitId> {
+    let selected = pick_next_queue_candidate(
+        candidates,
+        mastered_after_three_reviews,
+        &QueueSelectionOptions {
+            now,
+            ..QueueSelectionOptions::default()
+        },
+    );
+    let active_source_ids = active_source_ids(snapshot);
+    let mut current = select_due_variant(
+        snapshot,
+        candidates,
+        &active_source_ids,
+        now,
+        selected.as_ref(),
+    );
+    if current.is_none() {
+        current = selected
+            .as_ref()
+            .filter(|candidate| candidate.due <= now)
+            .and_then(|candidate| find_approved_draft(snapshot, candidate));
+    }
+    if current
+        .as_ref()
+        .is_some_and(|draft| !draft_has_active_source(draft, &active_source_ids))
+    {
+        current = None;
+    }
+    if current.is_none() {
+        let mut queue = candidates.to_vec();
+        queue.sort_by_key(|candidate| candidate.due);
+        current = queue
+            .iter()
+            .filter(|candidate| candidate.lifecycle.is_schedulable(now) && candidate.due <= now)
+            .find_map(|candidate| {
+                find_approved_draft(snapshot, candidate)
+                    .filter(|draft| draft_has_active_source(draft, &active_source_ids))
+            });
+    }
+    current.map(|draft| draft.review_unit_id)
 }
 
 impl BetaStudyGrade {
@@ -1623,9 +1643,15 @@ fn current_view(parts: CurrentViewParts<'_>) -> BetaStudyCurrent {
         feedback,
     } = parts;
 
+    let concept_key = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == draft.review_unit_id)
+        .and_then(|unit| unit.queue.concept_key.clone());
+
     BetaStudyCurrent {
         review_unit_id: draft.review_unit_id.clone(),
-        concept_key: draft.queue.concept_key.clone(),
+        concept_key,
         prompt_id: draft.prompt_id.clone(),
         activity_kind: draft.activity_kind.clone(),
         activity_stage: draft.activity_stage.clone(),

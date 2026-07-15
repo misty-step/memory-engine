@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::Path as FsPath,
-    sync::{Arc, Barrier},
+    sync::{mpsc, Arc, Barrier},
     thread,
 };
 
@@ -1464,6 +1464,67 @@ async fn workspace_html(app: &axum::Router, cookie: &str) -> String {
         .expect("workspace refresh");
     assert_eq!(response.status(), StatusCode::OK);
     response_text(response).await
+}
+
+async fn assert_html_concept_key_is_hidden(concept_key: &Value) {
+    let root = temp_store_root("concept_key_html");
+    let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app = router(state.clone());
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &shared_concept_body())],
+        ))
+        .await
+        .expect("start HTML session");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    let source_id = html_value(&started, "sourceId");
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let study_path = fs::read_dir(&root)
+        .expect("read HTML store root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("study.json"))
+        .find(|path| path.exists())
+        .expect("HTML study snapshot");
+    let mut snapshot: Value = serde_json::from_str(
+        &fs::read_to_string(&study_path).expect("read HTML concept-key snapshot"),
+    )
+    .expect("decode HTML concept-key snapshot");
+    for unit in snapshot["reviewUnits"]
+        .as_array_mut()
+        .expect("HTML review units")
+    {
+        unit["queue"]["conceptKey"] = concept_key.clone();
+    }
+    fs::write(
+        &study_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&snapshot).expect("encode HTML concept-key snapshot")
+        ),
+    )
+    .expect("write HTML concept-key snapshot");
+
+    let page = next_review_html(&app, &cookie, &csrf_token, "concept key").await;
+    assert!(!page.contains("Hide every card for this concept until tomorrow."));
+    let review_unit_id = html_value(&page, "reviewUnitId");
+    let rejected = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+            ],
+        ))
+        .await
+        .expect("concept-key HTML rejection");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 }
 
 async fn next_review_html(
@@ -4656,6 +4717,375 @@ async fn v1_json_concept_snooze_is_authenticated_and_defers_every_member() {
 }
 
 #[tokio::test]
+async fn file_concept_snooze_rejects_stale_archived_id_without_resurrection() {
+    let root = temp_store_root("stale_concept_snooze");
+    let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app = router(state);
+    let account = create_account_v1(&app, "stale-file-concept@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+
+    let study_path = root.join(&account.account_id).join("study.json");
+    let mut snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(&study_path).expect("read file study snapshot"))
+            .expect("decode file study snapshot");
+    let units = snapshot["reviewUnits"]
+        .as_array_mut()
+        .expect("review units");
+    let archived = units
+        .iter_mut()
+        .find(|unit| unit["reviewUnitId"] == stale_id)
+        .expect("stale current unit");
+    archived["archivedAt"] = json!(1);
+    fs::write(
+        &study_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&snapshot).expect("encode snapshot")
+        ),
+    )
+    .expect("archive stale file unit");
+
+    let rejected = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{stale_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("stale file concept snooze");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let after: Value = serde_json::from_str(
+        &fs::read_to_string(&study_path).expect("read file snapshot after rejection"),
+    )
+    .expect("decode file snapshot after rejection");
+    assert_eq!(
+        after["reviewUnits"].as_array().expect("review units").len(),
+        3
+    );
+    assert!(after["reviewUnits"]
+        .as_array()
+        .expect("review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .all(|unit| unit["snoozedUntil"].is_null()));
+    assert_eq!(
+        after["reviewUnits"]
+            .as_array()
+            .expect("review units")
+            .iter()
+            .find(|unit| unit["reviewUnitId"] == stale_id)
+            .expect("archived stale unit")["archivedAt"],
+        json!(1)
+    );
+}
+
+#[tokio::test]
+async fn file_two_registries_share_account_lock_and_reject_stale_snooze() {
+    let root = temp_store_root("two_registry_concept_snooze");
+    let state_one = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let state_two = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+    let app_one = router(state_one.clone());
+    let app_two = router(state_two);
+    let started = app_one
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &shared_and_other_concept_body())],
+        ))
+        .await
+        .expect("start first file registry");
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    let source_id = html_value(&started, "sourceId");
+    generate_source_html(&app_one, &state_one, &cookie, &csrf_token, &source_id).await;
+    let page = next_review_html(&app_one, &cookie, &csrf_token, "first registry").await;
+    let stale_id = html_value(&page, "reviewUnitId");
+
+    let archived = app_one
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/delete",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("reviewUnitId", &stale_id)],
+        ))
+        .await
+        .expect("archive through first file registry");
+    assert_eq!(archived.status(), StatusCode::OK);
+
+    let rejected = app_two
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/snooze-concept",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("reviewUnitId", &stale_id)],
+        ))
+        .await
+        .expect("stale snooze through second file registry");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let study_path = fs::read_dir(&root)
+        .expect("read two-registry root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("study.json"))
+        .find(|path| path.exists())
+        .expect("two-registry study snapshot");
+    let snapshot: Value =
+        serde_json::from_str(&fs::read_to_string(study_path).expect("read two-registry snapshot"))
+            .expect("decode two-registry snapshot");
+    assert!(snapshot["reviewUnits"]
+        .as_array()
+        .expect("two-registry review units")
+        .iter()
+        .filter(|unit| unit["queue"]["conceptKey"] == "nato-letter-a")
+        .all(|unit| unit["snoozedUntil"].is_null()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_update() {
+    let Some(database) = PostgresTestDatabase::new("stale_concept_snooze") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-postgres-concept@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+
+    tokio::task::block_in_place(|| {
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database.scoped_url)
+                .expect("connect stale postgres store");
+        store
+            .for_account(
+                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
+                    .expect("account scope"),
+            )
+            .archive_review_unit(
+                &memory_engine_core::ReviewUnitId::new(stale_id.clone()),
+                DEFAULT_BETA_STUDY_NOW,
+            )
+            .expect("archive stale postgres unit");
+    });
+
+    let rejected = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{stale_id}/snooze-concept",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("stale postgres concept snooze");
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_none() || unit.review_unit_id.as_str() == stale_id));
+    assert!(after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == stale_id)
+        .expect("archived postgres stale unit")
+        .archived_at
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_two_connections_lock_different_candidate_before_concept_snooze() {
+    let Some(database) = PostgresTestDatabase::new("stale_concept_two_connections") else {
+        return;
+    };
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let account = create_account_v1(&app, "stale-two-connection@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Shared NATO concept notes",
+        &shared_and_other_concept_body(),
+    )
+    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
+    let stale_id = next_review_v1(&app, &account).await;
+    let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    let other_id = before
+        .review_units
+        .iter()
+        .find(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-b"))
+        .expect("different candidate")
+        .review_unit_id
+        .to_string();
+    let (first_ready_tx, first_ready_rx) = mpsc::channel();
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let first_url = database.scoped_url.clone();
+    let first_account_id = account.account_id.clone();
+    let first_other_id = other_id.clone();
+    let first = thread::spawn(move || {
+        hold_postgres_account_lock_and_archive(
+            &first_url,
+            &first_account_id,
+            &first_other_id,
+            &first_ready_tx,
+            &release_first_rx,
+        );
+    });
+    tokio::task::block_in_place(|| first_ready_rx.recv().expect("first transaction ready"));
+
+    let (second_started_tx, second_started_rx) = mpsc::channel();
+    let database_url = database.scoped_url.clone();
+    let account_id = account.account_id.clone();
+    let stale_id_for_second = stale_id.clone();
+    let second = thread::spawn(move || {
+        second_started_tx
+            .send(())
+            .expect("signal second transaction start");
+        let mut store =
+            memory_engine_persistence_postgres::PostgresStudyStore::connect(&database_url)
+                .expect("connect second concurrency client");
+        let mut account_store = store.for_account(
+            memory_engine_persistence_postgres::AccountScope::new(account_id)
+                .expect("second account scope"),
+        );
+        account_store.snooze_current_review_unit_concept_until(
+            &stale_id_for_second,
+            DEFAULT_BETA_STUDY_NOW,
+            DEFAULT_BETA_STUDY_NOW + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+        )
+    });
+    tokio::task::block_in_place(|| {
+        second_started_rx
+            .recv()
+            .expect("second transaction started");
+    });
+    release_first_tx
+        .send(())
+        .expect("release first archive transaction");
+    first.join().expect("join first transaction");
+    let second_result = second.join().expect("join second transaction");
+    assert!(second_result.is_err(), "the requested id became stale");
+
+    let after = postgres_account_snapshot(&database.scoped_url, &account.account_id);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.schedules, before.schedules);
+    assert!(after
+        .review_units
+        .iter()
+        .filter(|unit| unit.queue.concept_key.as_deref() == Some("nato-letter-a"))
+        .all(|unit| unit.snoozed_until.is_none()));
+    assert!(after
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id.as_str() == other_id)
+        .expect("archived unit after two-connection race")
+        .archived_at
+        .is_some());
+}
+
+#[tokio::test]
+async fn concept_snooze_null_and_blank_keys_are_json_400_and_hidden_from_html() {
+    for (label, concept_key) in [("null", json!(null)), ("blank", json!("   "))] {
+        let root = temp_store_root(&format!("concept_key_{label}"));
+        let state = ApiState::new(AccountRegistry::with_store_root(root.clone()));
+        let app = router(state.clone());
+        let account = create_account_v1(&app, &format!("concept-key-{label}@example.com")).await;
+        let source_id = create_source_v1(
+            &app,
+            &account,
+            "One concept key edge case",
+            &shared_concept_body(),
+        )
+        .await;
+        let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, &account, draft_id).await;
+        }
+        let review_unit_id = next_review_v1(&app, &account).await;
+        let study_path = root.join(&account.account_id).join("study.json");
+        let mut snapshot: Value = serde_json::from_str(
+            &fs::read_to_string(&study_path).expect("read concept-key snapshot"),
+        )
+        .expect("decode concept-key snapshot");
+        for unit in snapshot["reviewUnits"]
+            .as_array_mut()
+            .expect("review units")
+        {
+            unit["queue"]["conceptKey"] = concept_key.clone();
+        }
+        fs::write(
+            &study_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&snapshot).expect("encode concept-key snapshot")
+            ),
+        )
+        .expect("write concept-key snapshot");
+
+        let rejected = app
+            .clone()
+            .oneshot(v1_empty_request(
+                "POST",
+                &format!(
+                    "/v1/accounts/{}/review/{review_unit_id}/snooze-concept",
+                    account.account_id
+                ),
+                &account.session_token,
+            ))
+            .await
+            .expect("concept-key JSON rejection");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(rejected).await["error"],
+            json!("The active review unit must have a nonblank concept key.")
+        );
+
+        assert_html_concept_key_is_hidden(&concept_key).await;
+    }
+}
+
+#[tokio::test]
 async fn v1_json_api_exposes_review_escape_hatches() {
     let app = router(ApiState::default());
     let account = create_account_v1(&app, "bridge@example.com").await;
@@ -5915,6 +6345,32 @@ fn temp_store_root(name: &str) -> std::path::PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&root);
     root
+}
+
+fn hold_postgres_account_lock_and_archive(
+    database_url: &str,
+    account_id: &str,
+    review_unit_id: &str,
+    ready: &mpsc::Sender<()>,
+    release: &mpsc::Receiver<()>,
+) {
+    let mut client = memory_engine_persistence_postgres::connect_client(database_url)
+        .expect("connect first concurrency client");
+    let mut transaction = client.transaction().expect("begin first transaction");
+    transaction
+        .execute(
+            "UPDATE memory_engine_review_units
+             SET archived_at_ms = $3,
+                 record = jsonb_set(record, '{archivedAt}', to_jsonb($3::BIGINT), true)
+             WHERE account_id = $1 AND review_unit_id = $2",
+            &[&account_id, &review_unit_id, &DEFAULT_BETA_STUDY_NOW],
+        )
+        .expect("archive requested unit in first transaction");
+    ready.send(()).expect("signal first transaction ready");
+    release.recv().expect("wait to commit first transaction");
+    transaction
+        .commit()
+        .expect("commit first archive transaction");
 }
 
 struct PostgresTestDatabase {

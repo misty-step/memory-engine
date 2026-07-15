@@ -754,6 +754,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .skip_review(account_id, &account.store_path, review_unit_id)
     }
@@ -773,6 +777,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .delete_review(account_id, &account.store_path, review_unit_id)
     }
@@ -789,6 +797,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .snooze_review(account_id, &account.store_path, review_unit_id)
     }
@@ -805,6 +817,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .snooze_concept_review(account_id, &account.store_path, review_unit_id)
     }
@@ -821,6 +837,10 @@ impl AccountRegistry {
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
             .bridge_review(account_id, &account.store_path, review_unit_id)
     }
@@ -846,6 +866,10 @@ impl AccountRegistry {
         }
         let storage = self.storage();
         let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut data = self.lock_data();
         if let Some(response) = data
             .accounts

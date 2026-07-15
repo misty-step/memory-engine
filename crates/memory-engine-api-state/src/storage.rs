@@ -16,9 +16,10 @@ use crate::{
     browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
     persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
     postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
-    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
-    ApiFailure, BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash, study_failure,
+    with_file_account_lock,
+    with_postgres_account, with_postgres_store, with_postgres_study, write_atomic, ApiFailure,
+    BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
     ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
 
@@ -707,6 +708,17 @@ impl FileStudyStorage {
     fn now_ms(&self) -> i64 {
         (self.now)()
     }
+
+    fn with_locked_study<R>(
+        &self,
+        store_path: &FsPath,
+        operation: impl FnOnce(&mut BetaStudySession) -> Result<R, ApiFailure>,
+    ) -> Result<R, ApiFailure> {
+        with_file_account_lock(store_path, || {
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            operation(&mut study)
+        })
+    }
 }
 
 impl StudyStorageAdapter for FileStudyStorage {
@@ -1178,17 +1190,19 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source: &SourceRecord,
     ) -> Result<(), ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        study
-            .add_source(BetaStudySourceInput {
-                id: source.source_id.clone(),
-                title: source.title.clone(),
-                body: source.body.clone(),
-                project_key: source.project_key.clone(),
-                ttl_expires_at: source.ttl_expires_at,
-            })
-            .map_err(study_failure)?;
-        Ok(())
+        with_file_account_lock(store_path, || {
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            study
+                .add_source(BetaStudySourceInput {
+                    id: source.source_id.clone(),
+                    title: source.title.clone(),
+                    body: source.body.clone(),
+                    project_key: source.project_key.clone(),
+                    ttl_expires_at: source.ttl_expires_at,
+                })
+                .map_err(study_failure)?;
+            Ok(())
+        })
     }
 
     fn list_sources(
@@ -1205,13 +1219,15 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        if !persisted_source_exists(store_path, source_id)? {
-            return Err(ApiFailure::not_found("Source not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = run_source_generation(&mut study, source_id)?;
+        with_file_account_lock(store_path, || {
+            if !persisted_source_exists(store_path, source_id)? {
+                return Err(ApiFailure::not_found("Source not found."));
+            }
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            let view = run_source_generation(&mut study, source_id)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn archive_source(
@@ -1220,13 +1236,15 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<(StudyViewResponse, usize), ApiFailure> {
-        if !persisted_source_exists(store_path, source_id)? {
-            return Err(ApiFailure::not_found("Source not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
+        with_file_account_lock(store_path, || {
+            if !persisted_source_exists(store_path, source_id)? {
+                return Err(ApiFailure::not_found("Source not found."));
+            }
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            let (view, archived_count) = study.archive_source(source_id).map_err(study_failure)?;
 
-        Ok((StudyViewResponse::from_view(view), archived_count))
+            Ok((StudyViewResponse::from_view(view), archived_count))
+        })
     }
 
     fn invalidate_project_deck(
@@ -1236,15 +1254,17 @@ impl StudyStorageAdapter for FileStudyStorage {
         deck_id: &str,
         invalidated_at: i64,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        if !persisted_project_deck_exists(store_path, deck_id)? {
-            return Err(ApiFailure::not_found("Project deck not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = study
-            .invalidate_project_deck(deck_id, invalidated_at)
-            .map_err(study_failure)?;
+        with_file_account_lock(store_path, || {
+            if !persisted_project_deck_exists(store_path, deck_id)? {
+                return Err(ApiFailure::not_found("Project deck not found."));
+            }
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            let view = study
+                .invalidate_project_deck(deck_id, invalidated_at)
+                .map_err(study_failure)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn approve_draft(
@@ -1253,10 +1273,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = study.approve_draft(draft_id).map_err(study_failure)?;
+        with_file_account_lock(store_path, || {
+            let mut study = crate::open_study_session(store_path, self.now)?;
+            let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn next_review(
@@ -1300,11 +1322,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = run_reference_generation(&mut study)?;
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = run_reference_generation(study)?;
 
-        Ok(StudyViewResponse::from_view(view))
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn skip_review(
@@ -1313,11 +1336,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.skip_current().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.skip_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn snooze_review(
@@ -1326,11 +1349,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.snooze_current().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.snooze_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn snooze_concept_review(
@@ -1339,11 +1362,17 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.snooze_current_concept().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            let view = study.start().map_err(study_failure)?;
+            let Some(current) = view.current else {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            };
+            if current.review_unit_id.to_string() != review_unit_id {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            }
+            let view = study.snooze_current_concept().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn delete_review(
@@ -1352,11 +1381,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study.archive_current().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study.archive_current().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn bridge_review(
@@ -1365,11 +1394,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = run_bridge_generation(&mut study)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = run_bridge_generation(study)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn submit_review(
@@ -1381,13 +1410,13 @@ impl StudyStorageAdapter for FileStudyStorage {
         response_time_ms: u32,
         idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        require_current_review(&mut study, review_unit_id)?;
-        let view = study
-            .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
-            .map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        self.with_locked_study(store_path, |study| {
+            require_current_review(study, review_unit_id)?;
+            let view = study
+                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
+                .map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn record_content_feedback(
@@ -1955,12 +1984,36 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         _store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_study(&self.database_url, account_id, self.now, |study| {
-            require_current_review_postgres(study, review_unit_id)?;
-            let view = study.snooze_current_concept().map_err(study_failure)?;
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account
+                    .snooze_current_review_unit_concept_until(
+                        review_unit_id,
+                        self.now_ms(),
+                        self.now_ms() + memory_engine_study::DEFAULT_SNOOZE_DEFER_MS,
+                    )
+                    .map_err(|error| {
+                        match error {
+                    memory_engine_persistence_postgres::PostgresStoreError::NoConceptKey => {
+                        ApiFailure::bad_request(
+                            "The active review unit must have a nonblank concept key.",
+                        )
+                    }
+                    memory_engine_persistence_postgres::PostgresStoreError::UnknownReviewUnit(
+                        _,
+                    ) => ApiFailure::not_found("Review unit not found."),
+                    error => postgres_failure(error),
+                }
+                    })?;
+                let mut study = BetaStudySession::from_store(account, self.now);
+                let view = study.start().map_err(study_failure)?;
 
-            Ok(StudyViewResponse::from_view(view))
-        })
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
     }
 
     fn delete_review(

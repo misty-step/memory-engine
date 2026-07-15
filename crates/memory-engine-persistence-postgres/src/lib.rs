@@ -4,7 +4,7 @@
 //! It intentionally stays outside `memory-engine-core` and keeps HTTP, auth,
 //! generation providers, and UI state out of the database adapter.
 
-use std::{cell::RefCell, error::Error, fmt};
+use std::{cell::RefCell, collections::BTreeMap, error::Error, fmt};
 
 use memory_engine_core::{
     defer_queue_availability, Prompt, QueueCandidate, ReviewUnitId, ReviewUnitLifecycle,
@@ -20,7 +20,7 @@ use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
     ServiceAttemptRecord,
 };
-use memory_engine_study::BetaStudyStore;
+use memory_engine_study::{select_current_review_unit, BetaStudyStore};
 use postgres::Client;
 
 pub const MIGRATION_SQL: &str = r"
@@ -1160,6 +1160,119 @@ impl AccountStudyStore<'_> {
         Ok(snoozed)
     }
 
+    /// Resolve and snooze the requested current review unit's whole concept
+    /// in one account-scoped transaction.
+    ///
+    /// The requested row, its persisted concept key, and the due candidate
+    /// chosen from the same locked snapshot are validated before any member is
+    /// updated. A stale request therefore commits no partial concept deferral.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the requested unit is stale, has no
+    /// usable concept key, or the transaction cannot be committed.
+    pub fn snooze_current_review_unit_concept_until(
+        &mut self,
+        review_unit_id: &str,
+        now: i64,
+        snoozed_until: i64,
+    ) -> Result<Vec<BetaReviewUnitRecord>, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        // Lock the complete active candidate set before resolving current.
+        // Every competing review mutation updates one of these rows, so a
+        // replica cannot change archive/current state between this read and
+        // the concept update. Ordering both lock queries by id keeps two
+        // account operations from acquiring row locks in opposite orders.
+        let active_rows = transaction.query(
+            "SELECT review_unit_id, record FROM memory_engine_review_units
+             WHERE account_id = $1 AND archived_at_ms IS NULL
+             ORDER BY review_unit_id
+             FOR UPDATE",
+            &[&self.scope.account_id],
+        )?;
+        let active_records = active_rows
+            .into_iter()
+            .map(|row| {
+                let review_unit_id: String = row.get(0);
+                let value: serde_json::Value = row.get(1);
+                Ok((review_unit_id, serde_json::from_value(value)?))
+            })
+            .collect::<Result<Vec<(String, BetaReviewUnitRecord)>, PostgresStoreError>>()?;
+        let Some((_, requested)) = active_records.iter().find(|(id, _)| id == review_unit_id)
+        else {
+            return Err(PostgresStoreError::UnknownReviewUnit(ReviewUnitId::new(
+                review_unit_id,
+            )));
+        };
+        let concept_key = requested
+            .queue
+            .concept_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .ok_or(PostgresStoreError::NoConceptKey)?;
+
+        let schedule_rows = transaction.query(
+            "SELECT schedules.review_unit_id, schedules.state
+             FROM memory_engine_schedules AS schedules
+             INNER JOIN memory_engine_review_units AS units
+               ON units.account_id = schedules.account_id
+              AND units.review_unit_id = schedules.review_unit_id
+             WHERE schedules.account_id = $1 AND units.archived_at_ms IS NULL
+             ORDER BY schedules.review_unit_id
+             FOR UPDATE OF schedules, units",
+            &[&self.scope.account_id],
+        )?;
+        let schedules = schedule_rows
+            .into_iter()
+            .map(|row| {
+                let review_unit_id: String = row.get(0);
+                let value: serde_json::Value = row.get(1);
+                Ok((review_unit_id, serde_json::from_value(value)?))
+            })
+            .collect::<Result<BTreeMap<String, ScheduleState>, PostgresStoreError>>()?;
+
+        if !current_review_unit_matches(
+            &mut transaction,
+            &self.scope.account_id,
+            &active_records,
+            &schedules,
+            review_unit_id,
+            now,
+        )? {
+            return Err(PostgresStoreError::UnknownReviewUnit(ReviewUnitId::new(
+                review_unit_id,
+            )));
+        }
+
+        let rows = transaction.query(
+            "UPDATE memory_engine_review_units
+             SET record = jsonb_set(
+                 record,
+                 '{snoozedUntil}',
+                 to_jsonb($3::BIGINT),
+                 true
+             )
+             WHERE account_id = $1
+               AND archived_at_ms IS NULL
+               AND record->'queue'->>'conceptKey' = $2
+             RETURNING record",
+            &[&self.scope.account_id, &concept_key, &snoozed_until],
+        )?;
+        let snoozed = rows
+            .into_iter()
+            .map(|row| {
+                let value: serde_json::Value = row.get(0);
+                Ok(serde_json::from_value(value)?)
+            })
+            .collect::<Result<Vec<BetaReviewUnitRecord>, PostgresStoreError>>()?;
+        transaction.commit()?;
+
+        Ok(snoozed)
+    }
+
     /// Replace volatile lifecycle metadata without changing schedule history.
     ///
     /// # Errors
@@ -1797,6 +1910,92 @@ impl BetaStudyStore for AccountStudyStore<'_> {
     }
 }
 
+fn current_review_unit_matches(
+    transaction: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    active_records: &[(String, BetaReviewUnitRecord)],
+    schedules: &BTreeMap<String, ScheduleState>,
+    requested_id: &str,
+    now: i64,
+) -> Result<bool, PostgresStoreError> {
+    let candidates = active_records
+        .iter()
+        .map(|(review_unit_id, record)| {
+            let schedule = schedules.get(review_unit_id).cloned();
+            let mut candidate = record.queue.with_schedule(schedule);
+            if let Some(deferred_until) = record.snoozed_until {
+                candidate = defer_queue_availability(&candidate, deferred_until);
+            }
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let source_documents = transaction
+        .query(
+            "SELECT document FROM memory_engine_source_documents
+             WHERE account_id = $1
+             ORDER BY created_at_ms, source_document_id",
+            &[&account_id],
+        )?
+        .into_iter()
+        .map(|row| {
+            let value: serde_json::Value = row.get(0);
+            Ok(serde_json::from_value(value)?)
+        })
+        .collect::<Result<Vec<SourceDocument>, PostgresStoreError>>()?;
+    let generated_prompt_drafts = transaction
+        .query(
+            "SELECT draft FROM memory_engine_generated_prompt_drafts
+             WHERE account_id = $1
+             ORDER BY created_at_ms, draft_id",
+            &[&account_id],
+        )?
+        .into_iter()
+        .map(|row| {
+            let value: serde_json::Value = row.get(0);
+            Ok(serde_json::from_value(value)?)
+        })
+        .collect::<Result<Vec<GeneratedPromptDraft>, PostgresStoreError>>()?;
+    let attempts = transaction
+        .query(
+            "SELECT attempt FROM memory_engine_attempts
+             WHERE account_id = $1
+             ORDER BY occurred_at_ms, attempt_id",
+            &[&account_id],
+        )?
+        .into_iter()
+        .map(|row| {
+            let value: serde_json::Value = row.get(0);
+            Ok(serde_json::from_value(value)?)
+        })
+        .collect::<Result<Vec<ServiceAttemptRecord>, PostgresStoreError>>()?;
+    let snapshot = BetaStoreSnapshot {
+        version: 1,
+        source_documents,
+        reference_spans: Vec::new(),
+        generated_prompt_drafts,
+        review_units: active_records
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect(),
+        schedules: schedules
+            .iter()
+            .map(|(review_unit_id, state)| ScheduleRecord {
+                review_unit_id: ReviewUnitId::new(review_unit_id.clone()),
+                state: state.clone(),
+            })
+            .collect(),
+        attempts,
+        generation_runs: Vec::new(),
+        applied_reviews: Vec::new(),
+        concept_reference_notes: Vec::new(),
+    };
+
+    Ok(select_current_review_unit(&snapshot, &candidates, now)
+        .as_ref()
+        .map(ReviewUnitId::as_str)
+        == Some(requested_id))
+}
+
 fn query_json_column<T>(
     client: &RefCell<Client>,
     sql: &str,
@@ -1988,6 +2187,7 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 #[derive(Debug)]
 pub enum PostgresStoreError {
     BlankAccountId,
+    NoConceptKey,
     UnknownSourceDocument(String),
     UnknownReviewUnit(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
@@ -2015,6 +2215,7 @@ impl fmt::Display for PostgresStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BlankAccountId => formatter.write_str("Account id must not be blank"),
+            Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
@@ -2073,6 +2274,7 @@ impl Error for PostgresStoreError {
             Self::Postgres(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::BlankAccountId
+            | Self::NoConceptKey
             | Self::UnknownSourceDocument(_)
             | Self::UnknownReviewUnit(_)
             | Self::UnknownGeneratedPromptDraft(_)

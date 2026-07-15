@@ -894,16 +894,20 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
             ICON_SNOOZE,
             "Hide until tomorrow.",
         ),
-        concept_snooze = current.concept_key.as_ref().map_or_else(String::new, |_| {
-            render_review_action(
-                account,
-                current,
-                "/app/snooze-concept",
-                "Snooze concept",
-                ICON_SNOOZE,
-                "Hide every card for this concept until tomorrow.",
-            )
-        }),
+        concept_snooze = current
+            .concept_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map_or_else(String::new, |_| {
+                render_review_action(
+                    account,
+                    current,
+                    "/app/snooze-concept",
+                    "Snooze concept",
+                    ICON_SNOOZE,
+                    "Hide every card for this concept until tomorrow.",
+                )
+            }),
         bridge = render_review_action(
             account,
             current,

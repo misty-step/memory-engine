@@ -1255,7 +1255,17 @@ async fn snooze_concept_app_review(
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn bridge_app_review(

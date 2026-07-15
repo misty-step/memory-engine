@@ -8,10 +8,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    fs,
+    fs::{self, OpenOptions},
     io::Write as _,
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -1188,6 +1193,11 @@ pub struct ApiFailure {
 
 impl ApiFailure {
     #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
     pub fn bad_request(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -1625,6 +1635,103 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+struct FileAccountLock {
+    path: PathBuf,
+    stop_heartbeat: Arc<AtomicBool>,
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+impl Drop for FileAccountLock {
+    fn drop(&mut self) {
+        self.stop_heartbeat.store(true, Ordering::Release);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_file_account_lock(store_path: &FsPath) -> Result<FileAccountLock, ApiFailure> {
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+    const STALE_AFTER: Duration = Duration::from_secs(30);
+    let lock_path = store_path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
+    }
+    let deadline = Instant::now() + ACQUIRE_TIMEOUT;
+
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let owner = format!("pid={}\n", std::process::id());
+                file.write_all(owner.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                let stop_heartbeat = Arc::new(AtomicBool::new(false));
+                let heartbeat_stop = Arc::clone(&stop_heartbeat);
+                let heartbeat_path = lock_path.clone();
+                let heartbeat = std::thread::spawn(move || {
+                    while !heartbeat_stop.load(Ordering::Acquire) {
+                        for _ in 0..20 {
+                            if heartbeat_stop.load(Ordering::Acquire) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                        let Ok(mut file) = OpenOptions::new().write(true).open(&heartbeat_path)
+                        else {
+                            return;
+                        };
+                        if file
+                            .set_len(0)
+                            .and_then(|()| file.write_all(owner.as_bytes()))
+                            .and_then(|()| file.sync_all())
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                return Ok(FileAccountLock {
+                    path: lock_path,
+                    stop_heartbeat,
+                    heartbeat: Some(heartbeat),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= STALE_AFTER);
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(ApiFailure::conflict(
+                        "The account study store is busy; try again shortly.",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(ApiFailure::internal(error.to_string())),
+        }
+    }
+}
+
+pub(crate) fn with_file_account_lock<R>(
+    store_path: &FsPath,
+    operation: impl FnOnce() -> Result<R, ApiFailure>,
+) -> Result<R, ApiFailure> {
+    let _lock = acquire_file_account_lock(store_path)?;
+    operation()
+}
+
 /// Generate drafts for one source using the configured provider.
 ///
 /// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
@@ -1887,6 +1994,9 @@ fn persisted_project_deck_exists(path: &FsPath, deck_id: &str) -> Result<bool, A
 fn study_failure<E: std::fmt::Display>(
     error: memory_engine_study::BetaStudyError<E>,
 ) -> ApiFailure {
+    if matches!(&error, memory_engine_study::BetaStudyError::NoConceptKey) {
+        return ApiFailure::bad_request("The active review unit must have a nonblank concept key.");
+    }
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
