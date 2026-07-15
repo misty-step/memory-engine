@@ -318,6 +318,58 @@ fn enumerable_numbered_lists_preserve_order_and_source_evidence() {
 }
 
 #[test]
+fn numbered_procedures_keep_process_semantics_instead_of_set_cards() {
+    let source = source_document(
+        "src-procedure-list",
+        "Three-step recipe",
+        "1. Mix flour and water.\n2. Knead the dough.\n3. Bake the loaf.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("entry for number")));
+    assert!(drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage == "procedure-composition"));
+}
+
+#[test]
+fn finite_sets_with_weak_process_words_keep_enumerable_semantics() {
+    let source = source_document(
+        "src-planets",
+        "The first three planets",
+        "1. Mercury\n2. Venus\n3. Earth",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::EnumerableSet
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("finite-set generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 3);
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_stage == "production-recall"));
+}
+
+#[test]
 fn sequential_sources_emit_one_verbatim_card_per_sentence() {
     let source = source_document(
         "src-sequence",
@@ -349,7 +401,8 @@ fn sequential_sources_emit_one_verbatim_card_per_sentence() {
     assert!(drafts.candidates.iter().all(|candidate| {
         candidate.activity_kind == GeneratedLearningActivityKind::Exercise
             && candidate.worked_solution.is_some()
-            && candidate.evidence.as_deref() == Some(candidate.answer.as_str())
+            && candidate.evidence.as_deref()
+                == Some("First faithful line. Second faithful line. Third faithful line.")
     }));
     assert_eq!(drafts.candidates[0].activity_stage, "free-recall");
     assert!(drafts.candidates[1..]

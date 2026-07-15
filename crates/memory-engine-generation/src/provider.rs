@@ -454,7 +454,20 @@ pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassi
     let normalized = format!("{} {}", source.title, body).to_lowercase();
     let lines = non_empty_lines(body);
     let list_facts = count_fact_sentences(body);
-    if looks_enumerable(body, &lines) {
+    let enumerable = looks_enumerable(body, &lines);
+    let process = looks_process(&normalized);
+    let ordered_process = looks_ordered_process(&normalized);
+    // A numbered procedure is both list-shaped and process-shaped. Let the
+    // strong ordered-action signal win that overlap, while keeping ordinary
+    // line-broken verse on the verbatim path and finite reference sets
+    // enumerable even when they mention weak process words such as "first".
+    if enumerable && ordered_process {
+        return LearningIntentClassification {
+            intent: LearningIntent::ProcedureProcess,
+            rationale: "source describes ordered actions or conditional steps".to_owned(),
+        };
+    }
+    if enumerable {
         return LearningIntentClassification {
             intent: LearningIntent::EnumerableSet,
             rationale: "source contains a finite set of independently recallable entries"
@@ -467,7 +480,7 @@ pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassi
             rationale: "source reads like a quoted passage or line-broken text".to_owned(),
         };
     }
-    if looks_process(&normalized) {
+    if process {
         return LearningIntentClassification {
             intent: LearningIntent::ProcedureProcess,
             rationale: "source describes ordered actions or conditional steps".to_owned(),
@@ -908,6 +921,25 @@ fn looks_process(normalized: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+fn looks_ordered_process(normalized: &str) -> bool {
+    [
+        "step",
+        "steps",
+        "procedure",
+        "process",
+        "recipe",
+        "instruction",
+        "instructions",
+        "workflow",
+        "how to ",
+        "follow these",
+        "in order",
+        "sequence",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn looks_concept(normalized: &str) -> bool {
     [
         " because ",
@@ -947,6 +979,7 @@ fn count_fact_sentences(body: &str) -> usize {
 
 fn verbatim_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
     let units = sequential_units(body);
+    let source_evidence = body.trim().to_owned();
     units
         .iter()
         .enumerate()
@@ -967,7 +1000,10 @@ fn verbatim_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidat
                 concept: format!("{} line {}", source.title, position + 1),
                 question,
                 answer: unit.clone(),
-                evidence: Some(unit.clone()),
+                // Keep the exact unit as the answer, but cite the complete
+                // source so short verse lines clear the production trust
+                // floor without weakening evidence_quote_matches.
+                evidence: Some(source_evidence.clone()),
                 distractors: Vec::new(),
                 worked_solution: Some(format!("The exact source line is: {unit}")),
                 activity_kind: GeneratedLearningActivityKind::Exercise,
