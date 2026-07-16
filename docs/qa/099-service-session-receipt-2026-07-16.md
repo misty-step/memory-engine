@@ -29,12 +29,12 @@ connection.
 | Step | Route | Result | Time |
 |---|---|---|---|
 | Issue credential | `POST /v1/service-sessions` | 201 | 0.304 s |
-| Save source | `POST /v1/accounts/{id}/sources` | 201 | 1.135 s |
-| Review next ×5 | `POST /v1/accounts/{id}/review/next` | 200 ×5 | 0.684–0.840 s |
-| List sources | `GET /v1/accounts/{id}/sources` | 200 | 0.681 s |
+| Save source | `POST /v1/accounts/{account_id}/sources` | 201 | 1.135 s |
+| Review next ×5 | `POST /v1/accounts/{account_id}/review/next` | 200 ×5 | 0.684–0.840 s |
+| List sources | `GET /v1/accounts/{account_id}/sources` | 200 | 0.681 s |
 | Rotate (reissue) | `POST /v1/service-sessions` | 201, same `accountId` | 0.419 s |
-| Prior token after rotation | `POST /v1/accounts/{id}/review/next` | **403** `Session token does not match account.` | immediate |
-| Fresh token | `POST /v1/accounts/{id}/review/next` | 200 | 0.794 s |
+| Prior token after rotation | `POST /v1/accounts/{account_id}/review/next` | **403** `Session token does not match account.` | immediate |
+| Fresh token | `POST /v1/accounts/{account_id}/review/next` | 200 | 0.794 s |
 
 Rotation-as-revocation is proven live: the pre-rotation token failed on the
 very next request with 403.
