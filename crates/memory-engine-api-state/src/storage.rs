@@ -924,7 +924,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
+        let _lock =
+            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let existing = match fs::read(&path) {
             Ok(bytes) => Some(
@@ -1034,7 +1035,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
+        let _lock =
+            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1070,11 +1072,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(&request.account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let Some(_lock) =
-            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
-        else {
-            return Ok(None);
-        };
+        let _lock =
+            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
+        let now_ms = request.now_ms;
+        let granted_at_ms = (self.now)();
+        let claim_ttl_ms = request
+            .claim_expires_at_ms
+            .saturating_sub(request.now_ms)
+            .max(0);
+        let unsubscribe_ttl_ms = request
+            .unsubscribe_expires_at_ms
+            .saturating_sub(request.now_ms)
+            .max(0);
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(None);
@@ -1083,11 +1092,11 @@ impl StudyStorageAdapter for FileStudyStorage {
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         let interval_elapsed = preference
             .last_sent_at_ms
-            .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
+            .is_none_or(|sent| now_ms.saturating_sub(sent) >= request.interval_ms);
         let eligible = (preference.pending_delivery_key.is_some()
             && preference
                 .next_retry_at_ms
-                .is_none_or(|retry_at| retry_at <= request.now_ms))
+                .is_none_or(|retry_at| retry_at <= now_ms))
             || (preference.pending_delivery_key.is_none()
                 && interval_elapsed
                 && (request.force_confirmation || request.due_count > 0));
@@ -1095,7 +1104,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             || !eligible
             || preference
                 .claim_expires_at_ms
-                .is_some_and(|expires| expires > request.now_ms)
+                .is_some_and(|expires| expires > now_ms)
         {
             return Ok(None);
         }
@@ -1111,9 +1120,9 @@ impl StudyStorageAdapter for FileStudyStorage {
         let due_count = preference.pending_due_count.unwrap_or(request.due_count);
         let unsubscribe_expires_at_ms = preference
             .pending_unsubscribe_expires_at_ms
-            .unwrap_or(request.unsubscribe_expires_at_ms);
+            .unwrap_or_else(|| granted_at_ms.saturating_add(unsubscribe_ttl_ms));
         preference.claim_id = Some(request.claim_id.clone());
-        preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
+        preference.claim_expires_at_ms = Some(granted_at_ms.saturating_add(claim_ttl_ms));
         preference.pending_delivery_key = Some(delivery_key.clone());
         preference.pending_due_count = Some(due_count);
         preference.pending_unsubscribe_expires_at_ms = Some(unsubscribe_expires_at_ms);
@@ -1135,16 +1144,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
-        sent_at_ms: i64,
+        _sent_at_ms: i64,
     ) -> Result<bool, ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let Some(_lock) =
-            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
-        else {
-            return Ok(false);
-        };
+        let _lock =
+            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
+        let sent_at_ms = (self.now)();
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1172,18 +1179,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
-        now_ms: i64,
+        _now_ms: i64,
     ) -> Result<(), ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let Some(_lock) =
-            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
-        else {
-            return Err(ApiFailure::conflict(
-                "Return notification state is busy; retry the delivery.",
-            ));
-        };
+        let _lock =
+            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
+        let now_ms = (self.now)();
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(());
@@ -2385,19 +2388,28 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
     };
     use memory_engine_persistence::GeneratedPromptModel;
     use memory_engine_service::MemoryServiceStore;
     use std::{
-        sync::{Arc, Barrier},
+        sync::{
+            atomic::{AtomicI64, Ordering},
+            mpsc, Arc, Barrier,
+        },
         thread,
+        time::Duration,
     };
 
     fn test_now() -> i64 {
         1_700_000_000_000
+    }
+
+    static NOTIFICATION_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+
+    fn notification_now() -> i64 {
+        NOTIFICATION_CLOCK.load(Ordering::SeqCst)
     }
 
     struct BlockingDraftProvider {
@@ -2419,6 +2431,187 @@ mod tests {
             self.release.wait();
             self.delegate.generate_drafts(source)
         }
+    }
+
+    #[test]
+    fn file_notification_claim_waits_and_rebases_ttls_after_lock_contention() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-notification-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        NOTIFICATION_CLOCK.store(test_now(), Ordering::SeqCst);
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: notification_now,
+        };
+        storage
+            .save_return_notification_preference(
+                "acct",
+                "learner@example.com",
+                true,
+                None,
+                "unsubscribe-nonce",
+            )
+            .expect("notification preference");
+        let held = crate::file_lock::acquire(&root.join("acct").join("return-notifications.lock"))
+            .expect("hold notification lock");
+        let request = ReturnNotificationClaimRequest {
+            account_id: "acct".to_owned(),
+            now_ms: test_now(),
+            due_count: 1,
+            force_confirmation: true,
+            interval_ms: 86_400_000,
+            claim_id: "claim".to_owned(),
+            delivery_key: "delivery".to_owned(),
+            claim_expires_at_ms: test_now() + 1,
+            unsubscribe_nonce: "next-unsubscribe-nonce".to_owned(),
+            unsubscribe_expires_at_ms: test_now() + 604_800_000,
+        };
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: notification_now,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let claim = thread::spawn(move || {
+            started_tx.send(()).expect("signal claim start");
+            result_tx
+                .send(contender.claim_return_notification(&request))
+                .expect("send claim result");
+        });
+        started_rx.recv().expect("claim started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "claim must wait while the notification lock is held"
+        );
+        NOTIFICATION_CLOCK.store(test_now() + 10, Ordering::SeqCst);
+        drop(held);
+        let result = early.unwrap_or_else(|_| result_rx.recv().expect("claim after lock release"));
+
+        assert!(
+            result.expect("claim result").is_some(),
+            "short lock contention must not be reported as an ineligible notification"
+        );
+        claim.join().expect("claim thread");
+        let preference = storage
+            .load_return_notification_preference("acct")
+            .expect("load notification preference")
+            .expect("saved notification preference");
+        assert_eq!(
+            preference.claim_expires_at_ms,
+            Some(test_now() + 11),
+            "claim TTL must start after the blocking lock wait"
+        );
+        assert_eq!(
+            preference.pending_unsubscribe_expires_at_ms,
+            Some(test_now() + 10 + 604_800_000),
+            "unsubscribe TTL must start after the blocking lock wait"
+        );
+        assert!(
+            storage
+                .claim_return_notification(&ReturnNotificationClaimRequest {
+                    account_id: "acct".to_owned(),
+                    now_ms: test_now() + 10,
+                    due_count: 1,
+                    force_confirmation: true,
+                    interval_ms: 86_400_000,
+                    claim_id: "premature-reclaim".to_owned(),
+                    delivery_key: "premature-delivery".to_owned(),
+                    claim_expires_at_ms: test_now() + 11,
+                    unsubscribe_nonce: "premature-nonce".to_owned(),
+                    unsubscribe_expires_at_ms: test_now() + 10 + 604_800_000,
+                })
+                .expect("premature reclaim check")
+                .is_none(),
+            "lock wait beyond the original TTL must not expose the fresh claim"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_notification_completion_waits_and_samples_time_after_lock_contention() {
+        static COMPLETION_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+        fn completion_now() -> i64 {
+            COMPLETION_CLOCK.load(Ordering::SeqCst)
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-notification-completion-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        COMPLETION_CLOCK.store(test_now(), Ordering::SeqCst);
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: completion_now,
+        };
+        storage
+            .save_return_notification_preference(
+                "acct",
+                "learner@example.com",
+                true,
+                None,
+                "unsubscribe-nonce",
+            )
+            .expect("notification preference");
+        storage
+            .claim_return_notification(&ReturnNotificationClaimRequest {
+                account_id: "acct".to_owned(),
+                now_ms: test_now(),
+                due_count: 1,
+                force_confirmation: true,
+                interval_ms: 86_400_000,
+                claim_id: "claim".to_owned(),
+                delivery_key: "delivery".to_owned(),
+                claim_expires_at_ms: test_now() + 300_000,
+                unsubscribe_nonce: "next-unsubscribe-nonce".to_owned(),
+                unsubscribe_expires_at_ms: test_now() + 604_800_000,
+            })
+            .expect("claim result")
+            .expect("claim");
+
+        let held = crate::file_lock::acquire(&root.join("acct").join("return-notifications.lock"))
+            .expect("hold notification lock before completion");
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: completion_now,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let completion = thread::spawn(move || {
+            started_tx.send(()).expect("signal completion start");
+            result_tx
+                .send(contender.complete_return_notification("acct", "claim", test_now()))
+                .expect("send completion result");
+        });
+        started_rx.recv().expect("completion started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "completion must wait while the notification lock is held"
+        );
+        COMPLETION_CLOCK.store(test_now() + 10, Ordering::SeqCst);
+        drop(held);
+        let result =
+            early.unwrap_or_else(|_| result_rx.recv().expect("completion after lock release"));
+
+        assert!(
+            result.expect("completion result"),
+            "short lock contention must not discard the matching completion"
+        );
+        completion.join().expect("completion thread");
+        assert_eq!(
+            storage
+                .load_return_notification_preference("acct")
+                .expect("load completed notification")
+                .expect("completed notification")
+                .last_sent_at_ms,
+            Some(test_now() + 10),
+            "completion timestamp must be sampled after the blocking lock wait"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2736,12 +2929,18 @@ mod tests {
 
     #[test]
     fn file_retry_backoff_reaches_and_holds_at_six_hours() {
+        static BACKOFF_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
+        fn backoff_now() -> i64 {
+            BACKOFF_CLOCK.load(Ordering::SeqCst)
+        }
+
         let root = std::env::temp_dir().join(format!(
             "memory-engine-return-backoff-cap-{}-{}",
             std::process::id(),
             rand::random::<u128>()
         ));
-        let storage = StudyStorage::file(&root, test_now);
+        BACKOFF_CLOCK.store(test_now(), Ordering::SeqCst);
+        let storage = StudyStorage::file(&root, backoff_now);
         storage
             .save_return_notification_preference(
                 "account-backoff-cap",
@@ -2756,6 +2955,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
+            BACKOFF_CLOCK.store(now_ms, Ordering::SeqCst);
             let claim_id = format!("backoff-claim-{attempt}");
             storage
                 .claim_return_notification(&ReturnNotificationClaimRequest {
@@ -2833,21 +3033,10 @@ mod tests {
         });
 
         let stale_result = stale.join().expect("stale worker");
-        match reenable.join().expect("reenable worker") {
-            Ok(()) => {}
-            Err(error) => {
-                assert_eq!(error.status, StatusCode::CONFLICT);
-                storage
-                    .save_return_notification_preference(
-                        "account-a",
-                        "a@example.com",
-                        true,
-                        None,
-                        "nonce-reenabled",
-                    )
-                    .expect("reenable after contention");
-            }
-        }
+        reenable
+            .join()
+            .expect("reenable worker")
+            .expect("reenable after contention");
         let preference = storage
             .load_return_notification_preference("account-a")
             .expect("load preference")
