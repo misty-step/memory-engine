@@ -4249,6 +4249,33 @@ async fn service_session_issuance_rejects_a_wrong_or_missing_admin_token() {
 }
 
 #[tokio::test]
+async fn service_session_issuance_refuses_unauthorized_bodies_before_parsing() {
+    // An unauthorized caller must get 403 even with a malformed body: the
+    // admin-token gate runs before the JSON parser ever sees the payload.
+    let app = router(service_session_state("operator-admin-token"));
+
+    let unauthorized = app
+        .clone()
+        .oneshot(service_session_request(
+            Some("not-the-token"),
+            "{not json at all",
+        ))
+        .await
+        .expect("unauthorized malformed response");
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    // The same malformed body with a valid token is a 400 from our envelope.
+    let malformed = app
+        .oneshot(service_session_request(
+            Some("operator-admin-token"),
+            "{not json at all",
+        ))
+        .await
+        .expect("authorized malformed response");
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn service_session_issuance_enforces_the_email_allowlist() {
     let app = router(service_session_state("operator-admin-token"));
 

@@ -174,6 +174,31 @@ impl AccountRegistry {
         self.create_browser_session(&account)
     }
 
+    /// Check a caller-supplied token against the configured operator admin
+    /// token.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured, empty, or
+    /// mismatched.
+    pub(crate) fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
+        let configured = {
+            let data = self.lock_data();
+            data.auth_config.admin_token.clone()
+        };
+        // Compare hashes, not raw strings: SHA-256 preimage resistance makes
+        // the non-constant-time equality useless to a timing attacker probing
+        // this privileged credential.
+        if configured.as_deref().is_none_or(|configured| {
+            configured.is_empty() || secret_hash(configured) != secret_hash(admin_token)
+        }) {
+            return Err(ApiFailure::forbidden(
+                "Service session issuance is not authorized.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Issue (or rotate) the account-scoped service-session credential.
     ///
     /// Gated by the operator admin token; the account is created on first
@@ -189,19 +214,11 @@ impl AccountRegistry {
         admin_token: &str,
         email: &str,
     ) -> Result<AccountCreated, ApiFailure> {
+        self.verify_admin_token(admin_token)?;
         let auth_config = {
             let data = self.lock_data();
             data.auth_config.clone()
         };
-        if auth_config
-            .admin_token
-            .as_deref()
-            .is_none_or(|configured| configured.is_empty() || configured != admin_token)
-        {
-            return Err(ApiFailure::forbidden(
-                "Service session issuance is not authorized.",
-            ));
-        }
         let email = normalize_email(email).ok_or_else(|| {
             ApiFailure::bad_request("Account email must contain one @ and a domain.")
         })?;

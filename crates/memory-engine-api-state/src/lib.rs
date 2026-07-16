@@ -153,6 +153,17 @@ impl ApiState {
         self.accounts.issue_service_session(admin_token, email)
     }
 
+    /// Check a caller-supplied token against the configured operator admin
+    /// token, without touching any request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured, empty, or
+    /// mismatched.
+    pub fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
+        self.accounts.verify_admin_token(admin_token)
+    }
+
     /// Request an auth magic link.
     ///
     /// # Errors

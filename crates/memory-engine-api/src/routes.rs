@@ -501,15 +501,22 @@ async fn create_account(
 /// Issue (or rotate) an account-scoped service-session credential for a
 /// machine consumer. Gated by the operator admin token; reissue revokes the
 /// prior credential immediately.
+///
+/// The admin token is verified before the body is deserialized, so an
+/// unauthorized caller can never exercise the JSON parser on this
+/// credential-minting surface.
 async fn issue_service_session(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(request): Json<CreateAccountRequest>,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
     let admin_token = headers
         .get("x-admin-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
+    state.verify_admin_token(admin_token)?;
+    let Json(request) = Json::<CreateAccountRequest>::from_bytes(&body)
+        .map_err(|_| ApiFailure::bad_request("Request body must be JSON with an email field."))?;
     let account = state.issue_service_session(admin_token, &request.email)?;
 
     Ok((StatusCode::CREATED, Json(account)))
