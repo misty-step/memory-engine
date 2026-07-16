@@ -174,6 +174,51 @@ impl AccountRegistry {
         self.create_browser_session(&account)
     }
 
+    /// Issue (or rotate) the account-scoped service-session credential.
+    ///
+    /// Gated by the operator admin token; the account is created on first
+    /// issue, and every issue mints a fresh token that immediately replaces
+    /// the prior one, so reissue doubles as revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// or the email is outside the allowlist; bad request on malformed email.
+    pub(crate) fn issue_service_session(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<AccountCreated, ApiFailure> {
+        let auth_config = {
+            let data = self.lock_data();
+            data.auth_config.clone()
+        };
+        if auth_config
+            .admin_token
+            .as_deref()
+            .is_none_or(|configured| configured.is_empty() || configured != admin_token)
+        {
+            return Err(ApiFailure::forbidden(
+                "Service session issuance is not authorized.",
+            ));
+        }
+        let email = normalize_email(email).ok_or_else(|| {
+            ApiFailure::bad_request("Account email must contain one @ and a domain.")
+        })?;
+        if !auth_config.email_allowed(&email) {
+            return Err(ApiFailure::forbidden(
+                "This email is not allowed to register.",
+            ));
+        }
+        let account = self.login_account(&email)?;
+        eprintln!(
+            "service session issued account={} at={}",
+            account.account_id,
+            self.now()
+        );
+        Ok(account)
+    }
+
     pub(crate) fn set_return_notification(
         &self,
         account_id: &str,

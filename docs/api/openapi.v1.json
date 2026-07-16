@@ -58,6 +58,48 @@
         }
       }
     },
+    "/v1/service-sessions": {
+      "post": {
+        "summary": "Issue or rotate a service-session credential",
+        "description": "Operator-gated machine bootstrap: issues a fresh account-scoped session token for an allowlisted service account, creating the account on first issue. Every issue replaces the prior token, so reissue doubles as immediate revocation. Disabled unless the host configures an admin token.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "x-admin-token",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccountRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Service session credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountCreated"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/sources": {
       "get": {
         "summary": "List active sources",

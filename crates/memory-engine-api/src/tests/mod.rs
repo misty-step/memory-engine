@@ -4188,6 +4188,236 @@ async fn create_account_rejects_malformed_email_without_account_id() {
     assert!(body.get("accountId").is_none());
 }
 
+fn service_session_request(admin_token: Option<&str>, body: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/service-sessions")
+        .header("content-type", "application/json");
+    if let Some(token) = admin_token {
+        builder = builder.header("x-admin-token", token);
+    }
+    builder.body(Body::from(body.to_owned())).expect("request")
+}
+
+fn service_session_state(admin_token: &str) -> ApiState {
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails(["dogfood@example.com".to_owned()]).with_admin_token(admin_token),
+    ))
+}
+
+#[tokio::test]
+async fn service_session_issuance_is_disabled_without_a_configured_admin_token() {
+    // No admin token configured: the endpoint refuses every caller, so a
+    // default deployment exposes no service-session surface at all.
+    let response = router(ApiState::default())
+        .oneshot(service_session_request(
+            Some("anything"),
+            r#"{"email":"dogfood@example.com"}"#,
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response_json(response).await;
+    assert!(body.get("sessionToken").is_none());
+}
+
+#[tokio::test]
+async fn service_session_issuance_rejects_a_wrong_or_missing_admin_token() {
+    let app = router(service_session_state("operator-admin-token"));
+
+    let wrong = app
+        .clone()
+        .oneshot(service_session_request(
+            Some("not-the-token"),
+            r#"{"email":"dogfood@example.com"}"#,
+        ))
+        .await
+        .expect("wrong token response");
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+    let missing = app
+        .oneshot(service_session_request(
+            None,
+            r#"{"email":"dogfood@example.com"}"#,
+        ))
+        .await
+        .expect("missing token response");
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let body = response_json(missing).await;
+    assert!(body.get("sessionToken").is_none());
+}
+
+#[tokio::test]
+async fn service_session_issuance_enforces_the_email_allowlist() {
+    let app = router(service_session_state("operator-admin-token"));
+
+    let denied = app
+        .oneshot(service_session_request(
+            Some("operator-admin-token"),
+            r#"{"email":"stranger@example.com"}"#,
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = response_json(denied).await;
+    assert!(body.get("sessionToken").is_none());
+}
+
+#[tokio::test]
+async fn service_session_issuance_rejects_a_malformed_email() {
+    let app = router(service_session_state("operator-admin-token"));
+
+    let response = app
+        .oneshot(service_session_request(
+            Some("operator-admin-token"),
+            r#"{"email":"not-an-email"}"#,
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn service_session_issues_a_credential_that_drives_the_account_api() {
+    let app = router(service_session_state("operator-admin-token"));
+
+    let issued = app
+        .clone()
+        .oneshot(service_session_request(
+            Some("operator-admin-token"),
+            r#"{"email":"dogfood@example.com"}"#,
+        ))
+        .await
+        .expect("issue response");
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued = response_json(issued).await;
+    let account_id = issued["accountId"].as_str().expect("account id");
+    let session_token = issued["sessionToken"].as_str().expect("session token");
+    assert!(session_token.starts_with("sess_"));
+
+    let saved = app
+        .oneshot(json_request(
+            "POST",
+            &format!("/v1/accounts/{account_id}/sources"),
+            session_token,
+            &json!({
+                "title": "NATO notes",
+                "body": "ALFA is the NATO code word for A."
+            }),
+        ))
+        .await
+        .expect("save source");
+    assert_eq!(saved.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn service_session_reissue_revokes_the_prior_credential_immediately() {
+    let app = router(service_session_state("operator-admin-token"));
+
+    let first = response_json(
+        app.clone()
+            .oneshot(service_session_request(
+                Some("operator-admin-token"),
+                r#"{"email":"dogfood@example.com"}"#,
+            ))
+            .await
+            .expect("first issue"),
+    )
+    .await;
+    let second = response_json(
+        app.clone()
+            .oneshot(service_session_request(
+                Some("operator-admin-token"),
+                r#"{"email":"dogfood@example.com"}"#,
+            ))
+            .await
+            .expect("second issue"),
+    )
+    .await;
+    let account_id = second["accountId"].as_str().expect("account id");
+    assert_eq!(first["accountId"], second["accountId"]);
+    assert_ne!(first["sessionToken"], second["sessionToken"]);
+
+    let revoked = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/v1/accounts/{account_id}/sources"),
+            first["sessionToken"].as_str().expect("first token"),
+            &json!({}),
+        ))
+        .await
+        .expect("revoked read");
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+
+    let live = app
+        .oneshot(json_request(
+            "GET",
+            &format!("/v1/accounts/{account_id}/sources"),
+            second["sessionToken"].as_str().expect("second token"),
+            &json!({}),
+        ))
+        .await
+        .expect("live read");
+    assert_eq!(live.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn service_session_credential_is_isolated_to_its_own_account() {
+    let state = ApiState::new(
+        AccountRegistry::default().with_auth_config(
+            AuthConfig::allow_emails([
+                "dogfood@example.com".to_owned(),
+                "human@example.com".to_owned(),
+            ])
+            .with_admin_token("operator-admin-token"),
+        ),
+    );
+    let app = router(state);
+    let human = create_account(&app, "human@example.com").await;
+
+    let issued = response_json(
+        app.clone()
+            .oneshot(service_session_request(
+                Some("operator-admin-token"),
+                r#"{"email":"dogfood@example.com"}"#,
+            ))
+            .await
+            .expect("issue response"),
+    )
+    .await;
+    let service_token = issued["sessionToken"].as_str().expect("service token");
+
+    let cross_read = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/v1/accounts/{}/sources", human.account_id),
+            service_token,
+            &json!({}),
+        ))
+        .await
+        .expect("cross read");
+    assert_eq!(cross_read.status(), StatusCode::FORBIDDEN);
+
+    let cross_write = app
+        .oneshot(json_request(
+            "POST",
+            &format!("/v1/accounts/{}/sources", human.account_id),
+            service_token,
+            &json!({
+                "title": "Injected",
+                "body": "Should never land in another account."
+            }),
+        ))
+        .await
+        .expect("cross write");
+    assert_eq!(cross_write.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn source_routes_are_scoped_to_the_account() {
     let app = router(ApiState::default());

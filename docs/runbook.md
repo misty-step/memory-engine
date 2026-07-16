@@ -19,6 +19,8 @@ only current application runtime; rollback stays within DigitalOcean plus git.
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
   `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
   `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
+  Machine consumers use operator-gated service sessions
+  (`MEMORY_ENGINE_ADMIN_TOKEN`, below) — never email.
 - Return scheduler: the API process owns a bounded, Postgres-backed sweep;
   disable it with `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED=false`,
   and keep the operator-only `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN`
@@ -56,6 +58,45 @@ curl -fsS --max-time 15 "$base/manifest.webmanifest" | jq -e \
 curl -fsS --max-time 15 "$base/favicon.png" | file - | grep -q 'PNG image data, 192 x 192'
 curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG image data, 180 x 180'
 ```
+
+## Service sessions (machine consumers)
+
+Agents, QA runs, and future service consumers authenticate without email.
+`POST /v1/service-sessions` issues (or rotates) the account-scoped session
+token for an allowlisted service account, gated by the operator admin token.
+The surface is disabled entirely unless the app sets
+`MEMORY_ENGINE_ADMIN_TOKEN`. Agents never read mail-provider archives; magic
+links stay a human-only delivery channel.
+
+Provisioning (operator, once):
+
+1. Add the dedicated dogfood email to `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` in
+   the app spec. Use a dedicated address — magic-link sign-in on the same
+   email rotates the API session token and would revoke the service
+   credential.
+2. Set `MEMORY_ENGINE_ADMIN_TOKEN` as an app-spec secret. Custody: Mint
+   (`secret://memory-engine/admin`); never commit or paste it.
+3. Issue the credential and store it in Mint as
+   `secret://memory-engine/dogfood`:
+
+```sh
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+curl -fsS --max-time 20 \
+  -H 'content-type: application/json' \
+  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
+  -d '{"email":"<dogfood-email>"}' \
+  "$base/v1/service-sessions"
+# -> {"accountId":"acct_...","sessionToken":"sess_..."}
+```
+
+The response maps onto the receipt variables below:
+`MEMORY_ENGINE_ACCOUNT_ID=accountId`,
+`MEMORY_ENGINE_SESSION_TOKEN=sessionToken`.
+
+Rotation and revocation are the same call: every issue mints a fresh token
+and the prior one fails with `403` immediately. To revoke without keeping a
+usable credential, reissue and discard the response. Issuance is audited in
+the app log (`service session issued account=...`).
 
 ## Legacy v1 compatibility latency
 
