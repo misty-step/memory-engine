@@ -1,0 +1,71 @@
+# 099 — Service-session production receipt (2026-07-16)
+
+Ticket: memory-engine-099. First live proof of the machine-consumer auth
+surface shipped in PR [#59](https://github.com/misty-step/memory-engine/pull/59)
+(merge `00c26c9`), deployed to DigitalOcean as deployment
+`6b3d943d-00c0-4772-a54b-5248644d0f9c` (ACTIVE), verified against
+`https://memory-engine-api-i2xcr.ondigitalocean.app`.
+
+## What this proves
+
+An agent obtained, used, rotated, and revoked a production credential for the
+dedicated dogfood account `memory-engine-dogfood@mistystep.io`
+(`acct_e4df8b03deafe7bc`) with **no email step and no browser session**. All
+calls were plain `curl`; timings are `%{time_total}` from a residential
+connection.
+
+## Deployed smoke (pre-receipt)
+
+| Check | Result |
+|---|---|
+| `GET /healthz` | 200 `"status":"ok"` |
+| `GET /readyz` | 200 `"status":"ready"` |
+| `GET /` | 200 |
+| `POST /v1/service-sessions` (no token) | 403, no body parse |
+| `POST /v1/service-sessions` (wrong token) | 403 |
+
+## Receipt
+
+| Step | Route | Result | Time |
+|---|---|---|---|
+| Issue credential | `POST /v1/service-sessions` | 201 | 0.304 s |
+| Save source | `POST /v1/accounts/{id}/sources` | 201 | 1.135 s |
+| Review next ×5 | `POST /v1/accounts/{id}/review/next` | 200 ×5 | 0.684–0.840 s |
+| List sources | `GET /v1/accounts/{id}/sources` | 200 | 0.681 s |
+| Rotate (reissue) | `POST /v1/service-sessions` | 201, same `accountId` | 0.419 s |
+| Prior token after rotation | `POST /v1/accounts/{id}/review/next` | **403** `Session token does not match account.` | immediate |
+| Fresh token | `POST /v1/accounts/{id}/review/next` | 200 | 0.794 s |
+
+Rotation-as-revocation is proven live: the pre-rotation token failed on the
+very next request with 403.
+
+## Isolation
+
+Proven by route-level tests in `crates/memory-engine-api/src/tests/mod.rs`
+(`service_session_credential_is_isolated_to_its_own_account`,
+`service_session_reissue_revokes_the_prior_credential_immediately`,
+`service_session_issuance_refuses_unauthorized_bodies_before_parsing`, and
+siblings). No production cross-account probe was run: exercising another
+account's routes with a live credential against real user data is exactly what
+the tests exist to avoid.
+
+## Open gap — full review-loop receipt (tracked: memory-engine-103)
+
+The generate → next → submit loop could not run unattended because the machine
+plane cannot mint review material in production: the synchronous
+`/v1/.../generate` route is production-disabled by design (409: "Direct
+synchronous generation is disabled in production.") and the durable queued
+workflow is browser-plane only (cookie + CSRF). `dueCount` stayed 0, so
+`/review/next` timings above are the authenticated empty-state path and no
+submit was possible. memory-engine-103 shapes the machine-facing queued
+generation surface; its receipt closes the remaining 099 criterion.
+
+## Custody
+
+- `MEMORY_ENGINE_ADMIN_TOKEN`: set as an encrypted app-spec secret on
+  DigitalOcean (operator-rotatable via `doctl apps update`). Mint keychain
+  custody (`secret://memory-engine/admin`) pending: the macOS keychain was
+  locked for the whole session (headless, no user interaction).
+- Dogfood session token (`secret://memory-engine/dogfood`): same pending
+  state. Until custody lands, the token is recoverable by reissuing through
+  the admin surface — rotation invalidates nothing but the previous token.
