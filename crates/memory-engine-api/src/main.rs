@@ -107,6 +107,12 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
             auth_config = auth_config.with_scheduler_manual_token(token.to_owned());
         }
     }
+    if let Ok(token) = env::var("MEMORY_ENGINE_ADMIN_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            auth_config = auth_config.with_admin_token(token.to_owned());
+        }
+    }
     // Local/dev only: surface the magic link on the "check your email" page so
     // sign-in works without a real mailer. Never enable in production.
     if env::var("MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS").as_deref() == Ok("true") {

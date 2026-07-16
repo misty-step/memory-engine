@@ -48,6 +48,7 @@ pub(crate) struct V1ContractOperation {
 enum V1Route {
     OpenApi,
     Accounts,
+    ServiceSessions,
     Sources,
     Source,
     ProjectDecks,
@@ -68,6 +69,7 @@ enum V1Route {
 const V1_OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.v1.json");
 const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
 const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
+const V1_SERVICE_SESSIONS_PATH: &str = "/v1/service-sessions";
 const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
 const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
 const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
@@ -90,6 +92,7 @@ const V1_CONTENT_FEEDBACK_PATH: &str =
 const V1_ROUTES: &[V1Route] = &[
     V1Route::OpenApi,
     V1Route::Accounts,
+    V1Route::ServiceSessions,
     V1Route::Sources,
     V1Route::Source,
     V1Route::ProjectDecks,
@@ -140,6 +143,9 @@ impl V1Route {
         match self {
             Self::OpenApi => router.route(V1_OPENAPI_PATH, get(v1_openapi)),
             Self::Accounts => router.route(V1_ACCOUNTS_PATH, post(create_account)),
+            Self::ServiceSessions => {
+                router.route(V1_SERVICE_SESSIONS_PATH, post(issue_service_session))
+            }
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
             Self::Source => router.route(V1_SOURCE_PATH, delete(archive_source)),
             Self::ProjectDecks => router.route(V1_PROJECT_DECKS_PATH, post(create_project_deck)),
@@ -173,6 +179,10 @@ impl V1Route {
             Self::Accounts => &[V1ContractOperation {
                 method: "POST",
                 path: V1_ACCOUNTS_PATH,
+            }],
+            Self::ServiceSessions => &[V1ContractOperation {
+                method: "POST",
+                path: V1_SERVICE_SESSIONS_PATH,
             }],
             Self::Sources => &[
                 V1ContractOperation {
@@ -484,6 +494,30 @@ async fn create_account(
     let email = normalize_email(&request.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))?;
     let account = state.create_account(&email)?;
+
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+/// Issue (or rotate) an account-scoped service-session credential for a
+/// machine consumer. Gated by the operator admin token; reissue revokes the
+/// prior credential immediately.
+///
+/// The admin token is verified before the body is deserialized, so an
+/// unauthorized caller can never exercise the JSON parser on this
+/// credential-minting surface.
+async fn issue_service_session(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
+    let admin_token = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    state.verify_admin_token(admin_token)?;
+    let Json(request) = Json::<CreateAccountRequest>::from_bytes(&body)
+        .map_err(|_| ApiFailure::bad_request("Request body must be JSON with an email field."))?;
+    let account = state.issue_service_session(admin_token, &request.email)?;
 
     Ok((StatusCode::CREATED, Json(account)))
 }

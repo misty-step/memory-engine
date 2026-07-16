@@ -137,6 +137,33 @@ impl ApiState {
         self.accounts.create_account(email)
     }
 
+    /// Issue (or rotate) the service-session credential for an allowlisted
+    /// account, gated by the operator admin token. Reissuing revokes the
+    /// prior credential immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is not configured or does not
+    /// match, or when the email is outside the allowlist.
+    pub fn issue_service_session(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<AccountCreated, ApiFailure> {
+        self.accounts.issue_service_session(admin_token, email)
+    }
+
+    /// Check a caller-supplied token against the configured operator admin
+    /// token, without touching any request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured, empty, or
+    /// mismatched.
+    pub fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
+        self.accounts.verify_admin_token(admin_token)
+    }
+
     /// Request an auth magic link.
     ///
     /// # Errors
@@ -1073,6 +1100,7 @@ pub struct AuthConfig {
     link_delivery: AuthLinkDelivery,
     unsubscribe_secret: String,
     scheduler_manual_token: Option<String>,
+    admin_token: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -1083,6 +1111,7 @@ impl Default for AuthConfig {
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
             scheduler_manual_token: None,
+            admin_token: None,
         }
     }
 }
@@ -1254,6 +1283,15 @@ impl AuthConfig {
     #[must_use]
     pub fn with_scheduler_manual_token(mut self, token: impl Into<String>) -> Self {
         self.scheduler_manual_token = Some(token.into());
+        self
+    }
+
+    /// Set the operator admin token that gates service-session issuance.
+    /// Production hosts should source this from a secret manager; leaving it
+    /// unset disables the service-session surface entirely.
+    #[must_use]
+    pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
+        self.admin_token = Some(token.into());
         self
     }
 
