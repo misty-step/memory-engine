@@ -1914,19 +1914,107 @@ impl AccountStudyStore<'_> {
     ///
     /// Returns [`PostgresStoreError`] when Postgres reads or JSON decoding fail.
     pub fn snapshot(&self) -> Result<BetaStoreSnapshot, PostgresStoreError> {
-        Ok(BetaStoreSnapshot {
+        let rows = self.client.borrow_mut().query(
+            "SELECT kind, value
+             FROM (
+                SELECT 'source_document'::text AS kind, created_at_ms AS sort_at,
+                       source_document_id::text AS sort_id, document AS value
+                FROM memory_engine_source_documents WHERE account_id = $1
+                UNION ALL
+                SELECT 'reference_span', created_at_ms, reference_span_id::text, span
+                FROM memory_engine_reference_spans WHERE account_id = $1
+                UNION ALL
+                SELECT 'generated_prompt_draft', created_at_ms, draft_id::text, draft
+                FROM memory_engine_generated_prompt_drafts WHERE account_id = $1
+                UNION ALL
+                SELECT 'review_unit', created_at_ms, review_unit_id::text, record
+                FROM memory_engine_review_units WHERE account_id = $1
+                UNION ALL
+                SELECT 'schedule', updated_at_ms, review_unit_id::text,
+                       jsonb_build_object('reviewUnitId', review_unit_id, 'state', state)
+                FROM memory_engine_schedules WHERE account_id = $1
+                UNION ALL
+                SELECT 'attempt', occurred_at_ms, lpad(attempt_id::text, 19, '0'), attempt
+                FROM memory_engine_attempts WHERE account_id = $1
+                UNION ALL
+                SELECT 'generation_run', started_at_ms, generation_run_id::text, run
+                FROM memory_engine_generation_runs WHERE account_id = $1
+                UNION ALL
+                SELECT 'content_feedback', occurred_at_ms, feedback_id::text, feedback
+                FROM memory_engine_content_feedback WHERE account_id = $1
+                UNION ALL
+                SELECT 'applied_review', applied_at_ms, receipt_key::text,
+                       jsonb_build_object(
+                           'key', receipt_key,
+                           'attempt', attempt,
+                           'expectedPriorScheduleState', expected_prior_schedule_state,
+                           'scheduleState', schedule_state
+                       )
+                FROM memory_engine_applied_reviews WHERE account_id = $1
+                UNION ALL
+                SELECT 'concept_reference_note', updated_at_ms, concept_key::text, note
+                FROM memory_engine_concept_reference_notes WHERE account_id = $1
+             ) AS snapshot_rows
+             ORDER BY kind, sort_at, sort_id",
+            &[&self.scope.account_id],
+        )?;
+
+        let mut snapshot = BetaStoreSnapshot {
             version: 1,
-            source_documents: self.source_documents()?,
-            reference_spans: self.reference_spans()?,
-            generated_prompt_drafts: self.generated_prompt_drafts()?,
-            review_units: self.review_units()?,
-            schedules: self.schedule_records()?,
-            attempts: self.attempts()?,
-            generation_runs: self.generation_runs()?,
-            content_feedback: self.content_feedback()?,
-            applied_reviews: self.applied_reviews()?,
-            concept_reference_notes: self.concept_reference_notes()?,
-        })
+            ..BetaStoreSnapshot::default()
+        };
+        for row in rows {
+            let kind: &str = row.get(0);
+            let value: serde_json::Value = row.get(1);
+            match kind {
+                "source_document" => {
+                    snapshot
+                        .source_documents
+                        .push(serde_json::from_value(value)?);
+                }
+                "reference_span" => {
+                    snapshot
+                        .reference_spans
+                        .push(serde_json::from_value(value)?);
+                }
+                "generated_prompt_draft" => {
+                    snapshot
+                        .generated_prompt_drafts
+                        .push(serde_json::from_value(value)?);
+                }
+                "review_unit" => {
+                    snapshot.review_units.push(serde_json::from_value(value)?);
+                }
+                "schedule" => {
+                    snapshot.schedules.push(serde_json::from_value(value)?);
+                }
+                "attempt" => {
+                    snapshot.attempts.push(serde_json::from_value(value)?);
+                }
+                "generation_run" => {
+                    snapshot
+                        .generation_runs
+                        .push(serde_json::from_value(value)?);
+                }
+                "content_feedback" => {
+                    snapshot
+                        .content_feedback
+                        .push(serde_json::from_value(value)?);
+                }
+                "applied_review" => {
+                    snapshot
+                        .applied_reviews
+                        .push(serde_json::from_value(value)?);
+                }
+                "concept_reference_note" => {
+                    snapshot
+                        .concept_reference_notes
+                        .push(serde_json::from_value(value)?);
+                }
+                _ => unreachable!("snapshot query returned an unknown row kind"),
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Ensure the scoped account row exists.
@@ -2859,134 +2947,6 @@ impl AccountStudyStore<'_> {
             Ok(())
         })
     }
-
-    fn source_documents(&self) -> Result<Vec<SourceDocument>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT document FROM memory_engine_source_documents
-             WHERE account_id = $1
-             ORDER BY created_at_ms, source_document_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn reference_spans(&self) -> Result<Vec<ReferenceSpan>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT span FROM memory_engine_reference_spans
-             WHERE account_id = $1
-             ORDER BY created_at_ms, reference_span_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn concept_reference_notes(&self) -> Result<Vec<ConceptReferenceNote>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT note FROM memory_engine_concept_reference_notes
-             WHERE account_id = $1
-             ORDER BY updated_at_ms, concept_key",
-            &self.scope.account_id,
-        )
-    }
-
-    fn generated_prompt_drafts(&self) -> Result<Vec<GeneratedPromptDraft>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT draft FROM memory_engine_generated_prompt_drafts
-             WHERE account_id = $1
-             ORDER BY created_at_ms, draft_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn review_units(&self) -> Result<Vec<BetaReviewUnitRecord>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT record FROM memory_engine_review_units
-             WHERE account_id = $1
-             ORDER BY created_at_ms, review_unit_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn schedule_records(&self) -> Result<Vec<ScheduleRecord>, PostgresStoreError> {
-        let rows = self.client.borrow_mut().query(
-            "SELECT review_unit_id, state FROM memory_engine_schedules
-             WHERE account_id = $1
-             ORDER BY updated_at_ms, review_unit_id",
-            &[&self.scope.account_id],
-        )?;
-
-        rows.into_iter()
-            .map(|row| {
-                let review_unit_id: String = row.get(0);
-                let value: serde_json::Value = row.get(1);
-                Ok(ScheduleRecord {
-                    review_unit_id: ReviewUnitId::new(review_unit_id),
-                    state: serde_json::from_value(value)?,
-                })
-            })
-            .collect()
-    }
-
-    fn attempts(&self) -> Result<Vec<ServiceAttemptRecord>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT attempt FROM memory_engine_attempts
-             WHERE account_id = $1
-             ORDER BY occurred_at_ms, attempt_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn generation_runs(&self) -> Result<Vec<GenerationRun>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT run FROM memory_engine_generation_runs
-             WHERE account_id = $1
-             ORDER BY started_at_ms, generation_run_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn content_feedback(&self) -> Result<Vec<ContentFeedback>, PostgresStoreError> {
-        query_json_column(
-            self.client,
-            "SELECT feedback FROM memory_engine_content_feedback
-             WHERE account_id = $1
-             ORDER BY occurred_at_ms, feedback_id",
-            &self.scope.account_id,
-        )
-    }
-
-    fn applied_reviews(&self) -> Result<Vec<AppliedReviewReceipt>, PostgresStoreError> {
-        let rows = self.client.borrow_mut().query(
-            "SELECT receipt_key, attempt, expected_prior_schedule_state, schedule_state
-             FROM memory_engine_applied_reviews
-             WHERE account_id = $1
-             ORDER BY applied_at_ms, receipt_key",
-            &[&self.scope.account_id],
-        )?;
-
-        rows.into_iter()
-            .map(|row| {
-                let key: String = row.get(0);
-                let attempt: serde_json::Value = row.get(1);
-                let expected_prior_schedule_state: Option<serde_json::Value> = row.get(2);
-                let schedule_state: serde_json::Value = row.get(3);
-
-                Ok(AppliedReviewReceipt {
-                    key,
-                    attempt: serde_json::from_value(attempt)?,
-                    expected_prior_schedule_state: expected_prior_schedule_state
-                        .map(serde_json::from_value)
-                        .transpose()?,
-                    schedule_state: serde_json::from_value(schedule_state)?,
-                })
-            })
-            .collect()
-    }
 }
 
 impl BetaGenerationStore for AccountStudyStore<'_> {
@@ -3257,24 +3217,6 @@ fn current_review_unit_matches(
         == Some(requested_id))
 }
 
-fn query_json_column<T>(
-    client: &RefCell<Client>,
-    sql: &str,
-    account_id: &str,
-) -> Result<Vec<T>, PostgresStoreError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let rows = client.borrow_mut().query(sql, &[&account_id])?;
-
-    rows.into_iter()
-        .map(|row| {
-            let value: serde_json::Value = row.get(0);
-            Ok(serde_json::from_value(value)?)
-        })
-        .collect()
-}
-
 impl MemoryServiceStore for AccountStudyStore<'_> {
     type Error = PostgresStoreError;
 
@@ -3435,16 +3377,25 @@ impl MemoryServiceStore for AccountStudyStore<'_> {
 
     fn list_queue_candidates(&self) -> Result<Vec<QueueCandidate>, Self::Error> {
         let rows = self.client.borrow_mut().query(
-            "SELECT record FROM memory_engine_review_units
-             WHERE account_id = $1 AND archived_at_ms IS NULL",
+            "SELECT review_units.record, schedules.state
+             FROM memory_engine_review_units AS review_units
+             LEFT JOIN memory_engine_schedules AS schedules
+               ON schedules.account_id = review_units.account_id
+              AND schedules.review_unit_id = review_units.review_unit_id
+             WHERE review_units.account_id = $1
+               AND review_units.archived_at_ms IS NULL
+             ORDER BY review_units.created_at_ms, review_units.review_unit_id",
             &[&self.scope.account_id],
         )?;
 
         rows.into_iter()
             .map(|row| {
-                let value: serde_json::Value = row.get(0);
-                let record: BetaReviewUnitRecord = serde_json::from_value(value)?;
-                let schedule_state = self.read_schedule_state(&record.review_unit_id)?;
+                let record: BetaReviewUnitRecord =
+                    serde_json::from_value(row.get::<_, serde_json::Value>(0))?;
+                let schedule_state = row
+                    .get::<_, Option<serde_json::Value>>(1)
+                    .map(serde_json::from_value)
+                    .transpose()?;
                 let mut candidate = record.queue.with_schedule(schedule_state);
                 if let Some(snoozed_until) = record.snoozed_until {
                     candidate = defer_queue_availability(&candidate, snoozed_until);
@@ -5233,6 +5184,13 @@ mod tests {
             ));
 
             record_live_content_feedback(&mut account_a, &review_unit_id)?;
+            let mut expected_attempts = vec![attempt.clone()];
+            for index in 0..11 {
+                let tied_attempt =
+                    service_attempt(&review_unit_id, &format!("same-ms-live-{index}"), NOW);
+                account_a.record_attempt(tied_attempt.clone())?;
+                expected_attempts.push(tied_attempt);
+            }
 
             let snapshot = account_a.snapshot()?;
             assert_eq!(snapshot.source_documents, vec![source.clone()]);
@@ -5243,7 +5201,7 @@ mod tests {
             assert_eq!(snapshot.schedules.len(), 1);
             assert_eq!(snapshot.schedules[0].review_unit_id, review_unit_id);
             assert_eq!(snapshot.schedules[0].state, next_schedule.clone());
-            assert_eq!(snapshot.attempts, vec![attempt.clone()]);
+            assert_eq!(snapshot.attempts, expected_attempts);
             assert_eq!(snapshot.applied_reviews.len(), 1);
             assert_eq!(
                 snapshot.applied_reviews[0].key,
