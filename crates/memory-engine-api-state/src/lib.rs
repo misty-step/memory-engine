@@ -27,7 +27,7 @@ use axum::{
     Json,
 };
 use hmac::Hmac;
-use memory_engine_generation::{FallbackProvider, StructuredBlockProvider};
+use memory_engine_generation::FallbackProvider;
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
 use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
 use memory_engine_persistence_postgres::{
@@ -2124,9 +2124,8 @@ where
     let ids = Some(vec![source_id.to_owned()]);
     match OpenRouterConfig::from_env() {
         Ok(config) => {
-            let structured = StructuredBlockProvider;
             let model = OpenRouterProvider::new(config);
-            let provider = FallbackProvider::new(&structured, &model);
+            let provider = FallbackProvider::new(&model);
             study.generate_with_provider_and_run_id(ids, &provider, run_id)
         }
         Err(_) => study.generate_with_run_id(ids, run_id),

@@ -4,7 +4,7 @@ use memory_engine_core::{ExactPromptKind, Prompt};
 use memory_engine_generation::{
     classify_learning_intent, run_beta_generation_with_provider, BetaGenerationRequest,
     DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
-    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage, StructuredBlockProvider,
+    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, GeneratedLearningActivityKind, GeneratedPromptModel,
@@ -416,8 +416,7 @@ fn structured_duplicate_repair_never_calls_the_model_fallback() {
             "Concept: Stable generation\nQuestion: What stays stable?\nAnswer: The job identity.",
         ))
         .expect("structured source");
-    let structured = StructuredBlockProvider;
-    let provider = FallbackProvider::new(&structured, &ModelFallback);
+    let provider = FallbackProvider::new(&ModelFallback);
 
     let first = run_beta_generation_with_provider(
         &mut store,
@@ -489,7 +488,7 @@ fn prose_repair_stays_with_the_model_fallback() {
     let fallback = RepairingFallback {
         repaired: Cell::new(false),
     };
-    let provider = FallbackProvider::new(&StructuredBlockProvider, &fallback);
+    let provider = FallbackProvider::new(&fallback);
 
     let result = run_beta_generation_with_provider(
         &mut store,
@@ -538,9 +537,8 @@ fn fallback_stamps_drafts_with_the_provider_that_actually_ran() {
         })
         .expect("structured source");
 
-    let structured = StructuredBlockProvider;
     let model = FakeModelProvider;
-    let provider = FallbackProvider::new(&structured, &model);
+    let provider = FallbackProvider::new(&model);
 
     // Prose: primary finds nothing, fallback (fake model) runs.
     run_beta_generation_with_provider(&mut store, &provider, request("run-prose", "src-prose"))

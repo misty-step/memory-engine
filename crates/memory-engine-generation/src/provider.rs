@@ -331,24 +331,20 @@ impl DraftProvider for StructuredBlockProvider {
     }
 }
 
-/// Routes each source to a primary provider, falling back to a secondary
-/// provider only when the primary produces no candidates.
+/// Routes structured blocks through the deterministic parser and falls back
+/// to a secondary provider only when the parser produces no candidates.
 ///
-/// Wiring `StructuredBlockProvider` as primary and a model provider as
-/// fallback keeps the deterministic, free path for hand-written
-/// `Concept:/Question:/Answer:` blocks while sending arbitrary prose — which
-/// the structured parser cannot handle — to the model. Primary parse
-/// failures are dropped when the fallback runs, so prose is not reported as
-/// malformed blocks.
+/// Keeping the structured parser implicit makes the routing invariant part of
+/// the type: repair may safely re-run this free, deterministic parse to recover
+/// which provider handled the first pass.
 pub struct FallbackProvider<'a> {
-    primary: &'a dyn DraftProvider,
     fallback: &'a dyn DraftProvider,
 }
 
 impl<'a> FallbackProvider<'a> {
     #[must_use]
-    pub fn new(primary: &'a dyn DraftProvider, fallback: &'a dyn DraftProvider) -> Self {
-        Self { primary, fallback }
+    pub fn new(fallback: &'a dyn DraftProvider) -> Self {
+        Self { fallback }
     }
 }
 
@@ -358,7 +354,7 @@ impl DraftProvider for FallbackProvider<'_> {
     }
 
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
-        let primary = self.primary.generate_drafts(source)?;
+        let primary = StructuredBlockProvider.generate_drafts(source)?;
         if primary.candidates.is_empty() {
             self.fallback.generate_drafts(source)
         } else {
@@ -375,10 +371,14 @@ impl DraftProvider for FallbackProvider<'_> {
         // Re-run the deterministic primary router: falling through merely
         // because the primary has no repair implementation would let model
         // output replace rejected structured material.
-        if self.primary.generate_drafts(source)?.candidates.is_empty() {
+        if StructuredBlockProvider
+            .generate_drafts(source)?
+            .candidates
+            .is_empty()
+        {
             self.fallback.repair_drafts(source, rejections)
         } else {
-            self.primary.repair_drafts(source, rejections)
+            StructuredBlockProvider.repair_drafts(source, rejections)
         }
     }
 }
