@@ -997,6 +997,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-engine-performance"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memory-engine-persistence"
 version = "0.0.0"
 dependencies = [
