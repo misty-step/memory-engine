@@ -7,7 +7,7 @@ use memory_engine_core::{
 use memory_engine_generation::{
     BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
     FakeModelProvider, FallbackProvider, ProviderFailure, ReferenceNoteDraft,
-    ReferenceNoteProvider, ReferenceNoteRequest, StructuredBlockProvider,
+    ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
@@ -1034,9 +1034,8 @@ fn generates_drafts_from_arbitrary_prose_via_model_provider() {
         .expect("source");
 
     // Structured-block primary finds nothing in prose, so the model provider runs.
-    let structured = StructuredBlockProvider;
     let model = FakeModelProvider;
-    let provider = FallbackProvider::new(&structured, &model);
+    let provider = FallbackProvider::new(&model);
     let generated = study
         .generate_with_provider(Some(vec!["src-prose".to_owned()]), &provider)
         .expect("generate");

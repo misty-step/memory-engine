@@ -11,7 +11,7 @@ use std::{
     net::{TcpListener, TcpStream},
 };
 
-use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
+use memory_engine_generation::{FakeModelProvider, FallbackProvider};
 use memory_engine_study::{
     infer_capture_title, BetaStudyCurrent, BetaStudyOptions, BetaStudySession,
     BetaStudySourceInput, BetaStudyView,
@@ -198,9 +198,8 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
 fn generate_all_sources(
     session: &mut BetaStudySession,
 ) -> Result<BetaStudyView, memory_engine_study::BetaStudyError> {
-    let structured = StructuredBlockProvider;
     let model = FakeModelProvider;
-    let provider = FallbackProvider::new(&structured, &model);
+    let provider = FallbackProvider::new(&model);
     session.generate_with_provider(None, &provider)
 }
 
