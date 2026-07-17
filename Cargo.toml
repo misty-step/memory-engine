@@ -19,6 +19,7 @@ members = [
     "crates/memory-engine-persistence",
     "crates/memory-engine-review",
     "crates/memory-engine-persistence-postgres",
+    "crates/memory-engine-performance",
     "crates/memory-engine-study",
     "crates/memory-engine-web-shell",
 ]
