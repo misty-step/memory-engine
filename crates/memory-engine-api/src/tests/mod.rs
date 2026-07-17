@@ -4446,6 +4446,282 @@ async fn service_session_credential_is_isolated_to_its_own_account() {
 }
 
 #[tokio::test]
+async fn service_session_enqueues_and_observes_durable_generation_without_a_browser() {
+    let state = service_session_state("operator-admin-token");
+    let app = router(state.clone());
+    let issued = response_json(
+        app.clone()
+            .oneshot(service_session_request(
+                Some("operator-admin-token"),
+                r#"{"email":"dogfood@example.com"}"#,
+            ))
+            .await
+            .expect("issue response"),
+    )
+    .await;
+    let account = TestAccount {
+        account_id: issued["accountId"].as_str().expect("account id").to_owned(),
+        session_token: issued["sessionToken"]
+            .as_str()
+            .expect("session token")
+            .to_owned(),
+    };
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "NATO notes",
+        "Concept: NATO phonetic alphabet\nQuestion: What is NATO code word for A?\nAnswer: ALFA\nReference: ALFA is the NATO code word for A.",
+    )
+    .await;
+    let enqueue_path = format!(
+        "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+        account.account_id
+    );
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&enqueue_path)
+                .body(Body::empty())
+                .expect("unauthenticated enqueue"),
+        )
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let first = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &enqueue_path,
+            &account.session_token,
+        ))
+        .await
+        .expect("enqueue response");
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first = response_json(first).await;
+    let job_id = first["id"].as_str().expect("job id").to_owned();
+    assert_eq!(first["sourceId"], json!(source_id));
+    assert_eq!(first["status"], json!("queued"));
+    assert_eq!(first["coalesced"], json!(false));
+
+    let repeated = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &enqueue_path,
+            &account.session_token,
+        ))
+        .await
+        .expect("repeated enqueue response");
+    assert_eq!(repeated.status(), StatusCode::OK);
+    let repeated = response_json(repeated).await;
+    assert_eq!(repeated["id"], json!(job_id));
+    assert_eq!(repeated["coalesced"], json!(true));
+    assert_eq!(state.jobs_for_account_id(&account.account_id).len(), 1);
+
+    let blocking_state = state.clone();
+    tokio::task::spawn_blocking(move || blocking_state.run_pending_jobs_blocking())
+        .await
+        .expect("generation drain");
+
+    let observed = app
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!(
+                "/v1/accounts/{}/generation-jobs/{job_id}",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("job observation response");
+    assert_eq!(observed.status(), StatusCode::OK);
+    let observed = response_json(observed).await;
+    assert_eq!(observed["id"], json!(job_id));
+    assert_eq!(observed["sourceId"], json!(source_id));
+    assert_eq!(observed["status"], json!("succeeded"));
+    assert!(
+        observed["error"].is_null(),
+        "successful jobs must preserve the nullable error field: {observed}"
+    );
+    assert!(
+        observed["cardCount"].as_u64().expect("card count") > 0,
+        "successful generation must schedule at least one card: {observed}"
+    );
+}
+
+#[tokio::test]
+async fn generation_job_observation_preserves_the_failed_contract() {
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let account = create_account_v1(&app, "failed-job@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &account,
+        "Archived source",
+        "Concept: durable jobs\nQuestion: What survives?\nAnswer: The job record.",
+    )
+    .await;
+    let enqueued = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("enqueue response");
+    assert_eq!(enqueued.status(), StatusCode::ACCEPTED);
+    let job_id = response_json(enqueued).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+
+    archive_source_v1(&app, &account, &source_id).await;
+    state.run_pending_jobs_blocking();
+
+    let observed = app
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!(
+                "/v1/accounts/{}/generation-jobs/{job_id}",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("failed job response");
+    assert_eq!(observed.status(), StatusCode::OK);
+    let observed = response_json(observed).await;
+    assert_eq!(observed["status"], json!("failed"));
+    assert_eq!(observed["cardCount"], json!(0));
+    assert_eq!(observed["retryable"], json!(true));
+    assert_eq!(observed["error"], json!("Source not found."));
+}
+
+#[tokio::test]
+async fn generation_jobs_are_scoped_to_the_bearer_account() {
+    let app = router(ApiState::default());
+    let service = create_account_v1(&app, "dogfood@example.com").await;
+    let human = create_account_v1(&app, "human@example.com").await;
+    let source_id = create_source_v1(
+        &app,
+        &service,
+        "NATO notes",
+        "ALFA is the NATO code word for A.",
+    )
+    .await;
+    let enqueue_path = format!(
+        "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+        service.account_id
+    );
+    let enqueued = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &enqueue_path,
+            &service.session_token,
+        ))
+        .await
+        .expect("enqueue response");
+    assert_eq!(enqueued.status(), StatusCode::ACCEPTED);
+    let job_id = response_json(enqueued).await["id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
+    let cross_enqueue = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+                service.account_id
+            ),
+            &human.session_token,
+        ))
+        .await
+        .expect("cross-account enqueue response");
+    assert_eq!(cross_enqueue.status(), StatusCode::FORBIDDEN);
+
+    let cross_observation = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!(
+                "/v1/accounts/{}/generation-jobs/{job_id}",
+                service.account_id
+            ),
+            &human.session_token,
+        ))
+        .await
+        .expect("cross-account observation response");
+    assert_eq!(cross_observation.status(), StatusCode::FORBIDDEN);
+
+    let hidden_source = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+                human.account_id
+            ),
+            &human.session_token,
+        ))
+        .await
+        .expect("account-scoped source response");
+    assert_eq!(hidden_source.status(), StatusCode::NOT_FOUND);
+
+    let hidden_job = app
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!("/v1/accounts/{}/generation-jobs/{job_id}", human.account_id),
+            &human.session_token,
+        ))
+        .await
+        .expect("account-scoped job response");
+    assert_eq!(hidden_job.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn generation_job_routes_report_missing_owned_resources() {
+    let app = router(ApiState::default());
+    let account = create_account_v1(&app, "dogfood@example.com").await;
+
+    let missing_source = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/sources/src-does-not-exist/generation-jobs",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("missing source response");
+    assert_eq!(missing_source.status(), StatusCode::NOT_FOUND);
+
+    let missing_job = app
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!(
+                "/v1/accounts/{}/generation-jobs/job-does-not-exist",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("missing job response");
+    assert_eq!(missing_job.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn source_routes_are_scoped_to_the_account() {
     let app = router(ApiState::default());
     let first = create_account(&app, "first@example.com").await;
@@ -6535,6 +6811,20 @@ async fn v1_openapi_artifact_matches_registered_routes() {
         "ConceptProgress",
         &["averageResponseTimeMs", "responseTimeTrend"],
     );
+    assert_schema_requires(
+        &contract,
+        "GenerationJob",
+        &[
+            "id",
+            "sourceId",
+            "status",
+            "cardCount",
+            "retryable",
+            "error",
+            "createdAt",
+            "updatedAt",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -6887,7 +7177,9 @@ async fn generate_source_queued(state: &ApiState, account_id: &str, source_id: &
     tokio::task::spawn_blocking(move || {
         match blocking_state.enqueue_generation_job_for_account_id(&account, &source, &title) {
             EnqueueOutcome::Started(_) | EnqueueOutcome::AlreadyInFlight(_) => {}
-            EnqueueOutcome::Rejected(reason) => panic!("queued generation rejected: {reason}"),
+            EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => {
+                panic!("queued generation rejected: {reason}")
+            }
         }
         blocking_state.run_pending_jobs_blocking();
     })

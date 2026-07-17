@@ -1005,6 +1005,58 @@ impl ApiState {
             .enqueue_or_coalesce(account.account_id(), source_id, title)
     }
 
+    /// Enqueue durable generation for an API-authenticated account and owned source.
+    ///
+    /// Returns the account-scoped job and whether this request coalesced onto an
+    /// existing in-flight job.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, source lookup, or enqueue
+    /// fails.
+    pub fn enqueue_generation_job_for_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+    ) -> Result<(GenerationJob, bool), ApiFailure> {
+        let source = self
+            .accounts
+            .list_sources(account_id, session_token)?
+            .into_iter()
+            .find(|source| source.source_id == source_id)
+            .ok_or_else(|| ApiFailure::not_found("Source not found."))?;
+        match self
+            .jobs
+            .enqueue_or_coalesce(account_id, &source.source_id, &source.title)
+        {
+            EnqueueOutcome::Started(job) => Ok((job, false)),
+            EnqueueOutcome::AlreadyInFlight(job) => Ok((job, true)),
+            EnqueueOutcome::Rejected(reason) => Err(ApiFailure::conflict_message(reason)),
+            EnqueueOutcome::Unavailable(reason) => Err(ApiFailure::service_unavailable(reason)),
+        }
+    }
+
+    /// Return one durable generation job to its API-authenticated owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication fails or the account does not
+    /// own the requested job.
+    pub fn generation_job_for_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        job_id: &str,
+    ) -> Result<GenerationJob, ApiFailure> {
+        self.accounts
+            .authenticate_account(account_id, session_token)?;
+        self.jobs
+            .job_for_account(account_id, job_id)
+            .map_err(ApiFailure::service_unavailable)?
+            .ok_or_else(|| ApiFailure::not_found("Generation job not found."))
+    }
+
     /// Retry a background generation job.
     #[must_use]
     pub fn retry_generation_job(&self, account: &AppAccount, job_id: &str) -> bool {
@@ -1670,6 +1722,14 @@ impl ApiFailure {
     }
 
     #[must_use]
+    pub fn conflict_message(message: String) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message,
+        }
+    }
+
+    #[must_use]
     pub fn missing_session() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -1698,6 +1758,14 @@ impl ApiFailure {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn service_unavailable(message: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message,
         }
     }
 

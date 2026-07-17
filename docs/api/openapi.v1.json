@@ -262,6 +262,95 @@
         }
       }
     },
+    "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs": {
+      "post": {
+        "summary": "Enqueue durable generation for an owned source",
+        "description": "Starts the same bounded durable generation workflow used by the browser app. A repeated request while the account and source already have a queued or running job returns that existing job with coalesced=true.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/SourceId"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Generation job accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnqueuedGenerationJob"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Existing in-flight generation job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnqueuedGenerationJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/generation-jobs/{job_id}": {
+      "get": {
+        "summary": "Observe one account-scoped generation job",
+        "description": "Poll until status is succeeded or failed. cardCount reports how many accepted cards were scheduled and may be zero when no draft passed validation.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current durable generation job state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenerationJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/v1/accounts/{account_id}/drafts/{draft_id}/approve": {
       "post": {
         "summary": "Keep one generated draft as a review unit",
@@ -605,6 +694,15 @@
           "type": "string"
         }
       },
+      "JobId": {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^job-[a-f0-9]+$"
+        }
+      },
       "DeckId": {
         "name": "deck_id",
         "in": "path",
@@ -756,6 +854,74 @@
             "type": "integer"
           }
         }
+      },
+      "GenerationJob": {
+        "type": "object",
+        "required": [
+          "id",
+          "sourceId",
+          "title",
+          "status",
+          "cardCount",
+          "attempts",
+          "retryable",
+          "error",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "sourceId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "retry", "succeeded", "failed"]
+          },
+          "cardCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": ["string", "null"]
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "updatedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "EnqueuedGenerationJob": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GenerationJob"
+          },
+          {
+            "type": "object",
+            "required": [
+              "coalesced"
+            ],
+            "properties": {
+              "coalesced": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
       },
       "ProjectDeckRecord": {
         "type": "object",
