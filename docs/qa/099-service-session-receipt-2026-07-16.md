@@ -49,16 +49,14 @@ siblings). No production cross-account probe was run: exercising another
 account's routes with a live credential against real user data is exactly what
 the tests exist to avoid.
 
-## Open gap — full review-loop receipt (tracked: memory-engine-103)
+## Full review-loop gap — closed by memory-engine-103
 
-The generate → next → submit loop could not run unattended because the machine
-plane cannot mint review material in production: the synchronous
-`/v1/.../generate` route is production-disabled by design (409: "Direct
-synchronous generation is disabled in production.") and the durable queued
-workflow is browser-plane only (cookie + CSRF). `dueCount` stayed 0, so
-`/review/next` timings above are the authenticated empty-state path and no
-submit was possible. memory-engine-103 shapes the machine-facing queued
-generation surface; its receipt closes the remaining 099 criterion.
+This receipt originally stopped after authenticated empty-state reads because
+the machine plane could not enqueue production generation. PR #64 added bearer
+enqueue and polling over the durable queue. The
+[103 production receipt](103-machine-generation-receipt-2026-07-17.md) now
+proves service credential → source → queued generation → next → submit end to
+end and closes the remaining 099 criterion.
 
 ## Custody
 
