@@ -379,6 +379,12 @@ pub fn read_performance_timeline(
         let mut response = request
             .call()
             .map_err(|error| PerformanceError::Http(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PerformanceError::Http(format!(
+                "timeline returned HTTP {}",
+                response.status()
+            )));
+        }
         let body: Value = response
             .body_mut()
             .read_json()

@@ -56,6 +56,12 @@ fn emit_openapi() -> Result<(), String> {
     let started = Instant::now();
     let outcome = match agent.get(&url).call() {
         Ok(mut response) => {
+            let status = response.status();
+            if !status.is_success() {
+                let elapsed = duration_ms(started);
+                emit_observation(config, elapsed, Outcome::ServerFailed)?;
+                return Err(format!("OpenAPI request failed with status {status}"));
+            }
             response
                 .body_mut()
                 .read_to_vec()

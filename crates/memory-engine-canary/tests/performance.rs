@@ -330,6 +330,35 @@ fn timeline_readback_rejects_events_outside_service_authority() {
 }
 
 #[test]
+fn timed_out_shutdown_can_be_completed_by_retry() {
+    let (endpoint, accepted, _requests) = serve_delayed_error_then_event();
+    let reporter = CanaryReporter::new(test_config(endpoint));
+    reporter.report(&ErrorEvent {
+        error_class: "SyntheticBlock".to_owned(),
+        message: "hold worker".to_owned(),
+        severity: Severity::Info,
+        context: None,
+        fingerprint: Vec::new(),
+    });
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker entered network call");
+
+    let observation = CompletionMarker::server(
+        Action::Machine(MachineRouteAction::OpenApi),
+        CompletionPhase::ImmediateAck,
+        Outcome::Succeeded,
+    )
+    .expect("marker")
+    .observation(5)
+    .expect("observation");
+    assert!(reporter.report_performance(observation));
+
+    assert!(!reporter.shutdown(Duration::from_millis(10)));
+    assert!(reporter.shutdown(Duration::from_secs(2)));
+}
+
+#[test]
 fn shutdown_flushes_once_and_rejects_new_work() {
     let (endpoint, requests) = serve_responses(vec![(200, json!({"id": "EVT-1"}))]);
     let reporter = CanaryReporter::new(test_config(endpoint));

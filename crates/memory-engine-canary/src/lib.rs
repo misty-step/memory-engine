@@ -244,43 +244,49 @@ impl CanaryReporter {
     /// Returns `false` when the deadline expires. Repeated calls are harmless.
     #[must_use]
     pub fn shutdown(&self, deadline: Duration) -> bool {
-        if self.inner.closed.swap(true, Ordering::AcqRel) {
+        let started = Instant::now();
+        self.inner.closed.store(true, Ordering::Release);
+        if self
+            .inner
+            .worker
+            .lock()
+            .map_or(true, |worker| worker.is_none())
+        {
             return true;
         }
-        let started = Instant::now();
+
         let (acknowledge, received) = mpsc::channel();
-        if !send_control_until(
+        if send_control_until(
             &self.inner.sender,
             Command::Shutdown(acknowledge),
             started,
             deadline,
         ) {
-            return false;
+            let remaining = deadline.saturating_sub(started.elapsed());
+            let _ = received.recv_timeout(remaining);
         }
-        let remaining = deadline.saturating_sub(started.elapsed());
-        if received.recv_timeout(remaining).is_err() {
-            return false;
+
+        loop {
+            let finished = self.inner.worker.lock().map_or(true, |worker| {
+                worker
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished)
+            });
+            if finished {
+                break;
+            }
+            if started.elapsed() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
-        let remaining = deadline.saturating_sub(started.elapsed());
-        let Some(worker) = self
-            .inner
+
+        self.inner
             .worker
             .lock()
             .ok()
             .and_then(|mut worker| worker.take())
-        else {
-            return true;
-        };
-        if worker.is_finished() {
-            return worker.join().is_ok();
-        }
-        if remaining.is_zero() {
-            return false;
-        }
-        while !worker.is_finished() && started.elapsed() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        worker.is_finished() && worker.join().is_ok()
+            .is_none_or(|worker| worker.join().is_ok())
     }
 
     fn try_send(&self, command: Command, namespace: Option<Namespace>) -> bool {
@@ -439,7 +445,7 @@ fn send_performance_with_retry(
             .post(&url)
             .header("Authorization", &authorization)
             .send_json(&body)
-            .is_ok()
+            .is_ok_and(|response| response.status().is_success())
         {
             return (true, attempt, body);
         }
@@ -480,7 +486,7 @@ fn send_json_with_retry(
             .post(url)
             .header("Authorization", authorization)
             .send_json(body)
-            .is_ok()
+            .is_ok_and(|response| response.status().is_success())
         {
             return (true, attempt);
         }
