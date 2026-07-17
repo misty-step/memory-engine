@@ -100,7 +100,7 @@ pub struct JobBroadcast {
 
 /// One generation job. The account/source ids drive the worker; the rest is
 /// learner-facing status surfaced in the activity log and over SSE.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationJob {
     pub id: String,
@@ -208,28 +208,17 @@ impl From<PersistedJob> for GenerationJob {
     }
 }
 
-/// Outcome of [`JobQueue::enqueue_or_coalesce`]: whether a new job was
-/// started or an already in-flight (queued/running) job for the same
-/// account+source was reused. Route handlers use this to pick the
-/// learner-facing notice — coalescing must never silently duplicate a job or
-/// its resulting cards (082).
+/// Outcome of [`JobQueue::enqueue_or_coalesce`]: a new or existing in-flight
+/// job, a policy rejection, or a transient queue-store failure.
+///
+/// Carrying the job snapshot avoids a second Postgres read after a committed
+/// enqueue and keeps callers from reporting a false "not found" response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EnqueueOutcome {
-    Started(String),
-    AlreadyInFlight(String),
+    Started(GenerationJob),
+    AlreadyInFlight(GenerationJob),
     Rejected(String),
-}
-
-impl EnqueueOutcome {
-    /// The job id either way — the caller renders the same activity-log row
-    /// whether this call started the job or found it already running.
-    #[must_use]
-    pub fn job_id(&self) -> &str {
-        match self {
-            Self::Started(id) | Self::AlreadyInFlight(id) => id,
-            Self::Rejected(_) => "",
-        }
-    }
+    Unavailable(String),
 }
 
 /// An async queue of generation jobs plus the in-process worker that drains it.
@@ -370,7 +359,7 @@ impl JobQueue {
             enforce_terminal_retention(&mut jobs, account_id);
         }
         self.start(&snapshot);
-        EnqueueOutcome::Started(snapshot.id)
+        EnqueueOutcome::Started(snapshot)
     }
 
     /// Enqueue generation for an already-saved source, coalescing onto an
@@ -399,9 +388,9 @@ impl JobQueue {
                         && job.source_id == source_id
                         && !job.status.is_terminal()
                 })
-                .map(|job| job.id.clone());
-            if let Some(id) = active {
-                Err(id)
+                .cloned();
+            if let Some(job) = active {
+                Err(job)
             } else {
                 let snapshot = candidate.clone();
                 jobs.push(candidate);
@@ -412,15 +401,17 @@ impl JobQueue {
         match outcome {
             Ok(snapshot) => {
                 self.start(&snapshot);
-                EnqueueOutcome::Started(snapshot.id)
+                EnqueueOutcome::Started(snapshot)
             }
-            Err(id) => EnqueueOutcome::AlreadyInFlight(id),
+            Err(job) => EnqueueOutcome::AlreadyInFlight(job),
         }
     }
 
     fn enqueue_postgres(&self, account_id: &str, source_id: &str, title: &str) -> EnqueueOutcome {
         let Some(database_url) = self.inner.postgres_url.as_deref() else {
-            return EnqueueOutcome::Rejected("Postgres job store is not configured.".to_owned());
+            return EnqueueOutcome::Unavailable(
+                "Generation is temporarily unavailable. Please try again.".to_owned(),
+            );
         };
         let model_key = std::env::var("MEMORY_ENGINE_GENERATION_MODEL")
             .unwrap_or_else(|_| "deterministic".to_owned());
@@ -442,15 +433,15 @@ impl JobQueue {
         match result {
             Ok(PostgresEnqueueOutcome::Started(job)) => {
                 self.broadcast_postgres(&job);
-                EnqueueOutcome::Started(job.id)
+                EnqueueOutcome::Started(job.into())
             }
             Ok(PostgresEnqueueOutcome::AlreadyInFlight(job)) => {
-                EnqueueOutcome::AlreadyInFlight(job.id)
+                EnqueueOutcome::AlreadyInFlight(job.into())
             }
             Ok(PostgresEnqueueOutcome::Rejected(reason)) => EnqueueOutcome::Rejected(reason),
             Err(error) => {
                 eprintln!("memory-engine: generation enqueue failed: {error}");
-                EnqueueOutcome::Rejected(
+                EnqueueOutcome::Unavailable(
                     "Generation is temporarily unavailable. Please try again.".to_owned(),
                 )
             }
@@ -561,21 +552,33 @@ impl JobQueue {
         self.inner.updates.subscribe()
     }
 
-    /// Look up a single job (test + handler convenience).
-    #[must_use]
-    pub fn job_for_account(&self, account_id: &str, job_id: &str) -> Option<GenerationJob> {
+    /// Look up a single account-scoped job.
+    ///
+    /// Postgres read failures remain distinct from a missing job so machine
+    /// pollers can retry transient outages instead of discarding active work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable message when the Postgres job ledger is unavailable.
+    pub fn job_for_account(
+        &self,
+        account_id: &str,
+        job_id: &str,
+    ) -> Result<Option<GenerationJob>, String> {
         if let Some(database_url) = self.inner.postgres_url.as_deref() {
             return with_postgres_store(database_url, |store| {
                 store.generation_job(account_id, job_id)
             })
-            .ok()
-            .flatten()
-            .map(GenerationJob::from);
+            .map(|job| job.map(GenerationJob::from))
+            .map_err(|_| {
+                "Generation status is temporarily unavailable. Please try again.".to_owned()
+            });
         }
-        self.lock_jobs()
+        Ok(self
+            .lock_jobs()
             .iter()
             .find(|job| job.id == job_id && job.account_id == account_id)
-            .cloned()
+            .cloned())
     }
 
     /// Test-only lookup for file-backed queues. Production reads must carry an
@@ -1187,13 +1190,28 @@ mod tests {
 
     fn enqueue_id(outcome: EnqueueOutcome) -> String {
         match outcome {
-            EnqueueOutcome::Started(id) | EnqueueOutcome::AlreadyInFlight(id) => id,
-            EnqueueOutcome::Rejected(reason) => panic!("test enqueue rejected: {reason}"),
+            EnqueueOutcome::Started(job) | EnqueueOutcome::AlreadyInFlight(job) => job.id,
+            EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => {
+                panic!("test enqueue rejected: {reason}")
+            }
         }
     }
 
     fn test_clock_ms() -> i64 {
         TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn postgres_queue_failures_are_reported_as_unavailable() {
+        let queue = JobQueue::with_postgres(
+            AccountRegistry::default(),
+            "postgresql://invalid:invalid@127.0.0.1:1/unreachable",
+        );
+
+        let outcome = queue.enqueue("acct", GHOST, "unreachable queue");
+
+        assert!(matches!(outcome, EnqueueOutcome::Unavailable(_)));
+        assert!(queue.job_for_account("acct", "job-missing").is_err());
     }
 
     #[test]

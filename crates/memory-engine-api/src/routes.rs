@@ -13,7 +13,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
 #[path = "icons.rs"]
@@ -31,8 +31,8 @@ use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
-    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
-    InvalidateProjectDeckRequest, ProjectDeckRecord, ReadinessResponse,
+    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
+    InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
     ScheduledReturnNotificationReport, SourceList, SourceRecord, StudyViewResponse,
     SubmitReviewRequest,
 };
@@ -55,6 +55,8 @@ enum V1Route {
     ProjectDeckInvalidate,
     ContentFeedback,
     Generate,
+    GenerationJobs,
+    GenerationJob,
     Approve,
     Next,
     Reveal,
@@ -76,6 +78,9 @@ const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
 const V1_PROJECT_DECK_INVALIDATE_PATH: &str =
     "/v1/accounts/{account_id}/project-decks/{deck_id}/invalidate";
 const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/generate";
+const V1_GENERATION_JOBS_PATH: &str =
+    "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs";
+const V1_GENERATION_JOB_PATH: &str = "/v1/accounts/{account_id}/generation-jobs/{job_id}";
 const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
 const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
@@ -98,6 +103,8 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::ProjectDecks,
     V1Route::ProjectDeckInvalidate,
     V1Route::Generate,
+    V1Route::GenerationJobs,
+    V1Route::GenerationJob,
     V1Route::Approve,
     V1Route::Next,
     V1Route::Reveal,
@@ -109,6 +116,46 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Submit,
     V1Route::ContentFeedback,
 ];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationJobResource {
+    id: String,
+    source_id: String,
+    title: String,
+    status: JobStatus,
+    card_count: usize,
+    attempts: u32,
+    retryable: bool,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<GenerationJob> for GenerationJobResource {
+    fn from(job: GenerationJob) -> Self {
+        Self {
+            id: job.id,
+            source_id: job.source_id,
+            title: job.title,
+            status: job.status,
+            card_count: job.card_count,
+            attempts: job.attempts,
+            retryable: job.retryable,
+            error: job.error,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueuedGenerationJobResource {
+    #[serde(flatten)]
+    job: GenerationJobResource,
+    coalesced: bool,
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct AnalyticsQuery {
@@ -154,6 +201,10 @@ impl V1Route {
                 post(invalidate_project_deck),
             ),
             Self::Generate => router.route(V1_GENERATE_PATH, post(generate_source)),
+            Self::GenerationJobs => {
+                router.route(V1_GENERATION_JOBS_PATH, post(enqueue_generation_job))
+            }
+            Self::GenerationJob => router.route(V1_GENERATION_JOB_PATH, get(get_generation_job)),
             Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
             Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
@@ -209,6 +260,14 @@ impl V1Route {
             Self::Generate => &[V1ContractOperation {
                 method: "POST",
                 path: V1_GENERATE_PATH,
+            }],
+            Self::GenerationJobs => &[V1ContractOperation {
+                method: "POST",
+                path: V1_GENERATION_JOBS_PATH,
+            }],
+            Self::GenerationJob => &[V1ContractOperation {
+                method: "GET",
+                path: V1_GENERATION_JOB_PATH,
             }],
             Self::Approve => &[V1ContractOperation {
                 method: "POST",
@@ -586,6 +645,40 @@ async fn generate_source(
         session_token,
         &source_id,
     )?))
+}
+
+async fn enqueue_generation_job(
+    State(state): State<ApiState>,
+    Path((account_id, source_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<EnqueuedGenerationJobResource>), ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    let (job, coalesced) =
+        state.enqueue_generation_job_for_session(&account_id, session_token, &source_id)?;
+    let status = if coalesced {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+
+    Ok((
+        status,
+        Json(EnqueuedGenerationJobResource {
+            job: job.into(),
+            coalesced,
+        }),
+    ))
+}
+
+async fn get_generation_job(
+    State(state): State<ApiState>,
+    Path((account_id, job_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<GenerationJobResource>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    let job = state.generation_job_for_session(&account_id, session_token, &job_id)?;
+
+    Ok(Json(job.into()))
 }
 
 async fn archive_source(
@@ -1103,7 +1196,7 @@ async fn capture_app_source(
                     "Generating your cards. They'll appear below as they're ready.".to_owned()
                 }
                 EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
-                EnqueueOutcome::Rejected(reason) => reason,
+                EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
             }
         }
         Err(error) => {
@@ -1174,7 +1267,7 @@ async fn generate_app_source(
     let notice = match state.enqueue_generation_job_by_source(&account, &form.source_id, &title) {
         EnqueueOutcome::Started(_) => "Generating. Watch the activity log.".to_owned(),
         EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
-        EnqueueOutcome::Rejected(reason) => reason,
+        EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
     };
 
     Html(render_account_page(&state, &account, None, Some(&notice))).into_response()

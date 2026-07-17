@@ -98,13 +98,56 @@ and the prior one fails with `403` immediately. To revoke without keeping a
 usable credential, reissue and discard the response. Issuance is audited in
 the app log (`service session issued account=...`).
 
+## Queued generation (machine consumers)
+
+Bearer-authenticated clients enqueue the same bounded, durable generation job
+used by the browser app, then poll that account-scoped job until it reaches
+`succeeded` or `failed`. No browser cookie, CSRF token, or synchronous model
+request is involved. A duplicate POST while the same source is queued or
+running returns `200` with the existing job id and `"coalesced": true`; a new
+job returns `202`.
+Admission-control rejections return `409`; a transient queue-store failure
+returns `503` so machine clients can retry it.
+
+```sh
+set -euo pipefail
+
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
+session_token="${MEMORY_ENGINE_SESSION_TOKEN:?set MEMORY_ENGINE_SESSION_TOKEN}"
+source_id="${MEMORY_ENGINE_SOURCE_ID:?set MEMORY_ENGINE_SOURCE_ID}"
+
+job_response="$(curl -fsS --max-time 20 \
+  -H "authorization: Bearer $session_token" \
+  -X POST \
+  "$base/v1/accounts/$account_id/sources/$source_id/generation-jobs")"
+job_id="$(printf '%s' "$job_response" | jq -er '.id')"
+
+while :; do
+  job_response="$(curl -fsS --max-time 20 \
+    -H "authorization: Bearer $session_token" \
+    "$base/v1/accounts/$account_id/generation-jobs/$job_id")"
+  case "$(printf '%s' "$job_response" | jq -r '.status')" in
+    succeeded) break ;;
+    failed) printf '%s\n' "$job_response" >&2; exit 1 ;;
+    queued|running|retry) sleep 1 ;;
+    *) printf 'unexpected job response: %s\n' "$job_response" >&2; exit 1 ;;
+  esac
+done
+printf 'scheduled cards: %s\n' "$(printf '%s' "$job_response" | jq -r '.cardCount')"
+```
+
+A succeeded job can report `cardCount: 0` when generation completed but no
+draft passed the shared validation gate. That is a content-quality result, not
+a queue failure; callers may inspect the source or submit revised material.
+
 ## Legacy v1 compatibility latency
 
-Use this when a ticket needs the synchronous compatibility-path latency for
-`/v1/accounts/{account_id}/sources/{source_id}/generate`. This route remains a
-legacy direct API surface; production durable generation uses the queued app
-workflow and should not be described as this path. The command below uses an
-existing allowlisted v1 account/session, saves one article-sized source,
+Use this only when a ticket explicitly needs the synchronous compatibility
+path. `/v1/accounts/{account_id}/sources/{source_id}/generate` remains a
+legacy direct API surface and returns `409` on production Postgres hosts;
+production consumers use the queued generation-job workflow above.
+The command below uses an existing allowlisted v1 account/session, saves one article-sized source,
 times the end-to-end direct request, records the response, and archives the
 source. Production account creation is allowlist-protected, so do not use a
 throwaway email here; export a pre-provisioned account id and session token

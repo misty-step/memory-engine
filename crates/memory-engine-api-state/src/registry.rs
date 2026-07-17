@@ -1258,6 +1258,14 @@ impl AccountRegistry {
         Ok(())
     }
 
+    pub(crate) fn authenticate_account(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.require_account(account_id, session_token).map(drop)
+    }
+
     pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
         data.storage.storage(data.now_fn)
