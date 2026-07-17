@@ -371,9 +371,14 @@ impl DraftProvider for FallbackProvider<'_> {
         source: &SourceDocument,
         rejections: &[DraftRejection],
     ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
-        match self.primary.repair_drafts(source, rejections)? {
-            Some(drafts) => Ok(Some(drafts)),
-            None => self.fallback.repair_drafts(source, rejections),
+        // Repair must stay on the provider that handled the first pass.
+        // Re-run the deterministic primary router: falling through merely
+        // because the primary has no repair implementation would let model
+        // output replace rejected structured material.
+        if self.primary.generate_drafts(source)?.candidates.is_empty() {
+            self.fallback.repair_drafts(source, rejections)
+        } else {
+            self.primary.repair_drafts(source, rejections)
         }
     }
 }

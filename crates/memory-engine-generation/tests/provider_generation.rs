@@ -1,10 +1,10 @@
-use std::{fs, path::PathBuf};
+use std::{cell::Cell, fs, path::PathBuf};
 
 use memory_engine_core::{ExactPromptKind, Prompt};
 use memory_engine_generation::{
     classify_learning_intent, run_beta_generation_with_provider, BetaGenerationRequest,
-    DraftCandidate, DraftProvider, FakeModelProvider, FallbackProvider, LearningIntent,
-    ProviderDrafts, ProviderFailure, ProviderUsage, StructuredBlockProvider,
+    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
+    LearningIntent, ProviderDrafts, ProviderFailure, ProviderUsage, StructuredBlockProvider,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, GeneratedLearningActivityKind, GeneratedPromptModel,
@@ -375,6 +375,137 @@ fn provider_usage_is_aggregated_onto_the_generation_run() {
             cost_usd_micros: Some(480),
             latency_ms: 2_000,
         })
+    );
+}
+
+#[test]
+fn structured_duplicate_repair_never_calls_the_model_fallback() {
+    struct ModelFallback;
+
+    impl DraftProvider for ModelFallback {
+        fn model(&self) -> GeneratedPromptModel {
+            GeneratedPromptModel {
+                provider: "model".to_owned(),
+                name: "must-not-run".to_owned(),
+                version: "v1".to_owned(),
+            }
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            panic!("structured generation must not call the model fallback")
+        }
+
+        fn repair_drafts(
+            &self,
+            _source: &SourceDocument,
+            _rejections: &[DraftRejection],
+        ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+            panic!("structured duplicate repair must not call the model fallback")
+        }
+    }
+
+    let directory = TempDirectory::new("structured-duplicate-repair");
+    let mut store = open_store_with_prose(&directory);
+    store
+        .save_source_document(source_document(
+            "src-structured",
+            "Stable generation",
+            "Concept: Stable generation\nQuestion: What stays stable?\nAnswer: The job identity.",
+        ))
+        .expect("structured source");
+    let structured = StructuredBlockProvider;
+    let provider = FallbackProvider::new(&structured, &ModelFallback);
+
+    let first = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        request("run-structured-1", "src-structured"),
+    )
+    .expect("first structured generation");
+    assert_eq!(first.accepted_draft_ids.len(), 1);
+
+    let replay = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        request("run-structured-2", "src-structured"),
+    )
+    .expect("replayed structured generation");
+    assert!(
+        replay.accepted_draft_ids.is_empty(),
+        "the duplicate must stay rejected instead of escaping through model repair"
+    );
+}
+
+#[test]
+fn prose_repair_stays_with_the_model_fallback() {
+    struct RepairingFallback {
+        repaired: Cell<bool>,
+    }
+
+    impl DraftProvider for RepairingFallback {
+        fn model(&self) -> GeneratedPromptModel {
+            test_model("repairing-fallback")
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            Ok(ProviderDrafts {
+                model: self.model(),
+                learning_intent: Some(LearningIntent::FactRecall),
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: "Mitochondria energy".to_owned(),
+                    question: "What do mitochondria generate?".to_owned(),
+                    answer: "ATP".to_owned(),
+                    evidence: Some("fabricated evidence".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                }],
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+
+        fn repair_drafts(
+            &self,
+            source: &SourceDocument,
+            _rejections: &[DraftRejection],
+        ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+            self.repaired.set(true);
+            FakeModelProvider.generate_drafts(source).map(Some)
+        }
+    }
+
+    let directory = TempDirectory::new("prose-fallback-repair");
+    let mut store = open_store_with_prose(&directory);
+    let fallback = RepairingFallback {
+        repaired: Cell::new(false),
+    };
+    let provider = FallbackProvider::new(&StructuredBlockProvider, &fallback);
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        request("run-prose-repair", "src-prose"),
+    )
+    .expect("prose repair");
+
+    assert!(
+        fallback.repaired.get(),
+        "fallback repair must run for prose"
+    );
+    assert!(
+        !result.accepted_draft_ids.is_empty(),
+        "the fallback's repaired draft must pass the shared gate: {:?}",
+        result.validation_failures
     );
 }
 
