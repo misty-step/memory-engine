@@ -5368,10 +5368,13 @@ async fn postgres_review_actions_emit_latency_receipt() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
+    let next_started = Instant::now();
     let page = next_review_html(&app, &cookie, &csrf_token, "latency next").await;
+    let next_elapsed = next_started.elapsed();
 
     let review_unit_id = html_value(&page, "reviewUnitId");
     let idempotency_key = html_value(&page, "idempotencyKey");
+    let submit_started = Instant::now();
     let submitted = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -5388,12 +5391,14 @@ async fn postgres_review_actions_emit_latency_receipt() {
         ))
         .await
         .expect("submit review");
+    let submit_elapsed = submit_started.elapsed();
     assert_eq!(submitted.status(), StatusCode::OK);
     let submitted = response_text(submitted).await;
     assert!(
         submitted.contains("me-verdict"),
         "latency receipt submit must render graded feedback: {submitted}"
     );
+    eprintln!("postgres review latency: next={next_elapsed:?} submit={submit_elapsed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

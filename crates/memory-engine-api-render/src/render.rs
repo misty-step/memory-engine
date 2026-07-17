@@ -39,9 +39,14 @@ pub fn render_account_page(
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
 ) -> String {
-    render_account_page_with_source_loader(state, account, view, notice, || {
-        state.list_app_sources(account).unwrap_or_default()
-    })
+    render_account_page_with_loaders(
+        state,
+        account,
+        view,
+        notice,
+        || state.list_app_sources(account).unwrap_or_default(),
+        || state.jobs_for_app_account(account),
+    )
 }
 
 #[must_use]
@@ -62,12 +67,13 @@ pub fn render_edit_review_html(
     ))
 }
 
-fn render_account_page_with_source_loader(
+fn render_account_page_with_loaders(
     state: &ApiState,
     account: &AppAccount,
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
     load_sources: impl FnOnce() -> Vec<SourceRecord>,
+    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
 ) -> String {
     // When the caller doesn't supply a view (capture, generate, retry-refresh,
     // GET home), fetch the live study view so the due count and "Start review"
@@ -80,15 +86,23 @@ fn render_account_page_with_source_loader(
         None
     };
     let view = view.or(fetched.as_ref());
+    let active_review = view.is_some_and(|view| view.current.is_some());
     // Active review responses render only the supplied card. Loading the full
-    // source list here repeats a complete account snapshot on every hot-path
-    // action while `render_signed_in` never reads it in the review branch.
-    let sources = if view.is_some_and(|view| view.current.is_some()) {
+    // source list here repeats a complete account snapshot while
+    // `render_signed_in` never reads it in the review branch.
+    let sources = if active_review {
         Vec::new()
     } else {
         load_sources()
     };
-    let jobs = state.jobs_for_app_account(account);
+    // Jobs only affect an active review when they validate a "Generating…"
+    // notice. Keep that truth check, but avoid a second Postgres connection for
+    // ordinary next/submit responses where no such notice can be rendered.
+    let jobs = if active_review && !notice.is_some_and(is_generating_notice) {
+        Vec::new()
+    } else {
+        load_jobs()
+    };
     render_app_shell(Some(account), &sources, view, &jobs, notice)
 }
 
@@ -431,8 +445,12 @@ fn render_notice(message: Option<&str>, jobs: &[GenerationJob]) -> String {
 /// generation-in-progress notice needs to be checked against live job state,
 /// so it never lingers once nothing is left in flight (operator dogfood
 /// finding, memory-engine-081).
+fn is_generating_notice(text: &str) -> bool {
+    text.contains("Generating")
+}
+
 fn generating_notice_is_live(text: &str, jobs: &[GenerationJob]) -> bool {
-    if !text.contains("Generating") {
+    if !is_generating_notice(text) {
         return true;
     }
     jobs.iter()
@@ -1392,7 +1410,7 @@ mod source_loading_tests {
 
     use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
 
-    use super::render_account_page_with_source_loader;
+    use super::render_account_page_with_loaders;
 
     fn source_body() -> String {
         [
@@ -1408,7 +1426,7 @@ mod source_loading_tests {
     }
 
     #[test]
-    fn active_review_skips_source_loader_and_workspace_loads_it() {
+    fn active_review_loads_only_data_used_by_the_rendered_branch() {
         let state = ApiState::default();
         let created = state
             .create_account("render-loader-active@example.com")
@@ -1430,12 +1448,59 @@ mod source_loading_tests {
         state.run_pending_jobs_blocking();
         let active_view = state.next_app_review(&account).unwrap();
 
-        let active_loads = Cell::new(0);
-        render_account_page_with_source_loader(&state, &account, Some(&active_view), None, || {
-            active_loads.set(active_loads.get() + 1);
-            Vec::new()
-        });
-        assert_eq!(active_loads.get(), 0);
+        let active_source_loads = Cell::new(0);
+        let active_job_loads = Cell::new(0);
+        render_account_page_with_loaders(
+            &state,
+            &account,
+            Some(&active_view),
+            None,
+            || {
+                active_source_loads.set(active_source_loads.get() + 1);
+                Vec::new()
+            },
+            || {
+                active_job_loads.set(active_job_loads.get() + 1);
+                Vec::new()
+            },
+        );
+        assert_eq!(active_source_loads.get(), 0);
+        assert_eq!(active_job_loads.get(), 0);
+
+        render_account_page_with_loaders(
+            &state,
+            &account,
+            Some(&active_view),
+            Some("Generating review material…"),
+            Vec::new,
+            || {
+                active_job_loads.set(active_job_loads.get() + 1);
+                Vec::new()
+            },
+        );
+        assert_eq!(
+            active_job_loads.get(),
+            1,
+            "a generation notice still needs live jobs to suppress stale UI"
+        );
+
+        let notice_page = render_account_page_with_loaders(
+            &state,
+            &account,
+            Some(&active_view),
+            Some("That job can't be retried."),
+            Vec::new,
+            || {
+                active_job_loads.set(active_job_loads.get() + 1);
+                Vec::new()
+            },
+        );
+        assert_eq!(
+            active_job_loads.get(),
+            1,
+            "an unconditional notice does not require job history"
+        );
+        assert!(notice_page.contains("That job can't be retried."));
 
         let workspace_state = ApiState::default();
         let workspace_created = workspace_state
@@ -1444,18 +1509,24 @@ mod source_loading_tests {
         let workspace_account = workspace_state
             .create_browser_session(&workspace_created)
             .unwrap();
-        let workspace_loads = Cell::new(0);
-        render_account_page_with_source_loader(
+        let workspace_source_loads = Cell::new(0);
+        let workspace_job_loads = Cell::new(0);
+        render_account_page_with_loaders(
             &workspace_state,
             &workspace_account,
             None,
             None,
             || {
-                workspace_loads.set(workspace_loads.get() + 1);
+                workspace_source_loads.set(workspace_source_loads.get() + 1);
+                Vec::new()
+            },
+            || {
+                workspace_job_loads.set(workspace_job_loads.get() + 1);
                 Vec::new()
             },
         );
-        assert_eq!(workspace_loads.get(), 1);
+        assert_eq!(workspace_source_loads.get(), 1);
+        assert_eq!(workspace_job_loads.get(), 1);
     }
 }
 
