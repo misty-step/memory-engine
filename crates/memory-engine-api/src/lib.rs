@@ -12,8 +12,8 @@ mod routes;
 mod tests;
 
 pub use memory_engine_api_state::{
-    init_error_reporting, report_health_check_in, start_health_reporting_loop, AccountRegistry,
-    ApiState, AuthConfig,
+    init_error_reporting, report_health_check_in, shutdown_error_reporting,
+    start_health_reporting_loop, AccountRegistry, ApiState, AuthConfig,
 };
 
 #[cfg(test)]

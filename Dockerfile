@@ -2,7 +2,7 @@ FROM rust:1.94-bookworm AS builder
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p memory-engine-api
+RUN cargo build --release -p memory-engine-api -p memory-engine-canary
 
 FROM debian:bookworm-slim AS runtime
 
@@ -12,6 +12,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/memory-engine-api /usr/local/bin/memory-engine-api
+COPY --from=builder /src/target/release/memory-engine-canary-receipt /usr/local/bin/memory-engine-canary-receipt
 COPY --from=builder /src/bin/send-magic-link /usr/local/bin/send-magic-link
 
 ENV HOST=0.0.0.0

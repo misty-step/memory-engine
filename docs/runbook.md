@@ -238,16 +238,40 @@ curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status"
 doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
 ```
 
-Errors land in Canary. Query it directly:
+Errors, health check-ins, and closed performance aggregates land in Canary
+through one bounded worker queue. Every API 500 (`ApiFailure::internal`) is
+reported as service `memory-engine-api`, environment `production`.
+Performance observations are merged in process and export at most one batch
+per minute for each of the trusted server, untrusted browser, and job
+namespaces. Queue saturation, Canary failure, and shutdown deadlines remain
+fail-open for request handling; delivery/drop/invalid counts ride in the
+bounded aggregate schema. The same JSON is printed as
+`authority=non_authoritative_debug` for immediate log inspection.
+
+The production image includes a bounded live receipt. Open a DigitalOcean
+component console and run it without printing either encrypted value:
 
 ```sh
-curl -s "$CANARY_ENDPOINT/api/v1/status" -H "Authorization: Bearer $CANARY_API_KEY"
-curl -s "$CANARY_ENDPOINT/api/v1/report" -H "Authorization: Bearer $CANARY_API_KEY"
+doctl apps console 5ab05b73-9265-43c9-a01c-fef53f5f46a4 api
+memory-engine-canary-receipt emit-openapi
 ```
 
-Every API 500 (`ApiFailure::internal`) is reported as service
-`memory-engine-api`, environment `production`. Reporting is fire-and-forget;
-losing Canary never affects requests.
+The receipt times a real loopback `GET /v1/openapi.json`, queues one closed
+server observation, drains the worker, and exits nonzero on HTTP or delivery
+failure. Readback uses a distinct service-bound read credential; the
+production app keeps ingest-only authority:
+
+```sh
+CANARY_READ_ENDPOINT=https://canary.mistystep.io \
+CANARY_READ_API_KEY=... \
+CANARY_READ_SERVICE=memory-engine-api \
+cargo run -p memory-engine-canary --bin memory-engine-canary-receipt -- readback
+```
+
+Never reuse or promote the app's ingest key for readback. The deterministic
+admission-overhead receipt is
+`cargo run -p memory-engine-canary --bin memory-engine-canary-receipt -- overhead`;
+it fails above a 5 ms p95.
 
 ## Secrets
 
@@ -266,8 +290,8 @@ an encrypted App Platform variable and never copy its value into this repo.
 | `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Magic-link outbox file (no email provider wired yet; see Login). |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
 | `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.5-flash`; see docs/evals/). |
-| `CANARY_ENDPOINT` / `CANARY_API_KEY` | Error reporting to Canary; absent → reporting is a no-op. |
-| `MEMORY_ENGINE_ENVIRONMENT` | Environment label on Canary events. |
+| `CANARY_ENDPOINT` / `CANARY_API_KEY` | Ingest-only Canary error, check-in, and bounded performance export; absent → reporting is a no-op. |
+| `MEMORY_ENGINE_ENVIRONMENT` | Environment label on Canary error events. |
 
 ## Store backend selection
 
