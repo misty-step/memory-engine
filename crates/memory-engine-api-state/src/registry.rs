@@ -846,6 +846,17 @@ impl AccountRegistry {
         )
     }
 
+    pub(crate) fn content_feedback_head(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .content_feedback_head(account_id, &account.store_path, review_unit_id)
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors

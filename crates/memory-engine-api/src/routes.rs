@@ -27,10 +27,11 @@ use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
-    render_auth_recovery, render_edit_review_html, render_login_requested,
+    render_auth_recovery, render_content_feedback_recovery_html,
+    render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
     render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
-    AnalyticsConceptSort, AnalyticsViewOptions, LEDGER_CSS,
+    AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -1897,6 +1898,125 @@ fn valid_browser_submit_performance(event: &BrowserSubmitPerformance) -> bool {
     event.graded_visible_ms.abs_diff(reconstructed) <= 4
 }
 
+fn render_content_feedback_follow_up_failure(
+    state: &ApiState,
+    account: &AppAccount,
+    error: ApiFailure,
+) -> Response {
+    if error.is_session_expired() {
+        return app_failure_response(error);
+    }
+    let status = error.status();
+    let message = error.message;
+    let html = match state.next_app_review(account) {
+        Ok(view) => render_content_feedback_result_html(state, account, &view, &message),
+        Err(_) => render_account_page(state, account, None, Some(&message)),
+    };
+    let mut response = Html(html).into_response();
+    *response.status_mut() = status;
+    response
+}
+
+pub(crate) fn resolve_content_feedback_recovery_revision(
+    conflict_retry: bool,
+    review_unit_id: &str,
+    idempotency_key: &str,
+    supersedes_id: Option<&str>,
+    head_result: Option<Result<Option<String>, ApiFailure>>,
+    status: &mut StatusCode,
+    message: &mut String,
+) -> (String, Option<String>) {
+    let refreshed_head = match head_result {
+        Some(Ok(head)) => Some(head),
+        Some(Err(error)) => {
+            *status = error.status();
+            "Feedback was not saved, and the latest revision could not be loaded. Retry when storage is available.".clone_into(message);
+            None
+        }
+        None => None,
+    };
+    if let Some(head) = refreshed_head {
+        return (
+            format!("feedback-retry-{:032x}", rand::random::<u128>()),
+            head,
+        );
+    }
+    if !conflict_retry && idempotency_key.trim().is_empty() {
+        return (
+            format!(
+                "feedback-retry-{}-{}",
+                review_unit_id,
+                supersedes_id.unwrap_or("new")
+            ),
+            supersedes_id.map(str::to_owned),
+        );
+    }
+    (idempotency_key.to_owned(), supersedes_id.map(str::to_owned))
+}
+
+pub(crate) fn render_content_feedback_persistence_failure(
+    state: &ApiState,
+    account: &AppAccount,
+    review_unit_id: &str,
+    request: &ContentFeedbackRequest,
+    error: ApiFailure,
+) -> Response {
+    if error.is_session_expired() {
+        return app_failure_response(error);
+    }
+    let mut status = error.status();
+    let mut message = error.message;
+    let verdict = match request.verdict {
+        memory_engine_service::ContentFeedbackVerdict::Kept => "kept",
+        memory_engine_service::ContentFeedbackVerdict::Dropped => "dropped",
+    };
+    let conflict_retry =
+        status == StatusCode::CONFLICT && !request.idempotency_key.trim().is_empty();
+    let head_result =
+        conflict_retry.then(|| state.app_content_feedback_head(account, review_unit_id));
+    let (idempotency_key, supersedes_id) = resolve_content_feedback_recovery_revision(
+        conflict_retry,
+        review_unit_id,
+        &request.idempotency_key,
+        request.supersedes_id.as_deref(),
+        head_result,
+        &mut status,
+        &mut message,
+    );
+    let html = render_content_feedback_recovery_html(
+        state,
+        account,
+        &ContentFeedbackRecovery {
+            review_unit_id,
+            verdict,
+            rationale: request.rationale.as_deref(),
+            idempotency_key: &idempotency_key,
+            supersedes_id: supersedes_id.as_deref(),
+            message: &message,
+        },
+    );
+    let mut response = Html(html).into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
+}
+
+pub(crate) fn render_content_feedback_follow_up(
+    state: &ApiState,
+    account: &AppAccount,
+    next_review: Result<StudyViewResponse, ApiFailure>,
+) -> Response {
+    match next_review {
+        Ok(view) => Html(render_content_feedback_result_html(
+            state,
+            account,
+            &view,
+            "Saved. This card will help improve future generation.",
+        ))
+        .into_response(),
+        Err(error) => render_content_feedback_follow_up_failure(state, account, error),
+    }
+}
+
 async fn record_app_content_feedback(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1905,26 +2025,25 @@ async fn record_app_content_feedback(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return error.into_response(),
+            Err(error) => return app_failure_response(error),
         };
-    let result = state.record_app_content_feedback(
-        &account,
-        &form.review_unit_id,
-        &ContentFeedbackRequest {
-            verdict: form.verdict,
-            rationale: form.rationale,
-            idempotency_key: form.idempotency_key,
-            supersedes_id: form.supersedes_id,
-        },
-    );
+    let request = ContentFeedbackRequest {
+        verdict: form.verdict,
+        rationale: form.rationale,
+        idempotency_key: form.idempotency_key,
+        supersedes_id: form.supersedes_id,
+    };
+    let result = state.record_app_content_feedback(&account, &form.review_unit_id, &request);
     match result {
-        Ok(_) => Html(render_account_page(
+        Ok(_) => {
+            render_content_feedback_follow_up(&state, &account, state.next_app_review(&account))
+        }
+        Err(error) => render_content_feedback_persistence_failure(
             &state,
             &account,
-            None,
-            Some("Saved. This card will help improve future generation."),
-        ))
-        .into_response(),
-        Err(error) => error.into_response(),
+            &form.review_unit_id,
+            &request,
+            error,
+        ),
     }
 }

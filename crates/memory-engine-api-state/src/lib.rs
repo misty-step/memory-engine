@@ -1029,6 +1029,24 @@ impl ApiState {
         )
     }
 
+    /// Read the latest persisted content-feedback revision for a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the browser session or account-scoped
+    /// persistence read fails.
+    pub fn app_content_feedback_head(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure> {
+        self.accounts.content_feedback_head(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+        )
+    }
+
     /// Enqueue a background generation job, coalescing onto an existing
     /// queued/running job for the same account+source (082) instead of
     /// starting a duplicate.

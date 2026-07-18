@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use memory_engine_api_render::render_account_page;
-use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+use memory_engine_api_render::{render_account_page, render_content_feedback_result_html};
+use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome, StudyViewResponse};
+use memory_engine_study::BetaStudySummary;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -82,4 +83,37 @@ fn workspace_render_keeps_saved_material_without_active_review() {
     let html = render_account_page(&state, &account, None, None);
     assert!(html.contains("Saved material"));
     assert!(html.contains("NATO practice notes"));
+}
+
+#[test]
+fn completed_feedback_action_requires_an_explicit_workspace_exit() {
+    let state = ApiState::default();
+    let created = state
+        .create_account(&unique_email("complete"))
+        .expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let view = StudyViewResponse {
+        drafts: Vec::new(),
+        current: None,
+        concept_progress: Vec::new(),
+        summary: BetaStudySummary {
+            source_count: 1,
+            accepted_draft_count: 1,
+            approved_review_unit_count: 1,
+            attempt_count: 1,
+            last_outcome: None,
+            next_review_unit_id: None,
+        },
+        due_count: 0,
+        generation_notices: Vec::new(),
+    };
+
+    let html = render_content_feedback_result_html(&state, &account, &view, "Saved.");
+
+    assert!(html.contains("Review complete"));
+    assert!(html.contains(r#"href="/">Back to workspace</a>"#));
+    assert!(!html.contains("What do you want to remember?"));
+    assert!(!html.contains("Return gently"));
 }
