@@ -918,6 +918,7 @@ dependencies = [
 name = "memory-engine-canary"
 version = "0.0.0"
 dependencies = [
+ "memory-engine-performance",
  "serde_json",
  "ureq",
 ]

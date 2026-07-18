@@ -1815,6 +1815,16 @@ pub fn init_error_reporting() {
     );
 }
 
+/// Drain and stop the process-wide Canary worker during graceful shutdown.
+///
+/// Returns `false` only when an installed reporter misses the deadline.
+pub fn shutdown_error_reporting(deadline: std::time::Duration) -> bool {
+    CANARY
+        .get()
+        .and_then(Option::as_ref)
+        .is_none_or(|reporter| reporter.shutdown(deadline))
+}
+
 pub fn report_health_check_in() {
     if let Some(reporter) = CANARY.get().and_then(Option::as_ref) {
         reporter.check_in(&memory_engine_canary::CheckInEvent {

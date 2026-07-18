@@ -1,10 +1,10 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use std::{env, net::SocketAddr, process};
+use std::{env, net::SocketAddr, process, time::Duration};
 
 use memory_engine_api::{
-    init_error_reporting, router, start_health_reporting_loop, AccountRegistry, ApiState,
-    AuthConfig,
+    init_error_reporting, router, shutdown_error_reporting, start_health_reporting_loop,
+    AccountRegistry, ApiState, AuthConfig,
 };
 
 #[tokio::main]
@@ -68,6 +68,9 @@ async fn main() {
         eprintln!("{error}");
     }
     scheduler.shutdown().await;
+    if !shutdown_error_reporting(Duration::from_secs(6)) {
+        eprintln!("Canary reporter did not drain before shutdown deadline");
+    }
     if serve_result.is_err() {
         process::exit(1);
     }
