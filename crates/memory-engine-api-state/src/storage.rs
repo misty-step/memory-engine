@@ -117,6 +117,28 @@ fn order_content_feedback_for_copy(
     Ok(ordered)
 }
 
+fn current_content_feedback_head(
+    feedback: &[ContentFeedback],
+    account_id: &str,
+    review_unit_id: &str,
+) -> Option<String> {
+    feedback
+        .iter()
+        .filter(|candidate| {
+            candidate.account_id == account_id
+                && candidate.review_unit_id.as_str() == review_unit_id
+        })
+        .filter(|candidate| {
+            !feedback.iter().any(|child| {
+                child.account_id == account_id
+                    && child.review_unit_id.as_str() == review_unit_id
+                    && child.supersedes_id.as_deref() == Some(candidate.id.as_str())
+            })
+        })
+        .max_by_key(|candidate| (candidate.occurred_at, candidate.id.as_str()))
+        .map(|candidate| candidate.id.clone())
+}
+
 impl fmt::Debug for StudyStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -540,6 +562,16 @@ impl StudyStorage {
         self.inner
             .record_content_feedback(account_id, store_path, command)
     }
+
+    pub(crate) fn content_feedback_head(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure> {
+        self.inner
+            .content_feedback_head(account_id, store_path, review_unit_id)
+    }
 }
 
 trait StudyStorageAdapter: fmt::Debug + Send + Sync {
@@ -789,6 +821,12 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         command: RecordContentFeedbackCommand,
     ) -> Result<memory_engine_service::ContentFeedback, ApiFailure>;
+    fn content_feedback_head(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure>;
 }
 
 #[derive(Debug)]
@@ -1674,6 +1712,20 @@ impl StudyStorageAdapter for FileStudyStorage {
         let mut store = crate::open_persistence_store(store_path)?;
         record_content_feedback(&mut store, command).map_err(file_content_feedback_failure)
     }
+
+    fn content_feedback_head(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure> {
+        let store = crate::open_persistence_store(store_path)?;
+        Ok(current_content_feedback_head(
+            &store.snapshot().content_feedback,
+            account_id,
+            review_unit_id,
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -2525,6 +2577,22 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     .map_err(postgres_content_feedback_failure)
             },
         )
+    }
+
+    fn content_feedback_head(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<String>, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let snapshot = account.snapshot().map_err(postgres_failure)?;
+            Ok(current_content_feedback_head(
+                &snapshot.content_feedback,
+                account_id,
+                review_unit_id,
+            ))
+        })
     }
 }
 

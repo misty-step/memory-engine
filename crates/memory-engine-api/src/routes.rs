@@ -28,11 +28,10 @@ use memory_engine_study::infer_capture_title;
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
     render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_content_feedback_resume_html,
-    render_edit_review_html, render_login_requested, render_return_notification_confirmation,
-    render_return_notification_disabled, render_submit_action_result_html, render_submit_recovery,
-    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
-    LEDGER_CSS,
+    render_content_feedback_result_html, render_edit_review_html, render_login_requested,
+    render_return_notification_confirmation, render_return_notification_disabled,
+    render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
+    AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -1918,6 +1917,43 @@ fn render_content_feedback_follow_up_failure(
     response
 }
 
+pub(crate) fn resolve_content_feedback_recovery_revision(
+    conflict_retry: bool,
+    review_unit_id: &str,
+    idempotency_key: &str,
+    supersedes_id: Option<&str>,
+    head_result: Option<Result<Option<String>, ApiFailure>>,
+    status: &mut StatusCode,
+    message: &mut String,
+) -> (String, Option<String>) {
+    let refreshed_head = match head_result {
+        Some(Ok(head)) => Some(head),
+        Some(Err(error)) => {
+            *status = error.status();
+            "Feedback was not saved, and the latest revision could not be loaded. Retry when storage is available.".clone_into(message);
+            None
+        }
+        None => None,
+    };
+    if let Some(head) = refreshed_head {
+        return (
+            format!("feedback-retry-{:032x}", rand::random::<u128>()),
+            head,
+        );
+    }
+    if !conflict_retry && idempotency_key.trim().is_empty() {
+        return (
+            format!(
+                "feedback-retry-{}-{}",
+                review_unit_id,
+                supersedes_id.unwrap_or("new")
+            ),
+            supersedes_id.map(str::to_owned),
+        );
+    }
+    (idempotency_key.to_owned(), supersedes_id.map(str::to_owned))
+}
+
 pub(crate) fn render_content_feedback_persistence_failure(
     state: &ApiState,
     account: &AppAccount,
@@ -1928,35 +1964,25 @@ pub(crate) fn render_content_feedback_persistence_failure(
     if error.is_session_expired() {
         return app_failure_response(error);
     }
-    let status = error.status();
-    let message = error.message;
+    let mut status = error.status();
+    let mut message = error.message;
     let verdict = match request.verdict {
         memory_engine_service::ContentFeedbackVerdict::Kept => "kept",
         memory_engine_service::ContentFeedbackVerdict::Dropped => "dropped",
     };
-    if !status.is_server_error() && !request.idempotency_key.trim().is_empty() {
-        let html = render_content_feedback_resume_html(
-            state,
-            account,
-            verdict,
-            request.rationale.as_deref(),
-            &message,
-        );
-        let mut response = Html(html).into_response();
-        *response.status_mut() = status;
-        return no_store_response(response);
-    }
-    let fallback_key = request.idempotency_key.trim().is_empty().then(|| {
-        format!(
-            "feedback-retry-{}-{}",
-            review_unit_id,
-            request.supersedes_id.as_deref().unwrap_or("new")
-        )
-    });
-    let idempotency_key = fallback_key
-        .as_deref()
-        .unwrap_or(request.idempotency_key.as_str());
-    let supersedes_id = request.supersedes_id.as_deref();
+    let conflict_retry =
+        status == StatusCode::CONFLICT && !request.idempotency_key.trim().is_empty();
+    let head_result =
+        conflict_retry.then(|| state.app_content_feedback_head(account, review_unit_id));
+    let (idempotency_key, supersedes_id) = resolve_content_feedback_recovery_revision(
+        conflict_retry,
+        review_unit_id,
+        &request.idempotency_key,
+        request.supersedes_id.as_deref(),
+        head_result,
+        &mut status,
+        &mut message,
+    );
     let html = render_content_feedback_recovery_html(
         state,
         account,
@@ -1964,8 +1990,8 @@ pub(crate) fn render_content_feedback_persistence_failure(
             review_unit_id,
             verdict,
             rationale: request.rationale.as_deref(),
-            idempotency_key,
-            supersedes_id,
+            idempotency_key: &idempotency_key,
+            supersedes_id: supersedes_id.as_deref(),
             message: &message,
         },
     );

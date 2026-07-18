@@ -114,54 +114,6 @@ pub fn render_content_feedback_recovery_html(
 }
 
 #[must_use]
-pub fn render_content_feedback_resume_html(
-    state: &ApiState,
-    account: &AppAccount,
-    verdict: &str,
-    rationale: Option<&str>,
-    message: &str,
-) -> String {
-    let choice = if verdict == "dropped" {
-        "Drop this card"
-    } else {
-        "Keep this card"
-    };
-    let rationale = rationale
-        .filter(|rationale| !rationale.trim().is_empty())
-        .map_or_else(String::new, |rationale| {
-            format!(
-                r#"<p class="ae-lede">Your note: {}</p>"#,
-                escape_html(rationale)
-            )
-        });
-    let body = format!(
-        r#"<section class="ae-group me-content-feedback">
-<p class="me-kicker">Feedback not saved</p>
-<h1 class="me-display">Resume with the latest review.</h1>
-<p class="ae-lede">The card changed before this feedback could be applied.</p>
-<p class="ae-dim">Selected: <strong>{choice}</strong></p>
-{rationale}
-<form action="/app/next" method="post">
-{csrf}<button class="ae-button" type="submit">Resume review</button>
-</form>
-</section>"#,
-        choice = choice,
-        rationale = rationale,
-        csrf = hidden_csrf_input(account),
-    );
-    let due = state
-        .app_study_view(account)
-        .map_or(0, |view| view.due_count);
-    document(&render_signed_in_body(
-        account,
-        due,
-        Some(message),
-        &[],
-        &body,
-    ))
-}
-
-#[must_use]
 pub fn render_submit_action_result_html(
     state: &ApiState,
     account: &AppAccount,

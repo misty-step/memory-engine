@@ -1616,7 +1616,7 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
         next_review_html(&app, &cookie, &csrf_token, "start first feedback review").await;
     let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
     let first_review_key = html_value(&first_prompt, "idempotencyKey");
-    let graded = submit_review_ok(
+    submit_review_ok(
         &app,
         &cookie,
         &csrf_token,
@@ -1625,7 +1625,6 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
         &first_review_key,
     )
     .await;
-    let feedback_key = content_feedback_value(&graded, "idempotencyKey");
 
     let invalid = app
         .clone()
@@ -1655,39 +1654,6 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
     assert!(!invalid.contains(r#"action="/app/submit""#));
     assert!(!invalid.contains("What do you want to remember?"));
 
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::COOKIE,
-        cookie.parse().expect("cookie header"),
-    );
-    let account = state
-        .require_browser_session(&headers, &csrf_token)
-        .expect("browser session");
-    let unavailable = routes::render_content_feedback_persistence_failure(
-        &state,
-        &account,
-        &first_review_unit_id,
-        &ContentFeedbackRequest {
-            verdict: memory_engine_service::ContentFeedbackVerdict::Kept,
-            rationale: Some("keep this storage retry note".to_owned()),
-            idempotency_key: feedback_key.clone(),
-            supersedes_id: None,
-        },
-        ApiFailure::service_unavailable("Feedback storage is temporarily unavailable.".to_owned()),
-    );
-    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let unavailable = response_text(unavailable).await;
-    assert!(unavailable.contains("Feedback storage is temporarily unavailable."));
-    assert!(unavailable.contains(r#"action="/app/content-feedback""#));
-    assert!(unavailable.contains("keep this storage retry note"));
-    assert_eq!(
-        html_value(&unavailable, "reviewUnitId"),
-        first_review_unit_id
-    );
-    assert_eq!(html_value(&unavailable, "idempotencyKey"), feedback_key);
-    assert!(!unavailable.contains(r#"action="/app/submit""#));
-    assert!(!unavailable.contains("What do you want to remember?"));
-
     let continued = submit_content_feedback_ok(
         &app,
         &cookie,
@@ -1708,6 +1674,111 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
         first_review_unit_id,
         "feedback must advance into the next due review"
     );
+}
+
+#[tokio::test]
+async fn app_content_feedback_persistence_recovery_fields_can_be_submitted() {
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let first_prompt = next_review_html(
+        &app,
+        &cookie,
+        &csrf_token,
+        "start persistence recovery review",
+    )
+    .await;
+    let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
+    let first_review_key = html_value(&first_prompt, "idempotencyKey");
+    let graded = submit_review_ok(
+        &app,
+        &cookie,
+        &csrf_token,
+        &first_review_unit_id,
+        "deliberately wrong",
+        &first_review_key,
+    )
+    .await;
+    let feedback_key = content_feedback_value(&graded, "idempotencyKey");
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        cookie.parse().expect("cookie header"),
+    );
+    let account = state
+        .require_browser_session(&headers, &csrf_token)
+        .expect("browser session");
+    let unavailable = routes::render_content_feedback_persistence_failure(
+        &state,
+        &account,
+        &first_review_unit_id,
+        &ContentFeedbackRequest {
+            verdict: memory_engine_service::ContentFeedbackVerdict::Kept,
+            rationale: Some("keep this storage retry note".to_owned()),
+            idempotency_key: feedback_key,
+            supersedes_id: None,
+        },
+        ApiFailure::service_unavailable("Feedback storage is temporarily unavailable.".to_owned()),
+    );
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable = response_text(unavailable).await;
+    assert!(unavailable.contains("Feedback storage is temporarily unavailable."));
+    assert!(unavailable.contains(r#"action="/app/content-feedback""#));
+    assert!(unavailable.contains("keep this storage retry note"));
+    assert!(!unavailable.contains(r#"action="/app/submit""#));
+    assert!(!unavailable.contains("What do you want to remember?"));
+
+    let recovery_review_unit_id = html_value(&unavailable, "reviewUnitId");
+    let recovery_verdict = html_value(&unavailable, "verdict");
+    let recovery_key = html_value(&unavailable, "idempotencyKey");
+    let continued = submit_content_feedback_ok(
+        &app,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &recovery_review_unit_id),
+            ("verdict", &recovery_verdict),
+            ("rationale", "keep this storage retry note"),
+            ("idempotencyKey", &recovery_key),
+        ],
+    )
+    .await;
+
+    assert!(continued.contains("Saved. This card will help improve future generation."));
+    assert!(continued.contains(r#"action="/app/submit""#));
+    assert_ne!(
+        html_value(&continued, "reviewUnitId"),
+        first_review_unit_id,
+        "a submitted persistence-recovery form must advance to the next due review"
+    );
+}
+
+#[test]
+fn app_content_feedback_head_refresh_failure_preserves_retry_revision() {
+    let mut status = StatusCode::CONFLICT;
+    let mut message = "Feedback conflicts with the latest saved revision.".to_owned();
+    let (idempotency_key, supersedes_id) = routes::resolve_content_feedback_recovery_revision(
+        true,
+        "review-1",
+        "feedback-original",
+        Some("feedback-parent"),
+        Some(Err(ApiFailure::service_unavailable(
+            "feedback head unavailable".to_owned(),
+        ))),
+        &mut status,
+        &mut message,
+    );
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        message,
+        "Feedback was not saved, and the latest revision could not be loaded. Retry when storage is available."
+    );
+    assert_eq!(idempotency_key, "feedback-original");
+    assert_eq!(supersedes_id.as_deref(), Some("feedback-parent"));
 }
 
 #[tokio::test]
@@ -1771,28 +1842,29 @@ async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempo
         "a revised feedback render must not reuse the first idempotency key"
     );
 
-    let conflicting_replay = app
-        .clone()
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/content-feedback",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &second_review_unit_id),
-                ("verdict", "kept"),
-                ("rationale", "The card is useful after all."),
-                ("idempotencyKey", &first_feedback_key),
-            ],
-        ))
-        .await
-        .expect("changed replay with old key");
-    assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
-    let conflicting_replay = response_text(conflicting_replay).await;
-    assert!(conflicting_replay.contains(r#"action="/app/next""#));
-    assert!(!conflicting_replay.contains(r#"action="/app/content-feedback""#));
+    let stale_fields = [
+        ("csrfToken", csrf_token.as_str()),
+        ("reviewUnitId", second_review_unit_id.as_str()),
+        ("verdict", "kept"),
+        ("rationale", "The card is useful after all."),
+        ("idempotencyKey", first_feedback_key.as_str()),
+    ];
+    let conflicting_replay = submit_content_feedback_conflict(&app, &cookie, &stale_fields).await;
+    assert!(conflicting_replay.contains(r#"action="/app/content-feedback""#));
+    assert!(!conflicting_replay.contains(r#"action="/app/next""#));
     assert!(conflicting_replay.contains("The card is useful after all."));
-    assert!(conflicting_replay.contains("Resume with the latest review."));
+    assert!(conflicting_replay.contains("Try that feedback again."));
+    assert!(
+        conflicting_replay.contains(r#"name="supersedesId""#),
+        "{conflicting_replay}"
+    );
+    let retry_feedback_key = html_value(&conflicting_replay, "idempotencyKey");
+    let retry_head = html_value(&conflicting_replay, "supersedesId");
+    let repeated_conflict = submit_content_feedback_conflict(&app, &cookie, &stale_fields).await;
+    let repeated_retry_key = html_value(&repeated_conflict, "idempotencyKey");
+    assert_ne!(retry_feedback_key, first_feedback_key);
+    assert_ne!(retry_feedback_key, repeated_retry_key);
+    assert_eq!(retry_head, second_head);
 
     let revised_page = submit_content_feedback_ok(
         &app,
@@ -1802,8 +1874,8 @@ async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempo
             ("reviewUnitId", &second_review_unit_id),
             ("verdict", "kept"),
             ("rationale", "The card is useful after all."),
-            ("idempotencyKey", &second_feedback_key),
-            ("supersedesId", &second_head),
+            ("idempotencyKey", &retry_feedback_key),
+            ("supersedesId", &retry_head),
         ],
     )
     .await;
@@ -8129,6 +8201,25 @@ async fn submit_content_feedback_ok(
         .await
         .expect("content feedback submit");
     assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+async fn submit_content_feedback_conflict(
+    app: &axum::Router,
+    cookie: &str,
+    fields: &[(&str, &str)],
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            cookie,
+            fields,
+        ))
+        .await
+        .expect("conflicting content feedback submit");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     response_text(response).await
 }
 
