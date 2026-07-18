@@ -8,9 +8,9 @@
 //! reflect) and a review (prompt, answer, grade). Every interaction is a
 //! full-page form POST; `assets/app.js` layers progressive enhancement
 //! (honest response timing, job SSE, the Create pending state) on top.
-//! Graded pages never auto-advance on their own — the learner reviews the
-//! verdict, answer key, and dossier until they explicitly tap Continue
-//! (operator ruling, memory-engine-081).
+//! Graded pages never advance on their own — the learner reviews the verdict,
+//! answer key, and dossier until they explicitly continue or submit the
+//! generated-card quality feedback (operator rulings, memory-engine-081/116).
 
 use std::fmt::Write as _;
 
@@ -21,13 +21,144 @@ use memory_engine_api_state::{
     SubmitReviewTimings,
 };
 
+pub struct ContentFeedbackRecovery<'a> {
+    pub review_unit_id: &'a str,
+    pub verdict: &'a str,
+    pub rationale: Option<&'a str>,
+    pub idempotency_key: &'a str,
+    pub supersedes_id: Option<&'a str>,
+    pub message: &'a str,
+}
+
 #[must_use]
 pub fn render_action_result_html(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
 ) -> String {
-    render_action_result_html_with_head(state, account, result, "")
+    render_action_result_html_with_head(state, account, result, None, "")
+}
+
+#[must_use]
+pub fn render_content_feedback_result_html(
+    state: &ApiState,
+    account: &AppAccount,
+    view: &StudyViewResponse,
+    notice: &str,
+) -> String {
+    if view.current.is_none() && view.summary.approved_review_unit_count > 0 {
+        let inner = render_signed_in(
+            account,
+            &[],
+            Some(view),
+            &[],
+            Some(notice),
+            SignedInSurface::ReviewComplete,
+        );
+        document_with_head(&inner, "")
+    } else {
+        render_account_page_with_head(state, account, Some(view), Some(notice), "")
+    }
+}
+
+#[must_use]
+pub fn render_content_feedback_recovery_html(
+    state: &ApiState,
+    account: &AppAccount,
+    recovery: &ContentFeedbackRecovery<'_>,
+) -> String {
+    let supersedes = recovery.supersedes_id.map_or_else(String::new, |id| {
+        format!(
+            r#"<input type="hidden" name="supersedesId" value="{}">"#,
+            escape_html(id)
+        )
+    });
+    let choice = if recovery.verdict == "dropped" {
+        "Drop this card"
+    } else {
+        "Keep this card"
+    };
+    let body = format!(
+        r#"<section class="ae-group me-content-feedback">
+<p class="me-kicker">Feedback not saved</p>
+<h1 class="me-display">Try that feedback again.</h1>
+<p class="ae-lede">Selected: <strong>{choice}</strong></p>
+<form action="/app/content-feedback" method="post">
+{csrf}<input type="hidden" name="reviewUnitId" value="{review_unit_id}">
+<input type="hidden" name="verdict" value="{verdict}">
+<input type="hidden" name="idempotencyKey" value="{idempotency_key}">
+{supersedes}
+<label class="ae-label" for="me-content-feedback-retry-rationale">Why? <span class="ae-dim">(optional)</span></label>
+<textarea class="ae-input me-content-feedback-rationale" id="me-content-feedback-retry-rationale" name="rationale" rows="2">{rationale}</textarea>
+<div class="me-actions"><button class="ae-button" type="submit">Retry feedback</button></div>
+</form>
+</section>"#,
+        choice = choice,
+        csrf = hidden_csrf_input(account),
+        review_unit_id = escape_html(recovery.review_unit_id),
+        verdict = escape_html(recovery.verdict),
+        idempotency_key = escape_html(recovery.idempotency_key),
+        supersedes = supersedes,
+        rationale = escape_html(recovery.rationale.unwrap_or_default()),
+    );
+    let due = state
+        .app_study_view(account)
+        .map_or(0, |view| view.due_count);
+    document(&render_signed_in_body(
+        account,
+        due,
+        Some(recovery.message),
+        &[],
+        &body,
+    ))
+}
+
+#[must_use]
+pub fn render_content_feedback_resume_html(
+    state: &ApiState,
+    account: &AppAccount,
+    verdict: &str,
+    rationale: Option<&str>,
+    message: &str,
+) -> String {
+    let choice = if verdict == "dropped" {
+        "Drop this card"
+    } else {
+        "Keep this card"
+    };
+    let rationale = rationale
+        .filter(|rationale| !rationale.trim().is_empty())
+        .map_or_else(String::new, |rationale| {
+            format!(
+                r#"<p class="ae-lede">Your note: {}</p>"#,
+                escape_html(rationale)
+            )
+        });
+    let body = format!(
+        r#"<section class="ae-group me-content-feedback">
+<p class="me-kicker">Feedback not saved</p>
+<h1 class="me-display">Resume with the latest review.</h1>
+<p class="ae-lede">The card changed before this feedback could be applied.</p>
+<p class="ae-dim">Selected: <strong>{choice}</strong></p>
+{rationale}
+<form action="/app/next" method="post">
+{csrf}<button class="ae-button" type="submit">Resume review</button>
+</form>
+</section>"#,
+        choice = choice,
+        rationale = rationale,
+        csrf = hidden_csrf_input(account),
+    );
+    let due = state
+        .app_study_view(account)
+        .map_or(0, |view| view.due_count);
+    document(&render_signed_in_body(
+        account,
+        due,
+        Some(message),
+        &[],
+        &body,
+    ))
 }
 
 #[must_use]
@@ -97,10 +228,11 @@ fn render_action_result_html_with_head(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
+    notice: Option<&str>,
     head: &str,
 ) -> String {
     match result {
-        Ok(view) => render_account_page_with_head(state, account, Some(&view), None, head),
+        Ok(view) => render_account_page_with_head(state, account, Some(&view), notice, head),
         Err(error) => {
             render_account_page_with_head(state, account, None, Some(&error.message), head)
         }
@@ -149,7 +281,7 @@ pub fn render_edit_review_html(
         Some(view),
         &jobs,
         notice,
-        true,
+        SignedInSurface::Edit,
     ))
 }
 
@@ -250,7 +382,14 @@ fn render_app_shell_with_head(
     head: &str,
 ) -> String {
     let inner = match account {
-        Some(account) => render_signed_in(account, sources, view, jobs, notice, false),
+        Some(account) => render_signed_in(
+            account,
+            sources,
+            view,
+            jobs,
+            notice,
+            SignedInSurface::Workspace,
+        ),
         None => render_signed_out(notice),
     };
     document_with_head(&inner, head)
@@ -482,35 +621,61 @@ fn render_signed_out(notice: Option<&str>) -> String {
     screen("", &view, FOOTER_TAGLINE)
 }
 
+#[derive(Clone, Copy)]
+enum SignedInSurface {
+    Workspace,
+    Edit,
+    ReviewComplete,
+}
+
 fn render_signed_in(
     account: &AppAccount,
     sources: &[SourceRecord],
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
     notice: Option<&str>,
-    editing: bool,
+    surface: SignedInSurface,
 ) -> String {
     let due = view.map_or(0, |view| view.due_count);
+    let body = match surface {
+        SignedInSurface::Edit => view.and_then(|view| view.current.as_ref()).map_or_else(
+            || render_workspace(account, sources, view, jobs),
+            |current| render_edit_review(account, current),
+        ),
+        SignedInSurface::ReviewComplete => render_review_complete(),
+        SignedInSurface::Workspace => view.and_then(|view| view.current.as_ref()).map_or_else(
+            || render_workspace(account, sources, view, jobs),
+            |current| render_current_review(account, current),
+        ),
+    };
+    render_signed_in_body(account, due, notice, jobs, &body)
+}
+
+fn render_signed_in_body(
+    account: &AppAccount,
+    due: usize,
+    notice: Option<&str>,
+    jobs: &[GenerationJob],
+    body: &str,
+) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
     let footer = format!(
         r#"<span class="ae-dim">Signed in</span>
 <form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
         hidden_csrf_input(account)
     );
-
-    let body = if editing {
-        view.and_then(|view| view.current.as_ref()).map_or_else(
-            || render_workspace(account, sources, view, jobs),
-            |current| render_edit_review(account, current),
-        )
-    } else if let Some(current) = view.and_then(|view| view.current.as_ref()) {
-        render_current_review(account, current)
-    } else {
-        render_workspace(account, sources, view, jobs)
-    };
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
-
     screen(&header_right, &view_inner, &footer)
+}
+
+fn render_review_complete() -> String {
+    r#"<section class="ae-group me-review-complete">
+<p class="me-kicker">Review complete</p>
+<h1 class="me-display">You're all caught up.</h1>
+<p class="ae-lede">Nothing else is due right now.</p>
+<div class="me-actions"><a class="ae-button" href="/">Back to workspace</a></div>
+</section>"#
+        .to_owned()
 }
 
 fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
