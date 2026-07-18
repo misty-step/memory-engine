@@ -1,4 +1,8 @@
-use std::{convert::Infallible, time::Duration};
+use std::{
+    convert::Infallible,
+    fmt::Write as _,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{Form, Path, Query, State},
@@ -25,16 +29,18 @@ use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
     render_auth_recovery, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, LEDGER_CSS,
+    render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
+    AnalyticsConceptSort, AnalyticsViewOptions, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
-    html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
+    html_with_cleared_browser_session, normalize_email, read_session_token,
+    report_submit_browser_performance, report_submit_server_performance, AccountCreated,
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
     CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
     InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
     ScheduledReturnNotificationReport, SourceList, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest,
+    SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings, SubmitViewport,
 };
 
 #[cfg(test)]
@@ -376,6 +382,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
+        .route(
+            "/app/performance/submit",
+            post(record_submit_browser_performance),
+        )
         .route("/app/content-feedback", post(record_app_content_feedback))
         .route(
             "/accounts/{account_id}/sources",
@@ -917,6 +927,32 @@ struct AppReviewSubmitForm {
     // `Easy`.
     response_time_ms: Option<String>,
     idempotency_key: String,
+    performance_trace_id: Option<String>,
+}
+
+const BROWSER_SUBMIT_PERFORMANCE_SCHEMA: &str = "memory_engine.browser_submit.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserSubmitViewport {
+    Mobile,
+    Tablet,
+    Desktop,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserSubmitPerformance {
+    schema: String,
+    csrf_token: Option<String>,
+    request_id: String,
+    trace_id: String,
+    tap_to_ack_ms: u64,
+    request_to_response_ms: u64,
+    transfer_ms: u64,
+    navigation_ms: u64,
+    graded_visible_ms: u64,
+    viewport: BrowserSubmitViewport,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1403,6 +1439,22 @@ fn app_failure_response(error: ApiFailure) -> Response {
     }
     error.into_response()
 }
+fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> Response {
+    let mut response = Html(render_submit_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
+}
+
+fn submit_failure_response(error: ApiFailure) -> Response {
+    if error.is_session_expired() {
+        return app_failure_response(error);
+    }
+    submit_recovery_response(
+        error.status(),
+        "Review not submitted",
+        "Reload the app and try again. Your study data is safe.",
+    )
+}
 
 fn no_store_response(mut response: Response) -> Response {
     response
@@ -1608,24 +1660,241 @@ pub(crate) fn sanitize_response_time_ms(raw: Option<&str>) -> u32 {
 async fn submit_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Form(form): Form<AppReviewSubmitForm>,
+    form: Result<Form<AppReviewSubmitForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let account =
-        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-            Ok(account) => account,
-            Err(error) => return app_failure_response(error),
-        };
-    let result = state.submit_app_review(
-        &account,
-        &form.review_unit_id,
-        &SubmitReviewRequest {
-            answer: form.answer,
-            response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
-            idempotency_key: form.idempotency_key,
-        },
-    );
+    let started = Instant::now();
+    let request_id = format!("req_{:032x}", rand::random::<u128>());
+    let form = match form {
+        Ok(Form(form)) => form,
+        Err(rejection) => {
+            let render_started = Instant::now();
+            let status = rejection.into_response().status();
+            let response = submit_recovery_response(
+                status,
+                "Review not submitted",
+                "Reload the app and try again. Your study data is safe.",
+            );
+            let (response, total_ms) = submit_response_headers(
+                response,
+                &request_id,
+                None,
+                bounded_request_ms(started),
+                SubmitReviewTimings::default(),
+                bounded_request_ms(render_started),
+            );
+            report_submit_server_performance(total_ms, SubmitPerformanceOutcome::ClientRejected);
+            return no_store_response(response);
+        }
+    };
+    let trace_id = form
+        .performance_trace_id
+        .as_deref()
+        .filter(|value| strict_opaque_id(value, "trace_"))
+        .map(str::to_owned);
+    let mut postgres = SubmitReviewTimings::default();
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    let (response, render_ms, outcome) = match state.require_browser_session_with_timings(
+        &headers,
+        csrf_token(form.csrf_token.as_ref()),
+        &mut postgres,
+    ) {
+        Ok(account) => {
+            let result = state.submit_app_review(
+                &account,
+                &form.review_unit_id,
+                &SubmitReviewRequest {
+                    answer: form.answer,
+                    response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
+                    idempotency_key: form.idempotency_key,
+                },
+                &mut postgres,
+            );
+            let outcome = match result.as_ref() {
+                Ok(_) => SubmitPerformanceOutcome::Succeeded,
+                Err(error) => submit_outcome(error.status()),
+            };
+            let render_started = Instant::now();
+            let response = Html(render_submit_action_result_html(
+                &state,
+                &account,
+                result,
+                &request_id,
+                trace_id.as_deref(),
+                &mut postgres,
+            ))
+            .into_response();
+            (response, bounded_request_ms(render_started), outcome)
+        }
+        Err(error) => {
+            let outcome = submit_outcome(error.status());
+            let render_started = Instant::now();
+            let response = submit_failure_response(error);
+            (response, bounded_request_ms(render_started), outcome)
+        }
+    };
+
+    let (response, total_ms) = submit_response_headers(
+        response,
+        &request_id,
+        trace_id.as_deref(),
+        bounded_request_ms(started),
+        postgres,
+        render_ms,
+    );
+    report_submit_server_performance(total_ms, outcome);
+    no_store_response(response)
+}
+
+fn submit_response_headers(
+    mut response: Response,
+    request_id: &str,
+    trace_id: Option<&str>,
+    total_ms: u64,
+    postgres: SubmitReviewTimings,
+    render_ms: u64,
+) -> (Response, u64) {
+    let (total_ms, pgconnect_ms, pgop_ms, render_ms) =
+        normalize_submit_durations(total_ms, postgres, render_ms);
+    let mut timing = format!(r#"request;desc="{request_id}""#);
+    if let Some(trace_id) = trace_id {
+        let _ = write!(timing, r#", handoff;desc="{trace_id}""#);
+    }
+    let _ = write!(timing, ", total;dur={total_ms}");
+    if let Some(duration_ms) = pgconnect_ms {
+        let _ = write!(timing, ", pgconnect;dur={duration_ms}");
+    }
+    if let Some(duration_ms) = pgop_ms {
+        let _ = write!(timing, ", pgop;dur={duration_ms}");
+    }
+    if let Some(statement_count) = postgres.postgres_statement_count() {
+        let _ = write!(timing, r#", pgstmt;desc="{statement_count}""#);
+    }
+    let _ = write!(timing, ", render;dur={render_ms}");
+
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(request_id).unwrap_or(HeaderValue::from_static(
+            "req_00000000000000000000000000000000",
+        )),
+    );
+    response.headers_mut().insert(
+        "server-timing",
+        HeaderValue::from_str(&timing).unwrap_or(HeaderValue::from_static(
+            r#"request;desc="req_00000000000000000000000000000000", total;dur=60000, render;dur=60000"#,
+        )),
+    );
+    (response, total_ms)
+}
+
+fn normalize_submit_durations(
+    total_ms: u64,
+    postgres: SubmitReviewTimings,
+    render_ms: u64,
+) -> (u64, Option<u64>, Option<u64>, u64) {
+    let mut phases = [
+        postgres.postgres_connect_ms(),
+        postgres.postgres_operation_ms(),
+        Some(render_ms),
+    ];
+    let phase_count = u64::try_from(phases.iter().flatten().count()).unwrap_or(u64::MAX);
+    let total_ms = total_ms.max(phase_count).min(60_000);
+    let phase_sum = phases
+        .iter()
+        .flatten()
+        .copied()
+        .fold(0_u64, u64::saturating_add);
+    if phase_sum > total_ms {
+        let flexible_total = total_ms.saturating_sub(phase_count);
+        let flexible_sum = phase_sum.saturating_sub(phase_count);
+        for duration in phases.iter_mut().flatten() {
+            let scaled = if flexible_sum == 0 {
+                0
+            } else {
+                let numerator = u128::from(duration.saturating_sub(1)) * u128::from(flexible_total);
+                u64::try_from(numerator / u128::from(flexible_sum)).unwrap_or(u64::MAX)
+            };
+            *duration = 1_u64.saturating_add(scaled);
+        }
+    }
+
+    (total_ms, phases[0], phases[1], phases[2].unwrap_or(1))
+}
+
+fn strict_opaque_id(value: &str, prefix: &str) -> bool {
+    value.len() == prefix.len() + 32
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn bounded_request_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .clamp(1, 60_000)
+}
+
+fn submit_outcome(status: StatusCode) -> SubmitPerformanceOutcome {
+    if status.is_server_error() {
+        SubmitPerformanceOutcome::ServerFailed
+    } else {
+        SubmitPerformanceOutcome::ClientRejected
+    }
+}
+
+async fn record_submit_browser_performance(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(raw_event): Json<serde_json::Value>,
+) -> Response {
+    let csrf = raw_event
+        .get("csrfToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if let Err(error) = state.require_browser_session(&headers, csrf) {
+        return error.into_response();
+    }
+    let Ok(event) = serde_json::from_value::<BrowserSubmitPerformance>(raw_event) else {
+        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
+    };
+    if !valid_browser_submit_performance(&event) {
+        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
+    }
+
+    let viewport = match event.viewport {
+        BrowserSubmitViewport::Mobile => SubmitViewport::Mobile,
+        BrowserSubmitViewport::Tablet => SubmitViewport::Tablet,
+        BrowserSubmitViewport::Desktop => SubmitViewport::Desktop,
+    };
+    report_submit_browser_performance(event.tap_to_ack_ms, event.graded_visible_ms, viewport);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn valid_browser_submit_performance(event: &BrowserSubmitPerformance) -> bool {
+    if event.schema != BROWSER_SUBMIT_PERFORMANCE_SCHEMA
+        || !strict_opaque_id(&event.request_id, "req_")
+        || !strict_opaque_id(&event.trace_id, "trace_")
+    {
+        return false;
+    }
+    let durations = [
+        event.tap_to_ack_ms,
+        event.request_to_response_ms,
+        event.transfer_ms,
+        event.navigation_ms,
+        event.graded_visible_ms,
+    ];
+    if durations.iter().any(|duration| *duration > 60_000)
+        || event.tap_to_ack_ms > event.request_to_response_ms
+        || event.request_to_response_ms > event.graded_visible_ms
+    {
+        return false;
+    }
+    let reconstructed = event
+        .request_to_response_ms
+        .saturating_add(event.transfer_ms)
+        .saturating_add(event.navigation_ms);
+    event.graded_visible_ms.abs_diff(reconstructed) <= 4
 }
 
 async fn record_app_content_feedback(

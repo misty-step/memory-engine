@@ -12,6 +12,7 @@ memory-engine-canary = { path = "../memory-engine-canary" }
 memory-engine-generation = { path = "../memory-engine-generation" }
 memory-engine-openrouter = { path = "../memory-engine-openrouter" }
 memory-engine-persistence = { path = "../memory-engine-persistence" }
+memory-engine-performance = { path = "../memory-engine-performance" }
 memory-engine-persistence-postgres = { path = "../memory-engine-persistence-postgres" }
 memory-engine-service = { path = "../memory-engine-service" }
 memory-engine-study = { path = "../memory-engine-study" }

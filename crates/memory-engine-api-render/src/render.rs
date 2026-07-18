@@ -18,6 +18,7 @@ use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
+    SubmitReviewTimings,
 };
 
 #[must_use]
@@ -26,9 +27,83 @@ pub fn render_action_result_html(
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
 ) -> String {
+    render_action_result_html_with_head(state, account, result, "")
+}
+
+#[must_use]
+pub fn render_submit_action_result_html(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<StudyViewResponse, ApiFailure>,
+    request_id: &str,
+    trace_id: Option<&str>,
+    timings: &mut SubmitReviewTimings,
+) -> String {
+    let trace = trace_id.map_or_else(String::new, |trace_id| {
+        format!(
+            r#"<meta name="memory-engine-submit-handoff" content="{}">"#,
+            escape_html(trace_id)
+        )
+    });
+    let head = format!(
+        r#"<meta name="memory-engine-csrf-token" content="{}">
+<meta name="memory-engine-submit-request" content="{}">
+{}"#,
+        escape_html(account.csrf_token()),
+        escape_html(request_id),
+        trace,
+    );
     match result {
-        Ok(view) => render_account_page(state, account, Some(&view), None),
-        Err(error) => render_account_page(state, account, None, Some(&error.message)),
+        Ok(view) => render_submit_account_page(state, account, Some(&view), None, &head, timings),
+        Err(error) => {
+            let view = state.app_study_view_with_timings(account, timings).ok();
+            render_submit_account_page(
+                state,
+                account,
+                view.as_ref(),
+                Some(&error.message),
+                &head,
+                timings,
+            )
+        }
+    }
+}
+
+fn render_submit_account_page(
+    state: &ApiState,
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+    head: &str,
+    timings: &mut SubmitReviewTimings,
+) -> String {
+    let active_review = view.is_some_and(|view| view.current.is_some());
+    let sources = if active_review {
+        Vec::new()
+    } else {
+        state
+            .list_app_sources_with_timings(account, timings)
+            .unwrap_or_default()
+    };
+    let jobs = if active_review && !notice.is_some_and(is_generating_notice) {
+        Vec::new()
+    } else {
+        state.jobs_for_app_account_with_timings(account, timings)
+    };
+    render_app_shell_with_head(Some(account), &sources, view, &jobs, notice, head)
+}
+
+fn render_action_result_html_with_head(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<StudyViewResponse, ApiFailure>,
+    head: &str,
+) -> String {
+    match result {
+        Ok(view) => render_account_page_with_head(state, account, Some(&view), None, head),
+        Err(error) => {
+            render_account_page_with_head(state, account, None, Some(&error.message), head)
+        }
     }
 }
 
@@ -39,11 +114,22 @@ pub fn render_account_page(
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
 ) -> String {
-    render_account_page_with_loaders(
+    render_account_page_with_head(state, account, view, notice, "")
+}
+
+fn render_account_page_with_head(
+    state: &ApiState,
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+    head: &str,
+) -> String {
+    render_account_page_with_loaders_and_head(
         state,
         account,
         view,
         notice,
+        head,
         || state.list_app_sources(account).unwrap_or_default(),
         || state.jobs_for_app_account(account),
     )
@@ -67,11 +153,32 @@ pub fn render_edit_review_html(
     ))
 }
 
+#[cfg(test)]
 fn render_account_page_with_loaders(
     state: &ApiState,
     account: &AppAccount,
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
+    load_sources: impl FnOnce() -> Vec<SourceRecord>,
+    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
+) -> String {
+    render_account_page_with_loaders_and_head(
+        state,
+        account,
+        view,
+        notice,
+        "",
+        load_sources,
+        load_jobs,
+    )
+}
+
+fn render_account_page_with_loaders_and_head(
+    state: &ApiState,
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+    head: &str,
     load_sources: impl FnOnce() -> Vec<SourceRecord>,
     load_jobs: impl FnOnce() -> Vec<GenerationJob>,
 ) -> String {
@@ -85,7 +192,24 @@ fn render_account_page_with_loaders(
     } else {
         None
     };
-    let view = view.or(fetched.as_ref());
+    render_account_page_with_resolved_view_and_loaders(
+        account,
+        view.or(fetched.as_ref()),
+        notice,
+        head,
+        load_sources,
+        load_jobs,
+    )
+}
+
+fn render_account_page_with_resolved_view_and_loaders(
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+    head: &str,
+    load_sources: impl FnOnce() -> Vec<SourceRecord>,
+    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
+) -> String {
     let active_review = view.is_some_and(|view| view.current.is_some());
     // Active review responses render only the supplied card. Loading the full
     // source list here repeats a complete account snapshot while
@@ -103,7 +227,7 @@ fn render_account_page_with_loaders(
     } else {
         load_jobs()
     };
-    render_app_shell(Some(account), &sources, view, &jobs, notice)
+    render_app_shell_with_head(Some(account), &sources, view, &jobs, notice, head)
 }
 
 #[must_use]
@@ -114,11 +238,22 @@ pub fn render_app_shell(
     jobs: &[GenerationJob],
     notice: Option<&str>,
 ) -> String {
+    render_app_shell_with_head(account, sources, view, jobs, notice, "")
+}
+
+fn render_app_shell_with_head(
+    account: Option<&AppAccount>,
+    sources: &[SourceRecord],
+    view: Option<&StudyViewResponse>,
+    jobs: &[GenerationJob],
+    notice: Option<&str>,
+    head: &str,
+) -> String {
     let inner = match account {
         Some(account) => render_signed_in(account, sources, view, jobs, notice, false),
         None => render_signed_out(notice),
     };
-    document(&inner)
+    document_with_head(&inner, head)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -211,6 +346,20 @@ pub fn render_auth_recovery(title: &str, message: &str) -> String {
     );
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
+#[must_use]
+pub fn render_submit_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Review safely</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<p><a class="ae-button" href="/">Return to your review</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
 
 #[must_use]
 pub fn render_return_notification_confirmation(token: &str) -> String {
@@ -245,6 +394,10 @@ pub fn render_return_notification_disabled() -> String {
 
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
 fn document(inner: &str) -> String {
+    document_with_head(inner, "")
+}
+
+fn document_with_head(inner: &str, head: &str) -> String {
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -265,6 +418,7 @@ fn document(inner: &str) -> String {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">
 <link rel="stylesheet" href="/static/ledger.css">
+{head}
 <script src="/static/app.js" defer></script>
 </head>
 <body>

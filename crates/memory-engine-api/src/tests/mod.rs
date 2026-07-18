@@ -932,16 +932,202 @@ async fn mcq_review_is_click_to_answer_and_grades_case_insensitively() {
                 ("answer", "alfa"),
                 ("responseTimeMs", "1800"),
                 ("idempotencyKey", "review-mcq-case"),
+                (
+                    "performanceTraceId",
+                    "trace_0123456789abcdef0123456789abcdef",
+                ),
             ],
         ))
         .await
         .expect("submit lowercase answer");
     assert_eq!(graded.status(), StatusCode::OK);
+    let request_id = graded
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("submit request id")
+        .to_owned();
+    assert_eq!(request_id.len(), 36);
+    assert!(request_id.starts_with("req_"));
+    assert!(request_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let server_timing = graded
+        .headers()
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+        .expect("submit server timing");
+    assert!(server_timing.contains(&format!(r#"request;desc="{request_id}""#)));
+    assert!(server_timing.contains(r#"handoff;desc="trace_0123456789abcdef0123456789abcdef""#));
+    assert!(server_timing.contains("total;dur="));
+    assert!(server_timing.contains("render;dur="));
+    assert!(!server_timing.contains("pgconnect"));
+    assert!(!server_timing.contains("pgop"));
+    assert!(!server_timing.contains("pgstmt"));
+    assert!(!server_timing.contains("alfa"));
+    assert!(!server_timing.contains(&review_unit_id));
+    assert!(!server_timing.contains("review-mcq-case"));
     let graded = response_text(graded).await;
+    assert!(graded.contains(&format!(
+        r#"<meta name="memory-engine-submit-request" content="{request_id}">"#
+    )));
+    assert!(graded.contains(
+        r#"<meta name="memory-engine-submit-handoff" content="trace_0123456789abcdef0123456789abcdef">"#
+    ));
     assert!(
         graded.contains("me-verdict") && graded.contains(">Correct<"),
         "lowercase 'alfa' must grade correct against stored 'ALFA': {graded}"
     );
+}
+
+async fn assert_submit_recovery_document(
+    app: &axum::Router,
+    cookie: &str,
+    response: axum::response::Response,
+) {
+    let body = response_text(response).await;
+    assert!(
+        body.contains(r#"<script src="/static/app.js" defer></script>"#),
+        "submit recovery must load the handoff consumer"
+    );
+    assert!(body.contains(r#"href="/""#));
+    assert!(!body.contains("me-recovery-email"));
+
+    let recovered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("submit recovery request"),
+        )
+        .await
+        .expect("submit recovery response");
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered = response_text(recovered).await;
+    assert!(recovered.contains("csrfToken"));
+    assert!(!recovered.contains("me-recovery-email"));
+}
+
+async fn assert_malformed_submit_recovery(app: &axum::Router, cookie: &str, csrf: &str) {
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            cookie,
+            &[("csrfToken", csrf)],
+        ))
+        .await
+        .expect("malformed submit");
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(response.headers().contains_key("x-request-id"));
+    let timing = response
+        .headers()
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+        .expect("malformed submit timing");
+    assert!(timing.contains("total;dur="));
+    assert!(!timing.contains("handoff"));
+    assert_submit_recovery_document(app, cookie, response).await;
+}
+
+#[tokio::test]
+async fn browser_submit_receipts_are_bounded_and_other_routes_stay_uninstrumented() {
+    let state = ApiState::default();
+    let app = router(state);
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &source_body())],
+        ))
+        .await
+        .expect("start");
+    let cookie = session_cookie(&started);
+    let csrf = html_value(&response_text(started).await, "csrfToken");
+
+    let receipt = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/app/performance/submit",
+            &cookie,
+            &json!({
+                "schema": "memory_engine.browser_submit.v1",
+                "csrfToken": csrf,
+                "requestId": "req_0123456789abcdef0123456789abcdef",
+                "traceId": "trace_0123456789abcdef0123456789abcdef",
+                "tapToAckMs": 5,
+                "requestToResponseMs": 20,
+                "transferMs": 4,
+                "navigationMs": 11,
+                "gradedVisibleMs": 35,
+                "viewport": "mobile"
+            }),
+        ))
+        .await
+        .expect("browser submit receipt");
+    assert_eq!(receipt.status(), StatusCode::NO_CONTENT);
+    assert!(!receipt.headers().contains_key("server-timing"));
+    assert!(!receipt.headers().contains_key("x-request-id"));
+
+    let invalid = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/app/performance/submit",
+            &cookie,
+            &json!({
+                "schema": "memory_engine.browser_submit.v1",
+                "csrfToken": csrf,
+                "requestId": "req_0123456789abcdef0123456789abcdef",
+                "traceId": "trace_0123456789abcdef0123456789abcdef",
+                "tapToAckMs": 5,
+                "requestToResponseMs": 20,
+                "transferMs": 4,
+                "navigationMs": 11,
+                "gradedVisibleMs": 50,
+                "viewport": "mobile"
+            }),
+        ))
+        .await
+        .expect("invalid browser submit receipt");
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_shape = app
+        .clone()
+        .oneshot(json_request_with_cookie(
+            "POST",
+            "/app/performance/submit",
+            &cookie,
+            &json!({"csrfToken": csrf, "schema": 42}),
+        ))
+        .await
+        .expect("wrong-shaped browser submit receipt");
+    assert_eq!(wrong_shape.status(), StatusCode::BAD_REQUEST);
+
+    assert_malformed_submit_recovery(&app, &cookie, &csrf).await;
+
+    for request in [
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("health request"),
+        Request::builder()
+            .uri("/static/ledger.css")
+            .body(Body::empty())
+            .expect("static request"),
+        Request::builder()
+            .uri("/app/jobs/events")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .expect("event stream request"),
+    ] {
+        let response = app.clone().oneshot(request).await.expect("excluded route");
+        assert!(!response.headers().contains_key("server-timing"));
+        assert!(!response.headers().contains_key("x-request-id"));
+    }
 }
 
 #[tokio::test]
@@ -2238,6 +2424,9 @@ async fn assert_forbidden_form(
         .await
         .unwrap_or_else(|error| panic!("{context}: {error}"));
     assert_eq!(response.status(), StatusCode::FORBIDDEN, "{context}");
+    if uri == "/app/submit" {
+        assert_submit_recovery_document(app, cookie, response).await;
+    }
 }
 
 #[tokio::test]
@@ -5116,6 +5305,181 @@ async fn postgres_backend_source_archive_hides_source_and_blocks_generation() {
     );
 }
 
+fn server_timing_duration(timing: &str, name: &str) -> u64 {
+    timing
+        .split(',')
+        .map(str::trim)
+        .find_map(|metric| metric.strip_prefix(&format!("{name};dur=")))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("missing {name} duration in {timing}"))
+}
+
+fn assert_postgres_submit_timing(
+    response: &axum::response::Response,
+    expected_statement_count: u64,
+) {
+    let timing = response
+        .headers()
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+        .expect("Postgres submit timing");
+    assert!(timing.contains("pgconnect;dur="), "{timing}");
+    assert!(timing.contains("pgop;dur="), "{timing}");
+    let total_ms = server_timing_duration(timing, "total");
+    let phase_sum_ms = ["pgconnect", "pgop", "render"]
+        .into_iter()
+        .map(|name| server_timing_duration(timing, name))
+        .sum::<u64>();
+    assert!(
+        phase_sum_ms <= total_ms,
+        "Postgres phases must fit inside total duration: {timing}"
+    );
+    let statement_count = timing
+        .split(',')
+        .map(str::trim)
+        .find_map(|metric| metric.strip_prefix(r#"pgstmt;desc=""#))
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("Postgres statement count");
+    assert_eq!(
+        statement_count, expected_statement_count,
+        "cold-cache submit must count auth, review, and render work: {timing}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+}
+
+async fn assert_postgres_submit_receipt(
+    graded: axum::response::Response,
+    expected_statement_count: u64,
+) -> String {
+    assert_eq!(graded.status(), StatusCode::OK);
+    assert_postgres_submit_timing(&graded, expected_statement_count);
+    let graded = response_text(graded).await;
+    assert!(graded.contains("me-verdict") && graded.contains(">Correct<"));
+    graded
+}
+
+async fn prepare_postgres_browser_review(
+    database: &PostgresTestDatabase,
+) -> (String, String, String) {
+    let browser_source = [
+        "Concept: NATO letter A",
+        "Activity: quiz",
+        "Stage: recognition-3",
+        "Question: What is the NATO phonetic alphabet word for A?",
+        "Answer: ALFA",
+        "Distractors: BRAVO, CHARLIE",
+        "Reference: The NATO phonetic alphabet word for A is ALFA.",
+    ]
+    .join("\n");
+    let browser_state = ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    ));
+    let browser_app = router(browser_state.clone());
+    let started = browser_app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", &browser_source)],
+        ))
+        .await
+        .expect("start Postgres browser session");
+    assert_eq!(started.status(), StatusCode::OK);
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    let source_id = html_value(&started, "sourceId");
+    let generated = generate_source_html(
+        &browser_app,
+        &browser_state,
+        &cookie,
+        &csrf_token,
+        &source_id,
+    )
+    .await;
+    assert_activity_succeeded_html(&generated, 1);
+    let review = advance_to_prompt(
+        &browser_app,
+        &cookie,
+        &csrf_token,
+        "NATO phonetic alphabet word for A",
+    )
+    .await;
+    (html_value(&review, "reviewUnitId"), cookie, csrf_token)
+}
+
+async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) {
+    let (review_unit_id, cookie, csrf_token) = prepare_postgres_browser_review(database).await;
+    // A fresh process has no in-memory account or browser-session cache.
+    // The submit receipt must still account for its authentication queries.
+    let cold_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let graded = cold_browser_app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &review_unit_id),
+                ("answer", "ALFA"),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", "postgres-submit-timing"),
+                (
+                    "performanceTraceId",
+                    "trace_0123456789abcdef0123456789abcdef",
+                ),
+            ],
+        ))
+        .await
+        .expect("Postgres browser submit");
+    assert_postgres_submit_receipt(graded, 23).await;
+
+    let completed_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let completed = next_review_html(
+        &completed_browser_app,
+        &cookie,
+        &csrf_token,
+        "complete queue",
+    )
+    .await;
+    assert!(
+        !completed.contains(r#"name="reviewUnitId""#),
+        "the final card should return to workspace after Continue"
+    );
+
+    let workspace_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
+        database.scoped_url.clone(),
+    )));
+    let workspace_submit = workspace_browser_app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", "missing-review-unit"),
+                ("answer", "ALFA"),
+                ("responseTimeMs", "1800"),
+                ("idempotencyKey", "postgres-error-submit-timing"),
+            ],
+        ))
+        .await
+        .expect("Postgres browser submit without an active review");
+    assert_eq!(workspace_submit.status(), StatusCode::OK);
+    assert_postgres_submit_timing(&workspace_submit, 16);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_backend_routes_drive_source_to_review() {
     let Some(database) = PostgresTestDatabase::new("routes") else {
@@ -5149,6 +5513,8 @@ async fn postgres_backend_routes_drive_source_to_review() {
         generated["error"],
         json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
     );
+
+    assert_postgres_browser_submit_traces(&database).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7413,6 +7779,16 @@ fn json_request(method: &str, uri: &str, session_token: &str, body: &Value) -> R
         .uri(uri)
         .header("content-type", "application/json")
         .header("x-session-token", session_token)
+        .body(Body::from(body.to_string()))
+        .expect("request")
+}
+
+fn json_request_with_cookie(method: &str, uri: &str, cookie: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("cookie", cookie)
         .body(Body::from(body.to_string()))
         .expect("request")
 }

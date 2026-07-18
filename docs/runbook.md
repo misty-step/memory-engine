@@ -248,6 +248,24 @@ fail-open for request handling; delivery/drop/invalid counts ride in the
 bounded aggregate schema. The same JSON is printed as
 `authority=non_authoritative_debug` for immediate log inspection.
 
+`POST /app/submit` is the only HTTP route with per-request performance
+headers. Every response carries `X-Request-ID: req_<32 lowercase hex>` and a
+content-free `Server-Timing` value with `request`, `total`, and `render`.
+Browser-enhanced submits also carry the opaque `handoff` token. Postgres-backed
+submits add `pgconnect`, `pgop`, and the cumulative `pgstmt` call count; those
+metrics are omitted rather than reported as zero when the phase did not run.
+The response is always `Cache-Control: no-store`. Health/readiness, static
+assets, generation SSE, and the telemetry endpoint are intentionally outside
+this instrumentation.
+
+After a graded page is visible for two animation frames, the browser consumes
+its short-lived same-tab handoff and posts one strict, content-free receipt to
+`POST /app/performance/submit`. Canary receives the trusted server route total
+separately from the untrusted browser tap-to-ack and graded-visible durations;
+the browser series carries only a coarse `mobile`, `tablet`, or `desktop`
+viewport. Missing APIs, stale or mismatched handoffs, BFCache restores, and
+malformed timings fail closed without delaying or changing review submission.
+
 The production image includes a bounded live receipt. Open a DigitalOcean
 component console and run it without printing either encrypted value:
 

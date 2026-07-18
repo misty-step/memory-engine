@@ -17,9 +17,10 @@ use crate::{
     postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
     run_bridge_generation, run_reference_generation, run_source_generation,
     run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
-    with_postgres_store, with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord,
-    ReturnNotificationClaim, ReturnNotificationClaimRequest, ReturnNotificationPreference,
-    SourceRecord, StudyViewResponse,
+    with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
+    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    SubmitReviewRequest, SubmitReviewTimings,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -152,13 +153,14 @@ impl StudyStorage {
         self.inner.save_account_session(account_id, session_token)
     }
 
-    pub(crate) fn account_session_matches(
+    pub(crate) fn account_session_matches_with_timings(
         &self,
         account_id: &str,
         session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<bool, ApiFailure> {
         self.inner
-            .account_session_matches(account_id, session_token)
+            .account_session_matches_with_timings(account_id, session_token, timings)
     }
 
     pub(crate) fn save_browser_session(
@@ -174,6 +176,14 @@ impl StudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         self.inner.load_browser_session(session_id)
+    }
+    pub(crate) fn load_browser_session_with_timings(
+        &self,
+        session_id: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
+        self.inner
+            .load_browser_session_with_timings(session_id, timings)
     }
 
     pub(crate) fn revoke_browser_session(
@@ -304,6 +314,13 @@ impl StudyStorage {
     pub(crate) fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
         self.inner.account_exists(account_id)
     }
+    pub(crate) fn account_exists_with_timings(
+        &self,
+        account_id: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.account_exists_with_timings(account_id, timings)
+    }
 
     pub(crate) fn copy_account(
         &self,
@@ -324,12 +341,14 @@ impl StudyStorage {
         self.inner.save_source(account_id, store_path, source)
     }
 
-    pub(crate) fn list_sources(
+    pub(crate) fn list_sources_with_timings(
         &self,
         account_id: &str,
         store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        self.inner.list_sources(account_id, store_path)
+        self.inner
+            .list_sources_with_timings(account_id, store_path, timings)
     }
 
     pub(crate) fn generate_source(
@@ -402,6 +421,15 @@ impl StudyStorage {
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner.study_view(account_id, store_path)
+    }
+    pub(crate) fn study_view_with_timings(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .study_view_with_timings(account_id, store_path, timings)
     }
 
     pub(crate) fn reveal_review(
@@ -496,18 +524,11 @@ impl StudyStorage {
         account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        answer: String,
-        response_time_ms: u32,
-        idempotency_key: String,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner.submit_review(
-            account_id,
-            store_path,
-            review_unit_id,
-            answer,
-            response_time_ms,
-            idempotency_key,
-        )
+        self.inner
+            .submit_review(account_id, store_path, review_unit_id, request, timings)
     }
 
     pub(crate) fn record_content_feedback(
@@ -530,6 +551,14 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure>;
+    fn account_session_matches_with_timings(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        _timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<bool, ApiFailure> {
+        self.account_session_matches(account_id, session_token)
+    }
     fn save_browser_session(
         &self,
         session_id: &str,
@@ -539,6 +568,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure>;
+    fn load_browser_session_with_timings(
+        &self,
+        session_id: &str,
+        _timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
+        self.load_browser_session(session_id)
+    }
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
     fn save_auth_challenge(
         &self,
@@ -601,6 +637,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         max_attempts: u32,
     ) -> Result<bool, ApiFailure>;
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure>;
+    fn account_exists_with_timings(
+        &self,
+        account_id: &str,
+        _timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<bool, ApiFailure> {
+        self.account_exists(account_id)
+    }
     fn copy_account(
         &self,
         source_account_id: &str,
@@ -618,6 +661,15 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure>;
+    fn list_sources_with_timings(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Vec<SourceRecord>, ApiFailure> {
+        let _ = timings;
+        self.list_sources(account_id, store_path)
+    }
     fn generate_source(
         &self,
         account_id: &str,
@@ -664,6 +716,15 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure>;
+    fn study_view_with_timings(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let _ = timings;
+        self.study_view(account_id, store_path)
+    }
     fn reveal_review(
         &self,
         account_id: &str,
@@ -719,9 +780,8 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        answer: String,
-        response_time_ms: u32,
-        idempotency_key: String,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn record_content_feedback(
         &self,
@@ -1589,14 +1649,17 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        answer: String,
-        response_time_ms: u32,
-        idempotency_key: String,
+        request: SubmitReviewRequest,
+        _timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
             let view = study
-                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
+                .submit_answer_with_idempotency_key(
+                    request.answer,
+                    request.response_time_ms,
+                    Some(request.idempotency_key),
+                )
                 .map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
@@ -1658,6 +1721,18 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 .map_err(postgres_failure)
         })
     }
+    fn account_session_matches_with_timings(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            store
+                .api_session_matches(account_id, session_token)
+                .map_err(postgres_failure)
+        })
+    }
 
     fn save_browser_session(
         &self,
@@ -1683,6 +1758,25 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         with_postgres_store(&self.database_url, |store| {
+            store
+                .browser_session(&secret_hash(session_id), self.now_ms())
+                .map(|session| {
+                    session.map(|session| BrowserSessionRecord {
+                        account_id: session.account_id,
+                        session_token: session.session_token,
+                        csrf_token_hash: session.csrf_token_hash,
+                        expires_at_ms: session.expires_at_ms,
+                    })
+                })
+                .map_err(postgres_failure)
+        })
+    }
+    fn load_browser_session_with_timings(
+        &self,
+        session_id: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
+        with_postgres_store_timed(&self.database_url, timings, |store| {
             store
                 .browser_session(&secret_hash(session_id), self.now_ms())
                 .map(|session| {
@@ -1908,6 +2002,15 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             store.account_exists(account_id).map_err(postgres_failure)
         })
     }
+    fn account_exists_with_timings(
+        &self,
+        account_id: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            store.account_exists(account_id).map_err(postgres_failure)
+        })
+    }
 
     fn copy_account(
         &self,
@@ -2001,24 +2104,39 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     fn list_sources(
         &self,
         account_id: &str,
-        _store_path: &FsPath,
+        store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            Ok(account
-                .snapshot()
-                .map_err(postgres_failure)?
-                .source_documents
-                .into_iter()
-                .filter(|source| source.archived_at.is_none())
-                .map(|source| SourceRecord {
-                    source_id: source.id,
-                    title: source.title,
-                    body: source.body.unwrap_or_default(),
-                    project_key: source.project_key,
-                    ttl_expires_at: source.ttl_expires_at,
-                })
-                .collect())
-        })
+        self.list_sources_with_timings(account_id, store_path, None)
+    }
+
+    fn list_sources_with_timings(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Vec<SourceRecord>, ApiFailure> {
+        with_postgres_account_timed(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            timings,
+            |account| {
+                Ok(account
+                    .snapshot()
+                    .map_err(postgres_failure)?
+                    .source_documents
+                    .into_iter()
+                    .filter(|source| source.archived_at.is_none())
+                    .map(|source| SourceRecord {
+                        source_id: source.id,
+                        title: source.title,
+                        body: source.body.unwrap_or_default(),
+                        project_key: source.project_key,
+                        ttl_expires_at: source.ttl_expires_at,
+                    })
+                    .collect())
+            },
+        )
     }
 
     fn generate_source(
@@ -2188,13 +2306,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     fn study_view(
         &self,
         account_id: &str,
-        _store_path: &FsPath,
+        store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_study(&self.database_url, account_id, self.now, |study| {
-            let view = study.view().map_err(study_failure)?;
+        self.study_view_with_timings(account_id, store_path, None)
+    }
 
-            Ok(StudyViewResponse::from_view(view))
-        })
+    fn study_view_with_timings(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account_timed(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            timings,
+            |account| {
+                let study = BetaStudySession::from_store(account, self.now);
+                let view = study.view().map_err(study_failure)?;
+
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
     }
 
     fn reveal_review(
@@ -2342,29 +2476,38 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         _store_path: &FsPath,
         review_unit_id: &str,
-        answer: String,
-        response_time_ms: u32,
-        idempotency_key: String,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if account
-                .applied_review_idempotency_key_exists(&idempotency_key)
-                .map_err(postgres_failure)?
-            {
-                let study = BetaStudySession::from_store(account, self.now);
-                let view = study.view().map_err(study_failure)?;
+        with_postgres_account_timed(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            timings,
+            |account| {
+                if account
+                    .applied_review_idempotency_key_exists(&request.idempotency_key)
+                    .map_err(postgres_failure)?
+                {
+                    let study = BetaStudySession::from_store(account, self.now);
+                    let view = study.view().map_err(study_failure)?;
 
-                return Ok(StudyViewResponse::from_view(view));
-            }
+                    return Ok(StudyViewResponse::from_view(view));
+                }
 
-            let mut study = BetaStudySession::from_store(account, self.now);
-            require_current_review_postgres(&mut study, review_unit_id)?;
-            let view = study
-                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
-                .map_err(study_failure)?;
+                let mut study = BetaStudySession::from_store(account, self.now);
+                require_current_review_postgres(&mut study, review_unit_id)?;
+                let view = study
+                    .submit_answer_with_idempotency_key(
+                        request.answer,
+                        request.response_time_ms,
+                        Some(request.idempotency_key),
+                    )
+                    .map_err(study_failure)?;
 
-            Ok(StudyViewResponse::from_view(view))
-        })
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
     }
 
     fn record_content_feedback(

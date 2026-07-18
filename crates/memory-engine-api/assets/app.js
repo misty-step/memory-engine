@@ -1,23 +1,503 @@
-// Honest response timing for review submissions.
-//
-// The server renders every review form with a blank responseTimeMs and grades
-// a blank value conservatively (it can never rate Easy), so with JavaScript
-// off the flow still works and never overstates the learner's speed. This
-// script records when the card was presented — script evaluation, right after
-// the server-rendered card became visible — and fills in the real
-// presentation-to-submit elapsed time at the moment of submission.
+// One state machine for review-submit forms: response timing, immediate
+// acknowledgment, and the cross-document performance handoff stay together.
+// The native form navigation remains the source of truth, so JavaScript off is
+// unchanged and a failed navigation can recover without a stale global lock.
 (function () {
   "use strict";
-  if (!document.querySelector('input[name="responseTimeMs"]')) return;
-  var monotonic = window.performance && typeof performance.now === "function";
-  var shownAt = monotonic ? performance.now() : Date.now();
+
+  var HANDOFF_STORAGE_KEY = "memory-engine.submit-handoff.v1";
+  var HANDOFF_VERSION = 1;
+  var HANDOFF_ACTION = "review_submit";
+  var BUSY_RECOVERY_MS = 30000;
+  var MAX_DURATION_MS = 60000;
+  var HANDOFF_TTL_MS = MAX_DURATION_MS + 5000;
+  var MAX_SAFE_INTEGER = 9007199254740991;
+  var REQUEST_ID_RE = /^req_[0-9a-f]{32}$/;
+  var TRACE_ID_RE = /^trace_[0-9a-f]{32}$/;
+  var perf = window.performance;
+  var hasMonotonicClock =
+    !!perf && typeof perf.now === "function";
+  var presentedAt = hasMonotonicClock ? perf.now() : Date.now();
+  var state = {
+    busy: false,
+    form: null,
+    control: null,
+    dimmed: [],
+    token: null,
+    timeoutId: null,
+    landingAttempted: false
+  };
+
+  function isFiniteNumber(value) {
+    return typeof value === "number" && isFinite(value);
+  }
+
+  function isSafeInteger(value) {
+    return (
+      isFiniteNumber(value) &&
+      Math.floor(value) === value &&
+      value >= 0 &&
+      value <= MAX_SAFE_INTEGER
+    );
+  }
+
+  function hasClass(element, name) {
+    return !!element && !!element.classList && element.classList.contains(name);
+  }
+
+  function isNativeForm(form) {
+    return !!form && String(form.tagName || "").toLowerCase() === "form";
+  }
+
+  function isReviewSubmitForm(form) {
+    return (
+      isNativeForm(form) &&
+      typeof form.getAttribute === "function" &&
+      form.getAttribute("action") === "/app/submit"
+    );
+  }
+
+  function responseClockNow() {
+    return hasMonotonicClock ? perf.now() : Date.now();
+  }
+
+  // Handoff epochs deliberately use the absolute monotonic origin. Date.now()
+  // is not a substitute: wall-clock changes could make a valid token appear
+  // expired or let an expired token survive.
+  function absoluteEpochNow() {
+    if (
+      !perf ||
+      typeof perf.now !== "function" ||
+      !isFiniteNumber(perf.timeOrigin)
+    ) {
+      return null;
+    }
+    var epoch = perf.timeOrigin + perf.now();
+    return isSafeInteger(Math.round(epoch)) ? Math.round(epoch) : null;
+  }
+
+  function randomId(prefix) {
+    if (
+      !window.crypto ||
+      typeof window.crypto.getRandomValues !== "function" ||
+      typeof window.Uint8Array !== "function"
+    ) {
+      return null;
+    }
+    var bytes = new window.Uint8Array(16);
+    try {
+      window.crypto.getRandomValues(bytes);
+    } catch (error) {
+      return null;
+    }
+    var hex = "";
+    for (var i = 0; i < bytes.length; i++) {
+      hex += ("0" + bytes[i].toString(16)).slice(-2);
+    }
+    var value = prefix + hex;
+    return prefix === "req_"
+      ? REQUEST_ID_RE.test(value)
+        ? value
+        : null
+      : TRACE_ID_RE.test(value)
+      ? value
+      : null;
+  }
+
+  function storage() {
+    try {
+      return window.sessionStorage || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function removeHandoff() {
+    var store = storage();
+    if (!store) return;
+    try {
+      store.removeItem(HANDOFF_STORAGE_KEY);
+    } catch (error) {
+      // Storage can be unavailable or quota-blocked; telemetry fails closed.
+    }
+  }
+  function removeHandoffIfToken(token) {
+    var store = storage();
+    if (!store) return;
+    try {
+      var raw = store.getItem(HANDOFF_STORAGE_KEY);
+      if (!raw) return;
+      var handoff = JSON.parse(raw);
+      if (handoff && handoff.token === token) {
+        store.removeItem(HANDOFF_STORAGE_KEY);
+      }
+    } catch (error) {
+      // A malformed or unavailable store is never a reason to affect review.
+      removeHandoff();
+    }
+  }
+
+
+  function clearTimeoutIfAny() {
+    if (state.timeoutId !== null) {
+      if (typeof window.clearTimeout === "function") window.clearTimeout(state.timeoutId);
+      state.timeoutId = null;
+    }
+  }
+
+  function resetReviewUi() {
+    document.documentElement.removeAttribute("data-busy");
+    if (state.control) {
+      state.control.removeAttribute("data-pressed");
+      state.control.removeAttribute("aria-disabled");
+    }
+    for (var i = 0; i < state.dimmed.length; i++) {
+      state.dimmed[i].removeAttribute("data-dim");
+    }
+    state.control = null;
+    state.dimmed = [];
+  }
+
+  function resetState() {
+    clearTimeoutIfAny();
+    resetReviewUi();
+    state.busy = false;
+    state.form = null;
+    state.token = null;
+  }
+
+  function submitControl(form, event) {
+    var control = event && event.submitter;
+    if (control) return control;
+    if (!form || typeof form.querySelector !== "function") return null;
+    return form.querySelector('button[type="submit"], button:not([type])');
+  }
+
+  function setBusy(form, control) {
+    state.busy = true;
+    state.form = form;
+    state.control = control;
+    document.documentElement.setAttribute("data-busy", "");
+    if (control) {
+      control.setAttribute("data-pressed", "");
+      control.setAttribute("aria-disabled", "true");
+      if (hasClass(control, "me-choice") && typeof form.querySelectorAll === "function") {
+        var choices = form.querySelectorAll(".me-choice");
+        for (var i = 0; i < choices.length; i++) {
+          if (choices[i] !== control) {
+            choices[i].setAttribute("data-dim", "");
+            state.dimmed.push(choices[i]);
+          }
+        }
+      }
+    }
+    if (typeof window.setTimeout === "function") {
+      state.timeoutId = window.setTimeout(function () {
+        resetState();
+      }, BUSY_RECOVERY_MS);
+    }
+  }
+
+  function traceInput(form, traceId) {
+    if (!form || typeof form.querySelector !== "function") return false;
+    var input = form.querySelector('input[name="performanceTraceId"]');
+    if (!input) {
+      if (typeof document.createElement !== "function" || typeof form.appendChild !== "function") return false;
+      try {
+        input = document.createElement("input");
+        input.setAttribute("type", "hidden");
+        input.setAttribute("name", "performanceTraceId");
+        form.appendChild(input);
+      } catch (error) {
+        return false;
+      }
+    }
+    input.value = traceId;
+    return true;
+  }
+
+  function storeHandoff(form, startedAtMs, acknowledgedAtMs) {
+    // Overwrite, never queue: exactly one submit token can be live per tab.
+    removeHandoff();
+    var traceId = randomId("trace_");
+    if (!traceId) return;
+    if (!traceInput(form, traceId)) return;
+    state.token = traceId;
+    if (!isSafeInteger(startedAtMs) || !isSafeInteger(acknowledgedAtMs)) return;
+    var expiresAtMs = startedAtMs + HANDOFF_TTL_MS;
+    if (
+      !isSafeInteger(expiresAtMs) ||
+      acknowledgedAtMs < startedAtMs ||
+      acknowledgedAtMs > expiresAtMs
+    ) {
+      removeHandoff();
+      return;
+    }
+    var store = storage();
+    if (!store) return;
+    var handoff = {
+      version: HANDOFF_VERSION,
+      action: HANDOFF_ACTION,
+      token: traceId,
+      startedAtMs: startedAtMs,
+      acknowledgedAtMs: acknowledgedAtMs,
+      expiresAtMs: expiresAtMs
+    };
+    try {
+      store.setItem(HANDOFF_STORAGE_KEY, JSON.stringify(handoff));
+      if (typeof window.setTimeout === "function") {
+        window.setTimeout(function () {
+          removeHandoffIfToken(traceId);
+        }, HANDOFF_TTL_MS);
+      }
+    } catch (error) {
+      removeHandoff();
+    }
+  }
+
   document.addEventListener("submit", function (event) {
-    var form = event.target;
-    if (!form || !form.querySelector) return;
-    var input = form.querySelector('input[name="responseTimeMs"]');
-    if (!input) return;
-    var elapsed = (monotonic ? performance.now() : Date.now()) - shownAt;
-    input.value = String(Math.max(1, Math.round(elapsed)));
+    var form = event && event.target;
+    if (!isNativeForm(form)) return;
+    if (state.busy) {
+      event.preventDefault();
+      return;
+    }
+
+    var reviewSubmit = isReviewSubmitForm(form);
+    var startedAtMs = reviewSubmit ? absoluteEpochNow() : null;
+    if (reviewSubmit) {
+      var responseInput = form.querySelector('input[name="responseTimeMs"]');
+      if (responseInput) {
+        var elapsed = responseClockNow() - presentedAt;
+        responseInput.value = String(Math.max(1, Math.round(elapsed)));
+      }
+    }
+
+    var control = submitControl(form, event);
+    setBusy(form, control);
+    if (reviewSubmit) {
+      var acknowledgedAtMs = absoluteEpochNow();
+      storeHandoff(form, startedAtMs, acknowledgedAtMs);
+    }
+  });
+
+  function metaContent(name) {
+    if (typeof document.querySelectorAll !== "function") return null;
+    var metas = document.querySelectorAll('meta[name="' + name + '"]');
+    if (!metas || metas.length !== 1) return null;
+    var value = metas[0].getAttribute("content");
+    return typeof value === "string" && value ? value : null;
+  }
+
+  function navigationTiming() {
+    if (!perf || typeof perf.getEntriesByType !== "function") return null;
+    var entries = perf.getEntriesByType("navigation");
+    if (!entries || entries.length !== 1) return null;
+    var navigation = entries[0];
+    if (!navigation || navigation.type === "back_forward") return null;
+    if (!navigation.serverTiming || typeof navigation.serverTiming.length !== "number") return null;
+    return navigation;
+  }
+
+  function serverTimingDescription(navigation, name) {
+    var match = null;
+    var found = false;
+    for (var i = 0; i < navigation.serverTiming.length; i++) {
+      var entry = navigation.serverTiming[i];
+      if (!entry || entry.name !== name) continue;
+      if (found) return null;
+      found = true;
+      match = entry.description;
+    }
+    return found && typeof match === "string" ? match : null;
+  }
+
+  function consumeHandoff() {
+    var store = storage();
+    if (!store) return null;
+    var raw;
+    try {
+      raw = store.getItem(HANDOFF_STORAGE_KEY);
+      // Consume before validation/emission, so retries cannot duplicate a tap.
+      store.removeItem(HANDOFF_STORAGE_KEY);
+    } catch (error) {
+      return null;
+    }
+    if (!raw) return null;
+    var handoff;
+    try {
+      handoff = JSON.parse(raw);
+    } catch (error) {
+      return null;
+    }
+    if (!handoff || typeof handoff !== "object" || Array.isArray(handoff)) return null;
+    var keys = Object.keys(handoff);
+    if (
+      keys.length !== 6 ||
+      keys.indexOf("version") < 0 ||
+      keys.indexOf("action") < 0 ||
+      keys.indexOf("token") < 0 ||
+      keys.indexOf("startedAtMs") < 0 ||
+      keys.indexOf("acknowledgedAtMs") < 0 ||
+      keys.indexOf("expiresAtMs") < 0
+    ) {
+      return null;
+    }
+    if (
+      handoff.version !== HANDOFF_VERSION ||
+      handoff.action !== HANDOFF_ACTION ||
+      typeof handoff.token !== "string" ||
+      !TRACE_ID_RE.test(handoff.token) ||
+      !isSafeInteger(handoff.startedAtMs) ||
+      !isSafeInteger(handoff.acknowledgedAtMs) ||
+      !isSafeInteger(handoff.expiresAtMs) ||
+      handoff.expiresAtMs !== handoff.startedAtMs + HANDOFF_TTL_MS ||
+      handoff.acknowledgedAtMs < handoff.startedAtMs ||
+      handoff.acknowledgedAtMs > handoff.expiresAtMs
+    ) {
+      return null;
+    }
+    return handoff;
+  }
+
+  function boundedDuration(start, end) {
+    if (!isFiniteNumber(start) || !isFiniteNumber(end) || end < start) return null;
+    var duration = Math.round(end - start);
+    return duration >= 0 && duration <= MAX_DURATION_MS ? duration : null;
+  }
+
+  function navigationDuration(navigation, startName, endName) {
+    return boundedDuration(navigation[startName], navigation[endName]);
+  }
+
+  function navigationEpoch(navigation, relativeMs) {
+    if (!isFiniteNumber(relativeMs) || relativeMs < 0 || !perf || !isFiniteNumber(perf.timeOrigin)) return null;
+    var start = isFiniteNumber(navigation.startTime) ? navigation.startTime : 0;
+    var epoch = perf.timeOrigin + start + relativeMs;
+    return isSafeInteger(Math.round(epoch)) ? Math.round(epoch) : null;
+  }
+
+  function viewportClass() {
+    if (!isFiniteNumber(window.innerWidth) || window.innerWidth < 0) return null;
+    if (window.innerWidth < 600) return "mobile";
+    if (window.innerWidth < 1024) return "tablet";
+    return "desktop";
+  }
+
+  function emitLandingTelemetry(persisted) {
+    if (state.landingAttempted) return;
+    state.landingAttempted = true;
+    var handoff = consumeHandoff();
+    if (
+      !handoff ||
+      persisted ||
+      typeof document.querySelector !== "function" ||
+      !document.querySelector(".me-verdict")
+    ) return;
+    if (!window.fetch || typeof window.fetch !== "function") return;
+    if (!window.requestAnimationFrame || typeof window.requestAnimationFrame !== "function") return;
+
+    var navigation = navigationTiming();
+    var requestId = metaContent("memory-engine-submit-request");
+    var renderedTraceId = metaContent("memory-engine-submit-handoff");
+    var csrfToken = metaContent("memory-engine-csrf-token");
+    if (
+      !navigation ||
+      !requestId ||
+      !REQUEST_ID_RE.test(requestId) ||
+      !renderedTraceId ||
+      !TRACE_ID_RE.test(renderedTraceId) ||
+      !csrfToken
+    ) {
+      return;
+    }
+    var requestTimingId = serverTimingDescription(navigation, "request");
+    var handoffTimingId = serverTimingDescription(navigation, "handoff");
+    if (
+      !requestTimingId ||
+      !REQUEST_ID_RE.test(requestTimingId) ||
+      !handoffTimingId ||
+      !TRACE_ID_RE.test(handoffTimingId) ||
+      requestTimingId !== requestId ||
+      handoffTimingId !== renderedTraceId
+    ) {
+      return;
+    }
+    if (handoff.token !== renderedTraceId || handoff.token !== handoffTimingId) return;
+    var now = absoluteEpochNow();
+    if (now === null || now > handoff.expiresAtMs) return;
+
+    window.requestAnimationFrame(function () {
+      window.requestAnimationFrame(function () {
+        var visibleAtMs = absoluteEpochNow();
+        if (visibleAtMs === null || visibleAtMs > handoff.expiresAtMs) return;
+        var responseStartEpoch = navigationEpoch(navigation, navigation.responseStart);
+        var responseEndEpoch = navigationEpoch(navigation, navigation.responseEnd);
+        var tapToAckMs = boundedDuration(handoff.startedAtMs, handoff.acknowledgedAtMs);
+        var requestToResponseMs =
+          responseStartEpoch === null
+            ? null
+            : boundedDuration(handoff.startedAtMs, responseStartEpoch);
+        var transferMs = navigationDuration(navigation, "responseStart", "responseEnd");
+        var navigationMs =
+          responseEndEpoch === null
+            ? null
+            : boundedDuration(responseEndEpoch, visibleAtMs);
+        var gradedVisibleMs = boundedDuration(handoff.startedAtMs, visibleAtMs);
+        var viewport = viewportClass();
+        if (
+          tapToAckMs === null ||
+          requestToResponseMs === null ||
+          transferMs === null ||
+          navigationMs === null ||
+          gradedVisibleMs === null ||
+          !viewport ||
+          Math.abs(
+            gradedVisibleMs -
+              (requestToResponseMs + transferMs + navigationMs)
+          ) > 4
+        ) {
+          return;
+        }
+        var payload = {
+          schema: "memory_engine.browser_submit.v1",
+          csrfToken: csrfToken,
+          requestId: requestId,
+          traceId: handoff.token,
+          tapToAckMs: tapToAckMs,
+          requestToResponseMs: requestToResponseMs,
+          transferMs: transferMs,
+          navigationMs: navigationMs,
+          gradedVisibleMs: gradedVisibleMs,
+          viewport: viewport
+        };
+        try {
+          var request = window.fetch("/app/performance/submit", {
+            method: "POST",
+            credentials: "same-origin",
+            keepalive: true,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (request && typeof request.catch === "function") request.catch(function () {});
+        } catch (error) {
+          // Telemetry is best effort; the review result is already rendered.
+        }
+      });
+    });
+  }
+
+  window.addEventListener("pagehide", function () {
+    resetState();
+  });
+  window.addEventListener("pageshow", function (event) {
+    if (event && event.persisted) {
+      removeHandoff();
+      resetState();
+      state.landingAttempted = true;
+      return;
+    }
+    emitLandingTelemetry(false);
   });
 })();
 
@@ -37,42 +517,6 @@
     if (!button || button.disabled) return;
     button.disabled = true;
     button.textContent = "Creating…";
-  });
-})();
-
-// Instant acknowledgment for every form action (memory-engine-086).
-//
-// The server round trip can be slow (memory-engine-085 owns the real fix);
-// until then a press must never look inert. This script marks the pressed
-// control, dims the MCQ siblings so the tapped choice reads as chosen, shows
-// a thin in-flight bar, and swallows duplicate submits while one navigation
-// is in flight. Progressive enhancement only: forms still post normally and
-// JS-off behavior is unchanged. Controls are never disabled before the post
-// (disabling the submitter would strip its name=value pair — the MCQ answer —
-// from the form data); duplicate suppression uses the busy flag instead.
-(function () {
-  "use strict";
-  var busy = false;
-  document.addEventListener("submit", function (event) {
-    var form = event.target;
-    if (!(form instanceof HTMLFormElement)) return;
-    if (form.classList.contains("me-capture-form")) return; // owns its own pending state
-    if (busy) {
-      event.preventDefault();
-      return;
-    }
-    busy = true;
-    document.documentElement.setAttribute("data-busy", "");
-    var control =
-      event.submitter || form.querySelector('button[type="submit"], button:not([type])');
-    if (!control) return;
-    control.setAttribute("data-pressed", "");
-    if (control.classList.contains("me-choice")) {
-      var choices = form.querySelectorAll(".me-choice");
-      for (var i = 0; i < choices.length; i++) {
-        if (choices[i] !== control) choices[i].setAttribute("data-dim", "");
-      }
-    }
   });
 })();
 

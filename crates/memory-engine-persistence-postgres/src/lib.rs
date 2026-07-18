@@ -9,8 +9,10 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
-    sync::LazyLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
 };
 
 use memory_engine_core::{
@@ -28,7 +30,8 @@ use memory_engine_service::{
     ServiceAttemptRecord,
 };
 use memory_engine_study::{select_current_review_unit, BetaStudyStore};
-use postgres::Client;
+use postgres::types::ToSql;
+use postgres::{Client, ToStatement};
 
 static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -455,8 +458,184 @@ impl AccountScope {
     }
 }
 
+fn increment_statement_count(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        Some(count.saturating_add(1))
+    });
+}
+
+struct CountingClient {
+    client: Client,
+    statement_count: Arc<AtomicU64>,
+}
+
+impl CountingClient {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            statement_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn statement_count(&self) -> u64 {
+        self.statement_count.load(Ordering::Relaxed)
+    }
+
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.client.query(query, params)
+    }
+
+    fn query_one<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<postgres::Row, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.client.query_one(query, params)
+    }
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.client.query_opt(query, params)
+    }
+
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.client.execute(query, params)
+    }
+
+    fn batch_execute(&mut self, query: &str) -> Result<(), postgres::Error> {
+        increment_statement_count(&self.statement_count);
+        self.client.batch_execute(query)
+    }
+
+    fn transaction(&mut self) -> Result<CountingTransaction<'_>, postgres::Error> {
+        increment_statement_count(&self.statement_count);
+        let transaction = self.client.transaction()?;
+        Ok(CountingTransaction {
+            transaction: Some(transaction),
+            statement_count: Arc::clone(&self.statement_count),
+        })
+    }
+}
+
+struct CountingTransaction<'a> {
+    transaction: Option<postgres::Transaction<'a>>,
+    statement_count: Arc<AtomicU64>,
+}
+
+impl<'a> CountingTransaction<'a> {
+    fn transaction(&mut self) -> &mut postgres::Transaction<'a> {
+        self.transaction
+            .as_mut()
+            .expect("counted transaction remains live")
+    }
+
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.transaction().query(query, params)
+    }
+
+    fn query_one<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<postgres::Row, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.transaction().query_one(query, params)
+    }
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.transaction().query_opt(query, params)
+    }
+
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        increment_statement_count(&self.statement_count);
+        self.transaction().execute(query, params)
+    }
+
+    fn batch_execute(&mut self, query: &str) -> Result<(), postgres::Error> {
+        increment_statement_count(&self.statement_count);
+        self.transaction().batch_execute(query)
+    }
+
+    fn commit(mut self) -> Result<(), postgres::Error> {
+        increment_statement_count(&self.statement_count);
+        self.transaction
+            .take()
+            .expect("counted transaction remains live")
+            .commit()
+    }
+
+    fn rollback(mut self) -> Result<(), postgres::Error> {
+        increment_statement_count(&self.statement_count);
+        self.transaction
+            .take()
+            .expect("counted transaction remains live")
+            .rollback()
+    }
+}
+
+impl Drop for CountingTransaction<'_> {
+    fn drop(&mut self) {
+        if self.transaction.is_some() {
+            increment_statement_count(&self.statement_count);
+        }
+    }
+}
+
 pub struct PostgresStudyStore {
-    client: RefCell<Client>,
+    client: RefCell<CountingClient>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -606,8 +785,14 @@ impl PostgresStudyStore {
         let client = connect_client(url)?;
 
         Ok(Self {
-            client: RefCell::new(client),
+            client: RefCell::new(CountingClient::new(client)),
         })
+    }
+
+    /// Return the cumulative number of database calls made by this store.
+    #[must_use]
+    pub fn statement_count(&self) -> u64 {
+        self.client.borrow().statement_count()
     }
 
     /// Run the production schema migration.
@@ -1878,7 +2063,7 @@ fn generation_job_from_row(row: &postgres::Row) -> PostgresGenerationJob {
 
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
-    client: &'a RefCell<Client>,
+    client: &'a RefCell<CountingClient>,
     scope: AccountScope,
 }
 
@@ -1891,7 +2076,7 @@ impl AccountStudyStore<'_> {
     /// serial position, including across API replicas.
     fn with_account_transaction<R>(
         &mut self,
-        operation: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<R, PostgresStoreError>,
+        operation: impl FnOnce(&mut CountingTransaction<'_>) -> Result<R, PostgresStoreError>,
     ) -> Result<R, PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         let mut client = self.client.borrow_mut();
@@ -3075,7 +3260,7 @@ impl BetaStudyStore for AccountStudyStore<'_> {
 }
 
 fn assert_known_review_unit_in_transaction(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut CountingTransaction<'_>,
     account_id: &str,
     review_unit_id: &ReviewUnitId,
 ) -> Result<(), PostgresStoreError> {
@@ -3091,7 +3276,7 @@ fn assert_known_review_unit_in_transaction(
 }
 
 fn review_unit_from_transaction(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut CountingTransaction<'_>,
     account_id: &str,
     review_unit_id: &ReviewUnitId,
 ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
@@ -3111,7 +3296,7 @@ fn review_unit_from_transaction(
 }
 
 fn source_document_from_transaction(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut CountingTransaction<'_>,
     account_id: &str,
     source_document_id: &str,
 ) -> Result<SourceDocument, PostgresStoreError> {
@@ -3131,7 +3316,7 @@ fn source_document_from_transaction(
 }
 
 fn current_review_unit_matches(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut CountingTransaction<'_>,
     account_id: &str,
     active_records: &[(String, BetaReviewUnitRecord)],
     schedules: &BTreeMap<String, ScheduleState>,
@@ -3680,6 +3865,87 @@ mod tests {
         assert_eq!(result, Err("hard down"));
         assert_eq!(attempts, super::CONNECT_ATTEMPTS);
     }
+    #[test]
+    fn counting_client_counts_direct_and_transaction_calls_exactly() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping counting client test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let client = crate::connect_client(&database_url).expect("connect counting test client");
+        let mut client = super::CountingClient::new(client);
+
+        assert_eq!(client.statement_count(), 0);
+        client
+            .query("SELECT 1", &[])
+            .expect("direct query succeeds");
+        client
+            .query_one("SELECT 1", &[])
+            .expect("direct query_one succeeds");
+        client
+            .query_opt("SELECT 1", &[])
+            .expect("direct query_opt succeeds");
+        client
+            .execute("SELECT 1", &[])
+            .expect("direct execute succeeds");
+        client
+            .batch_execute("SELECT 1")
+            .expect("direct batch_execute succeeds");
+        assert_eq!(client.statement_count(), 5);
+
+        let statement_count = Arc::clone(&client.statement_count);
+        let mut transaction = client.transaction().expect("transaction begins");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 6);
+        transaction
+            .execute("SELECT 1", &[])
+            .expect("transaction body succeeds");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 7);
+        transaction.commit().expect("transaction commits");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 8);
+
+        let transaction = client.transaction().expect("rollback transaction begins");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 9);
+        transaction
+            .rollback()
+            .expect("explicit transaction rollback succeeds");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 10);
+
+        let mut transaction = client
+            .transaction()
+            .expect("implicit rollback transaction begins");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 11);
+        transaction
+            .execute("SELECT 1", &[])
+            .expect("implicit rollback body succeeds");
+        assert_eq!(statement_count.load(Ordering::Relaxed), 12);
+        drop(transaction);
+        assert_eq!(statement_count.load(Ordering::Relaxed), 13);
+    }
+
+    #[test]
+    fn statement_count_saturates_at_u64_max() {
+        let counter = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        super::increment_statement_count(&counter);
+        super::increment_statement_count(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn study_store_exposes_cumulative_statement_count() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping study store statement count test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let mut store = super::PostgresStudyStore::connect(&database_url)
+            .expect("connect statement count store");
+        assert_eq!(store.statement_count(), 0);
+        store.ping().expect("ping succeeds");
+        assert_eq!(store.statement_count(), 1);
+        store.ping().expect("second ping succeeds");
+        assert_eq!(store.statement_count(), 2);
+    }
+
     use memory_engine_persistence::{
         BetaReviewUnitRecord, BetaStoreSnapshot, GeneratedLearningActivityKind,
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
@@ -3692,7 +3958,7 @@ mod tests {
         RecordContentFeedbackCommand, ServiceAttemptRecord,
     };
     use memory_engine_study::{BetaStudySession, BetaStudySourceInput, BetaStudyStatus};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{atomic::Ordering, Arc, Barrier};
 
     use super::{
         applied_review_receipt_key, generation_jobs_migration_sql, migration_sql, AccountScope,
