@@ -880,6 +880,7 @@ dependencies = [
  "memory-engine-core",
  "memory-engine-generation",
  "memory-engine-openrouter",
+ "memory-engine-performance",
  "memory-engine-persistence",
  "memory-engine-persistence-postgres",
  "memory-engine-service",

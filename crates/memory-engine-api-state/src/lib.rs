@@ -213,6 +213,21 @@ impl ApiState {
     ) -> Result<AppAccount, ApiFailure> {
         self.accounts.require_browser_session(headers, csrf_token)
     }
+    /// Require a valid browser session while accounting for every Postgres
+    /// boundary traversed by the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the browser session or CSRF token is invalid.
+    pub fn require_browser_session_with_timings(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<AppAccount, ApiFailure> {
+        self.accounts
+            .require_browser_session_with_timings(headers, csrf_token, timings)
+    }
 
     /// Require a valid browser session for a read-only request.
     ///
@@ -320,6 +335,23 @@ impl ApiState {
     pub fn list_app_sources(&self, account: &AppAccount) -> Result<Vec<SourceRecord>, ApiFailure> {
         self.accounts
             .list_sources(account.account_id(), account.session_token())
+    }
+    /// List saved material while accounting for every Postgres boundary
+    /// traversed by a timed browser request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when persistence rejects the read.
+    pub fn list_app_sources_with_timings(
+        &self,
+        account: &AppAccount,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<Vec<SourceRecord>, ApiFailure> {
+        self.accounts.list_sources_with_timings(
+            account.account_id(),
+            account.session_token(),
+            Some(timings),
+        )
     }
 
     /// Save an email-backed account over an existing browser session.
@@ -445,6 +477,23 @@ impl ApiState {
     pub fn app_study_view(&self, account: &AppAccount) -> Result<StudyViewResponse, ApiFailure> {
         self.accounts
             .study_view(account.account_id(), account.session_token())
+    }
+    /// Render the current study view while accounting for every Postgres
+    /// boundary traversed by a timed browser request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when study state rejects the read.
+    pub fn app_study_view_with_timings(
+        &self,
+        account: &AppAccount,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.study_view_with_timings(
+            account.account_id(),
+            account.session_token(),
+            Some(timings),
+        )
     }
 
     /// Persist the learner's explicit due-count return-channel choice.
@@ -932,12 +981,14 @@ impl ApiState {
         account: &AppAccount,
         review_unit_id: &str,
         request: &SubmitReviewRequest,
+        timings: &mut SubmitReviewTimings,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.submit_review(
+        self.accounts.submit_review_with_timings(
             account.account_id(),
             account.session_token(),
             review_unit_id,
             request,
+            Some(timings),
         )
     }
 
@@ -1067,6 +1118,17 @@ impl ApiState {
     #[must_use]
     pub fn jobs_for_app_account(&self, account: &AppAccount) -> Vec<GenerationJob> {
         self.jobs.jobs_for(account.account_id())
+    }
+    /// Return rendered job history while accounting for every Postgres
+    /// boundary traversed by a timed browser request.
+    #[must_use]
+    pub fn jobs_for_app_account_with_timings(
+        &self,
+        account: &AppAccount,
+        timings: &mut SubmitReviewTimings,
+    ) -> Vec<GenerationJob> {
+        self.jobs
+            .jobs_for_with_timings(account.account_id(), timings)
     }
 
     /// Return rendered job history by account id. Test helper for route coverage.
@@ -1595,6 +1657,73 @@ pub struct SubmitReviewRequest {
     pub idempotency_key: String,
 }
 
+/// Blocking Postgres phases observed for one browser review submission.
+///
+/// `None` means the phase did not run. Callers must not coerce an absent
+/// phase to zero because auth, validation, and connection failures stop at
+/// different boundaries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SubmitReviewTimings {
+    connect_ms: Option<u64>,
+    operation_ms: Option<u64>,
+    statement_count: Option<u64>,
+}
+
+impl SubmitReviewTimings {
+    #[must_use]
+    pub const fn postgres_connect_ms(self) -> Option<u64> {
+        self.connect_ms
+    }
+
+    #[must_use]
+    pub const fn postgres_operation_ms(self) -> Option<u64> {
+        self.operation_ms
+    }
+
+    #[must_use]
+    pub const fn postgres_statement_count(self) -> Option<u64> {
+        self.statement_count
+    }
+
+    pub(crate) fn record_postgres_connect(&mut self, duration_ms: u64) {
+        self.connect_ms = Some(
+            self.connect_ms
+                .unwrap_or_default()
+                .saturating_add(duration_ms),
+        );
+    }
+
+    pub(crate) fn record_postgres_operation(&mut self, duration_ms: u64) {
+        self.operation_ms = Some(
+            self.operation_ms
+                .unwrap_or_default()
+                .saturating_add(duration_ms),
+        );
+    }
+
+    pub(crate) fn record_postgres_statement_count(&mut self, count: u64) {
+        self.statement_count = Some(
+            self.statement_count
+                .unwrap_or_default()
+                .saturating_add(count),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitPerformanceOutcome {
+    Succeeded,
+    ClientRejected,
+    ServerFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitViewport {
+    Mobile,
+    Tablet,
+    Desktop,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentFeedbackRequest {
@@ -1836,6 +1965,73 @@ pub fn report_health_check_in() {
                 "source": "memory-engine-api",
             })),
         });
+    }
+}
+
+pub fn report_submit_server_performance(duration_ms: u64, outcome: SubmitPerformanceOutcome) {
+    let outcome = match outcome {
+        SubmitPerformanceOutcome::Succeeded => memory_engine_performance::Outcome::Succeeded,
+        SubmitPerformanceOutcome::ClientRejected => {
+            memory_engine_performance::Outcome::ClientRejected
+        }
+        SubmitPerformanceOutcome::ServerFailed => memory_engine_performance::Outcome::ServerFailed,
+    };
+    let marker = memory_engine_performance::CompletionMarker::server(
+        memory_engine_performance::Action::Review(memory_engine_performance::ReviewAction::Submit),
+        memory_engine_performance::CompletionPhase::ImmediateAck,
+        outcome,
+    );
+    report_performance_observation(marker, duration_ms);
+}
+
+pub fn report_submit_browser_performance(
+    tap_to_ack_ms: u64,
+    graded_visible_ms: u64,
+    viewport: SubmitViewport,
+) {
+    let viewport = match viewport {
+        SubmitViewport::Mobile => memory_engine_performance::Viewport::Mobile,
+        SubmitViewport::Tablet => memory_engine_performance::Viewport::Tablet,
+        SubmitViewport::Desktop => memory_engine_performance::Viewport::Desktop,
+    };
+    for (phase, duration_ms) in [
+        (
+            memory_engine_performance::CompletionPhase::ImmediateAck,
+            tap_to_ack_ms,
+        ),
+        (
+            memory_engine_performance::CompletionPhase::VisibleAfterTwoAnimationFrames,
+            graded_visible_ms,
+        ),
+    ] {
+        let marker = memory_engine_performance::CompletionMarker::browser(
+            memory_engine_performance::Action::Review(
+                memory_engine_performance::ReviewAction::Submit,
+            ),
+            phase,
+            memory_engine_performance::Outcome::Succeeded,
+            memory_engine_performance::Navigation::FullPage,
+            viewport,
+        );
+        report_performance_observation(marker, duration_ms);
+    }
+}
+
+fn report_performance_observation(
+    marker: Result<
+        memory_engine_performance::CompletionMarker,
+        memory_engine_performance::MarkerError,
+    >,
+    duration_ms: u64,
+) {
+    let Some(reporter) = CANARY.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let Ok(marker) = marker else {
+        return;
+    };
+    if let Ok(observation) = marker.observation(duration_ms) {
+        let _ = reporter.report_performance(observation);
     }
 }
 
@@ -2318,6 +2514,48 @@ fn with_postgres_account<R>(
     }
 }
 
+fn with_postgres_account_timed<R>(
+    database_url: &str,
+    account_id: &str,
+    now_ms: i64,
+    timings: Option<&mut SubmitReviewTimings>,
+    operation: impl FnOnce(AccountStudyStore<'_>) -> Result<R, ApiFailure>,
+) -> Result<R, ApiFailure> {
+    let Some(timings) = timings else {
+        return with_postgres_account(database_url, account_id, now_ms, operation);
+    };
+    let run = || {
+        let connect_started = std::time::Instant::now();
+        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
+        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
+        let mut store = connected?;
+
+        let operation_started = std::time::Instant::now();
+        let result = (|| {
+            migrate_postgres_store(database_url, &mut store)?;
+            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
+            let mut account = store.for_account(scope);
+            account.ensure_account(now_ms).map_err(postgres_failure)?;
+            operation(account)
+        })();
+        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
+        timings.record_postgres_statement_count(store.statement_count());
+        result
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+
+fn bounded_elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .clamp(1, memory_engine_performance::REQUEST_UI_MAX_DURATION_MS)
+}
+
 fn with_postgres_store<R>(
     database_url: &str,
     operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
@@ -2326,6 +2564,36 @@ fn with_postgres_store<R>(
         let mut store = connect_postgres_migrated(database_url)?;
 
         operation(&mut store)
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+fn with_postgres_store_timed<R>(
+    database_url: &str,
+    timings: Option<&mut SubmitReviewTimings>,
+    operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
+) -> Result<R, ApiFailure> {
+    let Some(timings) = timings else {
+        return with_postgres_store(database_url, operation);
+    };
+    let run = || {
+        let connect_started = std::time::Instant::now();
+        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
+        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
+        let mut store = connected?;
+
+        let operation_started = std::time::Instant::now();
+        let result = (|| {
+            migrate_postgres_store(database_url, &mut store)?;
+            operation(&mut store)
+        })();
+        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
+        timings.record_postgres_statement_count(store.statement_count());
+        result
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -2353,13 +2621,20 @@ fn with_postgres_study<R>(
 /// pressure. The set is keyed by URL so tests pointing at scratch databases
 /// still migrate each one.
 fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, ApiFailure> {
-    static MIGRATED_URLS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeSet<String>>,
-    > = std::sync::OnceLock::new();
-
     let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
-    let migrated =
-        MIGRATED_URLS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    migrate_postgres_store(database_url, &mut store)?;
+    Ok(store)
+}
+
+fn migrate_postgres_store(
+    database_url: &str,
+    store: &mut PostgresStudyStore,
+) -> Result<(), ApiFailure> {
+    static MIGRATED_URLS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::BTreeSet<String>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+
+    let migrated = &*MIGRATED_URLS;
     // A panic while migrating must not poison every later request into a
     // panic; the set is a plain string collection, safe to keep using.
     let mut migrated = migrated
@@ -2369,8 +2644,7 @@ fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, A
         store.migrate().map_err(postgres_failure)?;
         migrated.insert(database_url.to_owned());
     }
-
-    Ok(store)
+    Ok(())
 }
 
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {

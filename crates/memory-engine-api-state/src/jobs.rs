@@ -544,6 +544,25 @@ impl JobQueue {
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         jobs
     }
+    /// Current jobs for a timed browser request. Postgres reads contribute to
+    /// the same request-local accumulator as auth, study, and rendering work.
+    #[must_use]
+    pub fn jobs_for_with_timings(
+        &self,
+        account_id: &str,
+        timings: &mut crate::SubmitReviewTimings,
+    ) -> Vec<GenerationJob> {
+        if let Some(database_url) = self.inner.postgres_url.as_deref() {
+            return crate::with_postgres_store_timed(database_url, Some(timings), |store| {
+                store
+                    .list_generation_jobs(account_id, 50)
+                    .map_err(crate::postgres_failure)
+            })
+            .map(|jobs| jobs.into_iter().map(GenerationJob::from).collect())
+            .unwrap_or_default();
+        }
+        self.jobs_for(account_id)
+    }
 
     /// Subscribe to job-status updates for SSE. Each item is a [`JobBroadcast`]
     /// carrying the owning account id, so the handler can filter to one learner.
