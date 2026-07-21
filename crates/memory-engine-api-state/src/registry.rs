@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
 use memory_engine_persistence::{GeneratedPromptValidationStatus, SourcePermission};
+use memory_engine_persistence_postgres::PostgresWaitlistEntry;
 use memory_engine_service::RecordContentFeedbackCommand;
 
 use crate::storage::GenerationCommitFence;
@@ -23,6 +24,17 @@ use crate::{
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
 
+/// Map a Postgres-backed waitlist row onto the public, backend-agnostic
+/// [`WaitlistEntry`] the API returns regardless of storage.
+fn waitlist_entry_from_postgres(entry: PostgresWaitlistEntry) -> WaitlistEntry {
+    WaitlistEntry {
+        email: entry.email,
+        created_at_ms: entry.created_at_ms,
+        updated_at_ms: entry.updated_at_ms,
+        source: entry.source,
+        invited_at_ms: entry.invited_at_ms,
+    }
+}
 impl AccountRegistry {
     /// Create a local account record for the production shell.
     ///
@@ -164,16 +176,15 @@ impl AccountRegistry {
     ///
     /// Rate limiting runs through the shared per-key attempt counter (the
     /// same mechanism backing `record_app_account_request`) so it works for
-    /// both storage backends even though entry persistence below is
-    /// file-store only. A malformed email still spends the IP quota, exactly
-    /// like `request_magic_link`, so a scripted probe can't skip the limiter
-    /// by sending garbage.
+    /// both storage backends. A malformed email still spends the IP quota,
+    /// exactly like `request_magic_link`, so a scripted probe can't skip the
+    /// limiter by sending garbage.
     ///
     /// # Errors
     ///
     /// Returns bad request on a malformed email, too-many-requests when the
-    /// per-email or per-IP limit is spent, and service-unavailable when the
-    /// registry is Postgres-backed (this slice is file-store only).
+    /// per-email or per-IP limit is spent, and service-unavailable when
+    /// storage rejects the write.
     pub(crate) fn join_waitlist(
         &self,
         email: &str,
@@ -187,14 +198,20 @@ impl AccountRegistry {
             ));
         };
         self.record_waitlist_request(Some(&email), client_rate_limit_key)?;
+        let now = self.now();
+        if let Some(database_url) = self.postgres_url() {
+            return crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_join(&email, source, now)
+                    .map_err(crate::postgres_failure)
+            });
+        }
         let Some(store_path) = self.waitlist_store_path() else {
             return Err(ApiFailure::service_unavailable(
-                "Waitlist persistence requires the Postgres adapter, which this slice does not \
-                 implement yet."
-                    .to_owned(),
+                "Waitlist persistence is not configured.".to_owned(),
             ));
         };
-        crate::waitlist::join(&store_path, &email, source, self.now())
+        crate::waitlist::join(&store_path, &email, source, now)
     }
 
     /// List every waitlist entry for the operator.
@@ -202,17 +219,108 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// Returns forbidden when the admin token is unconfigured or mismatched,
-    /// and service-unavailable when the registry is Postgres-backed.
-    pub(crate) fn list_waitlist(&self, admin_token: &str) -> Result<Vec<WaitlistEntry>, ApiFailure> {
+    /// and service-unavailable when storage rejects the read.
+    pub(crate) fn list_waitlist(
+        &self,
+        admin_token: &str,
+    ) -> Result<Vec<WaitlistEntry>, ApiFailure> {
         self.verify_admin_token(admin_token)?;
+        if let Some(database_url) = self.postgres_url() {
+            return crate::with_postgres_store(&database_url, |store| {
+                Ok(store
+                    .waitlist_list()
+                    .map_err(crate::postgres_failure)?
+                    .into_iter()
+                    .map(waitlist_entry_from_postgres)
+                    .collect())
+            });
+        }
         let Some(store_path) = self.waitlist_store_path() else {
             return Err(ApiFailure::service_unavailable(
-                "Waitlist persistence requires the Postgres adapter, which this slice does not \
-                 implement yet."
-                    .to_owned(),
+                "Waitlist persistence is not configured.".to_owned(),
             ));
         };
         crate::waitlist::list(&store_path)
+    }
+
+    /// Mark one waitlist entry invited for the operator. Idempotent: marking
+    /// an already-invited entry again leaves its `invited_at_ms` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the read or write.
+    pub(crate) fn mark_waitlist_invited(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<WaitlistEntry, ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        let Some(email) = normalize_email(email) else {
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        let now = self.now();
+        let entry = if let Some(database_url) = self.postgres_url() {
+            crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_mark_invited(&email, now)
+                    .map_err(crate::postgres_failure)
+            })?
+            .map(waitlist_entry_from_postgres)
+        } else {
+            let Some(store_path) = self.waitlist_store_path() else {
+                return Err(ApiFailure::service_unavailable(
+                    "Waitlist persistence is not configured.".to_owned(),
+                ));
+            };
+            crate::waitlist::mark_invited(&store_path, &email, now)?
+        };
+        entry.ok_or_else(|| ApiFailure::not_found("Waitlist entry not found."))
+    }
+
+    /// Delete one waitlist entry for the operator. The append-only audit
+    /// trail keeps a record of the join and any invite that preceded the
+    /// deletion; only the operational row is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the write.
+    pub(crate) fn delete_waitlist_entry(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<(), ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        let Some(email) = normalize_email(email) else {
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        let now = self.now();
+        let deleted = if let Some(database_url) = self.postgres_url() {
+            crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_delete(&email, now)
+                    .map_err(crate::postgres_failure)
+            })?
+        } else {
+            let Some(store_path) = self.waitlist_store_path() else {
+                return Err(ApiFailure::service_unavailable(
+                    "Waitlist persistence is not configured.".to_owned(),
+                ));
+            };
+            crate::waitlist::delete(&store_path, &email, now)?
+        };
+        if deleted {
+            Ok(())
+        } else {
+            Err(ApiFailure::not_found("Waitlist entry not found."))
+        }
     }
 
     /// Runs an API registry operation.

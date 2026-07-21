@@ -365,9 +365,12 @@ pub fn router(state: ApiState) -> Router {
             post(run_return_notification_scheduler),
         )
         .route("/internal/waitlist", get(list_waitlist))
+        .route("/internal/waitlist/export", get(export_waitlist))
+        .route("/internal/waitlist/invite", post(invite_waitlist))
+        .route("/internal/waitlist/delete", post(delete_waitlist))
         .route("/accounts", post(create_account));
 
-    mount_v1_routes(router)
+    let router = mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/analytics", get(app_analytics))
         .route("/app/account", post(create_app_account))
@@ -418,7 +421,16 @@ pub fn router(state: ApiState) -> Router {
             "/accounts/{account_id}/drafts/{draft_id}/approve",
             post(approve_draft),
         )
-        .route("/accounts/{account_id}/review/next", get(next_review))
+        .route("/accounts/{account_id}/review/next", get(next_review));
+    mount_review_routes(router).with_state(state)
+}
+
+/// The review "escape hatch" routes: reveal, cross-reference, skip, snooze,
+/// snooze-concept, bridge, submit, and content-feedback for one review unit.
+/// Split out of [`router`] to keep that function under the workspace line
+/// budget; these routes share no state setup with the rest of the router.
+fn mount_review_routes(router: Router<ApiState>) -> Router<ApiState> {
+    router
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/reveal",
             post(reveal_review),
@@ -451,7 +463,6 @@ pub fn router(state: ApiState) -> Router {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
-        .with_state(state)
 }
 
 async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -504,8 +515,9 @@ async fn static_ledger_css() -> impl IntoResponse {
 
 async fn static_manifest() -> impl IntoResponse {
     const MANIFEST: &str = r##"{
-  "name": "Memory Engine",
-  "short_name": "Memory Engine",
+  "name": "Scry",
+  "short_name": "Scry",
+  "description": "Remember everything",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
@@ -1041,6 +1053,13 @@ async fn create_app_waitlist(
     })
 }
 
+fn admin_token_from_headers(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
 /// Operator-only waitlist readout, gated by the admin token. Not part of the
 /// versioned `/v1` contract — like the return-notification scheduler route,
 /// this is internal tooling, not a public API surface.
@@ -1048,11 +1067,77 @@ async fn list_waitlist(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<WaitlistEntry>>, ApiFailure> {
-    let admin_token = headers
-        .get("x-admin-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    Ok(Json(state.list_waitlist(admin_token)?))
+    Ok(Json(
+        state.list_waitlist(admin_token_from_headers(&headers))?,
+    ))
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Operator-only waitlist CSV export, gated by the admin token. Same
+/// listing as `GET /internal/waitlist`; only the wire format differs, so an
+/// operator can open the result directly in a spreadsheet.
+async fn export_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiFailure> {
+    let entries = state.list_waitlist(admin_token_from_headers(&headers))?;
+    let mut csv = String::from("email,createdAtMs,updatedAtMs,source,invitedAtMs\n");
+    for entry in entries {
+        let invited_at_ms = entry
+            .invited_at_ms
+            .map_or_else(String::new, |value| value.to_string());
+        let _ = writeln!(
+            csv,
+            "{},{},{},{},{invited_at_ms}",
+            csv_field(&entry.email),
+            entry.created_at_ms,
+            entry.updated_at_ms,
+            csv_field(&entry.source),
+        );
+    }
+    Ok(([(CONTENT_TYPE, "text/csv; charset=utf-8")], csv).into_response())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WaitlistEmailRequest {
+    email: String,
+}
+
+/// Operator-only waitlist invite transition, gated by the admin token.
+/// Idempotent: inviting an already-invited address again returns its
+/// existing `invitedAtMs` unchanged.
+async fn invite_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WaitlistEmailRequest>,
+) -> Result<Json<WaitlistEntry>, ApiFailure> {
+    Ok(Json(state.mark_waitlist_invited(
+        admin_token_from_headers(&headers),
+        &request.email,
+    )?))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WaitlistDeleteResponse {
+    deleted: bool,
+}
+
+/// Operator-only waitlist delete, gated by the admin token. Removes only the
+/// operational row; the append-only audit trail is unaffected.
+async fn delete_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WaitlistEmailRequest>,
+) -> Result<Json<WaitlistDeleteResponse>, ApiFailure> {
+    state.delete_waitlist_entry(admin_token_from_headers(&headers), &request.email)?;
+    Ok(Json(WaitlistDeleteResponse { deleted: true }))
 }
 
 async fn verify_app_login(

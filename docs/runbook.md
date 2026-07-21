@@ -107,30 +107,65 @@ pair, and a source tag (`"first-run"`) — no account, session, or generation
 job is ever created. Joining is idempotent on normalized email and returns
 the identical response whether the address is brand new, already on the
 list, or already allowlisted, so the response can never be used to probe
-registration or allowlist state. The join and its per-email/per-IP rate
-limit share the same file-store/Postgres storage backend as the rest of the
-app; **this first slice implements the file-store side only** — a
-Postgres-backed deployment returns `503` on both join and listing rather
-than silently dropping the entry (see `crates/memory-engine-api-state/src/waitlist.rs`).
+registration or allowlist state. Rate limiting runs per normalized email and
+per client IP, trusting only the edge-set `do-connecting-ip` header (falling
+back to `x-real-ip`/`x-forwarded-for`) so a caller cannot forge its own quota
+identity.
 
-Operator readout, gated by `MEMORY_ENGINE_ADMIN_TOKEN` (the same admin token
-used by service sessions):
+Storage is dual-backend, dispatched the same way as every other
+`memory-engine-api` store: `MEMORY_ENGINE_POSTGRES_URL` set → Postgres
+(`memory_engine_waitlist_entries` plus an append-only
+`memory_engine_waitlist_audit_log` recording every join/invite/delete
+transition); unset → the local file store only
+(`crates/memory-engine-api-state/src/waitlist.rs`, `_waitlist.json` beside
+the other store-root sidecars under `MEMORY_ENGINE_API_STORE_DIR`, with its
+own `_waitlist_audit.jsonl` mirroring the same audit contract for local
+dev/tests without a database). Production always runs Postgres-backed; the
+join and admin routes below no longer return `503` there.
+
+Operator surface, gated by `MEMORY_ENGINE_ADMIN_TOKEN` (the same admin token
+used by service sessions) — list, export, mark invited, and delete, with no
+direct SQL required:
 
 ```sh
 base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+
+# List every entry as JSON.
 curl -fsS --max-time 20 \
   -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
   "$base/internal/waitlist"
 # -> [{"email":"...","createdAtMs":...,"updatedAtMs":...,"source":"first-run","invitedAtMs":null}, ...]
+
+# Export the same rows as CSV (email,createdAtMs,updatedAtMs,source,invitedAtMs).
+curl -fsS --max-time 20 \
+  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
+  "$base/internal/waitlist/export"
+
+# Mark one address invited. Idempotent: inviting an already-invited address
+# again returns its existing invitedAtMs unchanged. 404 if the address never
+# joined.
+curl -fsS --max-time 20 \
+  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"email":"<address>"}' \
+  "$base/internal/waitlist/invite"
+
+# Delete one address. Removes only the operational row; the audit log keeps
+# a permanent record that the address joined (and was invited, if it was).
+# 404 if the address is not present.
+curl -fsS --max-time 20 \
+  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"email":"<address>"}' \
+  "$base/internal/waitlist/delete"
 ```
 
-`/internal/waitlist` is operator tooling, not a versioned public contract —
-it sits beside `/internal/scheduler/return-notifications`, outside `/v1/*`.
-There is no export/invite-transition/delete surface or CLI wrapper yet;
-today an operator lists entries here and invites by hand through the
-existing allowlist + magic-link path. Local dev: the file store keeps
-`_waitlist.json` beside the other store-root sidecars
-(`_jobs.json`, `_rate_limits/`) under `MEMORY_ENGINE_API_STORE_DIR`.
+All four routes sit beside `/internal/scheduler/return-notifications`,
+outside the versioned `/v1/*` contract — operator tooling, not a public API
+surface. Marking invited only records that state on the waitlist row; it
+does not grant access. Invited access still requires the operator to add the
+address to `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` so the existing magic-link
+sign-in flow accepts it.
 
 ## Queued generation (machine consumers)
 

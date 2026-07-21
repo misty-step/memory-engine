@@ -146,12 +146,13 @@ impl ApiState {
     /// Join the invite-beta waitlist. Idempotent on normalized email and
     /// silent about allowlist/account state: a repeat join or a join by an
     /// address that already has access looks identical to a brand-new one.
+    /// Persists to Postgres in production and to the file store locally.
     ///
     /// # Errors
     ///
     /// Returns bad request on a malformed email, too-many-requests when the
-    /// per-email or per-IP limit is spent, and `not_implemented` when the
-    /// registry is Postgres-backed (this slice is file-store only).
+    /// per-email or per-IP limit is spent, and service-unavailable when
+    /// storage rejects the write.
     pub fn join_waitlist(
         &self,
         email: &str,
@@ -167,9 +168,39 @@ impl ApiState {
     /// # Errors
     ///
     /// Returns forbidden when the admin token is unconfigured or mismatched,
-    /// and `not_implemented` when the registry is Postgres-backed.
+    /// and service-unavailable when storage rejects the read.
     pub fn list_waitlist(&self, admin_token: &str) -> Result<Vec<WaitlistEntry>, ApiFailure> {
         self.accounts.list_waitlist(admin_token)
+    }
+
+    /// Mark one waitlist entry invited for the operator, gated by the admin
+    /// token. Idempotent: marking an already-invited entry again leaves its
+    /// `invitedAtMs` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the read or write.
+    pub fn mark_waitlist_invited(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<WaitlistEntry, ApiFailure> {
+        self.accounts.mark_waitlist_invited(admin_token, email)
+    }
+
+    /// Delete one waitlist entry for the operator, gated by the admin token.
+    /// The append-only audit trail keeps a record of what happened to the
+    /// address; only the operational row is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the write.
+    pub fn delete_waitlist_entry(&self, admin_token: &str, email: &str) -> Result<(), ApiFailure> {
+        self.accounts.delete_waitlist_entry(admin_token, email)
     }
 
     /// Issue (or rotate) the service-session credential for an allowlisted

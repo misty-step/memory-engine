@@ -343,6 +343,32 @@ ALTER TABLE memory_engine_generation_job_attempts
     ADD COLUMN IF NOT EXISTS generation_run_id TEXT;
 ";
 
+/// Production waitlist storage: one row per normalized email plus an
+/// append-only audit log of every join/invite/delete transition. The
+/// audit log is intentionally separate from the operational row so a
+/// `delete` can remove an address from the live waitlist while the
+/// operator still has a durable record that the address existed and what
+/// happened to it.
+const WAITLIST_MIGRATION_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS memory_engine_waitlist_entries (
+    email_normalized TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    invited_at_ms BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS memory_engine_waitlist_audit_log (
+    audit_id BIGSERIAL PRIMARY KEY,
+    email_normalized TEXT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('joined', 'invited', 'deleted')),
+    occurred_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_waitlist_audit_log_email_idx
+    ON memory_engine_waitlist_audit_log(email_normalized, occurred_at_ms);
+";
+
 /// The complete schema text remains available for smoke checks and operators.
 /// Runtime migration application uses the versioned list below.
 pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -351,6 +377,7 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOBS_MIGRATION_SQL,
         GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL,
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
+        WAITLIST_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -376,6 +403,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, GENERATION_JOBS_MIGRATION_SQL),
     (3, GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL),
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
+    (5, WAITLIST_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -438,6 +466,17 @@ pub enum PostgresEnqueueOutcome {
     Rejected(String),
 }
 
+/// One waitlist row as read back from Postgres. Mirrors
+/// `memory_engine_api_state::WaitlistEntry`; kept as a separate type so this
+/// crate never depends on the HTTP-facing boundary crate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostgresWaitlistEntry {
+    pub email: String,
+    pub source: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub invited_at_ms: Option<i64>,
+}
 impl AccountScope {
     /// Build an account scope for all subsequent store operations.
     ///
@@ -2037,6 +2076,132 @@ impl PostgresStudyStore {
         )?;
         Ok(changed == 1)
     }
+
+    /// Record a waitlist join and append a `joined` audit-log entry.
+    /// Idempotent on normalized email: a repeat join only bumps
+    /// `updated_at_ms` and still appends its own audit row, so the log
+    /// reflects every touch, not just the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn waitlist_join(
+        &mut self,
+        email_normalized: &str,
+        source: &str,
+        now_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.execute(
+            "INSERT INTO memory_engine_waitlist_entries
+                (email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms)
+             VALUES ($1, $2, $3, $3, NULL)
+             ON CONFLICT (email_normalized) DO UPDATE
+             SET updated_at_ms = EXCLUDED.updated_at_ms",
+            &[&email_normalized, &source, &now_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+             VALUES ($1, 'joined', $2)",
+            &[&email_normalized, &now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// List every waitlist entry, ordered by normalized email.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn waitlist_list(&mut self) -> Result<Vec<PostgresWaitlistEntry>, PostgresStoreError> {
+        let rows = self.client.borrow_mut().query(
+            "SELECT email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms
+             FROM memory_engine_waitlist_entries
+             ORDER BY email_normalized",
+            &[],
+        )?;
+        Ok(rows.iter().map(waitlist_entry_from_row).collect())
+    }
+
+    /// Mark one waitlist entry invited, idempotently, appending an
+    /// `invited` audit-log entry only on the first transition. Returns
+    /// `None` when no entry matches the normalized email.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read or write.
+    pub fn waitlist_mark_invited(
+        &mut self,
+        email_normalized: &str,
+        now_ms: i64,
+    ) -> Result<Option<PostgresWaitlistEntry>, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let Some(row) = transaction.query_opt(
+            "SELECT email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms
+             FROM memory_engine_waitlist_entries
+             WHERE email_normalized = $1
+             FOR UPDATE",
+            &[&email_normalized],
+        )?
+        else {
+            transaction.rollback()?;
+            return Ok(None);
+        };
+        let existing_invited_at_ms: Option<i64> = row.get(4);
+        if existing_invited_at_ms.is_none() {
+            transaction.execute(
+                "UPDATE memory_engine_waitlist_entries
+                 SET invited_at_ms = $2
+                 WHERE email_normalized = $1",
+                &[&email_normalized, &now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+                 VALUES ($1, 'invited', $2)",
+                &[&email_normalized, &now_ms],
+            )?;
+        }
+        let entry = PostgresWaitlistEntry {
+            email: row.get(0),
+            source: row.get(1),
+            created_at_ms: row.get(2),
+            updated_at_ms: row.get(3),
+            invited_at_ms: Some(existing_invited_at_ms.unwrap_or(now_ms)),
+        };
+        transaction.commit()?;
+        Ok(Some(entry))
+    }
+
+    /// Delete one waitlist entry and append a `deleted` audit-log entry.
+    /// Returns `false` when no entry matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn waitlist_delete(
+        &mut self,
+        email_normalized: &str,
+        now_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let deleted = transaction.execute(
+            "DELETE FROM memory_engine_waitlist_entries WHERE email_normalized = $1",
+            &[&email_normalized],
+        )?;
+        if deleted > 0 {
+            transaction.execute(
+                "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+                 VALUES ($1, 'deleted', $2)",
+                &[&email_normalized, &now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
 }
 
 fn generation_job_from_row(row: &postgres::Row) -> PostgresGenerationJob {
@@ -2059,6 +2224,16 @@ fn generation_job_from_row(row: &postgres::Row) -> PostgresGenerationJob {
         lease_expires_at: row.get(13),
         lease_token: row.get(14),
         reserved_cost_usd_micros: row.get(15),
+    }
+}
+
+fn waitlist_entry_from_row(row: &postgres::Row) -> PostgresWaitlistEntry {
+    PostgresWaitlistEntry {
+        email: row.get(0),
+        source: row.get(1),
+        created_at_ms: row.get(2),
+        updated_at_ms: row.get(3),
+        invited_at_ms: row.get(4),
     }
 }
 
@@ -5119,6 +5294,26 @@ mod tests {
     }
 
     #[test]
+    fn live_postgres_waitlist_join_invite_and_delete_round_trip() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!("memory_engine_test_waitlist_{}_{}", std::process::id(), NOW);
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = run_live_postgres_waitlist_contract(&scoped_url);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live postgres waitlist contract");
+    }
+
+    #[test]
     fn live_postgres_return_notification_claim_is_atomic_and_fenced() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
@@ -5518,6 +5713,72 @@ mod tests {
             "app-account-ip:203.0.113.11".to_owned(),
         ];
         assert!(!store.record_rate_limit_attempts(&keys, NOW + 60_000, 900_000, MAX_ATTEMPTS)?);
+
+        Ok(())
+    }
+
+    fn run_live_postgres_waitlist_contract(database_url: &str) -> Result<(), PostgresStoreError> {
+        let mut store = PostgresStudyStore::connect(database_url)?;
+        store.migrate()?;
+
+        // A fresh join creates one row and a `joined` audit entry.
+        store.waitlist_join("waitlist-live@example.com", "first-run", NOW)?;
+        let entries = store.waitlist_list()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].email, "waitlist-live@example.com");
+        assert_eq!(entries[0].source, "first-run");
+        assert_eq!(entries[0].created_at_ms, NOW);
+        assert_eq!(entries[0].updated_at_ms, NOW);
+        assert_eq!(entries[0].invited_at_ms, None);
+
+        // A duplicate join is idempotent: same row, bumped `updated_at_ms`,
+        // unchanged `created_at_ms`, still exactly one row.
+        store.waitlist_join("waitlist-live@example.com", "first-run", NOW + 1_000)?;
+        let entries = store.waitlist_list()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].created_at_ms, NOW);
+        assert_eq!(entries[0].updated_at_ms, NOW + 1_000);
+
+        // Marking invited transitions once and is idempotent thereafter.
+        let invited = store
+            .waitlist_mark_invited("waitlist-live@example.com", NOW + 2_000)?
+            .expect("entry exists");
+        assert_eq!(invited.invited_at_ms, Some(NOW + 2_000));
+        let invited_again = store
+            .waitlist_mark_invited("waitlist-live@example.com", NOW + 3_000)?
+            .expect("entry exists");
+        assert_eq!(invited_again.invited_at_ms, Some(NOW + 2_000));
+
+        // Marking an unknown email invited is a clean `None`, not an error.
+        assert_eq!(
+            store.waitlist_mark_invited("unknown@example.com", NOW + 3_000)?,
+            None
+        );
+
+        // Every join/invite transition left its own append-only audit row.
+        let mut raw = crate::connect_client(database_url)?;
+        let audit_rows = raw.query(
+            "SELECT email_normalized, event FROM memory_engine_waitlist_audit_log ORDER BY audit_id",
+            &[],
+        )?;
+        let audit_events: Vec<(String, String)> = audit_rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            audit_events,
+            vec![
+                ("waitlist-live@example.com".to_owned(), "joined".to_owned()),
+                ("waitlist-live@example.com".to_owned(), "joined".to_owned()),
+                ("waitlist-live@example.com".to_owned(), "invited".to_owned()),
+            ]
+        );
+
+        // Delete removes the operational row; the audit trail above proves
+        // the history stays intact because delete never touches that table.
+        assert!(store.waitlist_delete("waitlist-live@example.com", NOW + 4_000)?);
+        assert_eq!(store.waitlist_list()?, Vec::new());
+        assert!(!store.waitlist_delete("waitlist-live@example.com", NOW + 5_000)?);
 
         Ok(())
     }
