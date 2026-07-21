@@ -27,9 +27,9 @@ use axum::{
     Json,
 };
 use hmac::Hmac;
-use memory_engine_generation::FallbackProvider;
 #[cfg(test)]
 use memory_engine_generation::DraftProvider;
+use memory_engine_generation::FallbackProvider;
 pub use memory_engine_openrouter::OpenRouterConfig;
 use memory_engine_openrouter::OpenRouterProvider;
 pub use memory_engine_persistence::SourcePermission;
@@ -2486,7 +2486,9 @@ where
         .find(|source| source.id == source_id)
         .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
     if local_only {
-        return study.generate_with_run_id(ids, run_id).map_err(study_failure);
+        return study
+            .generate_with_run_id(ids, run_id)
+            .map_err(study_failure);
     }
     match generation_provider_config {
         Some(config) => {
