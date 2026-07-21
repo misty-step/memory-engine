@@ -1149,6 +1149,7 @@ fn save_manual_parent(store: &mut BetaPersistenceStore) -> ReviewUnitId {
             generated_prompt_draft_id: None,
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         })
         .expect("manual parent");

@@ -25,7 +25,7 @@ use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVaria
 use memory_engine_persistence::{
     BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptModel, GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan,
-    SourceDocument, SourceDocumentKind, SourcePermission,
+    RemediationPackRecord, SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use serde::Deserialize;
 
@@ -583,6 +583,13 @@ impl BenchGenerationStore {
             .retain(|existing| existing.id != draft.id);
         self.snapshot.generated_prompt_drafts.push(draft);
     }
+
+    fn upsert_remediation_pack(&mut self, pack: RemediationPackRecord) {
+        self.snapshot
+            .remediation_packs
+            .retain(|existing| existing.id != pack.id);
+        self.snapshot.remediation_packs.push(pack);
+    }
 }
 
 impl BetaGenerationStore for BenchGenerationStore {
@@ -619,6 +626,14 @@ impl BetaGenerationStore for BenchGenerationStore {
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         self.upsert_generated_prompt_draft(draft.clone());
         Ok(draft)
+    }
+
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error> {
+        self.upsert_remediation_pack(pack.clone());
+        Ok(pack)
     }
 }
 

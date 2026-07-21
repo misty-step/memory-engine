@@ -127,6 +127,8 @@ pub struct GeneratedPromptDraft {
     pub model: GeneratedPromptModel,
     pub validation: GeneratedPromptValidation,
     pub critique_notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_pack_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -172,6 +174,43 @@ pub struct ConceptReferenceNote {
     pub updated_at: i64,
 }
 
+/// Lifecycle of one boundary-owned remediation pack.
+///
+/// A pack is created when a learner answers a review unit wrong, close, or
+/// revealed; its members are easier prerequisite quizzes shown ahead of the
+/// deferred parent. Remediation packs never use `supersedes` — the parent is
+/// only deferred (via `snoozed_until`), never hidden by mastery, so it always
+/// comes back.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemediationPackStatus {
+    Active,
+    Completed,
+    Rejected,
+    Expired,
+    Exited,
+}
+
+/// Boundary-owned lineage connecting a remediation pack to its exact failed
+/// attempt and parent review unit.
+///
+/// `attempt_id` is the grading attempt's idempotency key, reused (not
+/// reinvented) so duplicate requests, retries, and process restarts resolve
+/// to the same pack instead of generating a second one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemediationPackRecord {
+    pub id: String,
+    pub parent_review_unit_id: ReviewUnitId,
+    pub attempt_id: String,
+    pub concept_key: String,
+    pub review_unit_ids: Vec<ReviewUnitId>,
+    pub status: RemediationPackStatus,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BetaReviewUnitRecord {
@@ -187,6 +226,8 @@ pub struct BetaReviewUnitRecord {
     pub archived_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_pack_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -316,6 +357,8 @@ pub struct BetaStoreSnapshot {
     pub applied_reviews: Vec<AppliedReviewReceipt>,
     #[serde(default)]
     pub concept_reference_notes: Vec<ConceptReferenceNote>,
+    #[serde(default)]
+    pub remediation_packs: Vec<RemediationPackRecord>,
 }
 
 impl Default for BetaStoreSnapshot {
@@ -332,6 +375,7 @@ impl Default for BetaStoreSnapshot {
             content_feedback: Vec::new(),
             applied_reviews: Vec::new(),
             concept_reference_notes: Vec::new(),
+            remediation_packs: Vec::new(),
         }
     }
 }
@@ -821,6 +865,24 @@ impl BetaPersistenceStore {
         })
     }
 
+    /// Save or replace a boundary-owned remediation pack record.
+    ///
+    /// Upserts by `id`, so resolving a pack's status (Completed, Rejected,
+    /// Expired, Exited) is the same call as creating it: fetch, mutate, save.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] for commit failures.
+    pub fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, BetaStoreError> {
+        self.transact(|snapshot| {
+            upsert_by_id(&mut snapshot.remediation_packs, pack.clone());
+            Ok(pack)
+        })
+    }
+
     /// Save or replace a generated prompt draft.
     ///
     /// # Errors
@@ -880,6 +942,7 @@ impl BetaPersistenceStore {
                 generated_prompt_draft_id: Some(draft.id.clone()),
                 archived_at: None,
                 snoozed_until: None,
+                remediation_pack_id: draft.remediation_pack_id.clone(),
                 created_at: draft.created_at,
             };
             snapshot.review_units.push(review_unit.clone());
@@ -1681,6 +1744,12 @@ impl HasId for GeneratedPromptDraft {
 }
 
 impl HasId for GenerationRun {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for RemediationPackRecord {
     fn id(&self) -> &str {
         &self.id
     }

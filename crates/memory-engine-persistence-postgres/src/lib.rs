@@ -23,7 +23,8 @@ use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     parse_strict_boolean_answer, AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions,
     BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
+    GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, RemediationPackRecord,
+    ScheduleRecord, SourceDocument,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -342,6 +343,20 @@ ALTER TABLE memory_engine_generation_job_attempts
     ADD COLUMN IF NOT EXISTS generation_run_id TEXT;
 ";
 
+const REMEDIATION_PACKS_MIGRATION_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS memory_engine_remediation_packs (
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    pack_id TEXT NOT NULL,
+    pack JSONB NOT NULL,
+    attempt_id TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (account_id, pack_id)
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_remediation_packs_attempt_idx
+    ON memory_engine_remediation_packs(account_id, attempt_id);
+";
+
 /// The complete schema text remains available for smoke checks and operators.
 /// Runtime migration application uses the versioned list below.
 pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -350,6 +365,7 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOBS_MIGRATION_SQL,
         GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL,
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
+        REMEDIATION_PACKS_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -375,6 +391,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, GENERATION_JOBS_MIGRATION_SQL),
     (3, GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL),
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
+    (5, REMEDIATION_PACKS_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -2139,6 +2156,9 @@ impl AccountStudyStore<'_> {
                 UNION ALL
                 SELECT 'concept_reference_note', updated_at_ms, concept_key::text, note
                 FROM memory_engine_concept_reference_notes WHERE account_id = $1
+                UNION ALL
+                SELECT 'remediation_pack', created_at_ms, pack_id::text, pack
+                FROM memory_engine_remediation_packs WHERE account_id = $1
              ) AS snapshot_rows
              ORDER BY kind, sort_at, sort_id",
             &[&self.scope.account_id],
@@ -2194,6 +2214,11 @@ impl AccountStudyStore<'_> {
                 "concept_reference_note" => {
                     snapshot
                         .concept_reference_notes
+                        .push(serde_json::from_value(value)?);
+                }
+                "remediation_pack" => {
+                    snapshot
+                        .remediation_packs
                         .push(serde_json::from_value(value)?);
                 }
                 _ => unreachable!("snapshot query returned an unknown row kind"),
@@ -2367,6 +2392,7 @@ impl AccountStudyStore<'_> {
                 generated_prompt_draft_id: Some(draft.id.clone()),
                 archived_at: None,
                 snoozed_until: None,
+                remediation_pack_id: draft.remediation_pack_id.clone(),
                 created_at: draft.created_at,
             };
             let value = serde_json::to_value(&review_unit)?;
@@ -2766,6 +2792,36 @@ impl AccountStudyStore<'_> {
                  SET note = EXCLUDED.note,
                      updated_at_ms = EXCLUDED.updated_at_ms",
                 &[&account_id, &note.concept_key, &value, &note.updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Save or replace a boundary-owned remediation pack record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when serialization or persistence fails.
+    pub fn save_remediation_pack(
+        &mut self,
+        pack: &RemediationPackRecord,
+    ) -> Result<(), PostgresStoreError> {
+        let value = serde_json::to_value(pack)?;
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_remediation_packs
+                    (account_id, pack_id, pack, attempt_id, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (account_id, pack_id) DO UPDATE
+                 SET pack = EXCLUDED.pack",
+                &[
+                    &account_id,
+                    &pack.id,
+                    &value,
+                    &pack.attempt_id,
+                    &pack.created_at,
+                ],
             )?;
             Ok(())
         })
@@ -3173,6 +3229,15 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
 
         Ok(draft)
     }
+
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error> {
+        AccountStudyStore::save_remediation_pack(self, &pack)?;
+
+        Ok(pack)
+    }
 }
 
 impl ContentFeedbackStore for AccountStudyStore<'_> {
@@ -3394,6 +3459,7 @@ fn current_review_unit_matches(
         content_feedback: Vec::new(),
         applied_reviews: Vec::new(),
         concept_reference_notes: Vec::new(),
+        remediation_packs: Vec::new(),
     };
 
     Ok(select_current_review_unit(&snapshot, &candidates, now)
@@ -5953,6 +6019,7 @@ mod tests {
                 reasons: Vec::new(),
             },
             critique_notes: vec!["Grounded in live Postgres source span.".to_owned()],
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }
@@ -5968,6 +6035,7 @@ mod tests {
             generated_prompt_draft_id: Some(draft.id.clone()),
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }
@@ -5994,6 +6062,7 @@ mod tests {
             generated_prompt_draft_id: None,
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }

@@ -7,8 +7,8 @@ use memory_engine_core::{QueueCandidate, ReviewUnitId, ReviewUnitLifecycle, Sche
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord,
-    BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GenerationRun, ReferenceSpan,
-    SourceDocument,
+    BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GenerationRun,
+    ReferenceSpan, RemediationPackRecord, SourceDocument,
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
@@ -62,6 +62,13 @@ impl BetaGenerationStore for SnapshotCountingStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         self.inner.save_generated_prompt_draft(draft)
+    }
+
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error> {
+        self.inner.save_remediation_pack(pack)
     }
 }
 
