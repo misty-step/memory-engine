@@ -746,16 +746,22 @@ fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
                 >= 3)
 }
 
+/// Checks whether `word` appears as a whole token in `haystack`, splitting on
+/// any non-alphanumeric byte. Plain `str::contains` would let compound words
+/// such as "universe", "diverse", or "quoted" trip on "verse"/"quote" and
+/// silently convert ordinary conceptual prose into a recitation exercise.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|token| token == word)
+}
+
 fn looks_explicit_verbatim(normalized: &str) -> bool {
-    normalized.contains("recite")
-        || normalized.contains("memorize")
-        || normalized.contains("verbatim")
-        || normalized.contains("poem")
-        || normalized.contains("oath")
-        || normalized.contains("creed")
-        || normalized.contains("excerpt")
-        || normalized.contains("verse")
-        || normalized.contains("quote")
+    [
+        "recite", "memorize", "verbatim", "poem", "oath", "creed", "excerpt", "verse", "quote",
+    ]
+    .iter()
+    .any(|keyword| contains_word(normalized, keyword))
 }
 
 /// Apply deterministic content policy after a provider has classified a source.
@@ -779,19 +785,31 @@ pub fn enforce_content_policy(
             drafts.candidates =
                 enumerable_candidates(source, source.body.as_deref().unwrap_or_default());
             assert_exhaustive_indices(&drafts.candidates);
+            // The provider's own per-candidate failures described candidates
+            // that no longer exist once the policy replaced them wholesale;
+            // carrying them forward would misreport diagnostics against a
+            // fully exhaustive, policy-owned draft set.
+            drafts.failures.clear();
         }
         // The legacy 047/084 ordinal prose fixture remains fact-labelled for
         // intent-shape parity, but its source-owned coverage oracle is still a
         // finite ordinal set and must receive the complete enumerable drafts.
-        LearningIntent::FactRecall if ordinal_mapping_entries(body).len() >= 3 => {
+        // A two-entry ordinal mapping (e.g. a binary on/off toggle) is still a
+        // finite, non-derivable set and deserves the same exhaustive coverage
+        // as three-or-more entries.
+        LearningIntent::FactRecall
+            if is_definitive_mapping(body, ordinal_mapping_entries(body).len()) =>
+        {
             drafts.candidates = enumerable_candidates(source, body);
             assert_exhaustive_indices(&drafts.candidates);
+            drafts.failures.clear();
         }
         LearningIntent::VerbatimMemorization => {
             drafts.learning_intent = Some(classification.intent);
             drafts.candidates =
                 verbatim_candidates(source, source.body.as_deref().unwrap_or_default());
             assert_exhaustive_indices(&drafts.candidates);
+            drafts.failures.clear();
         }
         LearningIntent::ConceptUnderstanding
         | LearningIntent::FactRecall
@@ -807,18 +825,35 @@ struct EnumerableEntry {
     evidence: String,
 }
 
+/// A finite key-to-value mapping (e.g. "0 is off. 1 is on.") is a
+/// non-derivable set even with just two entries. But `mapping_entries`
+/// splits on every '.', so a two-entry match can also be an incidental
+/// fragment of an unrelated sentence buried inside a much larger,
+/// already-structured document (for example a "Reference: C is CHARLIE. A
+/// is ALFA." annotation line inside an authored multi-block source). Three
+/// or more entries are unambiguous regardless of body size; exactly two are
+/// trusted only when the whole body is small enough that the mapping is
+/// plausibly the entire point of the source.
+const TWO_ENTRY_MAPPING_BODY_WORD_LIMIT: usize = 40;
+
+fn is_definitive_mapping(body: &str, entry_count: usize) -> bool {
+    entry_count >= 3
+        || (entry_count == 2
+            && body.split_whitespace().count() <= TWO_ENTRY_MAPPING_BODY_WORD_LIMIT)
+}
+
 fn looks_enumerable(body: &str, lines: &[String]) -> bool {
-    mapping_entries(body).len() >= 3 || list_entries(lines).len() >= 3
+    is_definitive_mapping(body, mapping_entries(body).len()) || list_entries(lines).len() >= 3
 }
 
 fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
     let ordinal_mappings = ordinal_mapping_entries(body);
-    if ordinal_mappings.len() >= 3 {
+    if is_definitive_mapping(body, ordinal_mappings.len()) {
         return ordinal_mappings;
     }
 
     let mappings = mapping_entries(body);
-    if mappings.len() >= 3 {
+    if is_definitive_mapping(body, mappings.len()) {
         return mappings;
     }
 

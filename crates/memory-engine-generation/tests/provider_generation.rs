@@ -432,6 +432,65 @@ fn finite_sets_with_weak_process_words_keep_enumerable_semantics() {
 }
 
 #[test]
+fn two_entry_finite_mappings_receive_exhaustive_enumerable_coverage() {
+    let source = source_document(
+        "src-binary-toggle",
+        "Binary toggle states",
+        "0 is off. 1 is on.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::EnumerableSet,
+        "a two-entry key-to-value mapping is still a finite, non-derivable set"
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("two-entry mapping generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 2);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["off", "on"]
+    );
+}
+
+#[test]
+fn conceptual_prose_with_collision_substrings_is_not_misclassified_as_verbatim() {
+    // "universe" and "diverse" contain "verse"; "quoted" contains "quote".
+    // A naive substring check on the verbatim keyword gate would wrongly
+    // force recitation cards onto this ordinary conceptual paragraph.
+    let source = source_document(
+        "src-universe-concept",
+        "Diverse views of the universe",
+        "The universe contains diverse galaxies. Philosophers argue that quoted prose about \
+         physics helps students grasp the underlying principle without needing memorization.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ConceptUnderstanding,
+        "substrings like universe/diverse/quoted must not trip the verbatim keyword gate"
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("conceptual generation");
+    assert_ne!(
+        drafts.learning_intent,
+        Some(LearningIntent::VerbatimMemorization)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_kind != GeneratedLearningActivityKind::Exercise));
+}
+
+#[test]
 fn sequential_sources_emit_one_verbatim_card_per_sentence() {
     let source = source_document(
         "src-sequence",
