@@ -516,6 +516,21 @@ pub fn render_return_notification_disabled() -> String {
     document(&screen_centered("", view, FOOTER_TAGLINE))
 }
 
+#[must_use]
+pub fn render_return_notification_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Return gently</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
 fn document(inner: &str) -> String {
     document_with_head(inner, "")

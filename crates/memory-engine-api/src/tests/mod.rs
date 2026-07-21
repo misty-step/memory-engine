@@ -3237,6 +3237,19 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .expect("stale unsubscribe GET response");
     assert_eq!(stale_get.status(), StatusCode::FORBIDDEN);
     assert_no_store_and_no_referrer(&stale_get);
+    assert_eq!(
+        stale_get
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let stale_get_body = response_text(stale_get).await;
+    assert!(stale_get_body.contains("reminder link"));
+    assert!(stale_get_body.contains(r#"<a class="ae-accent" href="/">Back to Scry</a>"#));
+    assert!(!stale_get_body.contains(r#"{"error""#));
+    assert!(!stale_get_body.contains("Memory Engine"));
     let stale_post = app
         .clone()
         .oneshot(form_request(
@@ -3254,6 +3267,17 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .expect("stale unsubscribe POST response");
     assert_eq!(stale_post.status(), StatusCode::FORBIDDEN);
     assert_no_store_and_no_referrer(&stale_post);
+    assert_eq!(
+        stale_post
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let stale_post_body = response_text(stale_post).await;
+    assert!(stale_post_body.contains("reminder link"));
+    assert!(!stale_post_body.contains(r#"{"error""#));
 
     let current_get = app
         .clone()
@@ -3282,6 +3306,182 @@ async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
         .await
         .expect("current unsubscribe POST response");
     assert_eq!(current_post.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn invalid_or_expired_return_notification_token_renders_direct_recovery_instead_of_json() {
+    // A token that was never issued: no `.` payload/signature separator, so
+    // `verify_unsubscribe_token` fails before any HMAC computation. Needs no
+    // account/auth setup — the failure is structural, not scope-related.
+    let bogus_app = router(ApiState::default());
+    let bogus_get = bogus_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/return-notifications?token=not-a-real-token")
+                .body(Body::empty())
+                .expect("bogus token GET"),
+        )
+        .await
+        .expect("bogus token GET response");
+    assert_eq!(bogus_get.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&bogus_get);
+    assert_eq!(
+        bogus_get
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let bogus_get_body = response_text(bogus_get).await;
+    assert!(bogus_get_body.contains("That reminder link needs a refresh"));
+    assert!(bogus_get_body.contains(r#"<a class="ae-accent" href="/">Back to Scry</a>"#));
+    assert!(!bogus_get_body.contains(r#"{"error""#));
+    assert!(!bogus_get_body.contains("Memory Engine"));
+
+    let bogus_post = bogus_app
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[("unsubscribeToken", "not-a-real-token")],
+        ))
+        .await
+        .expect("bogus token POST response");
+    assert_eq!(bogus_post.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&bogus_post);
+    assert_eq!(
+        bogus_post
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let bogus_post_body = response_text(bogus_post).await;
+    assert!(bogus_post_body.contains("That reminder link needs a refresh"));
+    assert!(!bogus_post_body.contains(r#"{"error""#));
+
+    // A real, correctly signed token whose `expires_at_ms` has since passed.
+    let (expiry_clock, expiry_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    expiry_clock.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let store_root = temp_store_root("return-notification-token-expiry-recovery");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(expiry_now)
+            .with_auth_config(
+                AuthConfig::allow_emails(["learner@example.com".to_owned()])
+                    .with_unsubscribe_secret("test-unsubscribe-secret")
+                    .with_link_outbox(&outbox_path),
+            ),
+    ));
+    let requested = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/account",
+            &[("email", "learner@example.com")],
+        ))
+        .await
+        .expect("request magic link");
+    let verify_path = fs::read_to_string(&outbox_path)
+        .expect("auth outbox")
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').nth(1))
+        .map(str::to_owned)
+        .expect("magic link");
+    drop(requested);
+    let verified = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&verify_path)
+                .body(Body::empty())
+                .expect("verify request"),
+        )
+        .await
+        .expect("verify");
+    let cookie = session_cookie(&verified);
+    let verified = response_text(verified).await;
+    let csrf_token = html_value(&verified, "csrfToken");
+
+    app.clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("enabled", "on"),
+                ("reminderEmail", "learner@example.com"),
+            ],
+        ))
+        .await
+        .expect("enable return channel");
+    let outbox = fs::read_to_string(&outbox_path).expect("outbox after enable");
+    let unsubscribe_link = outbox
+        .lines()
+        .find(|line| line.starts_with("due-count\t"))
+        .and_then(|line| line.split('\t').nth(4))
+        .expect("signed unsubscribe link")
+        .to_owned();
+    let token = unsubscribe_link
+        .split("token=")
+        .nth(1)
+        .expect("token")
+        .to_owned();
+
+    expiry_clock.fetch_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS + 1, Ordering::SeqCst);
+
+    let expired_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&unsubscribe_link)
+                .body(Body::empty())
+                .expect("expired token GET"),
+        )
+        .await
+        .expect("expired token GET response");
+    assert_eq!(expired_get.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&expired_get);
+    assert_eq!(
+        expired_get
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let expired_get_body = response_text(expired_get).await;
+    assert!(expired_get_body.contains("That reminder link needs a refresh"));
+    assert!(expired_get_body.contains("invalid or expired"));
+    assert!(!expired_get_body.contains(r#"{"error""#));
+
+    let expired_post = app
+        .oneshot(form_request(
+            "POST",
+            "/app/return-notifications",
+            &[("unsubscribeToken", &token)],
+        ))
+        .await
+        .expect("expired token POST response");
+    assert_eq!(expired_post.status(), StatusCode::FORBIDDEN);
+    assert_no_store_and_no_referrer(&expired_post);
+    assert_eq!(
+        expired_post
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+        "text/html; charset=utf-8"
+    );
+    let expired_post_body = response_text(expired_post).await;
+    assert!(expired_post_body.contains("That reminder link needs a refresh"));
+    assert!(!expired_post_body.contains(r#"{"error""#));
 }
 
 #[test]

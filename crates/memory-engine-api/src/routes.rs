@@ -30,9 +30,9 @@ use memory_engine_api_render::{
     render_auth_recovery, render_content_feedback_recovery_html,
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions,
-    ContentFeedbackRecovery, LEDGER_CSS,
+    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
+    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
+    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -1228,7 +1228,7 @@ async fn return_notification_page(
     Query(query): Query<AppReturnNotificationQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> Result<Response, ApiFailure> {
         if let Some(token) = query.token.as_deref() {
             state.validate_return_notification_token(token)?;
             return Ok(no_store_response(
@@ -1243,11 +1243,30 @@ async fn return_notification_page(
     .await;
     match result {
         Ok(Ok(response)) => response,
+        Ok(Err(error)) if error.is_return_notification_link_invalid() => {
+            return_notification_token_recovery_response(&error)
+        }
         Ok(Err(error)) => no_store_response(app_failure_response(error)),
         Err(error) => no_store_response(app_failure_response(ApiFailure::internal(format!(
             "notification page worker join failed: {error}"
         )))),
     }
+}
+
+/// Style a return-notification (due-count reminder) token failure as a
+/// direct recovery page instead of the raw JSON `app_failure_response`
+/// would otherwise render. This route is reached straight from an emailed
+/// link, never through the authenticated app shell, so there is no session
+/// to recover — the only safe next action is back to the study space.
+fn return_notification_token_recovery_response(error: &ApiFailure) -> Response {
+    let status = error.status();
+    let mut response = Html(render_return_notification_recovery(
+        "That reminder link needs a refresh",
+        &error.message,
+    ))
+    .into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
 }
 
 async fn update_return_notifications(
@@ -1269,6 +1288,9 @@ async fn update_return_notifications(
             .and_then(|result| result);
         return no_store_response(match result {
             Ok(()) => Html(render_return_notification_disabled()).into_response(),
+            Err(error) if error.is_return_notification_link_invalid() => {
+                return_notification_token_recovery_response(&error)
+            }
             Err(error) => app_failure_response(error),
         });
     }
