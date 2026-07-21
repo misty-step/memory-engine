@@ -710,7 +710,7 @@ where
 pub fn run_remediation_pack_generation_with_provider<S>(
     store: &mut S,
     provider: &dyn BridgeMaterialProvider,
-    request: RemediationPackGenerationRequest,
+    request: &RemediationPackGenerationRequest,
 ) -> Result<RemediationPackGenerationResult, BetaGenerationError<S::Error>>
 where
     S: BetaGenerationStore,
@@ -730,8 +730,7 @@ where
     }
 
     let pack_id = format!("remediation-pack:{}", request.attempt_id);
-    let context =
-        bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
+    let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
     let provider_request = bridge_material_request(&snapshot, &context);
     let material = provider
         .generate_bridge_material(&provider_request)
@@ -740,9 +739,10 @@ where
         .model
         .clone()
         .unwrap_or_else(|| material.model.clone());
-    let (note, note_body, _) = bridge_reference_note(&context, &material, &model, request.started_at);
+    let (note, note_body, _) =
+        bridge_reference_note(&context, &material, &model, request.started_at);
 
-    let run_request = remediation_pack_run_request(&request);
+    let run_request = remediation_pack_run_request(request);
     store
         .save_generation_run(run_receipt(&run_request, &model, RunProgress::Started))
         .map_err(BetaGenerationError::Store)?;
@@ -1374,8 +1374,14 @@ fn bridge_draft(
     candidate: &DraftCandidate,
     context: &BridgeDraftContext<'_>,
 ) -> GeneratedPromptDraft {
+    // Remediation members are scoped by pack lineage (`remediation-pack:{attempt_id}`),
+    // not the constant "remediation" domain key, so a later distinct failed
+    // attempt against the same parent mints genuinely new review-unit ids
+    // instead of colliding with an earlier, already-resolved pack's members.
+    // Bridge material (no pack id) keeps its original domain-scoped id.
+    let unit_id_prefix = context.remediation_pack_id.unwrap_or(context.domain_key);
     let unit_id = ReviewUnitId::new(bridge_generated_id(
-        context.domain_key,
+        unit_id_prefix,
         activity_kind_slug(&candidate.activity_kind),
         context.parent_review_unit_id,
         candidate,

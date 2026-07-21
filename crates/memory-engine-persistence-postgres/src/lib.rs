@@ -2171,58 +2171,7 @@ impl AccountStudyStore<'_> {
         for row in rows {
             let kind: &str = row.get(0);
             let value: serde_json::Value = row.get(1);
-            match kind {
-                "source_document" => {
-                    snapshot
-                        .source_documents
-                        .push(serde_json::from_value(value)?);
-                }
-                "reference_span" => {
-                    snapshot
-                        .reference_spans
-                        .push(serde_json::from_value(value)?);
-                }
-                "generated_prompt_draft" => {
-                    snapshot
-                        .generated_prompt_drafts
-                        .push(serde_json::from_value(value)?);
-                }
-                "review_unit" => {
-                    snapshot.review_units.push(serde_json::from_value(value)?);
-                }
-                "schedule" => {
-                    snapshot.schedules.push(serde_json::from_value(value)?);
-                }
-                "attempt" => {
-                    snapshot.attempts.push(serde_json::from_value(value)?);
-                }
-                "generation_run" => {
-                    snapshot
-                        .generation_runs
-                        .push(serde_json::from_value(value)?);
-                }
-                "content_feedback" => {
-                    snapshot
-                        .content_feedback
-                        .push(serde_json::from_value(value)?);
-                }
-                "applied_review" => {
-                    snapshot
-                        .applied_reviews
-                        .push(serde_json::from_value(value)?);
-                }
-                "concept_reference_note" => {
-                    snapshot
-                        .concept_reference_notes
-                        .push(serde_json::from_value(value)?);
-                }
-                "remediation_pack" => {
-                    snapshot
-                        .remediation_packs
-                        .push(serde_json::from_value(value)?);
-                }
-                _ => unreachable!("snapshot query returned an unknown row kind"),
-            }
+            hydrate_snapshot_row(&mut snapshot, kind, value)?;
         }
         Ok(snapshot)
     }
@@ -3340,6 +3289,44 @@ fn assert_known_review_unit_in_transaction(
         .ok_or_else(|| PostgresStoreError::UnknownReviewUnit(review_unit_id.clone()))
 }
 
+fn hydrate_snapshot_row(
+    snapshot: &mut BetaStoreSnapshot,
+    kind: &str,
+    value: serde_json::Value,
+) -> Result<(), PostgresStoreError> {
+    match kind {
+        "source_document" => snapshot
+            .source_documents
+            .push(serde_json::from_value(value)?),
+        "reference_span" => snapshot
+            .reference_spans
+            .push(serde_json::from_value(value)?),
+        "generated_prompt_draft" => snapshot
+            .generated_prompt_drafts
+            .push(serde_json::from_value(value)?),
+        "review_unit" => snapshot.review_units.push(serde_json::from_value(value)?),
+        "schedule" => snapshot.schedules.push(serde_json::from_value(value)?),
+        "attempt" => snapshot.attempts.push(serde_json::from_value(value)?),
+        "generation_run" => snapshot
+            .generation_runs
+            .push(serde_json::from_value(value)?),
+        "content_feedback" => snapshot
+            .content_feedback
+            .push(serde_json::from_value(value)?),
+        "applied_review" => snapshot
+            .applied_reviews
+            .push(serde_json::from_value(value)?),
+        "concept_reference_note" => snapshot
+            .concept_reference_notes
+            .push(serde_json::from_value(value)?),
+        "remediation_pack" => snapshot
+            .remediation_packs
+            .push(serde_json::from_value(value)?),
+        _ => unreachable!("snapshot query returned an unknown row kind"),
+    }
+    Ok(())
+}
+
 fn review_unit_from_transaction(
     transaction: &mut CountingTransaction<'_>,
     account_id: &str,
@@ -4016,8 +4003,8 @@ mod tests {
         BetaReviewUnitRecord, BetaStoreSnapshot, GeneratedLearningActivityKind,
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
         GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage,
-        PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-        SourcePermission,
+        PersistedQueueCandidate, ReferenceSpan, RemediationPackRecord, RemediationPackStatus,
+        SourceDocument, SourceDocumentKind, SourcePermission,
     };
     use memory_engine_service::{
         record_content_feedback, ContentFeedbackError, ContentFeedbackVerdict,
@@ -5401,6 +5388,7 @@ mod tests {
         run_low_level_postgres_store_contract(&mut store)?;
         run_postgres_study_session_contract(&mut store)?;
         run_postgres_concept_snooze_contract(&mut store)?;
+        run_postgres_remediation_pack_contract(&mut store)?;
 
         Ok(())
     }
@@ -5903,6 +5891,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![NOW + 86_400_000; 2]
         );
+
+        Ok(())
+    }
+
+    /// Save+snapshot-readback coverage for remediation packs: an Active
+    /// pack round-trips through the JSONB store intact, and resolving it
+    /// (Active -> Completed) upserts by `pack_id` — the row count never
+    /// grows, matching `save_remediation_pack`'s `ON CONFLICT` contract.
+    fn run_postgres_remediation_pack_contract(
+        store: &mut PostgresStudyStore,
+    ) -> Result<(), PostgresStoreError> {
+        let parent_review_unit_id = ReviewUnitId::new("unit-live-remediation-parent");
+        let member_a = ReviewUnitId::new("unit-live-remediation-member-a");
+        let member_b = ReviewUnitId::new("unit-live-remediation-member-b");
+        let mut account = store.for_account(AccountScope::new("acct_live_remediation")?);
+        account.ensure_account(NOW)?;
+
+        let active_pack = RemediationPackRecord {
+            id: "remediation-pack:live-attempt-1".to_owned(),
+            parent_review_unit_id: parent_review_unit_id.clone(),
+            attempt_id: "live-attempt-1".to_owned(),
+            concept_key: "live-remediation-concept".to_owned(),
+            review_unit_ids: vec![member_a.clone(), member_b.clone()],
+            status: RemediationPackStatus::Active,
+            created_at: NOW,
+            resolved_at: None,
+        };
+        account.save_remediation_pack(&active_pack)?;
+
+        let snapshot = account.snapshot()?;
+        assert_eq!(snapshot.remediation_packs, vec![active_pack.clone()]);
+
+        let mut resolved_pack = active_pack.clone();
+        resolved_pack.status = RemediationPackStatus::Completed;
+        resolved_pack.resolved_at = Some(NOW + 1_000);
+        account.save_remediation_pack(&resolved_pack)?;
+
+        let resolved_snapshot = account.snapshot()?;
+        assert_eq!(
+            resolved_snapshot.remediation_packs.len(),
+            1,
+            "resolving a pack must upsert by pack_id, never duplicate the row"
+        );
+        assert_eq!(resolved_snapshot.remediation_packs[0], resolved_pack);
 
         Ok(())
     }

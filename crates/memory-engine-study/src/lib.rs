@@ -492,6 +492,7 @@ pub struct BetaStudySession<S = BetaPersistenceStore> {
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
     remediation_packs_enabled: bool,
+    remediation_provider: Option<Box<dyn BridgeMaterialProvider>>,
 }
 
 impl BetaStudySession<BetaPersistenceStore> {
@@ -520,6 +521,7 @@ impl BetaStudySession<BetaPersistenceStore> {
             grade: None,
             schedule_change: None,
             remediation_packs_enabled: false,
+            remediation_provider: None,
         })
     }
 }
@@ -547,17 +549,39 @@ where
             grade: None,
             schedule_change: None,
             remediation_packs_enabled: false,
+            remediation_provider: None,
         }
     }
 
-    /// Opt this session into automatic remediation-pack generation.
+    /// Opt this session into automatic remediation-pack generation using the
+    /// deterministic, CI-safe `FakeModelProvider` fixture.
     ///
     /// Defaults to `false` so every existing caller (API, MCP, CLI, web
     /// shell, other tests) keeps today's behavior unchanged until it
-    /// deliberately opts in.
+    /// deliberately opts in. This is a test/dev-only entry point: it never
+    /// wires a real model, so it must never back a production face. Live
+    /// callers must use [`Self::with_remediation_provider`] instead, which
+    /// enables packs and injects a real provider in the same call.
     #[must_use]
     pub fn with_remediation_packs_enabled(mut self, enabled: bool) -> Self {
         self.remediation_packs_enabled = enabled;
+        self
+    }
+
+    /// Opt this session into automatic remediation-pack generation backed by
+    /// a real model provider, mirroring
+    /// [`Self::generate_bridge_material_with_provider`]'s explicit
+    /// injection seam.
+    ///
+    /// Enables packs and wires the supplied provider together in one call,
+    /// so a production face can never end up with packs enabled while
+    /// silently falling back to the deterministic fixture content
+    /// `with_remediation_packs_enabled` uses. This is the only
+    /// production-safe entry point for automatic remediation generation.
+    #[must_use]
+    pub fn with_remediation_provider(mut self, provider: Box<dyn BridgeMaterialProvider>) -> Self {
+        self.remediation_provider = Some(provider);
+        self.remediation_packs_enabled = true;
         self
     }
 
@@ -1184,12 +1208,16 @@ where
     ///
     /// A pack member's grade only checks for pack completion; it never
     /// spawns a nested pack (remediation stays a small, bounded ladder, not
-    /// a recursive DAG). A non-member's wrong, close, or revealed grade may
-    /// trigger a new pack; a correct grade never does.
+    /// a recursive DAG). A non-member's wrong or close grade may trigger a
+    /// new pack; so does any grade recorded after the learner revealed the
+    /// answer first (`was_revealed`), since the deterministic grader has no
+    /// way to distinguish a copied reveal from genuine recall; a correct
+    /// grade without a prior reveal never does.
     fn reconcile_remediation_after_grade(
         &mut self,
         review_unit_id: &ReviewUnitId,
         review: &ReviewAppliedResult,
+        was_revealed: bool,
     ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let now = (self.now)();
         let snapshot = self.snapshot()?;
@@ -1215,10 +1243,7 @@ where
             return Ok(());
         }
 
-        if !matches!(
-            review.grade.verdict,
-            Verdict::Wrong | Verdict::Close | Verdict::Revealed
-        ) {
+        if !was_revealed && !matches!(review.grade.verdict, Verdict::Wrong | Verdict::Close) {
             return Ok(());
         }
         if snapshot.remediation_packs.iter().any(|pack| {
@@ -1263,10 +1288,17 @@ where
             .map_or(now, |unit| unit.queue.due);
         let pack_due = parent_due.saturating_sub(1_000);
         self.invalidate_snapshot();
+        // Production callers must inject a real provider via
+        // `with_remediation_provider`; only test/dev sessions left on the
+        // default fall through to the deterministic fixture.
+        let provider: &dyn BridgeMaterialProvider = self
+            .remediation_provider
+            .as_deref()
+            .unwrap_or(&FakeModelProvider);
         let outcome = run_remediation_pack_generation_with_provider(
             &mut self.store,
-            &FakeModelProvider,
-            RemediationPackGenerationRequest {
+            provider,
+            &RemediationPackGenerationRequest {
                 run_id: format!("remediation-run-{attempt_id}"),
                 parent_review_unit_id: parent_review_unit_id.clone(),
                 attempt_id: attempt_id.to_owned(),
@@ -1352,7 +1384,10 @@ where
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let now = (self.now)();
         let snapshot = self.snapshot()?;
-        let active_review_unit_id = self.current.as_ref().map(|draft| draft.review_unit_id.clone());
+        let active_review_unit_id = self
+            .current
+            .as_ref()
+            .map(|draft| draft.review_unit_id.clone());
         if let Some(active_review_unit_id) = active_review_unit_id {
             let pack = snapshot
                 .remediation_packs
@@ -1420,6 +1455,7 @@ where
         if self.status == BetaStudyStatus::Graded {
             return self.view();
         }
+        let was_revealed = self.status == BetaStudyStatus::Revealed;
         let active = self
             .current
             .clone()
@@ -1459,7 +1495,7 @@ where
         });
         self.status = BetaStudyStatus::Graded;
         if self.remediation_packs_enabled {
-            self.reconcile_remediation_after_grade(&active.review_unit_id, &review)?;
+            self.reconcile_remediation_after_grade(&active.review_unit_id, &review, was_revealed)?;
         }
         self.view()
     }

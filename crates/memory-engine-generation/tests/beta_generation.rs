@@ -5,15 +5,17 @@ use memory_engine_core::{
 };
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
-    BetaGenerationError, BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial,
-    BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection,
-    ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
-    ReferenceNoteRequest,
+    run_remediation_pack_generation_with_provider, BetaGenerationError, BetaGenerationRequest,
+    BridgeGenerationRequest, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
+    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, ProviderDrafts,
+    ProviderFailure, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    ReferenceNoteRequest, RemediationPackGenerationRequest,
 };
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
-    GeneratedPromptModel, GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument,
-    SourceDocumentKind, SourcePermission,
+    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord,
+    GeneratedLearningActivityKind, GeneratedPromptModel, GeneratedPromptValidationStatus,
+    PersistedQueueCandidate, RemediationPackStatus, SourceDocument, SourceDocumentKind,
+    SourcePermission,
 };
 
 const NOW: i64 = 1_780_162_400_000;
@@ -624,6 +626,169 @@ fn bridge_generation_rejects_duplicate_of_manual_parent_review_unit() {
 }
 
 #[test]
+fn remediation_pack_generation_is_idempotent_per_attempt_id() {
+    let directory = TempDirectory::new("remediation-idempotent");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+
+    let request = RemediationPackGenerationRequest {
+        run_id: "remediation-run-attempt-1".to_owned(),
+        parent_review_unit_id: parent.clone(),
+        attempt_id: "remediation-attempt:manual-nato-cat-parent:1".to_owned(),
+        started_at: NOW,
+        completed_at: Some(NOW),
+        default_due: NOW - 1_000,
+        model: None,
+    };
+
+    let first =
+        run_remediation_pack_generation_with_provider(&mut store, &FakeModelProvider, &request)
+            .expect("first remediation generation");
+    assert_eq!(first.pack.status, RemediationPackStatus::Active);
+    assert_eq!(first.pack.review_unit_ids.len(), 2);
+    for draft_id in &first.accepted_draft_ids {
+        store
+            .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
+            .expect("approve first pack draft");
+    }
+
+    let snapshot_after_first = store.snapshot();
+    let generation_runs_after_first = snapshot_after_first.generation_runs.len();
+    let review_units_after_first = snapshot_after_first.review_units.len();
+
+    // Retry with the identical attempt_id (client retry or process restart
+    // replaying the same request): must resolve to the SAME pack instead of
+    // generating new content or a second pack.
+    let retried =
+        run_remediation_pack_generation_with_provider(&mut store, &FakeModelProvider, &request)
+            .expect("retried remediation generation");
+    assert_eq!(retried.pack, first.pack);
+    assert!(retried.accepted_draft_ids.is_empty());
+    assert!(retried.rejected_draft_ids.is_empty());
+
+    let snapshot_after_retry = store.snapshot();
+    assert_eq!(
+        snapshot_after_retry
+            .remediation_packs
+            .iter()
+            .filter(|pack| pack.attempt_id == first.pack.attempt_id)
+            .count(),
+        1,
+        "a retried attempt_id must never duplicate the pack"
+    );
+    assert_eq!(
+        snapshot_after_retry.generation_runs.len(),
+        generation_runs_after_first,
+        "a retry must not record a second generation run"
+    );
+    assert_eq!(
+        snapshot_after_retry.review_units.len(),
+        review_units_after_first,
+        "a retry must not create new review units"
+    );
+}
+
+#[test]
+fn distinct_attempt_after_resolved_pack_creates_a_disjoint_useful_pack() {
+    let directory = TempDirectory::new("remediation-distinct-attempt");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+
+    let first = run_remediation_pack_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        &RemediationPackGenerationRequest {
+            run_id: "remediation-run-attempt-1".to_owned(),
+            parent_review_unit_id: parent.clone(),
+            attempt_id: "remediation-attempt:manual-nato-cat-parent:1".to_owned(),
+            started_at: NOW,
+            completed_at: Some(NOW),
+            default_due: NOW - 1_000,
+            model: None,
+        },
+    )
+    .expect("first remediation generation");
+    assert_eq!(first.pack.review_unit_ids.len(), 2);
+    for draft_id in &first.accepted_draft_ids {
+        store
+            .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
+            .expect("approve first pack draft");
+    }
+
+    // Resolve the first pack the way the study session does when it
+    // completes, expires, or is exited: generation only cares that the pack
+    // is no longer Active, not which resolution path produced that.
+    let mut resolved_first = first.pack.clone();
+    resolved_first.status = RemediationPackStatus::Completed;
+    resolved_first.resolved_at = Some(NOW + 1_000);
+    store
+        .save_remediation_pack(resolved_first)
+        .expect("resolve first pack");
+
+    // A later, genuinely distinct failed attempt against the SAME parent,
+    // with a provider that legitimately generates different remediation
+    // content -- proxying how a real model varies phrasing between calls.
+    let second = run_remediation_pack_generation_with_provider(
+        &mut store,
+        &SecondAttemptBridgeProvider,
+        &RemediationPackGenerationRequest {
+            run_id: "remediation-run-attempt-2".to_owned(),
+            parent_review_unit_id: parent.clone(),
+            attempt_id: "remediation-attempt:manual-nato-cat-parent:2".to_owned(),
+            started_at: NOW + 2_000,
+            completed_at: Some(NOW + 2_000),
+            default_due: NOW + 1_000,
+            model: None,
+        },
+    )
+    .expect("second remediation generation");
+    for draft_id in &second.accepted_draft_ids {
+        store
+            .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
+            .expect("approve second pack draft");
+    }
+
+    assert_eq!(
+        second.pack.status,
+        RemediationPackStatus::Active,
+        "a genuinely distinct later attempt must still be able to produce a useful pack"
+    );
+    assert_eq!(second.pack.review_unit_ids.len(), 2);
+    assert_ne!(second.pack.id, first.pack.id);
+    assert!(
+        second
+            .pack
+            .review_unit_ids
+            .iter()
+            .all(|id| !first.pack.review_unit_ids.contains(id)),
+        "the second pack's members must be genuinely new review units, not collide \
+         with the first pack's now-resolved members"
+    );
+
+    let snapshot = store.snapshot();
+    assert_eq!(
+        snapshot
+            .review_units
+            .iter()
+            .filter(|unit| unit.remediation_pack_id.as_deref() == Some(first.pack.id.as_str()))
+            .count(),
+        2,
+        "the first pack's members must remain intact, not be overwritten"
+    );
+    assert_eq!(
+        snapshot
+            .review_units
+            .iter()
+            .filter(|unit| unit.remediation_pack_id.as_deref() == Some(second.pack.id.as_str()))
+            .count(),
+        2,
+        "the second pack's members must persist as their own distinct review units"
+    );
+}
+
+#[test]
 fn authored_block_without_a_reference_is_a_world_knowledge_card() {
     let directory = TempDirectory::new("no-reference");
     let path = directory.path().join("store.json");
@@ -1206,6 +1371,78 @@ impl BridgeMaterialProvider for DuplicateParentBridgeProvider {
                 activity_stage: "recognition-bridge".to_owned(),
                 unsupported: false,
             }],
+            usage: None,
+        })
+    }
+}
+
+/// A model-style provider that generates distinguishable remediation
+/// content, proxying how a real model varies phrasing between calls. Used
+/// to prove a genuinely later attempt against the same parent can still
+/// mint a useful pack after an earlier attempt's pack resolved.
+struct SecondAttemptBridgeProvider;
+
+impl ReferenceNoteProvider for SecondAttemptBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "second-attempt-remediation".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: format!("Second-attempt reference: {}", request.concept_label),
+            body: "An independently generated remediation note for a later attempt.".to_owned(),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for SecondAttemptBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Ok(BridgeMaterial {
+            model: ReferenceNoteProvider::model(self),
+            reference_note: self.explain_concept(&ReferenceNoteRequest {
+                concept_key: request.concept_key.clone(),
+                concept_label: request.concept_label.clone(),
+                prompt: request.parent_prompt.clone(),
+                expected_answer: request.parent_expected_answer.clone(),
+                recent_performance: request.recent_performance.clone(),
+            })?,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: which letters open the target word?".to_owned(),
+                    answer: "second-attempt-cue".to_owned(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition-bridge".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: recall the full composition after the retry cue."
+                        .to_owned(),
+                    answer: request.parent_expected_answer.clone(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: Some("Second attempt worked solution.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "cued-recall-bridge".to_owned(),
+                    unsupported: false,
+                },
+            ],
             usage: None,
         })
     }

@@ -1296,6 +1296,204 @@ fn remediation_pack_state_survives_session_restart() {
 }
 
 #[test]
+fn close_answer_triggers_remediation_pack() {
+    let directory = TempDirectory::new("remediation-pack-close");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    // One character off "CHARLIE ALFA TANGO" — within the near-miss edit
+    // distance, so the deterministic grader calls it Close, not Wrong.
+    let graded = study
+        .submit_answer("CHARLIE ALFA TANGP", 1_800)
+        .expect("close submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Close
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect("a close attempt must trigger a remediation pack");
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+    assert_eq!(pack.review_unit_ids.len(), 2);
+}
+
+#[test]
+fn revealed_then_submitted_answer_triggers_remediation_pack() {
+    let directory = TempDirectory::new("remediation-pack-revealed");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study.reveal().expect("reveal");
+    // The deterministic grader has no way to tell a copied reveal from
+    // genuine recall, so text-matching the just-revealed answer still
+    // grades Correct — the remediation trigger must not depend on that.
+    let graded = study
+        .submit_answer("CHARLIE ALFA TANGO", 1_800)
+        .expect("revealed submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Correct
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect(
+            "an attempt submitted after a reveal must trigger a remediation pack \
+             even though the copied answer grades correct",
+        );
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+    assert_eq!(pack.review_unit_ids.len(), 2);
+}
+
+#[test]
+fn correct_answer_without_a_reveal_still_never_triggers_a_pack() {
+    let directory = TempDirectory::new("remediation-pack-correct-no-reveal");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+
+    study
+        .submit_answer("CHARLIE ALFA TANGO", 1_800)
+        .expect("correct submit without reveal");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot.remediation_packs.is_empty(),
+        "a correct attempt with no prior reveal must never trigger a remediation pack"
+    );
+}
+
+#[test]
+fn distinct_later_attempt_creates_a_new_useful_pack_via_injected_provider() {
+    let directory = TempDirectory::new("remediation-pack-distinct-attempt");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study
+        .submit_answer("wrong answer", 1_800)
+        .expect("first wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let first_pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("first remediation pack");
+    assert_eq!(first_pack.status, RemediationPackStatus::Active);
+
+    // Complete the first pack's members so it resolves to Completed and the
+    // parent returns on its own schedule, exactly like
+    // `wrong_answer_triggers_remediation_pack_before_parent_returns` proves.
+    for _ in 0..first_pack.review_unit_ids.len() {
+        let advanced = study.advance().expect("advance");
+        let current = advanced.current.expect("pack member current");
+        assert!(first_pack.review_unit_ids.contains(&current.review_unit_id));
+        study
+            .submit_answer("pack-member-answer", 1_000)
+            .expect("submit pack member");
+    }
+
+    // Reopen past the relearn interval with a real provider injected
+    // through the production-safe seam, so the parent can fail again on a
+    // genuinely later, distinct attempt.
+    let mut second_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_relearn))
+            .expect("reopen for second attempt")
+            .with_remediation_provider(Box::new(SecondAttemptRemediationProvider));
+    assert!(second_session.remediation_packs_enabled());
+    let resumed = second_session.start().expect("resume for second attempt");
+    assert_eq!(
+        resumed.current.expect("parent returns").review_unit_id,
+        parent_id
+    );
+    second_session
+        .submit_answer("still wrong", 1_800)
+        .expect("second wrong submit");
+
+    let second_snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let second_pack = second_snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id && pack.id != first_pack.id)
+        .expect("a distinct later attempt must produce a new, useful pack");
+    assert_eq!(second_pack.status, RemediationPackStatus::Active);
+    assert_eq!(second_pack.review_unit_ids.len(), 2);
+    assert!(
+        second_pack
+            .review_unit_ids
+            .iter()
+            .all(|id| !first_pack.review_unit_ids.contains(id)),
+        "the second pack's members must be genuinely new, not collide with the first pack's"
+    );
+
+    // Prove the injected provider's content — not the deterministic
+    // fixture the first pack used — actually produced these members.
+    for member_id in &second_pack.review_unit_ids {
+        let member = second_snapshot
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == *member_id)
+            .expect("second pack member");
+        match &member.prompt {
+            Prompt::Exact(exact) => assert!(
+                exact.prompt.contains("Second attempt"),
+                "member prompt must come from the injected provider, not the fixture: {}",
+                exact.prompt
+            ),
+            other => panic!("expected an Exact prompt from the injected provider: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn bridge_material_failure_keeps_the_parent_current() {
     let directory = TempDirectory::new("bridge-rejected");
     let path = directory.path().join("study.json");
@@ -1837,6 +2035,79 @@ impl BridgeMaterialProvider for RejectedBridgeProvider {
                 activity_stage: "composition".to_owned(),
                 unsupported: false,
             }],
+            usage: None,
+        })
+    }
+}
+
+/// A model-style provider that generates distinguishable remediation
+/// content, proxying how a real model varies phrasing between calls. Used
+/// to prove `with_remediation_provider` actually wires production content
+/// and that a genuinely later attempt can still mint a useful pack after an
+/// earlier attempt's pack resolved.
+struct SecondAttemptRemediationProvider;
+
+impl ReferenceNoteProvider for SecondAttemptRemediationProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "second-attempt-remediation".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: format!("Second-attempt reference: {}", request.concept_label),
+            body: "An independently generated remediation note for a later attempt.".to_owned(),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for SecondAttemptRemediationProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Ok(BridgeMaterial {
+            model: ReferenceNoteProvider::model(self),
+            reference_note: self.explain_concept(&ReferenceNoteRequest {
+                concept_key: request.concept_key.clone(),
+                concept_label: request.concept_label.clone(),
+                prompt: request.parent_prompt.clone(),
+                expected_answer: request.parent_expected_answer.clone(),
+                recent_performance: request.recent_performance.clone(),
+            })?,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: which letters open the target word?".to_owned(),
+                    answer: "second-attempt-cue".to_owned(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition-bridge".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: recall the full composition after the retry cue."
+                        .to_owned(),
+                    answer: request.parent_expected_answer.clone(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: Some("Second attempt worked solution.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "cued-recall-bridge".to_owned(),
+                    unsupported: false,
+                },
+            ],
             usage: None,
         })
     }
