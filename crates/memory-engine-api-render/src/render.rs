@@ -489,7 +489,7 @@ pub fn render_return_notification_disabled() -> String {
 <p class="me-kicker">Return gently</p>
 <h1 class="me-display">Reminders are off.</h1>
 <p class="ae-lede ae-dim me-support">You will not receive further due-count reminders. You can opt in again from your study space.</p>
-<p><a class="ae-accent" href="/">Back to Memory Engine</a></p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
 }
@@ -512,7 +512,7 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<title>Memory Engine</title>
+<title>Scry</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/favicon.png" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
@@ -545,7 +545,7 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
     format!(
         r#"<div class="ae-screen">
 <header class="ae-bar">
-<a class="ae-name" href="/">MEMORY ENGINE</a>
+<a class="ae-name" href="/">SCRY</a>
 {header_right}
 </header>
 <main class="{stage}">
@@ -570,8 +570,8 @@ fn render_signed_out(notice: Option<&str>) -> String {
     let view = format!(
         r#"<div class="me-cover">
 {notice}
-<p class="me-kicker">Spaced repetition, made effortless</p>
-<h1 class="me-display">Read it once.<br>Remember it for good.</h1>
+<p class="me-kicker">Scry</p>
+<h1 class="me-display">Remember everything.</h1>
 <p class="ae-lede ae-dim me-support">Capture anything worth remembering. We bring it back when it matters.</p>
 <section class="ae-group me-capture-hero">
 <form action="/app/account" method="post">
@@ -1704,7 +1704,7 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">A memory instrument</span>"#;
+const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">Scry — Remember everything</span>"#;
 
 // Lucide icons (ISC), inlined for `.ae-icon`: 1.5px stroke, currentColor, no
 // fill. Status hue rides the glyph; the sentence stays ink.

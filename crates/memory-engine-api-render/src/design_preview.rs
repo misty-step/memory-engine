@@ -399,9 +399,9 @@ fn emit_preview_pages() -> Result<(), Box<dyn std::error::Error>> {
     let mut index = String::from(
         "<!doctype html><html lang=en><meta charset=utf-8>\
 <meta name=viewport content='width=device-width,initial-scale=1'>\
-<title>Memory Engine — design preview</title>\
+<title>Scry — design preview</title>\
 <body style='margin:0;background:#525252;font-family:system-ui,sans-serif'>\
-<p style='color:#fff;font:13px/1.4 system-ui;padding:14px 18px;margin:0'>Memory Engine — every UI state. Each frame is a full rendered page.</p>",
+<p style='color:#fff;font:13px/1.4 system-ui;padding:14px 18px;margin:0'>Scry — every UI state. Each frame is a full rendered page.</p>",
     );
     for (name, html) in &pages {
         fs::write(out.join(format!("{name}.html")), html)?;
