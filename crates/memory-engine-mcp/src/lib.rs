@@ -410,32 +410,4 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("kept") && error.contains("dropped"));
     }
-
-    #[test]
-    fn create_deck_never_calls_the_legacy_synchronous_generate_route() {
-        // `create_deck`'s only generation-shaped composition target is
-        // `MemoryEngineClient::create_deck`, which — per client.rs — enqueues
-        // on `/generation-jobs` and polls `/generation-jobs/{id}`; there is
-        // no code path in this crate's production source that calls
-        // `/generate`. This is a structural regression guard: the legacy
-        // route name must not appear in this crate's non-test, non-doc
-        // source. `client.rs`'s own `#[cfg(test)] mod tests` intentionally
-        // calls the legacy route directly (bypassing `MemoryEngineClient`)
-        // to seed a pre-existing unapproved draft fixture — that is a test
-        // fixture, not a composition this crate ships, so it is excluded
-        // from the scan rather than the guard weakened to allow it broadly.
-        let source = include_str!("client.rs");
-        let production_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("client.rs source");
-        let legacy_calls = production_source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .any(|line| line.contains("/generate\"") || line.contains("/generate\","));
-        assert!(
-            !legacy_calls,
-            "memory-engine-mcp must never call the legacy synchronous /generate route"
-        );
-    }
 }

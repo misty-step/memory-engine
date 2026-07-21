@@ -89,7 +89,7 @@ fn run_login(args: &[String]) -> Result<(), CliFailure> {
     let mut email = None;
     let mut account_id = None;
     let mut session_token = None;
-    let mut credentials_path = default_credentials_path();
+    let mut credentials_path_override: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         let flag = &args[index];
@@ -101,7 +101,7 @@ fn run_login(args: &[String]) -> Result<(), CliFailure> {
             "--email" => email = Some(value.clone()),
             "--account-id" => account_id = Some(value.clone()),
             "--session-token" => session_token = Some(value.clone()),
-            "--credentials-path" => credentials_path = PathBuf::from(value),
+            "--credentials-path" => credentials_path_override = Some(PathBuf::from(value)),
             other => return Err(CliFailure(format!("unknown argument {other}"))),
         }
         index += 2;
@@ -142,6 +142,11 @@ fn run_login(args: &[String]) -> Result<(), CliFailure> {
         }
     };
 
+    let credentials_path = match credentials_path_override {
+        Some(path) => path,
+        None => resolve_default_credentials_path()?,
+    };
+
     write_credentials(&credentials_path, &credentials)?;
     println!(
         "Saved credentials for account {} to {} (base url {}).",
@@ -172,7 +177,7 @@ fn run_review(
     stdout: &mut impl Write,
 ) -> Result<ReviewSessionReceipt, CliFailure> {
     let mut base_url_override = None;
-    let mut credentials_path = default_credentials_path();
+    let mut credentials_path_override: Option<PathBuf> = None;
     let mut log_path = default_log_path();
     let mut max_cards = DEFAULT_MAX_CARDS;
     let mut index = 0;
@@ -183,7 +188,7 @@ fn run_review(
             .ok_or_else(|| CliFailure(format!("{flag} requires a value")))?;
         match flag.as_str() {
             "--base-url" => base_url_override = Some(value.clone()),
-            "--credentials-path" => credentials_path = PathBuf::from(value),
+            "--credentials-path" => credentials_path_override = Some(PathBuf::from(value)),
             "--log-path" => log_path = PathBuf::from(value),
             "--max-cards" => {
                 max_cards = value.parse().map_err(|_| {
@@ -195,7 +200,7 @@ fn run_review(
         index += 2;
     }
 
-    let session = resolve_session(base_url_override, &credentials_path)?;
+    let session = resolve_session(base_url_override, credentials_path_override)?;
     let agent = build_agent();
     let client = ReviewClient::new(
         agent,
@@ -572,7 +577,7 @@ struct Session {
 
 fn resolve_session(
     base_url_override: Option<String>,
-    credentials_path: &Path,
+    credentials_path_override: Option<PathBuf>,
 ) -> Result<Session, CliFailure> {
     if let Some(session) =
         memory_engine_credentials::env_session(base_url_override.clone(), DEFAULT_BASE_URL)
@@ -584,7 +589,12 @@ fn resolve_session(
         });
     }
 
-    let stored = read_credentials(credentials_path)?.ok_or_else(|| {
+    let credentials_path = match credentials_path_override {
+        Some(path) => path,
+        None => resolve_default_credentials_path()?,
+    };
+
+    let stored = read_credentials(&credentials_path)?.ok_or_else(|| {
         CliFailure(format!(
             "no credentials found (checked MEMORY_ENGINE_ACCOUNT_ID/MEMORY_ENGINE_SESSION_TOKEN \
              and {}). Run `memory-engine-review login --email you@example.com` first.",
@@ -604,6 +614,16 @@ fn resolve_session(
 /// copying between the two clients' credential files.
 fn default_credentials_path() -> PathBuf {
     memory_engine_credentials::default_credentials_path()
+}
+
+/// Resolves the shared default path, migrating either client's legacy
+/// per-subdirectory credentials file into it first if the shared file does
+/// not exist yet (see
+/// `memory_engine_credentials::resolve_default_credentials_path`). Only
+/// used when `--credentials-path` was not passed — an explicit path never
+/// searches or migrates legacy files.
+fn resolve_default_credentials_path() -> Result<PathBuf, CliFailure> {
+    memory_engine_credentials::resolve_default_credentials_path().map_err(CliFailure)
 }
 
 fn default_log_path() -> PathBuf {
@@ -861,7 +881,15 @@ impl Error for CliFailure {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{io::Cursor, sync::Mutex};
+
+    // `resolve_session`/`run_review` read process-global env vars
+    // (`MEMORY_ENGINE_HOME`, `MEMORY_ENGINE_ACCOUNT_ID`,
+    // `MEMORY_ENGINE_SESSION_TOKEN`); the default test harness runs tests in
+    // parallel threads, so any test that sets/removes one of these must
+    // serialize against every other test that does. This lock is that
+    // serialization point.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn civil_from_days_matches_known_reference_dates() {
@@ -1043,6 +1071,9 @@ mod tests {
 
     #[test]
     fn resolve_session_prefers_env_vars_over_credentials_file() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempdir();
         let credentials_path = dir.join("credentials.json");
         write_credentials(
@@ -1059,12 +1090,83 @@ mod tests {
         // that read these two variable names.
         std::env::set_var("MEMORY_ENGINE_ACCOUNT_ID", "acct_env");
         std::env::set_var("MEMORY_ENGINE_SESSION_TOKEN", "env-token");
-        let session = resolve_session(None, &credentials_path).expect("session");
+        let session = resolve_session(None, Some(credentials_path.clone())).expect("session");
         std::env::remove_var("MEMORY_ENGINE_ACCOUNT_ID");
         std::env::remove_var("MEMORY_ENGINE_SESSION_TOKEN");
 
         assert_eq!(session.account_id, "acct_env");
         assert_eq!(session.token, "env-token");
+    }
+
+    #[test]
+    fn resolve_session_with_an_explicit_override_never_touches_legacy_files() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempdir();
+        std::env::set_var("MEMORY_ENGINE_HOME", &home);
+
+        let legacy_path = home.join("review").join("credentials.json");
+        write_credentials(
+            &legacy_path,
+            &StoredCredentials {
+                base_url: "https://legacy.example.com".to_owned(),
+                account_id: "acct_legacy".to_owned(),
+                session_token: "legacy-token".to_owned(),
+            },
+        )
+        .expect("seed legacy credentials file");
+
+        let explicit_path = home.join("explicit-credentials.json");
+        write_credentials(
+            &explicit_path,
+            &StoredCredentials {
+                base_url: "https://explicit.example.com".to_owned(),
+                account_id: "acct_explicit".to_owned(),
+                session_token: "explicit-token".to_owned(),
+            },
+        )
+        .expect("seed explicit credentials file");
+
+        let session = resolve_session(None, Some(explicit_path))
+            .expect("session resolves from the explicit path");
+        std::env::remove_var("MEMORY_ENGINE_HOME");
+
+        assert_eq!(session.account_id, "acct_explicit");
+        assert!(
+            legacy_path.exists(),
+            "an explicit --credentials-path override must never search or migrate legacy files"
+        );
+    }
+
+    #[test]
+    fn resolve_session_migrates_the_default_path_when_no_override_is_given() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempdir();
+        std::env::set_var("MEMORY_ENGINE_HOME", &home);
+
+        let legacy_path = home.join("review").join("credentials.json");
+        write_credentials(
+            &legacy_path,
+            &StoredCredentials {
+                base_url: "https://legacy.example.com".to_owned(),
+                account_id: "acct_legacy".to_owned(),
+                session_token: "legacy-token".to_owned(),
+            },
+        )
+        .expect("seed legacy credentials file");
+
+        let session = resolve_session(None, None).expect("session resolves via migration");
+        std::env::remove_var("MEMORY_ENGINE_HOME");
+
+        assert_eq!(session.account_id, "acct_legacy");
+        assert_eq!(session.token, "legacy-token");
+        assert!(
+            !legacy_path.exists(),
+            "the legacy file must be migrated (removed), not left as a permanent dual-read shim"
+        );
     }
 
     #[test]
@@ -1170,7 +1272,11 @@ mod tests {
                 .expect("approve draft");
         }
 
-        // SAFETY: no other test in this process depends on these two names.
+        // Serialized by ENV_LOCK: MEMORY_ENGINE_ACCOUNT_ID/SESSION_TOKEN are
+        // process-global and other tests in this file also touch them.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var("MEMORY_ENGINE_ACCOUNT_ID", &created.account_id);
         std::env::set_var("MEMORY_ENGINE_SESSION_TOKEN", &created.session_token);
 

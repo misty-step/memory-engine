@@ -746,7 +746,17 @@ fn endpoint(base_url: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        extract::{Request, State},
+        middleware::{self, Next},
+        response::Response,
+    };
+
     use super::*;
+
+    type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
 
     async fn spawn_local_api() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -762,6 +772,40 @@ mod tests {
             .expect("serve local API");
         });
         (format!("http://{address}"), handle)
+    }
+
+    /// Same real local API as `spawn_local_api`, but with its generation-jobs
+    /// worker started (so a queued job actually progresses to a terminal
+    /// state) and a request-capture layer recording every method+path this
+    /// crate's client sends it — the evidence behind
+    /// `create_deck_enqueues_and_polls_without_ever_requesting_generate`
+    /// below, which asserts on the capture instead of scanning source text.
+    async fn spawn_local_api_with_capture() -> (String, tokio::task::JoinHandle<()>, RequestLog) {
+        let state = memory_engine_api::ApiState::default();
+        state.start_worker();
+
+        let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local API listener");
+        let address = listener.local_addr().expect("local address");
+        let router = memory_engine_api::router(state).layer(middleware::from_fn_with_state(
+            requests.clone(),
+            capture_request,
+        ));
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve local API");
+        });
+        (format!("http://{address}"), handle, requests)
+    }
+
+    async fn capture_request(State(log): State<RequestLog>, req: Request, next: Next) -> Response {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((req.method().to_string(), req.uri().path().to_owned()));
+        next.run(req).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -860,5 +904,53 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_deck_enqueues_and_polls_without_ever_requesting_generate() {
+        let (base_url, server, requests) = spawn_local_api_with_capture().await;
+
+        let created = create_account(&base_url, "mcp-client-generate-guard-test@example.com")
+            .expect("create account");
+        let client = MemoryEngineClient::new(
+            base_url,
+            created.account_id.clone(),
+            created.session_token.clone(),
+        );
+
+        let deck_body = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\n\
+            Question: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\n\
+            Distractors: BRAVO, CHARLIE\n\
+            Reference: The NATO phonetic alphabet word for A is ALFA.";
+
+        let (_deck, outcome) = client
+            .create_deck("nato-onboarding", "NATO letter A fixture", deck_body, None)
+            .expect("create_deck reaches a terminal outcome against a real worker");
+        assert!(
+            matches!(outcome, GenerationOutcome::Succeeded { .. }),
+            "the job must reach succeeded against a real running worker, not time out: {outcome:?}"
+        );
+
+        server.abort();
+
+        let captured = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !captured.iter().any(|(_, path)| path.ends_with("/generate")),
+            "create_deck must never request the legacy synchronous /generate route; captured: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(method, path)| method == "POST" && path.ends_with("/generation-jobs")),
+            "create_deck must enqueue on the durable generation-jobs queue; captured: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(method, path)| method == "GET" && path.contains("/generation-jobs/")),
+            "create_deck must poll the enqueued job's status; captured: {captured:?}"
+        );
     }
 }

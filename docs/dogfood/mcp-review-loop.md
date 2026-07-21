@@ -115,16 +115,18 @@ calls, a tool is a bare REST-route echo instead of an agent intent, or
 ## Automated coverage
 
 - `crates/memory-engine-mcp/src/lib.rs` unit tests: tool contract shape
-  (fifteen agent-intent tools, no REST-route names), schema validity,
-  argument validation, and a structural guard
-  (`create_deck_never_calls_the_legacy_synchronous_generate_route`) that
-  `create_deck` never touches `/generate`.
+  (fifteen agent-intent tools, no REST-route names), schema validity, and
+  argument validation.
 - `crates/memory-engine-mcp/src/session.rs` unit tests: credential
-  resolution precedence (shared with `memory-engine-review`) and the
+  resolution precedence (shared with `memory-engine-review`, including a
+  one-time legacy-file migration to the shared default) and the
   no-fallback failure path.
 - `crates/memory-engine-mcp/src/client.rs` unit tests: the queued
-  generation-jobs composition, and a legacy-origin unapproved draft can
-  still be inspected (`list_drafts`) and approved (`approve_draft`).
+  generation-jobs composition, a behavioral HTTP-request-capture proof
+  (`create_deck_enqueues_and_polls_without_ever_requesting_generate`) that
+  `create_deck` never requests the legacy `/generate` route and does
+  enqueue+poll, and a legacy-origin unapproved draft can still be
+  inspected (`list_drafts`) and approved (`approve_draft`).
 - `crates/memory-engine-mcp/tests/no_credentials_fallback.rs`: spawns the
   real compiled binary with no credential path configured; asserts non-zero
   exit and no stdout.

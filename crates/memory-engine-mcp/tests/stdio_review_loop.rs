@@ -13,10 +13,11 @@
 //! production route contract even though this fixture's `ApiState::default()`
 //! is an ephemeral file store, not Postgres — the legacy synchronous
 //! `/generate` route is never called regardless of backend (see
-//! `create_deck_never_calls_the_legacy_synchronous_generate_route` in
-//! `src/lib.rs` for the structural guard; production additionally refuses
-//! `/generate` outright with HTTP 409 once `MEMORY_ENGINE_POSTGRES_URL` is
-//! set — `memory-engine-api-state::registry::generate_source`).
+//! `create_deck_enqueues_and_polls_without_ever_requesting_generate` in
+//! `src/client.rs` for a behavioral, HTTP-request-capture proof of that;
+//! production additionally refuses `/generate` outright with HTTP 409 once
+//! `MEMORY_ENGINE_POSTGRES_URL` is set —
+//! `memory-engine-api-state::registry::generate_source`).
 
 use std::{
     io::{BufRead, BufReader, Write},
