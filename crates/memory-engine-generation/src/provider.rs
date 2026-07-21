@@ -1282,6 +1282,16 @@ fn grounded_fact_distractors(facts: &[(String, String, String)], answer: &str) -
     }
 }
 
+/// Ordinary process/how-to prose has no authoritative step boundaries the way
+/// a numbered list does, so `procedure_candidates`'s non-list fallback stays
+/// on the fewer-better policy: a small, fixed number of representative
+/// drafts regardless of how many sentences the source happens to contain.
+/// Without this cap, `split_sentences` turns any multi-sentence prose
+/// paragraph into one card per sentence, silently reintroducing the
+/// exhaustive coverage policy that is supposed to be reserved for
+/// enumerable/verbatim sources.
+const PROCEDURE_PROSE_FALLBACK_CAP: usize = 3;
+
 fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
     let lines = non_empty_lines(body);
     let ordered_entries = list_entries(&lines);
@@ -1313,6 +1323,7 @@ fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandida
     let source_evidence = body.trim().to_owned();
     sentences
         .into_iter()
+        .take(PROCEDURE_PROSE_FALLBACK_CAP)
         .enumerate()
         .map(|(position, sentence)| DraftCandidate {
             index: position + 1,

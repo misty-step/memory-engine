@@ -372,6 +372,69 @@ fn numbered_imperative_procedures_keep_process_semantics_without_metadata() {
 }
 
 #[test]
+fn non_list_process_prose_stays_bounded_instead_of_one_card_per_sentence() {
+    // Regression guard for a real PR46 defect: the non-list ProcedureProcess
+    // fallback was rewritten to emit one candidate per `split_sentences()`
+    // sentence, silently reintroducing exhaustive-coverage behavior into
+    // ordinary prose (e.g. the `spacing-effect` bench fixture grew from 2
+    // accepted drafts to 11, blowing through its declared `max_drafts: 8`).
+    // Conceptual/procedure prose must stay on a small, bounded fewer-better
+    // fallback regardless of source length; only numbered lists (handled by
+    // the list_entries branch above) and verbatim/enumerable sources get
+    // exhaustive per-unit coverage.
+    let source = source_document(
+        "src-spacing-effect-like",
+        "Spaced review process",
+        "Spaced practice is a process that improves retention over many separate study \
+         sessions. Each review session should be spaced further apart as recall becomes more \
+         reliable. First you study the material once. Then you wait a day and try to recall it \
+         without notes. If you succeed, the next review interval doubles. If you fail, the \
+         interval resets to the beginning. Always review right before you would otherwise \
+         forget, not before or after. This process continues indefinitely as long as the \
+         material stays relevant. Finally, keep track of your review history so you can audit \
+         the schedule.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+
+    let sentence_count = source
+        .body
+        .as_deref()
+        .unwrap_or_default()
+        .split(['.', '?', '!'])
+        .filter(|sentence| sentence.split_whitespace().count() >= 3)
+        .count();
+    assert!(
+        sentence_count > 3,
+        "fixture must outnumber the fewer-better cap to be a meaningful regression guard: \
+         {sentence_count} sentences"
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("non-list procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(
+        drafts.candidates.len() <= 3,
+        "non-list process prose must stay bounded by the fewer-better fallback cap, not scale \
+         with sentence count: got {} candidates from {sentence_count} sentences",
+        drafts.candidates.len()
+    );
+    assert!(
+        drafts.candidates.len() < sentence_count,
+        "candidate count must not track one-per-sentence: {} candidates for {sentence_count} \
+         sentences",
+        drafts.candidates.len()
+    );
+}
+
+#[test]
 fn explicit_poem_intent_outranks_generic_list_shape() {
     let source = source_document(
         "src-oath-list",

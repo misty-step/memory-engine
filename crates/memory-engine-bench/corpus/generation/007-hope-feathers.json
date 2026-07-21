@@ -3,9 +3,10 @@
   "title": "Hope is the thing with feathers (Emily Dickinson)",
   "category": "verbatim-verse",
   "body": "\"Hope\" is the thing with feathers -\nThat perches in the soul -\nAnd sings the tune without the words -\nAnd never stops - at all -\n\nAnd sweetest - in the Gale - is heard -\nAnd sore must be the storm -\nThat could abash the little Bird\nThat kept so many warm -",
+  "rationale": "Verbatim recitation emits one exact-recall card per non-empty source line (see verbatim_candidates/sequential_units), independent of the bounded procedure-prose fallback cap. This stanza has 8 lines, so 8 drafts is the correct exhaustive-per-line count by design, not count inflation; max_drafts was raised from 6 to 8 to match. No other fixture's range was widened for this change.",
   "expect": {
     "min_drafts": 1,
-    "max_drafts": 6,
+    "max_drafts": 8,
     "key_terms": ["feathers", "soul", "Gale"],
     "intent": "verbatim_memorization",
     "required_activity_kinds": ["exercise"],
