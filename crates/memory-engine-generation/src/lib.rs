@@ -309,62 +309,23 @@ where
     let mut seen_signatures =
         existing_accepted_candidate_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
-        let drafts = match provider.generate_drafts(source) {
-            Ok(drafts) => drafts,
-            Err(failure) => {
-                validation_failures.push(format!("{}: {failure}", source.id));
-                continue;
-            }
-        };
-        validation_failures.extend(drafts.failures);
-        usage = merge_usage(usage, drafts.usage);
-        // Stamp drafts with the provider that actually generated them, not the
-        // composite's declared identity. A caller override still wins.
-        let source_model = request.model.clone().unwrap_or(drafts.model);
-        if !drafts.candidates.is_empty() && !producing_models.contains(&source_model) {
-            producing_models.push(source_model.clone());
-        }
-
-        // Grounding is decided per card, by the generator, not by a heuristic
-        // over the source: a card that cites a verbatim quote is source-grounded
-        // (the quote must verify); a card with no quote is a world-knowledge
-        // expansion grounded in the captured topic itself.
-        let mut source_rejections = Vec::new();
-        let mut max_candidate_index = 0;
-        persist_candidates(
+        let Some(source_usage) = process_generation_source(
             store,
+            provider,
+            &request,
             source,
-            drafts.candidates,
-            &mut PersistCandidatesContext {
-                request: &request,
-                source_model: &source_model,
-                seen_signatures: &mut seen_signatures,
-                validation_failures: &mut validation_failures,
-                draft_ids: &mut draft_ids,
-                accepted_draft_ids: &mut accepted_draft_ids,
-                rejected_draft_ids: &mut rejected_draft_ids,
-                source_rejections: &mut source_rejections,
-                max_candidate_index: &mut max_candidate_index,
-            },
-        )?;
-
-        usage = merge_usage(
-            usage,
-            try_repair_source(
-                store,
-                provider,
-                source,
-                &request,
-                &source_rejections,
-                &mut seen_signatures,
-                &mut validation_failures,
-                &mut draft_ids,
-                &mut accepted_draft_ids,
-                &mut rejected_draft_ids,
-                &mut producing_models,
-                &mut max_candidate_index,
-            )?,
-        );
+            &mut seen_signatures,
+            &mut validation_failures,
+            &mut draft_ids,
+            &mut accepted_draft_ids,
+            &mut rejected_draft_ids,
+            &mut producing_models,
+        )?
+        else {
+            continue;
+        };
+        usage = merge_usage(usage, source_usage.drafts);
+        usage = merge_usage(usage, source_usage.repair);
         save_generation_run_progress(
             store,
             &request,
@@ -401,6 +362,95 @@ where
         rejected_draft_ids,
         validation_failures,
     })
+}
+
+/// The two provider-usage additions [`process_generation_source`] accumulated
+/// for one source, mirrored in the same order the original inline loop body
+/// merged them: draft generation first, then repair.
+struct SourceGenerationUsage {
+    drafts: Option<ProviderUsage>,
+    repair: Option<ProviderUsage>,
+}
+
+/// Runs generation and repair for one source, mutating the run's shared
+/// accumulators in place. Returns `None` when draft generation itself failed
+/// for this source (the caller records the failure and skips this source's
+/// progress checkpoint, matching the prior inline-loop `continue`), or
+/// `Some(usage)` mirroring the two provider-usage additions the original
+/// inline loop body accumulated.
+#[allow(clippy::too_many_arguments)]
+fn process_generation_source<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    request: &BetaGenerationRequest,
+    source: &SourceDocument,
+    seen_signatures: &mut Vec<CandidateSignature>,
+    validation_failures: &mut Vec<String>,
+    draft_ids: &mut Vec<String>,
+    accepted_draft_ids: &mut Vec<String>,
+    rejected_draft_ids: &mut Vec<String>,
+    producing_models: &mut Vec<GeneratedPromptModel>,
+) -> Result<Option<SourceGenerationUsage>, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let drafts = match provider.generate_drafts(source) {
+        Ok(drafts) => drafts,
+        Err(failure) => {
+            validation_failures.push(format!("{}: {failure}", source.id));
+            return Ok(None);
+        }
+    };
+    validation_failures.extend(drafts.failures);
+    // Stamp drafts with the provider that actually generated them, not the
+    // composite's declared identity. A caller override still wins.
+    let source_model = request.model.clone().unwrap_or(drafts.model);
+    if !drafts.candidates.is_empty() && !producing_models.contains(&source_model) {
+        producing_models.push(source_model.clone());
+    }
+
+    // Grounding is decided per card, by the generator, not by a heuristic
+    // over the source: a card that cites a verbatim quote is source-grounded
+    // (the quote must verify); a card with no quote is a world-knowledge
+    // expansion grounded in the captured topic itself.
+    let mut source_rejections = Vec::new();
+    let mut max_candidate_index = 0;
+    persist_candidates(
+        store,
+        source,
+        drafts.candidates,
+        &mut PersistCandidatesContext {
+            request,
+            source_model: &source_model,
+            seen_signatures,
+            validation_failures,
+            draft_ids,
+            accepted_draft_ids,
+            rejected_draft_ids,
+            source_rejections: &mut source_rejections,
+            max_candidate_index: &mut max_candidate_index,
+        },
+    )?;
+
+    let repair_usage = try_repair_source(
+        store,
+        provider,
+        source,
+        request,
+        &source_rejections,
+        seen_signatures,
+        validation_failures,
+        draft_ids,
+        accepted_draft_ids,
+        rejected_draft_ids,
+        producing_models,
+        &mut max_candidate_index,
+    )?;
+
+    Ok(Some(SourceGenerationUsage {
+        drafts: drafts.usage,
+        repair: repair_usage,
+    }))
 }
 
 fn load_sources<E>(
