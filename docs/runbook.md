@@ -462,10 +462,15 @@ Postgres/file claims provide the cross-instance concurrency bound and provider
 idempotency prevents duplicate logical sends.
 
 The file adapter's per-account notification lock is a persistent path with an
-OS descriptor lock acquired nonblockingly. It is never deleted as part of
-ownership release, so stale paths are harmless; a process crash releases the
-descriptor and a contending scheduler skips that account until it can acquire
-the lock. The same libc-backed helper protects the repository-owned file
+OS descriptor lock. Every writer (save/disable preference, claim, complete,
+release) acquires the lock with a blocking `flock`, so a contending writer
+waits for the lock instead of skipping the account outright; after acquiring
+it, the writer re-reads the account's current on-disk state and re-checks
+eligibility (enabled, claim ownership, retry timing) before mutating, so a
+recheck always sees the latest committed state rather than a stale in-memory
+view. The lock path is never deleted as part of ownership release, so stale
+paths are harmless, and a process crash releases the descriptor for the next
+waiter. The same libc-backed helper protects the repository-owned file
 outbox: it scans durable delivery keys while holding the descriptor lock and
 does not append a duplicate after a lease-expiry reclaim.
 
@@ -485,6 +490,18 @@ curl -fsS -X POST \
   -H "x-scheduler-token: ${MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN:?set token}" \
   "$base/internal/scheduler/return-notifications"
 ```
+
+**Production receipt gate (open):** the manual trigger above has been proven
+locally and against real Postgres, and `/healthz` confirms the deployed
+scheduler is live (`returnNotificationScheduler.enabled: true`), but no
+production-safe receipt has yet been executed proving the *deployed*
+scheduler — not a local run or a page render — initiated an allowlisted
+reminder end to end (provider send + delivery evidence). Card memory-engine-097
+criterion 6 stays open until an operator runs the manual trigger above against
+production with `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN`, against one
+allowlisted account with a genuinely due card, and links the resulting send
+receipt (provider log line and/or file-outbox `due-count` entry) to the card.
+Do not mark memory-engine-097 complete without that receipt.
 
 A failed provider send releases the claim but preserves the complete 092
 delivery envelope and applies bounded exponential retry backoff (one minute,
