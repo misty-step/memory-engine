@@ -5605,6 +5605,17 @@ fn assert_postgres_submit_timing(
     response: &axum::response::Response,
     expected_statement_count: u64,
 ) {
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("submit request id");
+    assert!(
+        request_id.len() == 36
+            && request_id.starts_with("req_")
+            && request_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "request id must be strict req_[0-9a-f]{{32}}: {request_id}"
+    );
     let timing = response
         .headers()
         .get("server-timing")
@@ -5612,11 +5623,19 @@ fn assert_postgres_submit_timing(
         .expect("Postgres submit timing");
     assert!(timing.contains("pgconnect;dur="), "{timing}");
     assert!(timing.contains("pgop;dur="), "{timing}");
+    let pgconnect_ms = server_timing_duration(timing, "pgconnect");
+    let pgop_ms = server_timing_duration(timing, "pgop");
+    assert!(
+        pgconnect_ms > 0,
+        "pgconnect phase must be nonzero, not silently zeroed: {timing}"
+    );
+    assert!(
+        pgop_ms > 0,
+        "pgop phase must be nonzero, not silently zeroed: {timing}"
+    );
     let total_ms = server_timing_duration(timing, "total");
-    let phase_sum_ms = ["pgconnect", "pgop", "render"]
-        .into_iter()
-        .map(|name| server_timing_duration(timing, name))
-        .sum::<u64>();
+    let render_ms = server_timing_duration(timing, "render");
+    let phase_sum_ms = pgconnect_ms + pgop_ms + render_ms;
     assert!(
         phase_sum_ms <= total_ms,
         "Postgres phases must fit inside total duration: {timing}"

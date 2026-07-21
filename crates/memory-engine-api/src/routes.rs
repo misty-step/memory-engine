@@ -1877,8 +1877,8 @@ async fn submit_app_review(
     let form = match form {
         Ok(Form(form)) => form,
         Err(rejection) => {
-            let render_started = Instant::now();
             let status = rejection.into_response().status();
+            let render_started = Instant::now();
             let response = submit_recovery_response(
                 status,
                 "Review not submitted",
@@ -1996,36 +1996,31 @@ fn submit_response_headers(
     (response, total_ms)
 }
 
+/// Postgres connect/operation and render are measured as disjoint,
+/// sequential phases; each is independently clamped to at least 1ms
+/// (`bounded_request_ms`), so their raw values are never rescaled or
+/// otherwise fabricated here. A request whose wall-clock `total_ms` came in
+/// under that floor-clamped phase sum (only possible on extremely fast
+/// requests where every phase rounds up to the 1ms floor) has its `total_ms`
+/// raised to the true phase sum instead: the reported total must always
+/// honestly bound its own parts, and raising the coarser aggregate is honest
+/// where shrinking the measured parts to fit would not be.
 fn normalize_submit_durations(
     total_ms: u64,
     postgres: SubmitReviewTimings,
     render_ms: u64,
 ) -> (u64, Option<u64>, Option<u64>, u64) {
-    let mut phases = [
+    let phases = [
         postgres.postgres_connect_ms(),
         postgres.postgres_operation_ms(),
         Some(render_ms),
     ];
-    let phase_count = u64::try_from(phases.iter().flatten().count()).unwrap_or(u64::MAX);
-    let total_ms = total_ms.max(phase_count).min(60_000);
     let phase_sum = phases
         .iter()
         .flatten()
         .copied()
         .fold(0_u64, u64::saturating_add);
-    if phase_sum > total_ms {
-        let flexible_total = total_ms.saturating_sub(phase_count);
-        let flexible_sum = phase_sum.saturating_sub(phase_count);
-        for duration in phases.iter_mut().flatten() {
-            let scaled = if flexible_sum == 0 {
-                0
-            } else {
-                let numerator = u128::from(duration.saturating_sub(1)) * u128::from(flexible_total);
-                u64::try_from(numerator / u128::from(flexible_sum)).unwrap_or(u64::MAX)
-            };
-            *duration = 1_u64.saturating_add(scaled);
-        }
-    }
+    let total_ms = total_ms.max(phase_sum).min(60_000);
 
     (total_ms, phases[0], phases[1], phases[2].unwrap_or(1))
 }
@@ -2076,7 +2071,16 @@ async fn record_submit_browser_performance(
         BrowserSubmitViewport::Tablet => SubmitViewport::Tablet,
         BrowserSubmitViewport::Desktop => SubmitViewport::Desktop,
     };
-    report_submit_browser_performance(event.tap_to_ack_ms, event.graded_visible_ms, viewport);
+    report_submit_browser_performance(
+        &event.request_id,
+        &event.trace_id,
+        event.tap_to_ack_ms,
+        event.request_to_response_ms,
+        event.transfer_ms,
+        event.navigation_ms,
+        event.graded_visible_ms,
+        viewport,
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 

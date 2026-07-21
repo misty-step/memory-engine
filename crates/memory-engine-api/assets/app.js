@@ -25,7 +25,11 @@
     dimmed: [],
     token: null,
     timeoutId: null,
-    landingAttempted: false
+    landingAttempted: false,
+    // Bumped every pagehide so a two-RAF emission scheduled before this
+    // document was hidden (and possibly BFCache-frozen) can tell, once
+    // resumed, that it is stale rather than firing with leftover state.
+    landingEpoch: 0
   };
 
   function isFiniteNumber(value) {
@@ -427,8 +431,26 @@
     var now = absoluteEpochNow();
     if (now === null || now > handoff.expiresAtMs) return;
 
+    // A pagehide between this point and the second animation frame —
+    // including one that freezes this document into BFCache — must
+    // invalidate the scheduled emission: landingEpoch changes, and this
+    // revalidation refuses to let a stale, resumed landing consume state
+    // (or a newer handoff written after restore) that no longer describes
+    // the page the user is actually looking at.
+    var scheduledEpoch = state.landingEpoch;
+    function stillLive() {
+      return (
+        state.landingEpoch === scheduledEpoch &&
+        document.visibilityState !== "hidden" &&
+        typeof document.querySelector === "function" &&
+        !!document.querySelector(".me-verdict")
+      );
+    }
+
     window.requestAnimationFrame(function () {
+      if (!stillLive()) return;
       window.requestAnimationFrame(function () {
+        if (!stillLive()) return;
         var visibleAtMs = absoluteEpochNow();
         if (visibleAtMs === null || visibleAtMs > handoff.expiresAtMs) return;
         var responseStartEpoch = navigationEpoch(navigation, navigation.responseStart);
@@ -488,6 +510,7 @@
   }
 
   window.addEventListener("pagehide", function () {
+    state.landingEpoch += 1;
     resetState();
   });
   window.addEventListener("pageshow", function (event) {
