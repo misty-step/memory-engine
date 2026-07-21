@@ -6,19 +6,23 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use memory_engine_credentials::DEFAULT_BASE_URL;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 
-const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded poll for a queued generation job — same ceiling
+/// `memory-engine-mcp`'s client uses.
+const GENERATION_POLL_MAX_ATTEMPTS: u32 = 40;
+const GENERATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SOURCE_BODY: &str = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.\n\nConcept: NATO CAT composition\nActivity: exercise\nStage: composition\nQuestion: Spell CAT over the phone using the NATO phonetic alphabet.\nAnswer: CHARLIE ALFA TANGO\nWorked Solution: C is CHARLIE, A is ALFA, and T is TANGO.\nReference: C is CHARLIE. A is ALFA. T is TANGO.";
 const REQUIRED_CONTRACT_PATHS: &[&str] = &[
     "/v1/accounts",
     "/v1/accounts/{account_id}/sources",
     "/v1/accounts/{account_id}/sources/{source_id}",
-    "/v1/accounts/{account_id}/sources/{source_id}/generate",
-    "/v1/accounts/{account_id}/drafts/{draft_id}/approve",
+    "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs",
+    "/v1/accounts/{account_id}/generation-jobs/{job_id}",
     "/v1/accounts/{account_id}/review/next",
     "/v1/accounts/{account_id}/review/{review_unit_id}/reveal",
     "/v1/accounts/{account_id}/review/{review_unit_id}/submit",
@@ -114,7 +118,7 @@ fn run_contract(config: &ContractConfig) -> Result<ContractReceipt, ContractFail
         account_id: client.account_id.clone(),
         created_account: client.created_account,
         source_id,
-        draft_id: proof.draft_id,
+        job_id: proof.job_id,
         review_unit_id: proof.review_unit_id,
         revealed_answer: proof.revealed_answer,
         verdict: proof.verdict,
@@ -152,22 +156,27 @@ fn drive_review_loop(
     client: &ContractClient,
     source_id: &str,
 ) -> Result<ReviewLoopProof, ContractFailure> {
-    let generated: StudyView = client.post_empty(&format!(
-        "/v1/accounts/{}/sources/{source_id}/generate",
-        client.account_id
-    ))?;
-    let draft_id = generated
-        .drafts
-        .first()
-        .ok_or_else(|| ContractFailure("source generation returned no drafts".to_owned()))?
-        .id
-        .clone();
+    let enqueued = client.enqueue_generation_job(source_id)?;
+    let job = client.poll_generation_job(enqueued)?;
+    if job.status != "succeeded" {
+        return Err(ContractFailure(format!(
+            "generation job {} ended in status {:?} instead of succeeded (error: {:?})",
+            job.id, job.status, job.error
+        )));
+    }
+    if job.card_count == 0 {
+        return Err(ContractFailure(format!(
+            "generation job {} succeeded with zero cards; the fixture source must yield at \
+             least one",
+            job.id
+        )));
+    }
 
-    client.post_empty::<StudyView>(&format!(
-        "/v1/accounts/{}/drafts/{draft_id}/approve",
-        client.account_id
-    ))?;
-
+    // The queue's worker optimistically approves every accepted draft as
+    // part of a succeeded job (`registry.rs::run_generation_job`), so the
+    // card is already scheduled — no separate approve call, unlike the
+    // retired synchronous `/generate` + `/drafts/{id}/approve` pair this
+    // replaces.
     let next: StudyView =
         client.post_empty(&format!("/v1/accounts/{}/review/next", client.account_id))?;
     let review_unit_id = next
@@ -204,7 +213,7 @@ fn drive_review_loop(
         .verdict;
 
     Ok(ReviewLoopProof {
-        draft_id,
+        job_id: job.id,
         review_unit_id,
         revealed_answer,
         verdict,
@@ -434,6 +443,51 @@ impl ContractClient {
         read_json(&mut response, "list sources")
     }
 
+    /// Enqueue (or join an in-flight) generation job on the durable queue —
+    /// the same route `memory-engine-mcp`'s client uses, never the legacy
+    /// synchronous `/generate` route (refused with HTTP 409 once
+    /// `MEMORY_ENGINE_POSTGRES_URL` is set — every production deployment).
+    fn enqueue_generation_job(&self, source_id: &str) -> Result<GenerationJob, ContractFailure> {
+        self.post_empty(&format!(
+            "/v1/accounts/{}/sources/{source_id}/generation-jobs",
+            self.account_id
+        ))
+    }
+
+    fn generation_job(&self, job_id: &str) -> Result<GenerationJob, ContractFailure> {
+        let mut response = self
+            .agent
+            .get(&endpoint(
+                &self.base_url,
+                &format!("/v1/accounts/{}/generation-jobs/{job_id}", self.account_id),
+            ))
+            .header("Authorization", &self.authorization())
+            .call()
+            .map_err(|error| transport_failure("generation job", &error))?;
+        read_json(&mut response, "generation job")
+    }
+
+    /// Poll one job to a bounded terminal state.
+    fn poll_generation_job(
+        &self,
+        mut job: GenerationJob,
+    ) -> Result<GenerationJob, ContractFailure> {
+        for attempt in 0..GENERATION_POLL_MAX_ATTEMPTS {
+            if job.status == "succeeded" || job.status == "failed" {
+                return Ok(job);
+            }
+            if attempt + 1 == GENERATION_POLL_MAX_ATTEMPTS {
+                return Err(ContractFailure(format!(
+                    "generation job {} did not reach a terminal state within {} polls",
+                    job.id, GENERATION_POLL_MAX_ATTEMPTS
+                )));
+            }
+            std::thread::sleep(GENERATION_POLL_INTERVAL);
+            job = self.generation_job(&job.id)?;
+        }
+        Ok(job)
+    }
+
     fn archive_source(&self, source_id: &str) -> Result<(), ContractFailure> {
         let response = self
             .agent
@@ -508,6 +562,18 @@ struct SourceList {
     sources: Vec<SourceRecord>,
 }
 
+/// A queued generation job (`GenerationJob` in the `OpenAPI` contract) —
+/// same shape `memory-engine-mcp`'s client polls, trimmed to the fields
+/// this runner's reproduction/proof needs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GenerationJob {
+    id: String,
+    status: String,
+    card_count: usize,
+    error: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct StudyView {
@@ -542,7 +608,7 @@ struct StudySummary {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReviewLoopProof {
-    draft_id: String,
+    job_id: String,
     review_unit_id: String,
     revealed_answer: String,
     verdict: String,
@@ -558,7 +624,7 @@ struct ContractReceipt {
     account_id: String,
     created_account: bool,
     source_id: String,
-    draft_id: String,
+    job_id: String,
     review_unit_id: String,
     revealed_answer: String,
     verdict: String,
@@ -648,7 +714,7 @@ mod tests {
             account_id: "acct_demo".to_owned(),
             created_account: false,
             source_id: "src_demo".to_owned(),
-            draft_id: "draft_demo".to_owned(),
+            job_id: "job_demo".to_owned(),
             review_unit_id: "ru_demo".to_owned(),
             revealed_answer: "ALFA".to_owned(),
             verdict: "correct".to_owned(),
@@ -679,13 +745,14 @@ mod tests {
             .await
             .expect("bind local API listener");
         let address = listener.local_addr().expect("local address");
+        let state = memory_engine_api::ApiState::default();
+        // Matches production: generation is job-queue-based end to end, so
+        // the worker must run for a queued job to ever reach `succeeded`.
+        state.start_worker();
         let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                memory_engine_api::router(memory_engine_api::ApiState::default()),
-            )
-            .await
-            .expect("serve local API");
+            axum::serve(listener, memory_engine_api::router(state))
+                .await
+                .expect("serve local API");
         });
 
         let receipt = run_contract(&ContractConfig {

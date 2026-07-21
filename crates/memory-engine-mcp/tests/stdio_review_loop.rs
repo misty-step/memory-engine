@@ -1,10 +1,22 @@
 //! Cold-agent evidence: spawns the real compiled `memory-engine-mcp` binary
-//! (not a mocked transport) and drives a full deck-create -> review ->
-//! invalidate loop over its actual stdin/stdout JSON-RPC pipes, against a
-//! real local `memory-engine-api` instance (the same Rust binary that runs
-//! in production, an in-process axum server here). A hand-run transcript of
-//! this same flow, captured from a real terminal, lives at
-//! `docs/dogfood/mcp-review-loop.md`.
+//! (not a mocked transport) and drives a full deck-create -> inspect ->
+//! approve -> review -> remediation -> feedback -> invalidate loop over its
+//! actual stdin/stdout JSON-RPC pipes, against a real local
+//! `memory-engine-api` instance (the same Rust binary that runs in
+//! production, an in-process axum server with its background generation
+//! worker started here — the same worker the deployed binary starts). A
+//! hand-run transcript of this same flow, captured from a real terminal,
+//! lives at `docs/dogfood/mcp-review-loop.md`.
+//!
+//! Generation goes through the durable job queue exclusively
+//! (`create_deck` enqueues + polls `/generation-jobs`), proving the supported
+//! production route contract even though this fixture's `ApiState::default()`
+//! is an ephemeral file store, not Postgres — the legacy synchronous
+//! `/generate` route is never called regardless of backend (see
+//! `create_deck_never_calls_the_legacy_synchronous_generate_route` in
+//! `src/lib.rs` for the structural guard; production additionally refuses
+//! `/generate` outright with HTTP 409 once `MEMORY_ENGINE_POSTGRES_URL` is
+//! set — `memory-engine-api-state::registry::generate_source`).
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -18,17 +30,20 @@ use serde_json::{json, Value};
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_agent_completes_a_full_review_loop_over_stdio() {
+    let state = memory_engine_api::ApiState::default();
+    // Matches production's `main.rs`: generation is job-queue-based end to
+    // end, so the worker must actually run for a queued job to ever reach
+    // `succeeded`.
+    state.start_worker();
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind local API listener");
     let address = listener.local_addr().expect("local address");
     let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            memory_engine_api::router(memory_engine_api::ApiState::default()),
-        )
-        .await
-        .expect("serve local API");
+        axum::serve(listener, memory_engine_api::router(state))
+            .await
+            .expect("serve local API");
     });
 
     let base_url = format!("http://{address}");
@@ -69,24 +84,29 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     });
 
     let mut transcript = Vec::new();
+    let mut id = 0_u64;
+    let mut next_id = || {
+        id += 1;
+        id
+    };
 
     // 1. initialize
     let init = call(
         &mut stdin,
         &rx,
         &mut transcript,
-        1,
+        next_id(),
         "initialize",
         &json!({}),
     );
     assert_eq!(init["result"]["serverInfo"]["name"], "memory-engine");
 
-    // 2. tools/list — six agent-intent tools, not REST-route echoes.
+    // 2. tools/list — fifteen agent-intent tools, not REST-route echoes.
     let list = rpc(
         &mut stdin,
         &rx,
         &mut transcript,
-        2,
+        next_id(),
         "tools/list",
         &json!({}),
     );
@@ -96,12 +116,27 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(tool_names.len(), 6);
-    assert!(tool_names.contains(&"create_deck".to_owned()));
+    assert_eq!(tool_names.len(), 15);
+    for expected in [
+        "create_deck",
+        "list_drafts",
+        "approve_draft",
+        "reveal_answer",
+        "record_content_feedback",
+    ] {
+        assert!(
+            tool_names.contains(&expected.to_owned()),
+            "missing {expected}"
+        );
+    }
 
-    // 3. create_deck — one call composes save+generate+approve; the deck is
-    //    immediately due, proving the tool is intent-shaped, not a 1:1 wrapper
-    //    around POST /project-decks.
+    // 3. create_deck — saves the source and drives it through the durable
+    //    generation-jobs queue (enqueue + bounded poll), never the legacy
+    //    synchronous /generate route. The production job runner
+    //    optimistically approves every accepted draft as part of a
+    //    succeeded job (existing, cross-client server behavior this ticket
+    //    leaves unchanged), so the card is already scheduled by the time
+    //    this call returns — no separate approve_draft call needed here.
     let deck_body = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\n\
          Question: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\n\
          Distractors: BRAVO, CHARLIE\n\
@@ -110,7 +145,7 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         &mut stdin,
         &rx,
         &mut transcript,
-        3,
+        next_id(),
         "create_deck",
         &json!({
             "project_key": "nato-onboarding",
@@ -119,38 +154,68 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         }),
     );
     let deck_payload = tool_payload(&created_deck);
-    assert!(
-        deck_payload["approvedCardCount"].as_u64().unwrap_or(0) >= 1,
-        "create_deck must generate and approve at least one card: {deck_payload}"
+    assert_eq!(
+        deck_payload["generation"]["status"], "succeeded",
+        "queued generation must reach succeeded: {deck_payload}"
+    );
+    assert_eq!(
+        deck_payload["generation"]["job"]["cardCount"], 1,
+        "the fixture body must yield exactly one generated card: {deck_payload}"
     );
     let deck_id = deck_payload["deck"]["deckId"]
         .as_str()
         .expect("deckId")
         .to_owned();
 
-    // 4. list_decks — the new deck is visible, scoped to its project_key.
+    // 4. list_drafts — inspect: nothing is left pending a decision, because
+    //    the job above already committed its own accepted draft.
+    let drafts = call_tool(
+        &mut stdin,
+        &rx,
+        &mut transcript,
+        next_id(),
+        "list_drafts",
+        &json!({}),
+    );
+    assert_eq!(
+        tool_payload(&drafts).as_array().map(Vec::len),
+        Some(0),
+        "a normal succeeded job must leave nothing pending approve_draft"
+    );
+
+    // 5. list_due — the card generated above is already due, proving the
+    //    queued path schedules cards the same way the retired legacy
+    //    /generate route used to (immediately due), just without the 409.
+    let due = call_tool(
+        &mut stdin,
+        &rx,
+        &mut transcript,
+        next_id(),
+        "list_due",
+        &json!({}),
+    );
+    assert_eq!(tool_payload(&due)["dueCount"], 1);
+
+    // 6. list_decks — the new deck is visible, scoped to its project_key.
     let listed_decks = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        4,
+        next_id(),
         "list_decks",
         &json!({"project_key": "nato-onboarding"}),
     );
-    let listed_decks_payload = tool_payload(&listed_decks);
-    assert_eq!(listed_decks_payload.as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        tool_payload(&listed_decks).as_array().map(Vec::len),
+        Some(1)
+    );
 
-    // 5. list_due — a lightweight status check before committing to review.
-    let due = call_tool(&mut stdin, &rx, &mut transcript, 5, "list_due", &json!({}));
-    let due_payload = tool_payload(&due);
-    assert_eq!(due_payload["dueCount"], 1);
-
-    // 6. review_next — full detail needed to actually answer.
+    // 7. review_next — full detail needed to actually answer.
     let next = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        6,
+        next_id(),
         "review_next",
         &json!({}),
     );
@@ -164,12 +229,26 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         .unwrap_or_default()
         .contains("NATO phonetic alphabet word for A"));
 
-    // 7. submit_answer — grades the card and advances the schedule.
+    // 8. reveal_answer — declared remediation: show the answer without
+    //    grading, and the queue stays on the same card.
+    let revealed = call_tool(
+        &mut stdin,
+        &rx,
+        &mut transcript,
+        next_id(),
+        "reveal_answer",
+        &json!({"review_unit_id": review_unit_id}),
+    );
+    let revealed_payload = tool_payload(&revealed);
+    assert_eq!(revealed_payload["current"]["reviewUnitId"], review_unit_id);
+    assert_eq!(revealed_payload["current"]["expectedAnswer"], "ALFA");
+
+    // 9. submit_answer — grades the card and advances the schedule.
     let submitted = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        7,
+        next_id(),
         "submit_answer",
         &json!({"review_unit_id": review_unit_id, "answer": "ALFA"}),
     );
@@ -177,17 +256,30 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     assert_eq!(submitted_payload["current"]["grade"]["verdict"], "correct");
     assert_eq!(submitted_payload["dueCount"], 0);
 
-    // 8. invalidate_deck — retires the deck; due count stays at 0.
+    // 10. record_content_feedback — a kept/dropped verdict on the content
+    //     itself, distinct from grading the answer.
+    let feedback = call_tool(
+        &mut stdin,
+        &rx,
+        &mut transcript,
+        next_id(),
+        "record_content_feedback",
+        &json!({"review_unit_id": review_unit_id, "verdict": "kept", "rationale": "clear and correct"}),
+    );
+    let feedback_payload = tool_payload(&feedback);
+    assert_eq!(feedback_payload["verdict"], "kept");
+    assert_eq!(feedback_payload["reviewUnitId"], review_unit_id);
+
+    // 11. invalidate_deck — retires the deck; due count stays at 0.
     let invalidated = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        8,
+        next_id(),
         "invalidate_deck",
         &json!({"deck_id": deck_id, "event": "onboarding project closed"}),
     );
-    let invalidated_payload = tool_payload(&invalidated);
-    assert_eq!(invalidated_payload["dueCount"], 0);
+    assert_eq!(tool_payload(&invalidated)["dueCount"], 0);
 
     drop(stdin);
     let _ = child.wait();
@@ -195,8 +287,8 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     server.abort();
 
     assert!(
-        transcript.len() >= 8,
-        "expected at least 8 request/response pairs in the transcript, got {}",
+        transcript.len() >= 11,
+        "expected at least 11 request/response pairs in the transcript, got {}",
         transcript.len()
     );
 }
@@ -210,12 +302,14 @@ fn rpc(
     params: &Value,
 ) -> Value {
     let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-    writeln!(stdin, "{request}").expect("write request line");
-    stdin.flush().expect("flush stdin");
-    let line = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("read response line before timeout");
-    let response: Value = serde_json::from_str(&line).expect("response is valid json");
+    let line = serde_json::to_string(&request).expect("serialize request");
+    writeln!(stdin, "{line}").expect("write request");
+    stdin.flush().expect("flush request");
+
+    let response_line = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("no response to {method} within timeout: {error}"));
+    let response: Value = serde_json::from_str(&response_line).expect("response is valid json");
     transcript.push((request, response.clone()));
     response
 }

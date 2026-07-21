@@ -7,7 +7,12 @@
   },
   "servers": [
     {
-      "url": "https://memory-engine-api-i2xcr.ondigitalocean.app"
+      "url": "https://scry.study",
+      "description": "Branded production origin (default)."
+    },
+    {
+      "url": "https://memory-engine-api-i2xcr.ondigitalocean.app",
+      "description": "DigitalOcean App Platform origin scry.study fronts. Operator-origin fallback only, e.g. while DNS for the branded domain is degraded."
     }
   ],
   "security": [

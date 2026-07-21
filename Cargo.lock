@@ -940,6 +940,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "memory-engine-api",
+ "memory-engine-credentials",
  "serde",
  "serde_json",
  "tokio",
@@ -953,6 +954,14 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-normalization",
+]
+
+[[package]]
+name = "memory-engine-credentials"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -981,6 +990,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "memory-engine-api",
+ "memory-engine-credentials",
  "serde",
  "serde_json",
  "tokio",
@@ -1044,6 +1054,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "memory-engine-api",
+ "memory-engine-credentials",
  "serde",
  "serde_json",
  "tokio",

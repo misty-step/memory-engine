@@ -1,38 +1,23 @@
 //! Credential resolution for the stdio server.
 //!
-//! Mirrors `memory-engine-review`'s credential model exactly (same env var
-//! names `docs/runbook.md` already documents), but with no interactive
-//! `login` subcommand: stdin is the JSON-RPC channel, not a terminal. A
-//! brand-new local server bootstraps its own account non-interactively from
-//! `MEMORY_ENGINE_MCP_EMAIL` instead. There is no silent in-memory fallback —
-//! if none of the three paths below resolve, the server fails loudly at
-//! startup rather than guessing.
+//! Uses `memory-engine-credentials` (same crate `memory-engine-review` uses)
+//! for the env var names, on-disk format, and default file path, so
+//! `memory-engine-review login` and this server agree on one account without
+//! manual copying. There is no interactive `login` subcommand: stdin is the
+//! JSON-RPC channel, not a terminal. A brand-new local server bootstraps its
+//! own account non-interactively from `MEMORY_ENGINE_MCP_EMAIL` instead.
+//! There is no silent in-memory fallback — if none of the three paths below
+//! resolve, the server fails loudly at startup rather than guessing.
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
+use std::path::Path;
+
+use memory_engine_credentials::{
+    env_session, read_credentials, write_credentials, StoredCredentials, DEFAULT_BASE_URL,
 };
-
-use serde::{Deserialize, Serialize};
 
 use crate::client;
 
-pub const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredCredentials {
-    base_url: String,
-    account_id: String,
-    session_token: String,
-}
-
-#[derive(Debug)]
-pub struct Session {
-    pub base_url: String,
-    pub account_id: String,
-    pub session_token: String,
-}
+pub use memory_engine_credentials::{Session, OPERATOR_ORIGIN_FALLBACK_BASE_URL};
 
 /// Resolve credentials in order: `MEMORY_ENGINE_ACCOUNT_ID` /
 /// `MEMORY_ENGINE_SESSION_TOKEN` env vars, then `credentials_path`, then a
@@ -44,29 +29,22 @@ pub struct Session {
 /// Returns an error describing every path that was tried when none resolves,
 /// or when account creation fails.
 pub fn resolve(credentials_path: &Path) -> Result<Session, String> {
-    let base_url =
-        non_empty_env("MEMORY_ENGINE_MCP_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let base_url_override = memory_engine_credentials::non_empty_env("MEMORY_ENGINE_MCP_BASE_URL");
 
-    if let (Some(account_id), Some(session_token)) = (
-        non_empty_env("MEMORY_ENGINE_ACCOUNT_ID"),
-        non_empty_env("MEMORY_ENGINE_SESSION_TOKEN"),
-    ) {
-        return Ok(Session {
-            base_url,
-            account_id,
-            session_token,
-        });
+    if let Some(session) = env_session(base_url_override.clone(), DEFAULT_BASE_URL) {
+        return Ok(session);
     }
 
     if let Some(stored) = read_credentials(credentials_path)? {
         return Ok(Session {
-            base_url: stored.base_url,
+            base_url: base_url_override.unwrap_or(stored.base_url),
             account_id: stored.account_id,
             session_token: stored.session_token,
         });
     }
 
-    if let Some(email) = non_empty_env("MEMORY_ENGINE_MCP_EMAIL") {
+    if let Some(email) = memory_engine_credentials::non_empty_env("MEMORY_ENGINE_MCP_EMAIL") {
+        let base_url = base_url_override.unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
         let created = client::create_account(&base_url, &email)?;
         write_credentials(
             credentials_path,
@@ -86,87 +64,19 @@ pub fn resolve(credentials_path: &Path) -> Result<Session, String> {
     Err(format!(
         "no memory-engine credentials found. Set MEMORY_ENGINE_ACCOUNT_ID and \
          MEMORY_ENGINE_SESSION_TOKEN (see docs/runbook.md), or a credentials file at {} \
-         (written by this server or `memory-engine-review login`), or MEMORY_ENGINE_MCP_EMAIL \
-         to bootstrap a fresh account. There is no in-memory fallback: a stdio MCP server \
-         that silently created and discarded an account would leave an agent believing its \
-         study state persisted when it did not.",
+         (written by this server or `memory-engine-review login` — one shared file, no manual \
+         copying between clients), or MEMORY_ENGINE_MCP_EMAIL to bootstrap a fresh account. \
+         There is no in-memory fallback: a stdio MCP server that silently created and discarded \
+         an account would leave an agent believing its study state persisted when it did not.",
         credentials_path.display()
     ))
 }
 
-#[must_use]
-pub fn default_credentials_path() -> PathBuf {
-    memory_engine_home().join("mcp").join("credentials.json")
-}
-
-fn memory_engine_home() -> PathBuf {
-    non_empty_env("MEMORY_ENGINE_HOME").map_or_else(
-        || {
-            let home = non_empty_env("HOME").unwrap_or_else(|| ".".to_owned());
-            PathBuf::from(home).join(".memory-engine")
-        },
-        PathBuf::from,
-    )
-}
-
-fn read_credentials(path: &Path) -> Result<Option<StoredCredentials>, String> {
-    match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents)
-            .map(Some)
-            .map_err(|error| format!("malformed credentials at {}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("could not read {}: {error}", path.display())),
-    }
-}
-
-fn write_credentials(path: &Path, credentials: &StoredCredentials) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
-    }
-    let serialized =
-        serde_json::to_string_pretty(credentials).map_err(|error| error.to_string())?;
-    let mut file = open_restricted(path)?;
-    std::io::Write::write_all(&mut file, serialized.as_bytes())
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
-}
-
-// Creates (or truncates) the file with mode 0600 set at open time, on Unix,
-// matching `memory-engine-review`'s credential file: no window where the
-// session token is readable under the ambient umask before a follow-up
-// chmod narrows it.
-#[cfg(unix)]
-fn open_restricted(path: &Path) -> Result<fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| format!("could not open {}: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn open_restricted(path: &Path) -> Result<fs::File, String> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|error| format!("could not open {}: {error}", path.display()))
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-}
+pub use memory_engine_credentials::default_credentials_path;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{env, fs, path::PathBuf, sync::Mutex};
 
     use super::*;
 
@@ -218,6 +128,22 @@ mod tests {
 
         let error = resolve(&credentials_path).expect_err("must fail without any credential path");
         assert!(error.contains("no memory-engine credentials found"));
+    }
+
+    #[test]
+    fn resolved_credentials_path_matches_the_shared_default() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        env::set_var(
+            "MEMORY_ENGINE_HOME",
+            "/tmp/memory-engine-mcp-session-shared-home",
+        );
+        assert_eq!(
+            default_credentials_path(),
+            PathBuf::from("/tmp/memory-engine-mcp-session-shared-home/credentials.json")
+        );
+        env::remove_var("MEMORY_ENGINE_HOME");
     }
 
     fn tempdir(label: &str) -> PathBuf {

@@ -17,10 +17,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use memory_engine_credentials::DEFAULT_BASE_URL;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 
-const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Safety cap on cards reviewed in a single run. A real due queue should
@@ -562,13 +562,7 @@ fn read_streak_events(log_path: &Path) -> Result<Vec<StreakEvent>, CliFailure> {
 // credentials
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredCredentials {
-    base_url: String,
-    account_id: String,
-    session_token: String,
-}
+use memory_engine_credentials::StoredCredentials;
 
 struct Session {
     base_url: String,
@@ -580,14 +574,13 @@ fn resolve_session(
     base_url_override: Option<String>,
     credentials_path: &Path,
 ) -> Result<Session, CliFailure> {
-    let env_account_id = non_empty_env("MEMORY_ENGINE_ACCOUNT_ID");
-    let env_session_token = non_empty_env("MEMORY_ENGINE_SESSION_TOKEN");
-
-    if let (Some(account_id), Some(token)) = (env_account_id, env_session_token) {
+    if let Some(session) =
+        memory_engine_credentials::env_session(base_url_override.clone(), DEFAULT_BASE_URL)
+    {
         return Ok(Session {
-            base_url: base_url_override.unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
-            account_id,
-            token,
+            base_url: session.base_url,
+            account_id: session.account_id,
+            token: session.session_token,
         });
     }
 
@@ -606,83 +599,25 @@ fn resolve_session(
     })
 }
 
+/// Shared with `memory-engine-mcp`: logging in here is enough for a
+/// freshly started MCP server to pick up the same account too, no manual
+/// copying between the two clients' credential files.
 fn default_credentials_path() -> PathBuf {
-    memory_engine_home().join("review").join("credentials.json")
+    memory_engine_credentials::default_credentials_path()
 }
 
 fn default_log_path() -> PathBuf {
-    memory_engine_home().join("review").join("streak.ndjson")
-}
-
-fn memory_engine_home() -> PathBuf {
-    non_empty_env("MEMORY_ENGINE_HOME").map_or_else(
-        || {
-            let home = non_empty_env("HOME").unwrap_or_else(|| ".".to_owned());
-            PathBuf::from(home).join(".memory-engine")
-        },
-        PathBuf::from,
-    )
+    memory_engine_credentials::memory_engine_home()
+        .join("review")
+        .join("streak.ndjson")
 }
 
 fn read_credentials(path: &Path) -> Result<Option<StoredCredentials>, CliFailure> {
-    match fs::read_to_string(path) {
-        Ok(contents) => serde_json::from_str(&contents).map(Some).map_err(|error| {
-            CliFailure(format!(
-                "malformed credentials at {}: {error}",
-                path.display()
-            ))
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(CliFailure(format!(
-            "could not read {}: {error}",
-            path.display()
-        ))),
-    }
+    memory_engine_credentials::read_credentials(path).map_err(CliFailure)
 }
 
 fn write_credentials(path: &Path, credentials: &StoredCredentials) -> Result<(), CliFailure> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            CliFailure(format!("could not create {}: {error}", parent.display()))
-        })?;
-    }
-    let serialized =
-        serde_json::to_string_pretty(credentials).map_err(|error| CliFailure(error.to_string()))?;
-    let mut file = open_restricted(path)?;
-    file.write_all(serialized.as_bytes())
-        .map_err(|error| CliFailure(format!("could not write {}: {error}", path.display())))
-}
-
-// Creates (or truncates) the file with mode 0600 set at open time, on Unix,
-// so there is never a window where the session token is readable under the
-// ambient umask before a follow-up chmod narrows it.
-#[cfg(unix)]
-fn open_restricted(path: &Path) -> Result<std::fs::File, CliFailure> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| CliFailure(format!("could not open {}: {error}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn open_restricted(path: &Path) -> Result<std::fs::File, CliFailure> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|error| CliFailure(format!("could not open {}: {error}", path.display())))
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+    memory_engine_credentials::write_credentials(path, credentials).map_err(CliFailure)
 }
 
 // ---------------------------------------------------------------------------
