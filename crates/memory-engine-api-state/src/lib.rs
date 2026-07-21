@@ -1877,6 +1877,24 @@ pub enum SubmitViewport {
     Desktop,
 }
 
+/// One browser-reported completion for a single `/app/submit` round trip:
+/// the five raw phase durations from tap to graded-visible, joined to the
+/// server request/trace ids, plus the viewport class. Groups what would
+/// otherwise be an eight-argument call into one coherent value so
+/// [`report_submit_browser_performance`] stays within clippy's
+/// `too_many_arguments` limit.
+#[derive(Clone, Copy, Debug)]
+pub struct BrowserSubmitReceipt<'a> {
+    pub request_id: &'a str,
+    pub trace_id: &'a str,
+    pub tap_to_ack_ms: u64,
+    pub request_to_response_ms: u64,
+    pub transfer_ms: u64,
+    pub navigation_ms: u64,
+    pub graded_visible_ms: u64,
+    pub viewport: SubmitViewport,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentFeedbackRequest {
@@ -2150,17 +2168,8 @@ pub fn report_submit_server_performance(duration_ms: u64, outcome: SubmitPerform
 /// attach to under v1; [`report_browser_submit_durations_receipt`] keeps them
 /// queryable through the same production-log path the Canary batch export
 /// already relies on, without bumping the frozen series cardinality.
-pub fn report_submit_browser_performance(
-    request_id: &str,
-    trace_id: &str,
-    tap_to_ack_ms: u64,
-    request_to_response_ms: u64,
-    transfer_ms: u64,
-    navigation_ms: u64,
-    graded_visible_ms: u64,
-    viewport: SubmitViewport,
-) {
-    let performance_viewport = match viewport {
+pub fn report_submit_browser_performance(receipt: BrowserSubmitReceipt<'_>) {
+    let performance_viewport = match receipt.viewport {
         SubmitViewport::Mobile => memory_engine_performance::Viewport::Mobile,
         SubmitViewport::Tablet => memory_engine_performance::Viewport::Tablet,
         SubmitViewport::Desktop => memory_engine_performance::Viewport::Desktop,
@@ -2168,11 +2177,11 @@ pub fn report_submit_browser_performance(
     for (phase, duration_ms) in [
         (
             memory_engine_performance::CompletionPhase::ImmediateAck,
-            tap_to_ack_ms,
+            receipt.tap_to_ack_ms,
         ),
         (
             memory_engine_performance::CompletionPhase::VisibleAfterTwoAnimationFrames,
-            graded_visible_ms,
+            receipt.graded_visible_ms,
         ),
     ] {
         let marker = memory_engine_performance::CompletionMarker::browser(
@@ -2186,19 +2195,7 @@ pub fn report_submit_browser_performance(
         );
         report_performance_observation(marker, duration_ms);
     }
-    println!(
-        "{}",
-        report_browser_submit_durations_receipt(
-            request_id,
-            trace_id,
-            tap_to_ack_ms,
-            request_to_response_ms,
-            transfer_ms,
-            navigation_ms,
-            graded_visible_ms,
-            viewport,
-        )
-    );
+    println!("{}", report_browser_submit_durations_receipt(receipt));
 }
 
 /// Build (without printing) the queryable five-duration receipt for one
@@ -2206,31 +2203,22 @@ pub fn report_submit_browser_performance(
 /// decomposition can be asserted on directly in tests; see
 /// [`report_submit_browser_performance`] for why this exists alongside the
 /// two Canary observations.
-fn report_browser_submit_durations_receipt(
-    request_id: &str,
-    trace_id: &str,
-    tap_to_ack_ms: u64,
-    request_to_response_ms: u64,
-    transfer_ms: u64,
-    navigation_ms: u64,
-    graded_visible_ms: u64,
-    viewport: SubmitViewport,
-) -> serde_json::Value {
-    let viewport = match viewport {
+fn report_browser_submit_durations_receipt(receipt: BrowserSubmitReceipt<'_>) -> serde_json::Value {
+    let viewport = match receipt.viewport {
         SubmitViewport::Mobile => "mobile",
         SubmitViewport::Tablet => "tablet",
         SubmitViewport::Desktop => "desktop",
     };
     serde_json::json!({
         "schema": "memory_engine.browser_submit_durations.v1",
-        "request_id": request_id,
-        "trace_id": trace_id,
+        "request_id": receipt.request_id,
+        "trace_id": receipt.trace_id,
         "viewport": viewport,
-        "tap_to_ack_ms": tap_to_ack_ms,
-        "request_to_response_ms": request_to_response_ms,
-        "transfer_ms": transfer_ms,
-        "navigation_ms": navigation_ms,
-        "graded_visible_ms": graded_visible_ms,
+        "tap_to_ack_ms": receipt.tap_to_ack_ms,
+        "request_to_response_ms": receipt.request_to_response_ms,
+        "transfer_ms": receipt.transfer_ms,
+        "navigation_ms": receipt.navigation_ms,
+        "graded_visible_ms": receipt.graded_visible_ms,
     })
 }
 
@@ -3205,16 +3193,16 @@ mod tests {
         // silently discarding request_to_response_ms/transfer_ms/navigation_ms
         // at ingestion. The receipt must carry every one of the five raw
         // values through unchanged, joined to the same request/trace ids.
-        let receipt = report_browser_submit_durations_receipt(
-            "req_0123456789abcdef0123456789abcdef",
-            "trace_0123456789abcdef0123456789abcdef",
-            11,
-            22,
-            33,
-            44,
-            99,
-            SubmitViewport::Mobile,
-        );
+        let receipt = report_browser_submit_durations_receipt(BrowserSubmitReceipt {
+            request_id: "req_0123456789abcdef0123456789abcdef",
+            trace_id: "trace_0123456789abcdef0123456789abcdef",
+            tap_to_ack_ms: 11,
+            request_to_response_ms: 22,
+            transfer_ms: 33,
+            navigation_ms: 44,
+            graded_visible_ms: 99,
+            viewport: SubmitViewport::Mobile,
+        });
         assert_eq!(
             receipt,
             serde_json::json!({

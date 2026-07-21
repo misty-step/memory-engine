@@ -1018,7 +1018,9 @@ async fn mcq_review_is_click_to_answer_and_grades_case_insensitively() {
         .to_owned();
     assert_eq!(request_id.len(), 36);
     assert!(request_id.starts_with("req_"));
-    assert!(request_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(request_id[4..]
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     let server_timing = graded
         .headers()
         .get("server-timing")
@@ -5613,7 +5615,9 @@ fn assert_postgres_submit_timing(
     assert!(
         request_id.len() == 36
             && request_id.starts_with("req_")
-            && request_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+            && request_id[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "request id must be strict req_[0-9a-f]{{32}}: {request_id}"
     );
     let timing = response
@@ -5657,6 +5661,39 @@ fn assert_postgres_submit_timing(
             .get("cache-control")
             .and_then(|value| value.to_str().ok()),
         Some("no-store")
+    );
+}
+
+/// Cross-checks the server's self-reported `total` against wall-clock time
+/// the test measured around the whole in-process request.
+///
+/// `normalize_submit_durations` raises the reported total to at least the
+/// summed phase durations, so a bare `phase_sum <= total` assertion is
+/// tautologically true by construction (`total` is *defined* as
+/// `total.max(phase_sum)`) and can never catch the total itself being
+/// inflated beyond reality. This closes that gap: memory-engine-109 review
+/// finding — Postgres reads nested inside the timed render window on the
+/// empty-queue/error path (`app_study_view_with_timings`,
+/// `list_app_sources_with_timings`, `jobs_for_app_account_with_timings`)
+/// used to be double-counted into both `render` and `pgconnect`/`pgop`,
+/// which raises `phase_sum`, and therefore the reported `total`, above the
+/// real elapsed time. `measured_ms` is real wall-clock elapsed time around
+/// the entire in-process `oneshot` call, so the honestly reported total can
+/// never legitimately exceed it by more than harness/rounding slack.
+fn assert_reported_total_is_not_inflated_beyond_measured_wall_clock(
+    response: &axum::response::Response,
+    measured_ms: u64,
+) {
+    let timing = response
+        .headers()
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+        .expect("submit server timing");
+    let total_ms = server_timing_duration(timing, "total");
+    assert!(
+        total_ms <= measured_ms + 25,
+        "reported total {total_ms}ms must not exceed the independently \
+         measured wall clock {measured_ms}ms by more than harness slack: {timing}"
     );
 }
 
@@ -5767,6 +5804,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
     let workspace_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
     )));
+    let workspace_submit_started = Instant::now();
     let workspace_submit = workspace_browser_app
         .oneshot(form_request_with_cookie(
             "POST",
@@ -5782,8 +5820,19 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
         ))
         .await
         .expect("Postgres browser submit without an active review");
+    let workspace_submit_measured_ms =
+        u64::try_from(workspace_submit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     assert_eq!(workspace_submit.status(), StatusCode::OK);
     assert_postgres_submit_timing(&workspace_submit, 16);
+    // This is the exact empty-queue/error-render path (missing review unit,
+    // no active review) that nests app_study_view_with_timings +
+    // list_app_sources_with_timings + jobs_for_app_account_with_timings
+    // inside the timed render window — see
+    // assert_reported_total_is_not_inflated_beyond_measured_wall_clock.
+    assert_reported_total_is_not_inflated_beyond_measured_wall_clock(
+        &workspace_submit,
+        workspace_submit_measured_ms,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
