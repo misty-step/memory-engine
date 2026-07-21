@@ -15,9 +15,10 @@ use crate::{
     CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
     ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
     ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
+    SubmitReviewRequest, SubmitReviewTimings, WaitlistEntry, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
     APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
+    WAITLIST_RATE_LIMIT_WINDOW_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -157,6 +158,61 @@ impl AccountRegistry {
         Ok(MagicLinkRequest {
             debug_link: auth_config.expose_debug_links.then_some(link),
         })
+    }
+
+    /// Join the invite-beta waitlist.
+    ///
+    /// Rate limiting runs through the shared per-key attempt counter (the
+    /// same mechanism backing `record_app_account_request`) so it works for
+    /// both storage backends even though entry persistence below is
+    /// file-store only. A malformed email still spends the IP quota, exactly
+    /// like `request_magic_link`, so a scripted probe can't skip the limiter
+    /// by sending garbage.
+    ///
+    /// # Errors
+    ///
+    /// Returns bad request on a malformed email, too-many-requests when the
+    /// per-email or per-IP limit is spent, and service-unavailable when the
+    /// registry is Postgres-backed (this slice is file-store only).
+    pub(crate) fn join_waitlist(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let Some(email) = normalize_email(email) else {
+            self.record_waitlist_request(None, client_rate_limit_key)?;
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        self.record_waitlist_request(Some(&email), client_rate_limit_key)?;
+        let Some(store_path) = self.waitlist_store_path() else {
+            return Err(ApiFailure::service_unavailable(
+                "Waitlist persistence requires the Postgres adapter, which this slice does not \
+                 implement yet."
+                    .to_owned(),
+            ));
+        };
+        crate::waitlist::join(&store_path, &email, source, self.now())
+    }
+
+    /// List every waitlist entry for the operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// and service-unavailable when the registry is Postgres-backed.
+    pub(crate) fn list_waitlist(&self, admin_token: &str) -> Result<Vec<WaitlistEntry>, ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        let Some(store_path) = self.waitlist_store_path() else {
+            return Err(ApiFailure::service_unavailable(
+                "Waitlist persistence requires the Postgres adapter, which this slice does not \
+                 implement yet."
+                    .to_owned(),
+            ));
+        };
+        crate::waitlist::list(&store_path)
     }
 
     /// Runs an API registry operation.
@@ -565,6 +621,33 @@ impl AccountRegistry {
         )? {
             return Err(ApiFailure::too_many_requests(
                 "Too many sign-in attempts. Try again later.",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn record_waitlist_request(
+        &self,
+        email: Option<&str>,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let storage = self.storage();
+        let now_ms = self.now();
+        let mut keys = Vec::with_capacity(2);
+        if let Some(email) = email {
+            keys.push(format!("waitlist-email:{email}"));
+        }
+        keys.push(format!("waitlist-ip:{client_rate_limit_key}"));
+
+        if !storage.record_rate_limit_attempts(
+            &keys,
+            now_ms,
+            WAITLIST_RATE_LIMIT_WINDOW_MS,
+            WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
+        )? {
+            return Err(ApiFailure::too_many_requests(
+                "Too many waitlist attempts. Try again later.",
             ));
         }
 

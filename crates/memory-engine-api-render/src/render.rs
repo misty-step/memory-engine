@@ -417,6 +417,17 @@ pub fn render_login_requested(debug_link: Option<&str>) -> String {
 }
 
 #[must_use]
+pub fn render_waitlist_joined() -> String {
+    let view = r#"<div class="me-cover">
+<p class="me-kicker">You're on the list</p>
+<h1 class="me-display">Thanks for joining.</h1>
+<p class="ae-lede ae-dim me-support">We’ll email you when a spot opens. No account was created and nothing else happens until then.</p>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#;
+    document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
 pub fn render_auth_recovery(title: &str, message: &str) -> String {
     let view = format!(
         r#"<div class="me-cover">
@@ -552,8 +563,10 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
 fn render_signed_out(notice: Option<&str>) -> String {
     // Onboarding is auth-first. Accounts are required (the magic-link
     // allowlist), so anonymous visitors never see the capture form — they would
-    // only dead-end on it. The display promise leads, then one action: enter an
-    // email and get a sign-in link. Capture and review live behind auth.
+    // only dead-end on it. The display promise leads, then two actions: sign in
+    // with an allowlisted email, or join the invite-beta waitlist below it. Both
+    // forms read identically to a visitor who doesn't know their own allowlist
+    // state, so neither response can be used to probe it.
     let view = format!(
         r#"<div class="me-cover">
 {notice}
@@ -565,6 +578,14 @@ fn render_signed_out(notice: Option<&str>) -> String {
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
 <div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
+</form>
+</section>
+<section class="ae-group me-capture-hero">
+<p class="me-kicker">New here?</p>
+<form action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
 </form>
 </section>
 </div>"#,

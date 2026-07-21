@@ -30,8 +30,9 @@ use memory_engine_api_render::{
     render_auth_recovery, render_content_feedback_recovery_html,
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
-    AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
+    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
+    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
+    LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -42,7 +43,7 @@ use memory_engine_api_state::{
     InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
     ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
     StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
-    SubmitViewport,
+    SubmitViewport, WaitlistEntry,
 };
 
 #[cfg(test)]
@@ -363,12 +364,14 @@ pub fn router(state: ApiState) -> Router {
             "/internal/scheduler/return-notifications",
             post(run_return_notification_scheduler),
         )
+        .route("/internal/waitlist", get(list_waitlist))
         .route("/accounts", post(create_account));
 
     mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/analytics", get(app_analytics))
         .route("/app/account", post(create_app_account))
+        .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
         .route(
@@ -880,6 +883,12 @@ struct AppAccountForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct AppWaitlistForm {
+    email: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct AppLoginVerifyQuery {
     token: String,
 }
@@ -1017,6 +1026,33 @@ async fn create_app_account(
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
         Err(error) => app_failure_response(error),
     })
+}
+
+async fn create_app_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppWaitlistForm>,
+) -> Response {
+    let result = state.join_waitlist(&form.email, "first-run", &client_rate_limit_key(&headers));
+
+    no_store_response(match result {
+        Ok(()) => Html(render_waitlist_joined()).into_response(),
+        Err(error) => app_failure_response(error),
+    })
+}
+
+/// Operator-only waitlist readout, gated by the admin token. Not part of the
+/// versioned `/v1` contract — like the return-notification scheduler route,
+/// this is internal tooling, not a public API surface.
+async fn list_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WaitlistEntry>>, ApiFailure> {
+    let admin_token = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    Ok(Json(state.list_waitlist(admin_token)?))
 }
 
 async fn verify_app_login(

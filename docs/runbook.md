@@ -98,6 +98,40 @@ and the prior one fails with `403` immediately. To revoke without keeping a
 usable credential, reissue and discard the response. Issuance is audited in
 the app log (`service session issued account=...`).
 
+## Waitlist (invite-beta first-run)
+
+The signed-out landing page offers two actions: sign in (allowlisted emails,
+existing flow) and join the waitlist (anyone, no account). `POST
+/app/waitlist` records only a normalized email, a created/updated timestamp
+pair, and a source tag (`"first-run"`) — no account, session, or generation
+job is ever created. Joining is idempotent on normalized email and returns
+the identical response whether the address is brand new, already on the
+list, or already allowlisted, so the response can never be used to probe
+registration or allowlist state. The join and its per-email/per-IP rate
+limit share the same file-store/Postgres storage backend as the rest of the
+app; **this first slice implements the file-store side only** — a
+Postgres-backed deployment returns `503` on both join and listing rather
+than silently dropping the entry (see `crates/memory-engine-api-state/src/waitlist.rs`).
+
+Operator readout, gated by `MEMORY_ENGINE_ADMIN_TOKEN` (the same admin token
+used by service sessions):
+
+```sh
+base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+curl -fsS --max-time 20 \
+  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
+  "$base/internal/waitlist"
+# -> [{"email":"...","createdAtMs":...,"updatedAtMs":...,"source":"first-run","invitedAtMs":null}, ...]
+```
+
+`/internal/waitlist` is operator tooling, not a versioned public contract —
+it sits beside `/internal/scheduler/return-notifications`, outside `/v1/*`.
+There is no export/invite-transition/delete surface or CLI wrapper yet;
+today an operator lists entries here and invites by hand through the
+existing allowlist + magic-link path. Local dev: the file store keeps
+`_waitlist.json` beside the other store-root sidecars
+(`_jobs.json`, `_rate_limits/`) under `MEMORY_ENGINE_API_STORE_DIR`.
+
 ## Queued generation (machine consumers)
 
 Bearer-authenticated clients enqueue the same bounded, durable generation job

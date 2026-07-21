@@ -22,9 +22,9 @@ pub use memory_engine_api_state::{
     CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, GenerationJob,
     HealthResponse, InvalidateProjectDeckRequest, JobBroadcast, JobQueue, JobStatus,
     ProjectDeckRecord, ReadinessResponse, ReturnNotificationSchedulerConfig, SourceList,
-    SourceRecord, StudyStorage, StudyViewResponse, SubmitReviewRequest,
+    SourceRecord, StudyStorage, StudyViewResponse, SubmitReviewRequest, WaitlistEntry,
     APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_SESSION_COOKIE_NAME, AUTH_CHALLENGE_TTL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
 };
 
 pub use routes::router;

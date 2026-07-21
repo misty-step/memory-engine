@@ -51,9 +51,11 @@ mod file_lock;
 mod jobs;
 mod registry;
 mod storage;
+mod waitlist;
 
 pub use jobs::{EnqueueOutcome, GenerationJob, JobBroadcast, JobQueue, JobStatus};
 pub use storage::StudyStorage;
+pub use waitlist::WaitlistEntry;
 
 use storage::StudyStorageConfig;
 
@@ -139,6 +141,35 @@ impl ApiState {
     /// Returns an API failure when auth or persistence rejects the account.
     pub fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
         self.accounts.create_account(email)
+    }
+
+    /// Join the invite-beta waitlist. Idempotent on normalized email and
+    /// silent about allowlist/account state: a repeat join or a join by an
+    /// address that already has access looks identical to a brand-new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns bad request on a malformed email, too-many-requests when the
+    /// per-email or per-IP limit is spent, and `not_implemented` when the
+    /// registry is Postgres-backed (this slice is file-store only).
+    pub fn join_waitlist(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .join_waitlist(email, source, client_rate_limit_key)
+    }
+
+    /// List every waitlist entry for the operator, gated by the admin token.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// and `not_implemented` when the registry is Postgres-backed.
+    pub fn list_waitlist(&self, admin_token: &str) -> Result<Vec<WaitlistEntry>, ApiFailure> {
+        self.accounts.list_waitlist(admin_token)
     }
 
     /// Issue (or rotate) the service-session credential for an allowlisted
@@ -1579,6 +1610,16 @@ impl AccountRegistry {
         }
     }
 
+    /// Where the waitlist should persist entries, or `None` when there is no
+    /// local file store. `_waitlist.json` sits beside the other store-root
+    /// sidecars (`_jobs.json`, `_rate_limits`).
+    pub(crate) fn waitlist_store_path(&self) -> Option<PathBuf> {
+        match &self.lock_data().storage {
+            StudyStorageConfig::File { store_root } => Some(store_root.join("_waitlist.json")),
+            StudyStorageConfig::Postgres { .. } => None,
+        }
+    }
+
     pub(crate) fn postgres_url(&self) -> Option<String> {
         match &self.lock_data().storage {
             StudyStorageConfig::Postgres { database_url } => Some(database_url.clone()),
@@ -2357,6 +2398,10 @@ pub const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 pub const MAX_SOURCE_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_SOURCE_TITLE_BYTES: usize = 512;
 const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
+/// Same policy shape as the magic-link request limiter: five attempts per
+/// window, keyed by normalized email and by client IP.
+pub const WAITLIST_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
+const WAITLIST_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // 30 minutes: links travel through email, where spam checks and device
 // switches routinely burn ten minutes. Found in dogfood: a link expired
 // before the operator could click it.
