@@ -195,12 +195,45 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
     }
 }
 
+/// Generate drafts for every active source, routing each by permission.
+///
+/// `LocalOnly` sources always go through the pure deterministic path
+/// (`BetaStudySession::generate`), which never references a model provider,
+/// so a `LocalOnly` capture can never reach one. `ModelEligible` sources go
+/// through the model-capable path (`generate_with_provider`), which still
+/// re-enforces the permission boundary at the provider itself. Splitting the
+/// batch by permission keeps one `LocalOnly` source from blocking generation
+/// for unrelated eligible sources — previously a single `LocalOnly` capture
+/// failed the whole all-sources run before any drafts were produced.
 fn generate_all_sources(
     session: &mut BetaStudySession,
 ) -> Result<BetaStudyView, memory_engine_study::BetaStudyError> {
     let model = FakeModelProvider;
     let provider = FallbackProvider::new(&model);
-    session.generate_with_provider(None, &provider)
+
+    let view = session.view()?;
+    let mut local_only_ids = Vec::new();
+    let mut model_eligible_ids = Vec::new();
+    for source in &view.sources {
+        if source.permission == SourcePermission::LocalOnly {
+            local_only_ids.push(source.id.clone());
+        } else {
+            model_eligible_ids.push(source.id.clone());
+        }
+    }
+
+    if local_only_ids.is_empty() && model_eligible_ids.is_empty() {
+        return session.generate_with_provider(None, &provider);
+    }
+
+    let mut latest_view = None;
+    if !local_only_ids.is_empty() {
+        latest_view = Some(session.generate(Some(local_only_ids))?);
+    }
+    if !model_eligible_ids.is_empty() {
+        latest_view = Some(session.generate_with_provider(Some(model_eligible_ids), &provider)?);
+    }
+    Ok(latest_view.expect("at least one source id list was non-empty"))
 }
 
 fn response_for(
@@ -1288,6 +1321,93 @@ mod tests {
         assert!(generated_html.contains("Drafts"));
         assert!(generated_html.contains("Explain the idea"));
         assert!(!generated_html.contains("No review items could be generated"));
+    }
+
+    #[test]
+    fn local_only_source_generates_locally_without_blocking_eligible_generation() {
+        let directory = TempDirectory::new("local-only-routing");
+        let mut session = session(directory.path().join("study.json"));
+
+        let local_source = route(
+            &mut session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-local",
+                    "title": "Private notes",
+                    "body": source_body(),
+                    "permission": "local-only"
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(local_source.status, 200);
+
+        let eligible_source = route(
+            &mut session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-eligible",
+                    "title": "Shareable notes",
+                    "body": "Mitochondria are organelles because cells use ATP as chemical energy.",
+                    "permission": "model-eligible"
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(eligible_source.status, 200);
+
+        // Before the fix, this call failed the entire batch with
+        // `LocalOnlySource` before any drafts were produced, because the
+        // local-only and eligible sources were sent through the same
+        // enforcing model-capable call together.
+        let generated = route(&mut session, &request("POST", "/generate", "{}"));
+        assert_eq!(generated.status, 200);
+        let generated: Value = serde_json::from_slice(&generated.body).expect("generated");
+        let drafts = generated["drafts"].as_array().expect("drafts array");
+
+        let local_draft_prompts: Vec<&str> = drafts
+            .iter()
+            .filter(|draft| {
+                draft["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("src-local"))
+            })
+            .filter_map(|draft| draft["prompt"].as_str())
+            .collect();
+        assert!(
+            !local_draft_prompts.is_empty(),
+            "expected the local-only source to generate locally, got: {generated}"
+        );
+        // `FakeModelProvider` is this crate's stand-in for a real model
+        // provider; its candidates are always tagged "Explain the idea...".
+        // The local-only path (`BetaStudySession::generate`) never wires a
+        // model provider at all, so a local-only draft can never carry it.
+        assert!(
+            local_draft_prompts
+                .iter()
+                .all(|prompt| !prompt.contains("Explain the idea")),
+            "local-only source must never reach the model-fallback provider: {local_draft_prompts:?}"
+        );
+
+        let eligible_draft_prompts: Vec<&str> = drafts
+            .iter()
+            .filter(|draft| {
+                draft["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("src-eligible"))
+            })
+            .filter_map(|draft| draft["prompt"].as_str())
+            .collect();
+        assert!(
+            eligible_draft_prompts
+                .iter()
+                .any(|prompt| prompt.contains("Explain the idea")),
+            "model-eligible source must still generate through the model-capable path: {eligible_draft_prompts:?}"
+        );
     }
 
     #[test]
