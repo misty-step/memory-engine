@@ -414,6 +414,16 @@ impl StudyStorage {
             .generate_source_with_run_id(account_id, store_path, source_id, run_id)
     }
 
+    pub(crate) fn discard_generation_run(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .discard_generation_run(account_id, store_path, run_id)
+    }
+
     /// Archive a source and every review unit generated from it. Returns the
     /// view plus the count of cards actually retired by this call (across
     /// every generation run for the source) — the caller reports this count
@@ -764,6 +774,15 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let _ = run_id;
         self.generate_source(account_id, store_path, source_id)
+    }
+
+    fn discard_generation_run(
+        &self,
+        _account_id: &str,
+        _store_path: &FsPath,
+        _run_id: &str,
+    ) -> Result<(), ApiFailure> {
+        Ok(())
     }
     fn archive_source(
         &self,
@@ -1581,6 +1600,17 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(StudyViewResponse::from_view(view))
     }
 
+    fn discard_generation_run(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+    ) -> Result<(), ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            study.discard_generation_run(run_id).map_err(study_failure)
+        })
+    }
+
     fn archive_source(
         &self,
         _account_id: &str,
@@ -2375,6 +2405,24 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             )?;
             Ok(StudyViewResponse::from_view(view))
         })
+    }
+
+    fn discard_generation_run(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        run_id: &str,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account
+                    .discard_generation_run(run_id)
+                    .map_err(postgres_failure)
+            },
+        )
     }
 
     fn archive_source(

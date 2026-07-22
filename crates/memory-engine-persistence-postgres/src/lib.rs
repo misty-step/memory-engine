@@ -3224,6 +3224,26 @@ impl AccountStudyStore<'_> {
         })
     }
 
+    /// Remove pending output for one account-scoped generation run.
+    ///
+    /// The operation is idempotent and never touches another run or account.
+    pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "DELETE FROM memory_engine_generated_prompt_drafts
+                 WHERE account_id = $1 AND draft->>'generationRunId' = $2",
+                &[&account_id, &run_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM memory_engine_generation_runs
+                 WHERE account_id = $1 AND generation_run_id = $2",
+                &[&account_id, &run_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Append one account-scoped learner content judgment. Replaying the same
     /// feedback id is idempotent; a different payload under that id is rejected.
     ///
@@ -3423,6 +3443,10 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
         AccountStudyStore::save_generated_prompt_draft(self, &draft)?;
 
         Ok(draft)
+    }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        AccountStudyStore::discard_generation_run(self, run_id)
     }
 }
 

@@ -881,6 +881,19 @@ where
         self.view()
     }
 
+    /// Remove a generation run after its worker lease fence rejects the commit.
+    ///
+    /// # Errors
+    /// Returns the underlying store error when rollback cannot be committed.
+    pub fn discard_generation_run(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .discard_generation_run(run_id)
+            .map_err(BetaStudyError::Store)
+    }
+
     /// Provider-backed counterpart to [`Self::generate_with_run_id`].
     ///
     /// # Errors

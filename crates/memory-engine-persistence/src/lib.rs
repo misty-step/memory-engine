@@ -922,6 +922,21 @@ impl BetaPersistenceStore {
         })
     }
 
+    /// Remove an uncommitted generation run and its pending provenance.
+    ///
+    /// This is used only when the durable worker lease fence rejects a run.
+    pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), BetaStoreError> {
+        self.transact(|snapshot| {
+            snapshot
+                .generated_prompt_drafts
+                .retain(|draft| draft.generation_run_id.as_deref() != Some(run_id));
+            snapshot
+                .generation_runs
+                .retain(|run| run.id.as_str() != run_id);
+            Ok(())
+        })
+    }
+
     /// Promote an accepted generated draft into a review unit.
     ///
     /// # Errors

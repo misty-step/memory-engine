@@ -970,6 +970,29 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
+    fn postgres_generation_lease_is_valid(
+        &self,
+        account_id: &str,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+    ) -> Result<bool, ApiFailure> {
+        let Some(database_url) = self.postgres_url() else {
+            return Ok(true);
+        };
+        crate::with_postgres_store(&database_url, |store| {
+            store
+                .generation_job_attempt_has_commit_fence(
+                    account_id,
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    self.now(),
+                )
+                .map_err(crate::postgres_failure)
+        })
+    }
+
     pub(crate) fn run_generation_job(
         &self,
         account_id: &str,
@@ -989,15 +1012,21 @@ impl AccountRegistry {
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
         storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
-        if !lease_valid() {
+        if !lease_valid()
+            || !self.postgres_generation_lease_is_valid(
+                account_id,
+                run_id,
+                generation_attempt,
+                lease_token,
+            )?
+        {
+            let _ = storage.discard_generation_run(account_id, &store_path, run_id);
             return Err(ApiFailure::conflict(
                 "Generation lease lost before cards could be committed.",
             ));
         }
-        let view = storage.study_view(account_id, &store_path)?;
+        let _view = storage.study_view(account_id, &store_path)?;
         // Generation reports scheduled cards, and generation never schedules.
-        // Keep the lease parameters in the signature for worker fencing.
-        let _ = (view, generation_attempt, lease_token);
         Ok(0)
     }
 

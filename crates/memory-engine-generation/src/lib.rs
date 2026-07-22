@@ -197,6 +197,11 @@ pub trait BetaGenerationStore {
         &mut self,
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error>;
+
+    /// Remove pending output when a durable worker lease loses its commit fence.
+    fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 impl BetaGenerationStore for BetaPersistenceStore {
@@ -229,6 +234,10 @@ impl BetaGenerationStore for BetaPersistenceStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         BetaPersistenceStore::save_generated_prompt_draft(self, draft)
+    }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        BetaPersistenceStore::discard_generation_run(self, run_id)
     }
 }
 

@@ -1205,7 +1205,6 @@ mod tests {
     // A ghost source fails fast in the worker (no model call), so every job
     // becomes terminal (failed) without touching the network.
     const GHOST: &str = "ghost-source";
-    static TEST_CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
     fn enqueue_id(outcome: EnqueueOutcome) -> String {
         match outcome {
@@ -1214,10 +1213,6 @@ mod tests {
                 panic!("test enqueue rejected: {reason}")
             }
         }
-    }
-
-    fn test_clock_ms() -> i64 {
-        TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[test]
@@ -1639,6 +1634,10 @@ mod tests {
                 snapshot.review_units.is_empty(),
                 "stale worker must not commit any review units after reclaim"
             );
+            assert!(
+                snapshot.generated_prompt_drafts.is_empty(),
+                "stale worker must not leave pending drafts after reclaim"
+            );
             match outcome {
                 Ok(_) => Err("stale worker was able to commit review units".to_owned()),
                 Err(error) => {
@@ -1661,6 +1660,10 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn postgres_generation_cannot_commit_after_live_lease_expiry_without_reclaim() {
+        static TEST_CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn test_clock_ms() -> i64 {
+            TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+        }
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!(
                 "skipping live Postgres expiry regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
@@ -1767,6 +1770,10 @@ mod tests {
             assert!(
                 snapshot.review_units.is_empty(),
                 "expired lease must not commit review units"
+            );
+            assert!(
+                snapshot.generated_prompt_drafts.is_empty(),
+                "expired lease must not leave pending drafts"
             );
             Ok(())
         })();
