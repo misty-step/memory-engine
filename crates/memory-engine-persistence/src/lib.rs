@@ -1851,6 +1851,8 @@ fn record_learner_draft_decision(
             prompt_text,
             expected_answer,
         } => {
+            let prompt_text = prompt_text.trim();
+            let expected_answer = expected_answer.trim();
             assert_non_blank(prompt_text, "Learner prompt")?;
             assert_non_blank(expected_answer, "Learner expected answer")?;
             replace_prompt_text(&mut draft.prompt, prompt_text);

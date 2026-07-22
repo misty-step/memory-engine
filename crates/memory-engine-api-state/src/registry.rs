@@ -965,11 +965,6 @@ impl AccountRegistry {
     /// Session-free by design — enqueueing was already authorized in the request
     /// that created the job, and the background worker is trusted, so it keys off
     /// the account id alone rather than carrying a credential.
-    /// Runs an API registry operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when auth, storage, or study state rejects the operation.
     fn postgres_generation_lease_is_valid(
         &self,
         account_id: &str,
@@ -1012,18 +1007,29 @@ impl AccountRegistry {
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
         storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
-        if !lease_valid()
-            || !self.postgres_generation_lease_is_valid(
-                account_id,
-                run_id,
-                generation_attempt,
-                lease_token,
-            )?
-        {
+        if !lease_valid() {
             let _ = storage.discard_generation_run(account_id, &store_path, run_id);
             return Err(ApiFailure::conflict(
                 "Generation lease lost before cards could be committed.",
             ));
+        }
+        match self.postgres_generation_lease_is_valid(
+            account_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = storage.discard_generation_run(account_id, &store_path, run_id);
+                return Err(ApiFailure::conflict(
+                    "Generation lease lost before cards could be committed.",
+                ));
+            }
+            Err(error) => {
+                let _ = storage.discard_generation_run(account_id, &store_path, run_id);
+                return Err(error);
+            }
         }
         let _view = storage.study_view(account_id, &store_path)?;
         // card_count is the number of scheduled cards, and generation never

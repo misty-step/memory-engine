@@ -1242,14 +1242,12 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
     let edited = store
         .edit_and_keep_generated_prompt_draft(
             draft_ids[1],
-            "Edited trust prompt",
-            "Edited trust answer",
+            "  Edited trust prompt  ",
+            "  Edited trust answer  ",
             NOW + 1,
         )
         .expect("edit and keep");
-    store
-        .reject_generated_prompt_draft(draft_ids[2], NOW + 2)
-        .expect("reject");
+    assert_decision_retries(&mut store, &draft_ids, &kept, &edited);
 
     let due = store.list_queue_candidates().expect("due queue");
     assert_eq!(due.len(), 2, "only kept and edited-kept drafts can be due");
@@ -1288,6 +1286,48 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
         serde_json::from_str::<serde_json::Value>(&reloaded_export).expect("reloaded export JSON"),
         export
     );
+}
+
+fn assert_decision_retries(
+    store: &mut BetaPersistenceStore,
+    draft_ids: &[&str; 3],
+    kept: &BetaReviewUnitRecord,
+    edited: &BetaReviewUnitRecord,
+) {
+    assert_eq!(
+        store
+            .keep_generated_prompt_draft(draft_ids[0], NOW + 3)
+            .expect("idempotent keep"),
+        *kept
+    );
+    assert_eq!(
+        store
+            .edit_and_keep_generated_prompt_draft(
+                draft_ids[1],
+                "Edited trust prompt",
+                "Edited trust answer",
+                NOW + 4,
+            )
+            .expect("idempotent edit"),
+        *edited
+    );
+    assert!(store
+        .edit_and_keep_generated_prompt_draft(
+            draft_ids[1],
+            "Different trust prompt",
+            "Edited trust answer",
+            NOW + 5,
+        )
+        .is_err());
+    store
+        .reject_generated_prompt_draft(draft_ids[2], NOW + 2)
+        .expect("reject");
+    store
+        .reject_generated_prompt_draft(draft_ids[2], NOW + 6)
+        .expect("idempotent reject");
+    assert!(store
+        .keep_generated_prompt_draft(draft_ids[2], NOW + 7)
+        .is_err());
 }
 
 fn source_document(id: &str) -> SourceDocument {

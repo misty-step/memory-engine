@@ -2595,6 +2595,8 @@ impl AccountStudyStore<'_> {
             let reject = matches!(decision, &PostgresLearnerDecision::Reject);
             let edited = matches!(decision, &PostgresLearnerDecision::Edit { .. });
             if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = decision {
+                let prompt_text = prompt_text.trim();
+                let expected_answer = expected_answer.trim();
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
                 replace_prompt_text(&mut draft.prompt, prompt_text);
