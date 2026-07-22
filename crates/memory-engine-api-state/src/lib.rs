@@ -2100,6 +2100,22 @@ impl ApiFailure {
     pub fn is_magic_link_recovery(&self) -> bool {
         self.status == StatusCode::FORBIDDEN && self.message == "Magic link is invalid or expired."
     }
+
+    /// True when this failure came from validating or acting on a
+    /// return-notification (due-count reminder) unsubscribe token: signature
+    /// mismatch, malformed payload, unknown/rotated nonce, or a token whose
+    /// `expires_at_ms` has passed. All three call sites in
+    /// [`AccountRegistry::verify_unsubscribe_token`],
+    /// [`AccountRegistry::validate_return_notification_token`], and
+    /// [`AccountRegistry::disable_return_notification`] use
+    /// [`ApiFailure::forbidden`] with a message that starts with this exact
+    /// prefix, so it is a safe, precise discriminator distinct from every
+    /// other `Forbidden` failure in the app surface (e.g.
+    /// `forbidden_account`).
+    #[must_use]
+    pub fn is_return_notification_link_invalid(&self) -> bool {
+        self.status == StatusCode::FORBIDDEN && self.message.starts_with("That unsubscribe link")
+    }
 }
 
 /// Process-wide Canary reporter, installed once by the binary entry point.
