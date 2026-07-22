@@ -199,6 +199,10 @@ pub trait BetaGenerationStore {
     ) -> Result<GeneratedPromptDraft, Self::Error>;
 
     /// Remove pending output when a durable worker lease loses its commit fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when rollback cannot be persisted.
     fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
         Ok(())
     }
