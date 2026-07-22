@@ -3,19 +3,19 @@
 Everything here is CLI/API-driven; no dashboards required. The app is
 `memory-engine-api` on DigitalOcean App Platform, with Postgres on Neon,
 serving both the JSON API and the server-rendered study UI from one Rust binary
-at `https://memory-engine-api-i2xcr.ondigitalocean.app`. DigitalOcean is the
-only current application runtime; rollback stays within DigitalOcean plus git.
+at `https://scry.study`. DigitalOcean is the only current application runtime;
+rollback stays within DigitalOcean plus git.
 
 ## Agent surface summary
 
 - App: `memory-engine-api`.
 - Platform: DigitalOcean App Platform (id
-  `5ab05b73-9265-43c9-a01c-fef53f5f46a4`), URL
-  `https://memory-engine-api-i2xcr.ondigitalocean.app`.
+  `5ab05b73-9265-43c9-a01c-fef53f5f46a4`), product URL `https://scry.study`,
+  direct origin `https://memory-engine-api-i2xcr.ondigitalocean.app`.
 - Runtime: Rust binary from `crates/memory-engine-api`, built by `Dockerfile`.
 - Store contract: production must set `MEMORY_ENGINE_POSTGRES_URL`; file store
   requires `MEMORY_ENGINE_ENABLE_FILE_STORE=true` and is local/dev only.
-- Auth contract: allowlist plus magic links; production account creation and
+- Human auth contract: invite allowlist plus magic links; production account creation and
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
   `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
   `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
@@ -35,7 +35,7 @@ workflow must not be restored: it previously reactivated an obsolete runtime
 after every green `master` push.
 
 ```sh
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://scry.study"
 
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}" "$base/healthz")
 test "$status" = "200"
@@ -80,7 +80,7 @@ Provisioning (operator, once):
    `secret://memory-engine/dogfood`:
 
 ```sh
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://scry.study"
 curl -fsS --max-time 20 \
   -H 'content-type: application/json' \
   -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
@@ -128,7 +128,7 @@ used by service sessions) — list, export, mark invited, and delete, with no
 direct SQL required:
 
 ```sh
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://scry.study"
 
 # List every entry as JSON.
 curl -fsS --max-time 20 \
@@ -181,7 +181,7 @@ returns `503` so machine clients can retry it.
 ```sh
 set -euo pipefail
 
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://scry.study"
 account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
 session_token="${MEMORY_ENGINE_SESSION_TOKEN:?set MEMORY_ENGINE_SESSION_TOKEN}"
 source_id="${MEMORY_ENGINE_SOURCE_ID:?set MEMORY_ENGINE_SOURCE_ID}"
@@ -225,7 +225,7 @@ first.
 ```sh
 set -euo pipefail
 
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
+base="https://scry.study"
 receipt_dir="docs/qa"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
@@ -303,7 +303,7 @@ rm -f /tmp/memory-engine-known-good.yaml
 ## Health
 
 ```sh
-curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status":"ok",...}
+curl -s https://scry.study/healthz   # {"status":"ok",...}
 doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
 ```
 
@@ -404,9 +404,9 @@ neonctl branches create --project-id twilight-brook-49749008 --name migration-te
 
 Use a branch to rehearse risky migrations against real data, then delete it.
 
-## Login (magic links over email)
+## Human login (magic links over email)
 
-Auth is allowlist + magic link, delivered by `bin/send-magic-link` (baked
+Human auth is invite allowlist + magic link, delivered by `bin/send-magic-link` (baked
 into the image at `/usr/local/bin/send-magic-link`), which sends through
 Resend from `onboarding@resend.dev` — deliverable only to the Resend account
 owner's address, which matches the solo-dogfood allowlist. Activate it by

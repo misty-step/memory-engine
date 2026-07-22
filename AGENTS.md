@@ -1,9 +1,26 @@
 # Agent Operations
 
-`memory-engine` is a Rust human-learning engine and repo-local dogfood
-workspace for spaced repetition, grading, progression, queueing,
-source-backed generation, and beta study workflows — the Anki-killer product
-direction described in `VISION.md`.
+Scry is the consumer product. `memory-engine` is its Rust engine and current
+production workspace. The canonical product promise is **Remember everything.**
+Quiz-driven memorization is the heart of the product; the five faces are PWA, CLI,
+skill, MCP, and API over one capability system. See `VISION.md` for the full
+product contract.
+
+## Product Topology
+
+- The phone-first PWA is the primary human surface.
+- CLI, skill, MCP, and API are additional faces over the same typed capabilities;
+  they must not grow separate learning or grading semantics.
+- Human beta access is invite-gated with a visible waitlist and magic-link sign-in
+  only; there is no OAuth path. Machine faces use operator-gated service sessions.
+  Subscription is intended; public signup waits for bounded costs, privacy,
+  reliability, and Stripe proof.
+- The current production proof surface is the Rust `memory-engine-api` application
+  on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the
+  product domain.
+- Repository consolidation into the Scry repository is approved but deferred. Do
+  not force-push, archive, repoint production, or change repository identity until
+  active claims drain and the operator gives a later explicit go.
 
 ## Stack & Boundaries
 
@@ -24,8 +41,9 @@ promotion.
 
 ## Ground Truth
 
-- `VISION.md` is the north star for the human learning product premise, Rust
-  kernel boundary, dogfood product surface, and application/service boundary.
+- `VISION.md` is the canonical Scry consumer-product vision: it governs the Remember
+  everything promise, quiz-first learning loop, five faces, product bars, Rust
+  engine boundary, production surface, and deferred repository consolidation.
 - `SPEC.md` is the older strategy document; `docs/rust-migration.md` records
   cutover state. Use them for technical history and boundary context;
   `VISION.md` governs when product positioning conflicts.
@@ -85,8 +103,8 @@ oracle.
    verdicts without a spec update.
 10. Do not add runtime dependencies without shaped scope and docs updates.
 11. Do not lower gates, bypass hooks, or mark unrun canaries as proof.
-12. Historical Scry and Vault canary branches are deprecated. Use repo-local
-    dogfood lanes and explicitly shaped current external proof instead.
+12. Use the current Scry product surface, repo-local dogfood lanes, and explicitly
+    shaped external proof for live-product decisions.
 
 ## Layout
 
@@ -115,8 +133,8 @@ oracle.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
 - Powder — shaped tickets, claims, closure, and proof for `/deliver`.
-- `SPEC.md` / `docs/rust-migration.md` — authoritative on strategy and
-  cutover state.
+- `SPEC.md` / `docs/rust-migration.md` — technical strategy and cutover context;
+  `VISION.md` governs product positioning.
 
 ## Conventions
 
@@ -144,14 +162,17 @@ bounded `/reflect`. `/groom` always reconciles Powder before strategy.
 - Keep the Rust cutover complete: no non-Dagger TypeScript runtime/test files
   should return, and operator docs must point at Rust crates, Cargo
   commands, Dagger CI, and the production runbook.
-- After cutover, prioritize repeated phone-sized dogfood receipts over new
-  abstractions. Beta app extraction or promotion needs repeated evidence
-  from the Rust app, not archived TypeScript-era tickets.
+- Prioritize repeated phone-sized Scry dogfood receipts over new abstractions.
+  Beta app extraction or promotion needs repeated evidence from the Rust app, not
+  speculative client architecture.
 - The largest current simplification pressure is in boundary crates,
   especially local HTTP hosts and persistence. Do not move that complexity
   into `memory-engine-core`.
+- Repository consolidation is a later operation, not current implementation work;
+  preserve the current engine identity and production surface until the explicit
+  operator go described above.
 
 ## Non-goals
 
-General-purpose hosting or auth frameworks, billing, chat tutoring, generalized
-content import, and extracting the beta app into another repository.
+General-purpose hosting or auth frameworks, chat tutoring, generalized content
+import, and immediate repository consolidation before its explicit go.
