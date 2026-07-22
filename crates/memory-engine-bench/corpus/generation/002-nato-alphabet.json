@@ -7,7 +7,7 @@
     "min_drafts": 26,
     "max_drafts": 26,
     "key_terms": ["Alfa", "Foxtrot", "Zulu"],
-    "intent": "fact_recall",
+    "intent": "enumerable_set",
     "content_fit": {
       "expected_type": "enumerable_set",
       "required_shape": "production_recall",

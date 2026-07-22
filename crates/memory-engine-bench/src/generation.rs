@@ -1517,13 +1517,14 @@ mod tests {
     }
 
     const BODY: &str = "A is Alfa. B is Bravo. C is Charlie.";
+    const CORPUS_SOURCE_BODY: &str = "The source explains Alfa and Bravo as code words.";
 
     fn corpus_source() -> CorpusSource {
         CorpusSource {
             id: "letters".to_owned(),
             title: "Letters".to_owned(),
             category: "fixture".to_owned(),
-            body: BODY.to_owned(),
+            body: CORPUS_SOURCE_BODY.to_owned(),
             expect: expectations(),
         }
     }
@@ -1909,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn presidents_fixture_records_current_fake_provider_gap_as_red() {
+    fn presidents_fixture_is_exhaustively_supported_by_the_fake_provider() {
         let source = load_corpus()
             .expect("corpus")
             .into_iter()
@@ -1920,11 +1921,12 @@ mod tests {
         let enumerable = score.enumerable_set.expect("enumerable score");
 
         assert_eq!(enumerable.expected, 47);
+        assert_eq!(enumerable.observed, 47);
+        assert_eq!(enumerable.covered, 47);
         assert!(
-            !enumerable.passes(),
-            "the fixture must expose the current gap"
+            enumerable.passes(),
+            "the canonical fixture must pass: {enumerable:?}"
         );
-        assert!(enumerable.missing > 0);
     }
 
     #[test]
@@ -1947,6 +1949,7 @@ mod tests {
             [
                 "concept_understanding",
                 "fact_recall",
+                "enumerable_set",
                 "procedure_process",
                 "verbatim_memorization",
             ]
@@ -1997,14 +2000,15 @@ mod tests {
 
         fn generate_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
         ) -> Result<ProviderDrafts, ProviderFailure> {
+            let evidence = source.body.clone().unwrap_or_default();
             Ok(ProviderDrafts {
                 model: self.model(),
                 learning_intent: None,
                 candidates: vec![
-                    candidate("What is A?", "Alfa", "A is Alfa."),
-                    candidate("What is A?", "Alfa", "A is Alfa."),
+                    candidate("What is A?", "Alfa", &evidence),
+                    candidate("What is A?", "Alfa", &evidence),
                 ],
                 failures: Vec::new(),
                 usage: None,
@@ -2023,9 +2027,11 @@ mod tests {
 
         fn generate_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
         ) -> Result<ProviderDrafts, ProviderFailure> {
+            let evidence = source.body.clone().unwrap_or_default();
             let mut rejected = candidate("What is A?", "Alfa", "A is Alfa.");
+            rejected.evidence = Some(evidence.clone());
             rejected.unsupported = true;
 
             Ok(ProviderDrafts {
@@ -2044,12 +2050,13 @@ mod tests {
 
         fn repair_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
             rejections: &[DraftRejection],
         ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
             assert_eq!(rejections.len(), 1);
             self.repair_calls.set(self.repair_calls.get() + 1);
-            let mut repaired = candidate("What is B?", "Bravo", "B is Bravo.");
+            let evidence = source.body.clone().unwrap_or_default();
+            let mut repaired = candidate("What is B?", "Bravo", &evidence);
             repaired.index = 2;
 
             Ok(Some(ProviderDrafts {

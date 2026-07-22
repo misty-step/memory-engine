@@ -243,6 +243,117 @@ fn expands_a_bare_topic_into_standalone_cards_without_requiring_quotes() {
 }
 
 #[test]
+fn model_output_for_an_enumerable_source_remains_provider_owned_before_runner_policy() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "learning_intent": "fact_recall",
+                    "drafts": [{
+                        "concept": "NATO alphabet: A",
+                        "question": "Which word stands for A?",
+                        "answer": "Alfa",
+                        "evidence_quote": "A is Alfa",
+                        "distractors": ["Bravo", "Charlie"],
+                        "activity_kind": "quiz",
+                        "activity_stage": "recognition",
+                        "worked_solution": ""
+                    }]
+                }).to_string()
+            }
+        }]
+    });
+    let (base_url, _request) = serve_once(200, &body.to_string());
+    let provider = OpenRouterProvider::new(OpenRouterConfig {
+        api_key: "test-key".to_owned(),
+        model: "test/model".to_owned(),
+        base_url,
+        proxy_socket: None,
+        timeout: Duration::from_secs(5),
+        prompt: PromptVariant::Principled,
+        max_drafts: 8,
+    });
+
+    let drafts = provider
+        .generate_drafts(&eval_source(
+            "NATO phonetic alphabet",
+            "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+        ))
+        .expect("provider output");
+
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::FactRecall));
+    assert_eq!(drafts.candidates.len(), 1);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["Alfa"]
+    );
+    assert_eq!(drafts.candidates[0].distractors, ["Bravo", "Charlie"]);
+    assert_eq!(drafts.candidates[0].activity_stage, "recognition");
+    assert!(drafts.candidates[0].evidence.is_some());
+}
+
+#[test]
+fn model_output_for_a_sequential_source_remains_provider_owned_before_runner_policy() {
+    let body = serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": serde_json::json!({
+                    "learning_intent": "concept_understanding",
+                    "drafts": [{
+                        "concept": "Oath overview",
+                        "question": "What is the oath about?",
+                        "answer": "A summary",
+                        "evidence_quote": "A summary",
+                        "distractors": ["Another answer", "A third answer"],
+                        "activity_kind": "quiz",
+                        "activity_stage": "recognition",
+                        "worked_solution": ""
+                    }]
+                }).to_string()
+            }
+        }]
+    });
+    let (base_url, _request) = serve_once(200, &body.to_string());
+    let provider = OpenRouterProvider::new(OpenRouterConfig {
+        api_key: "test-key".to_owned(),
+        model: "test/model".to_owned(),
+        base_url,
+        proxy_socket: None,
+        timeout: Duration::from_secs(5),
+        prompt: PromptVariant::Principled,
+        max_drafts: 8,
+    });
+
+    let drafts = provider
+        .generate_drafts(&eval_source(
+            "A quoted oath excerpt",
+            "First oath line. Second oath line. Third oath line.",
+        ))
+        .expect("provider output");
+
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ConceptUnderstanding)
+    );
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["A summary"]
+    );
+    assert!(drafts.candidates.iter().all(|candidate| {
+        candidate.activity_kind == memory_engine_persistence::GeneratedLearningActivityKind::Quiz
+            && candidate.distractors == ["Another answer", "A third answer"]
+    }));
+}
+
+#[test]
 fn sends_repair_feedback_and_parses_repaired_drafts_with_usage() {
     let body = serde_json::json!({
         "choices": [{
