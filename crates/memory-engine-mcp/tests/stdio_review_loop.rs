@@ -99,7 +99,7 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     assert_eq!(tool_names.len(), 6);
     assert!(tool_names.contains(&"create_deck".to_owned()));
 
-    // 3. create_deck — one call composes save+generate+approve; the deck is
+    // 3. create_deck — one call composes save+generate+keep; the deck is
     //    immediately due, proving the tool is intent-shaped, not a 1:1 wrapper
     //    around POST /project-decks.
     let deck_body = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\n\
@@ -121,7 +121,7 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     let deck_payload = tool_payload(&created_deck);
     assert!(
         deck_payload["approvedCardCount"].as_u64().unwrap_or(0) >= 1,
-        "create_deck must generate and approve at least one card: {deck_payload}"
+        "create_deck must generate and keep at least one card: {deck_payload}"
     );
     let deck_id = deck_payload["deck"]["deckId"]
         .as_str()

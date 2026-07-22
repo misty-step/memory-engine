@@ -112,7 +112,7 @@ impl MemoryEngineClient {
     /// Create a project-scoped deck, generate its review cards, and approve
     /// every accepted draft, so the deck is immediately due for study. This
     /// composes three v1 calls (`project-decks`, `sources/{id}/generate`,
-    /// `drafts/{id}/approve`) behind one agent-intent verb: an agent asking
+    /// `drafts/{id}/keep`) behind one agent-intent verb: an agent asking
     /// to "capture this as a deck" wants reviewable cards, not a bare saved
     /// source record.
     ///
@@ -152,7 +152,7 @@ impl MemoryEngineClient {
         let approved_count = pending.len();
         for draft_id in pending {
             let _: StudyView = self.post_empty(&format!(
-                "/v1/accounts/{}/drafts/{draft_id}/approve",
+                "/v1/accounts/{}/drafts/{draft_id}/keep",
                 self.account_id
             ))?;
         }
