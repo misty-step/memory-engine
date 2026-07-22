@@ -40,7 +40,7 @@ use memory_engine_persistence_postgres::{
 use memory_engine_service::{ContentFeedback, ContentFeedbackError, ContentFeedbackVerdict};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyOptions,
-    BetaStudySession, BetaStudySummary, BetaStudyView,
+    BetaStudySession, BetaStudySummary, BetaStudyView, LibrarySourceRow,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1919,6 +1919,10 @@ pub struct StudyViewResponse {
     pub due_count: usize,
     #[serde(default)]
     pub generation_notices: Vec<String>,
+    /// Per-source active-card inventory for the Library view
+    /// (memory-engine-087).
+    #[serde(default)]
+    pub library: Vec<LibrarySourceRow>,
 }
 
 impl StudyViewResponse {
@@ -1930,6 +1934,7 @@ impl StudyViewResponse {
             summary: view.summary,
             due_count: view.due_count,
             generation_notices: view.generation_notices,
+            library: view.library,
         }
     }
 }

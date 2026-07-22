@@ -28,10 +28,11 @@ use memory_engine_study::infer_capture_title;
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
     render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_edit_review_html, render_login_requested,
-    render_return_notification_confirmation, render_return_notification_disabled,
-    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
-    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
+    render_content_feedback_result_html, render_create_page, render_edit_review_html,
+    render_library_page, render_login_requested, render_return_notification_confirmation,
+    render_return_notification_disabled, render_return_notification_recovery,
+    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
+    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
     AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
@@ -373,6 +374,8 @@ pub fn router(state: ApiState) -> Router {
     let router = mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/analytics", get(app_analytics))
+        .route("/app/create", get(app_create))
+        .route("/app/library", get(app_library))
         .route("/app/account", post(create_app_account))
         .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
@@ -579,6 +582,20 @@ async fn app_analytics(
                 Some(&error.message),
             )),
         },
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
+}
+
+async fn app_create(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+    match state.require_browser_session_readonly(&headers) {
+        Ok(account) => Html(render_create_page(&state, &account, None)),
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
+}
+
+async fn app_library(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+    match state.require_browser_session_readonly(&headers) {
+        Ok(account) => Html(render_library_page(&state, &account, None, None)),
         Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
     }
 }
@@ -1460,17 +1477,12 @@ async fn capture_app_source(
             }
         }
         Err(error) => {
-            return Html(render_account_page(
-                &state,
-                &account,
-                None,
-                Some(&error.message),
-            ))
-            .into_response()
+            return Html(render_create_page(&state, &account, Some(&error.message)))
+                .into_response()
         }
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_create_page(&state, &account, Some(&notice))).into_response()
 }
 
 fn render_save_result_html(
@@ -1479,13 +1491,13 @@ fn render_save_result_html(
     result: Result<(), ApiFailure>,
 ) -> String {
     match result {
-        Ok(()) => render_account_page(
+        Ok(()) => render_library_page(
             state,
             account,
             None,
             Some("Capture saved. Create review when you are ready."),
         ),
-        Err(error) => render_account_page(state, account, None, Some(&error.message)),
+        Err(error) => render_library_page(state, account, None, Some(&error.message)),
     }
 }
 
@@ -1535,7 +1547,7 @@ async fn generate_app_source(
         EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_library_page(&state, &account, None, Some(&notice))).into_response()
 }
 
 async fn archive_app_source(
@@ -1558,7 +1570,7 @@ async fn archive_app_source(
             // run. Name the actual count instead.
             let cards = if archived_count == 1 { "card" } else { "cards" };
             let notice = format!("Source removed. {archived_count} {cards} retired.");
-            Html(render_account_page(
+            Html(render_library_page(
                 &state,
                 &account,
                 Some(&view),
@@ -1566,7 +1578,7 @@ async fn archive_app_source(
             ))
             .into_response()
         }
-        Err(error) => Html(render_account_page(
+        Err(error) => Html(render_library_page(
             &state,
             &account,
             None,
@@ -1587,14 +1599,14 @@ async fn update_app_source_permission(
             Err(error) => return app_failure_response(error),
         };
     match state.update_app_source_permission(&account, &form.source_id, form.permission) {
-        Ok(()) => Html(render_account_page(
+        Ok(()) => Html(render_library_page(
             &state,
             &account,
             None,
             Some("Source permission updated."),
         ))
         .into_response(),
-        Err(error) => Html(render_account_page(
+        Err(error) => Html(render_library_page(
             &state,
             &account,
             None,
@@ -1622,7 +1634,7 @@ async fn retry_app_job(
         "That job can't be retried."
     };
 
-    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+    Html(render_library_page(&state, &account, None, Some(notice))).into_response()
 }
 
 /// Live job-status stream (SSE). Pushes this account's job updates as they
