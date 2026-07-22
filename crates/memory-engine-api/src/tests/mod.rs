@@ -2246,18 +2246,14 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
     let source_id = html_value(&started, "sourceId");
-    // Generation auto-keeps and schedules both cards. Drive the queue to
-    // the CAT *exercise* card — the one that carries the escape hatches.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
     let approved = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
-    assert!(approved.contains("Reveal answer"));
-    assert!(approved.contains("Reference"));
-    assert!(approved.contains("Skip"));
-    assert!(approved.contains("Snooze"));
-    assert!(approved.contains("Bridge"));
+    assert_contains_all(
+        &approved,
+        &["Reveal answer", "Reference", "Skip", "Snooze", "Bridge"],
+    );
     let parent_id = html_value(&approved, "reviewUnitId");
-
     let referenced = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -2272,7 +2268,6 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let referenced = response_text(referenced).await;
     assert!(referenced.contains("Reference"));
     assert!(referenced.contains("C is CHARLIE"));
-
     let bridged = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -2307,7 +2302,6 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let opened_bridge = next_review_html(&app, &cookie, &csrf_token, "bridge").await;
     let bridge_id = html_value(&opened_bridge, "reviewUnitId");
     assert!(bridge_id.starts_with("bridge-"));
-
     let skipped = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -2323,7 +2317,6 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let next_bridge_id = html_value(&skipped, "reviewUnitId");
     assert!(next_bridge_id.starts_with("bridge-"));
     assert_ne!(next_bridge_id, bridge_id);
-
     let snoozed = app
         .oneshot(form_request_with_cookie(
             "POST",
@@ -7790,51 +7783,16 @@ async fn v1_json_api_exposes_review_escape_hatches() {
             id.contains("nato-cat-composition").then_some(id.to_owned())
         })
         .expect("exercise draft");
-    let parent_id = keep_draft_v1(&app, &account, &exercise_draft_id);
-    let parent_id = parent_id.await;
+    let parent_id = keep_draft_v1(&app, &account, &exercise_draft_id).await;
 
-    let referenced = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/review/{parent_id}/reference",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("reference");
-    assert_eq!(referenced.status(), StatusCode::OK);
-    let referenced = response_json(referenced).await;
+    let referenced = v1_review_action(&app, &account, &parent_id, "reference").await;
     assert!(referenced["current"]["referenceText"]
         .as_str()
         .expect("reference text")
         .contains("C is CHARLIE"));
 
-    let bridged = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/review/{parent_id}/bridge",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("bridge");
-    assert_eq!(bridged.status(), StatusCode::OK);
-    let bridged = response_json(bridged).await;
-    let bridge_draft_ids = bridged["drafts"]
-        .as_array()
-        .expect("bridge drafts")
-        .iter()
-        .filter_map(|draft| {
-            let id = draft["id"].as_str()?;
-            id.starts_with("bridge-").then_some(id.to_owned())
-        })
-        .collect::<Vec<_>>();
+    let bridged = v1_review_action(&app, &account, &parent_id, "bridge").await;
+    let bridge_draft_ids = bridge_draft_ids(&bridged);
     assert_eq!(bridge_draft_ids.len(), 2);
     assert!(
         bridged["current"].is_null(),
@@ -7847,38 +7805,14 @@ async fn v1_json_api_exposes_review_escape_hatches() {
     assert!(bridge_id.starts_with("bridge-"));
     assert_eq!(bridged["summary"]["attemptCount"], json!(0));
 
-    let skipped = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/review/{bridge_id}/skip",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("skip");
-    assert_eq!(skipped.status(), StatusCode::OK);
-    let skipped = response_json(skipped).await;
+    let skipped = v1_review_action(&app, &account, &bridge_id, "skip").await;
     let next_bridge_id = skipped["current"]["reviewUnitId"]
         .as_str()
         .expect("next bridge id");
     assert!(next_bridge_id.starts_with("bridge-"));
     assert_ne!(next_bridge_id, bridge_id);
 
-    let snoozed = app
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/review/{next_bridge_id}/snooze",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("snooze");
-    assert_eq!(snoozed.status(), StatusCode::OK);
+    v1_review_action(&app, &account, next_bridge_id, "snooze").await;
 }
 
 #[tokio::test]
@@ -8374,6 +8308,40 @@ async fn generate_source_v1_latest_draft(
         .as_str()
         .expect("draft id")
         .to_owned()
+}
+
+fn bridge_draft_ids(body: &Value) -> Vec<String> {
+    body["drafts"]
+        .as_array()
+        .expect("bridge drafts")
+        .iter()
+        .filter_map(|draft| {
+            let id = draft["id"].as_str()?;
+            id.starts_with("bridge-").then_some(id.to_owned())
+        })
+        .collect()
+}
+
+async fn v1_review_action(
+    app: &axum::Router,
+    account: &TestAccount,
+    review_unit_id: &str,
+    action: &str,
+) -> Value {
+    let response = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/review/{review_unit_id}/{action}",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("review action");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await
 }
 
 async fn keep_draft_v1(app: &axum::Router, account: &TestAccount, draft_id: &str) -> String {
@@ -8900,6 +8868,12 @@ fn correct_answer_for_prompt(body: &str) -> &'static str {
         "CHARLIE ALFA TANGO"
     } else {
         "ALFA"
+    }
+}
+
+fn assert_contains_all(body: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(body.contains(needle), "missing expected text: {needle}");
     }
 }
 

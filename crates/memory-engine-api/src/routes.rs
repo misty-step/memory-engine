@@ -53,6 +53,16 @@ pub(crate) struct V1ContractOperation {
     pub(crate) path: &'static str,
 }
 
+#[cfg(test)]
+macro_rules! single_operation {
+    ($method:literal, $path:expr) => {
+        &[V1ContractOperation {
+            method: $method,
+            path: $path,
+        }]
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum V1Route {
     OpenApi,
@@ -250,18 +260,9 @@ impl V1Route {
     #[cfg(test)]
     fn operations(self) -> &'static [V1ContractOperation] {
         match self {
-            Self::OpenApi => &[V1ContractOperation {
-                method: "GET",
-                path: V1_OPENAPI_PATH,
-            }],
-            Self::Accounts => &[V1ContractOperation {
-                method: "POST",
-                path: V1_ACCOUNTS_PATH,
-            }],
-            Self::ServiceSessions => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SERVICE_SESSIONS_PATH,
-            }],
+            Self::OpenApi => single_operation!("GET", V1_OPENAPI_PATH),
+            Self::Accounts => single_operation!("POST", V1_ACCOUNTS_PATH),
+            Self::ServiceSessions => single_operation!("POST", V1_SERVICE_SESSIONS_PATH),
             Self::Sources => &[
                 V1ContractOperation {
                     method: "GET",
@@ -282,74 +283,25 @@ impl V1Route {
                     path: V1_SOURCE_PATH,
                 },
             ],
-            Self::ProjectDecks => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECKS_PATH,
-            }],
-            Self::ProjectDeckInvalidate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECK_INVALIDATE_PATH,
-            }],
-            Self::Generate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATE_PATH,
-            }],
-            Self::GenerationJobs => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATION_JOBS_PATH,
-            }],
-            Self::GenerationJob => &[V1ContractOperation {
-                method: "GET",
-                path: V1_GENERATION_JOB_PATH,
-            }],
-            Self::Keep => &[V1ContractOperation {
-                method: "POST",
-                path: V1_KEEP_PATH,
-            }],
-            Self::EditDraft => &[V1ContractOperation {
-                method: "POST",
-                path: V1_EDIT_DRAFT_PATH,
-            }],
-            Self::RejectDraft => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REJECT_DRAFT_PATH,
-            }],
-            Self::Next => &[V1ContractOperation {
-                method: "POST",
-                path: V1_NEXT_PATH,
-            }],
-            Self::Reveal => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REVEAL_PATH,
-            }],
-            Self::Reference => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REFERENCE_PATH,
-            }],
-            Self::Skip => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SKIP_PATH,
-            }],
-            Self::Snooze => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_PATH,
-            }],
-            Self::SnoozeConcept => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_CONCEPT_PATH,
-            }],
-            Self::Bridge => &[V1ContractOperation {
-                method: "POST",
-                path: V1_BRIDGE_PATH,
-            }],
-            Self::Submit => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SUBMIT_PATH,
-            }],
-            Self::ContentFeedback => &[V1ContractOperation {
-                method: "POST",
-                path: V1_CONTENT_FEEDBACK_PATH,
-            }],
+            Self::ProjectDecks => single_operation!("POST", V1_PROJECT_DECKS_PATH),
+            Self::ProjectDeckInvalidate => {
+                single_operation!("POST", V1_PROJECT_DECK_INVALIDATE_PATH)
+            }
+            Self::Generate => single_operation!("POST", V1_GENERATE_PATH),
+            Self::GenerationJobs => single_operation!("POST", V1_GENERATION_JOBS_PATH),
+            Self::GenerationJob => single_operation!("GET", V1_GENERATION_JOB_PATH),
+            Self::Keep => single_operation!("POST", V1_KEEP_PATH),
+            Self::EditDraft => single_operation!("POST", V1_EDIT_DRAFT_PATH),
+            Self::RejectDraft => single_operation!("POST", V1_REJECT_DRAFT_PATH),
+            Self::Next => single_operation!("POST", V1_NEXT_PATH),
+            Self::Reveal => single_operation!("POST", V1_REVEAL_PATH),
+            Self::Reference => single_operation!("POST", V1_REFERENCE_PATH),
+            Self::Skip => single_operation!("POST", V1_SKIP_PATH),
+            Self::Snooze => single_operation!("POST", V1_SNOOZE_PATH),
+            Self::SnoozeConcept => single_operation!("POST", V1_SNOOZE_CONCEPT_PATH),
+            Self::Bridge => single_operation!("POST", V1_BRIDGE_PATH),
+            Self::Submit => single_operation!("POST", V1_SUBMIT_PATH),
+            Self::ContentFeedback => single_operation!("POST", V1_CONTENT_FEEDBACK_PATH),
         }
     }
 }

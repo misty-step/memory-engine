@@ -1486,7 +1486,7 @@ mod tests {
         );
         assert_eq!(second, 0, "a replay must not schedule duplicate material");
         let study = memory_engine_persistence::BetaPersistenceStore::open(
-            &registry.storage().account_store_path(&account.account_id),
+            registry.storage().account_store_path(&account.account_id),
         )
         .expect("study store");
         let snapshot = study.snapshot();

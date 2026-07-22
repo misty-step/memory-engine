@@ -1895,7 +1895,6 @@ mod source_loading_tests {
                 &pending_view.drafts[0].id,
             )
             .unwrap();
-
         let active_source_loads = Cell::new(0);
         let active_job_loads = Cell::new(0);
         render_account_page_with_loaders(
@@ -1914,7 +1913,6 @@ mod source_loading_tests {
         );
         assert_eq!(active_source_loads.get(), 0);
         assert_eq!(active_job_loads.get(), 0);
-
         render_account_page_with_loaders(
             &state,
             &account,
@@ -1931,7 +1929,6 @@ mod source_loading_tests {
             1,
             "a generation notice still needs live jobs to suppress stale UI"
         );
-
         let notice_page = render_account_page_with_loaders(
             &state,
             &account,
@@ -1949,7 +1946,10 @@ mod source_loading_tests {
             "an unconditional notice does not require job history"
         );
         assert!(notice_page.contains("That job can't be retried."));
+        assert_workspace_render_loads_all();
+    }
 
+    fn assert_workspace_render_loads_all() {
         let workspace_state = ApiState::default();
         let workspace_created = workspace_state
             .create_account("render-loader-workspace@example.com")

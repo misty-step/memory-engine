@@ -2490,16 +2490,28 @@ impl AccountStudyStore<'_> {
         })
     }
 
+    /// Promote an accepted generated draft into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected,
+    /// already decided, or cannot be persisted.
     pub fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        self.decide_learner_draft(draft_id, PostgresLearnerDecision::Keep, decided_at)?
+        self.decide_learner_draft(draft_id, &PostgresLearnerDecision::Keep, decided_at)?
             .1
             .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
     }
 
+    /// Edit an accepted generated draft and promote it into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, invalid,
+    /// already decided, or cannot be persisted.
     pub fn edit_and_keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
@@ -2509,7 +2521,7 @@ impl AccountStudyStore<'_> {
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
         self.decide_learner_draft(
             draft_id,
-            PostgresLearnerDecision::Edit {
+            &PostgresLearnerDecision::Edit {
                 prompt_text: prompt_text.to_owned(),
                 expected_answer: expected_answer.to_owned(),
             },
@@ -2519,12 +2531,18 @@ impl AccountStudyStore<'_> {
         .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
     }
 
+    /// Record a terminal rejection for an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, already
+    /// decided, or cannot be persisted.
     pub fn reject_generated_prompt_draft(
         &mut self,
         draft_id: &str,
         decided_at: i64,
     ) -> Result<GeneratedPromptDraft, PostgresStoreError> {
-        self.decide_learner_draft(draft_id, PostgresLearnerDecision::Reject, decided_at)?
+        self.decide_learner_draft(draft_id, &PostgresLearnerDecision::Reject, decided_at)?
             .0
             .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))
     }
@@ -2532,7 +2550,7 @@ impl AccountStudyStore<'_> {
     fn decide_learner_draft(
         &mut self,
         draft_id: &str,
-        decision: PostgresLearnerDecision,
+        decision: &PostgresLearnerDecision,
         decided_at: i64,
     ) -> Result<(Option<GeneratedPromptDraft>, Option<BetaReviewUnitRecord>), PostgresStoreError>
     {
@@ -2554,8 +2572,8 @@ impl AccountStudyStore<'_> {
                 return Err(PostgresStoreError::RejectedGeneratedPromptDraft);
             }
             if let Some(recorded) = draft.learner_decision.as_ref() {
-                if learner_decision_matches(&draft, recorded, &decision) {
-                    if matches!(decision, PostgresLearnerDecision::Reject) {
+                if learner_decision_matches(&draft, recorded, decision) {
+                    if matches!(decision, &PostgresLearnerDecision::Reject) {
                         return Ok((Some(draft), None));
                     }
                     let existing = review_unit_from_transaction(transaction, &account_id, &draft.review_unit_id)?;
@@ -2573,9 +2591,9 @@ impl AccountStudyStore<'_> {
             if !run_exists {
                 return Err(PostgresStoreError::MissingGenerationRunForAcceptedDraft);
             }
-            let reject = matches!(&decision, PostgresLearnerDecision::Reject);
-            let edited = matches!(&decision, PostgresLearnerDecision::Edit { .. });
-            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = &decision {
+            let reject = matches!(decision, &PostgresLearnerDecision::Reject);
+            let edited = matches!(decision, &PostgresLearnerDecision::Edit { .. });
+            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = decision {
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
                 replace_prompt_text(&mut draft.prompt, prompt_text);
@@ -3227,6 +3245,10 @@ impl AccountStudyStore<'_> {
     /// Remove pending output for one account-scoped generation run.
     ///
     /// The operation is idempotent and never touches another run or account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the transaction cannot be committed.
     pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
@@ -4104,7 +4126,8 @@ fn learner_decision_matches(
     requested: &PostgresLearnerDecision,
 ) -> bool {
     match (recorded, requested) {
-        (LearnerDraftDecision::Kept { edited: false, .. }, PostgresLearnerDecision::Keep) => true,
+        (LearnerDraftDecision::Kept { edited: false, .. }, PostgresLearnerDecision::Keep)
+        | (LearnerDraftDecision::Rejected { .. }, PostgresLearnerDecision::Reject) => true,
         (
             LearnerDraftDecision::Kept { edited: true, .. },
             PostgresLearnerDecision::Edit {
@@ -4115,7 +4138,6 @@ fn learner_decision_matches(
             prompt_text_for_export(&draft.prompt) == prompt_text.trim()
                 && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
         }
-        (LearnerDraftDecision::Rejected { .. }, PostgresLearnerDecision::Reject) => true,
         _ => false,
     }
 }

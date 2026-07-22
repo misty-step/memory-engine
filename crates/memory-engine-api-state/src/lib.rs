@@ -520,6 +520,11 @@ impl ApiState {
     }
 
     /// Keep an accepted generated draft and schedule it for review.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
     pub fn keep_draft(
         &self,
         account_id: &str,
@@ -531,6 +536,11 @@ impl ApiState {
     }
 
     /// Edit and keep an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, validation, draft decision, or
+    /// persistence rejects the request.
     pub fn edit_pending_draft(
         &self,
         account_id: &str,
@@ -549,6 +559,11 @@ impl ApiState {
     }
 
     /// Reject an accepted generated draft without scheduling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
     pub fn reject_pending_draft(
         &self,
         account_id: &str,
