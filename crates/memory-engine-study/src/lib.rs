@@ -371,12 +371,24 @@ pub trait BetaStudyStore:
         permission: SourcePermission,
     ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
 
+    /// Promote an accepted generated draft into the learner queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, already decided, or
+    /// cannot be persisted.
     fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
 
+    /// Edit an accepted generated draft and promote it into the learner queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, invalid, already
+    /// decided, or cannot be persisted.
     fn edit_and_keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
@@ -385,6 +397,12 @@ pub trait BetaStudyStore:
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
 
+    /// Record a terminal rejection for an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, already decided, or
+    /// cannot be persisted.
     fn reject_generated_prompt_draft(
         &mut self,
         draft_id: &str,
@@ -983,6 +1001,11 @@ where
         self.view()
     }
 
+    /// Edit one accepted draft, keep it, and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the draft decision or queue selection fails.
     pub fn edit_and_keep_draft(
         &mut self,
         draft_id: &str,
@@ -1002,6 +1025,11 @@ where
         self.view()
     }
 
+    /// Reject one accepted draft and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the draft decision or queue selection fails.
     pub fn reject_draft(
         &mut self,
         draft_id: &str,
