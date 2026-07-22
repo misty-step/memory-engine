@@ -22,7 +22,7 @@ pub struct ToolDef {
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_deck",
-        description: "Capture material as a project-scoped study deck: saves the text, generates review cards from it, and approves every accepted card so the deck is immediately due for study. Use project_key to group decks by the project/source they came from, so the whole deck can be invalidated later in one call when that material goes stale.",
+        description: "Capture material as a project-scoped study deck: saves the text, generates review cards from it, and keeps every accepted card so the deck is immediately due for study. Use project_key to group decks by the project/source they came from, so the whole deck can be invalidated later in one call when that material goes stale.",
         input_schema: r#"{"type":"object","required":["project_key","title","body"],"properties":{"project_key":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"ttl_expires_at":{"type":"integer","description":"Optional epoch-ms expiry after which the deck is eligible for cleanup."}}}"#,
     },
     ToolDef {
