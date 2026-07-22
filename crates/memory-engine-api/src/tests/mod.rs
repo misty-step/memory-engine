@@ -29,6 +29,22 @@ use memory_engine_api_state::{
     ContentFeedbackRequest, EnqueueOutcome, RETURN_NOTIFICATION_INTERVAL_MS,
 };
 
+/// A controllable test clock owned by exactly one test: each expansion carries
+/// its own static, so no test can advance another test's time. Returns
+/// `(&'static AtomicI64, fn() -> i64)` because the registry/storage clock seam
+/// takes a plain `fn() -> i64`, which cannot capture per-test state — sharing
+/// one module-level static across tests raced under parallel execution
+/// (memory-engine-101: hosted CI runs 29450012146 / 29451670231 / 29451827236).
+macro_rules! isolated_test_clock {
+    ($init:expr) => {{
+        static CLOCK: AtomicI64 = AtomicI64::new($init);
+        fn isolated_now() -> i64 {
+            CLOCK.load(Ordering::SeqCst)
+        }
+        (&CLOCK, isolated_now as fn() -> i64)
+    }};
+}
+
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
     let response = router(ApiState::default())
@@ -394,12 +410,12 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
 
 #[tokio::test]
 async fn home_get_does_not_send_or_mutate_return_notification_state() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("home-read-only-return-notifications");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(test_now)
             .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
     );
     let app = router(state.clone());
@@ -439,7 +455,7 @@ async fn home_get_does_not_send_or_mutate_return_notification_state() {
     assert_eq!(enabled.status(), StatusCode::OK);
     let outbox_before = fs::read_to_string(&outbox_path).expect("outbox after explicit enable");
     let preference_before = read_return_notification_preference(&store_root);
-    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
 
     let home = app
         .oneshot(
@@ -468,12 +484,12 @@ async fn home_get_does_not_send_or_mutate_return_notification_state() {
 
 #[test]
 fn scheduled_return_notification_sends_live_due_count_without_request_traffic() {
-    SCHEDULED_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("scheduled-return-notification");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(scheduled_clock)
+            .with_clock(test_now)
             .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
     );
     let created = state
@@ -516,7 +532,7 @@ fn scheduled_return_notification_sends_live_due_count_without_request_traffic() 
         .maybe_send_due_count_notification(&account, view.due_count, true)
         .expect("confirmation"));
     let before_scheduler = fs::read_to_string(&outbox_path).expect("confirmation outbox");
-    SCHEDULED_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
 
     let report = state
         .run_scheduled_return_notifications()
@@ -537,13 +553,13 @@ fn scheduled_return_notification_sends_live_due_count_without_request_traffic() 
 
 #[test]
 fn scheduled_return_notification_retries_with_durable_backoff() {
-    RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("scheduled-return-retry-backoff");
     fs::create_dir_all(&store_root).expect("retry store root");
     let mailer_command = retry_provider_script(&store_root);
     let state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(retry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::default()
                     .with_unsubscribe_secret("retry-backoff-secret")
@@ -574,7 +590,7 @@ fn scheduled_return_notification_retries_with_durable_backoff() {
         .expect("retry preference");
     assert!(preference["nextRetryAtMs"]
         .as_i64()
-        .is_some_and(|retry_at| { retry_at > RETRY_CLOCK.load(Ordering::SeqCst) }));
+        .is_some_and(|retry_at| { retry_at > test_clock.load(Ordering::SeqCst) }));
 
     let immediate = state
         .run_scheduled_return_notifications()
@@ -588,7 +604,7 @@ fn scheduled_return_notification_retries_with_durable_backoff() {
         1
     );
 
-    RETRY_CLOCK.fetch_add(60_001, Ordering::SeqCst);
+    test_clock.fetch_add(60_001, Ordering::SeqCst);
     let recovered = state
         .run_scheduled_return_notifications()
         .expect("backoff recovery run");
@@ -604,12 +620,12 @@ fn scheduled_return_notification_retries_with_durable_backoff() {
 
 #[test]
 fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
-    QUOTA_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("scheduled-return-quota");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(quota_clock)
+            .with_clock(test_now)
             .with_auth_config(AuthConfig::default().with_link_outbox(&outbox_path)),
     );
     for email in ["quota-a@example.com", "quota-b@example.com"] {
@@ -647,7 +663,7 @@ fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
             .maybe_send_due_count_notification(&account, 0, true)
             .expect("quota confirmation"));
     }
-    QUOTA_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
 
     let first = state
         .run_scheduled_return_notifications_with_config(ReturnNotificationSchedulerConfig {
@@ -680,13 +696,13 @@ fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
 
 #[test]
 fn concurrent_scheduler_instances_share_one_durable_file_claim() {
-    CONCURRENT_SCHEDULER_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("concurrent-scheduled-return-notification");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let auth_config = || AuthConfig::default().with_link_outbox(&outbox_path);
     let first = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(concurrent_scheduler_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let created = first
@@ -727,11 +743,11 @@ fn concurrent_scheduler_instances_share_one_durable_file_claim() {
     assert!(first
         .maybe_send_due_count_notification(&account, view.due_count, true)
         .expect("confirmation"));
-    CONCURRENT_SCHEDULER_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
 
     let second = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(concurrent_scheduler_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let barrier = Arc::new(Barrier::new(2));
@@ -764,7 +780,7 @@ fn concurrent_scheduler_instances_share_one_durable_file_claim() {
 
 #[tokio::test]
 async fn return_notification_enable_route_retries_the_same_provider_envelope_after_restart() {
-    ROUTE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("return-notification-route-retry");
     fs::create_dir_all(&store_root).expect("retry store root");
     let mailer_command = retry_provider_script(&store_root);
@@ -775,7 +791,7 @@ async fn return_notification_enable_route_retries_the_same_provider_envelope_aft
     };
     let first_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(route_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let first_app = router(first_state);
@@ -805,10 +821,10 @@ async fn return_notification_enable_route_retries_the_same_provider_envelope_aft
     assert!(failed_preference["pendingUnsubscribeExpiresAtMs"].is_number());
     assert!(failed_preference["claimId"].is_null());
 
-    ROUTE_RETRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    test_clock.fetch_add(123_456, Ordering::SeqCst);
     let recovery_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(route_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let recovery_app = router(recovery_state);
@@ -916,14 +932,14 @@ async fn blocked_return_sender_does_not_block_health_requests() {
 
 #[test]
 fn return_notification_new_envelopes_at_one_clock_tick_have_distinct_keys() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (_, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("return-notification-random-envelope");
     fs::create_dir_all(&store_root).expect("envelope store root");
     let mailer_command = retry_provider_script(&store_root);
     fs::write(store_root.join("retry-provider.failed"), "").expect("successful provider marker");
     let state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(expiry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::default()
                     .with_unsubscribe_secret("claim-secret")
@@ -1867,8 +1883,8 @@ fn app_content_feedback_head_refresh_failure_preserves_retry_revision() {
 
 #[tokio::test]
 async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempotency_key() {
-    CONTENT_FEEDBACK_REVISION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
-    let registry = AccountRegistry::default().with_clock(content_feedback_revision_clock);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let registry = AccountRegistry::default().with_clock(test_now);
     let state = ApiState::new(registry);
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
@@ -1902,7 +1918,7 @@ async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempo
     )
     .await;
 
-    CONTENT_FEEDBACK_REVISION_CLOCK.fetch_add(86_400_000, Ordering::SeqCst);
+    test_clock.fetch_add(86_400_000, Ordering::SeqCst);
 
     let second_prompt =
         advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
@@ -2817,10 +2833,10 @@ async fn token_bearing_login_request_response_is_not_cached() {
 
 #[tokio::test]
 async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let app = router(ApiState::new(
         AccountRegistry::default()
-            .with_clock(expiry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
             ),
@@ -2835,7 +2851,7 @@ async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
         .await
         .expect("request magic link");
     let verify_path = debug_sign_in_path(&response_text(requested).await);
-    EXPIRY_CLOCK.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
 
     let expired = app
         .oneshot(
@@ -2866,9 +2882,9 @@ async fn expired_magic_link_renders_direct_recovery_instead_of_json() {
 
 #[tokio::test]
 async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
-    SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let app = router(ApiState::new(
-        AccountRegistry::default().with_clock(session_clock),
+        AccountRegistry::default().with_clock(test_now),
     ));
     let started = app
         .clone()
@@ -2882,7 +2898,7 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
     let cookie = session_cookie(&started);
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
-    SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+    test_clock.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
 
     let expired = app
         .clone()
@@ -2940,14 +2956,14 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
 
 #[tokio::test]
 async fn expired_browser_session_renders_concept_snooze_recovery_instead_of_json() {
-    CONCEPT_SNOOZE_SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
-    let state = ApiState::new(AccountRegistry::default().with_clock(concept_snooze_session_clock));
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let state = ApiState::new(AccountRegistry::default().with_clock(test_now));
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
     let review_unit_id = html_value(&page, "reviewUnitId");
-    CONCEPT_SNOOZE_SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+    test_clock.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
 
     let expired = app
         .oneshot(form_request_with_cookie(
@@ -3384,11 +3400,11 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
         );
         return;
     };
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let outbox_path = temp_store_root("postgres-scheduled-return-notification").join("outbox.tsv");
     let state = ApiState::new(
         AccountRegistry::with_postgres_url(&database.scoped_url)
-            .with_clock(expiry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["scheduled-postgres@example.com".to_owned()])
                     .with_unsubscribe_secret("postgres-scheduler-secret")
@@ -3429,7 +3445,7 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
     assert!(state
         .maybe_send_due_count_notification(&account, view.due_count, true)
         .expect("Postgres confirmation"));
-    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
 
     let report = state
         .run_scheduled_return_notifications()
@@ -3456,7 +3472,7 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
         );
         return;
     };
-    POSTGRES_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("postgres-scheduler-recovery");
     fs::create_dir_all(&store_root).expect("Postgres recovery root");
     let retry_command = retry_provider_script(&store_root);
@@ -3467,7 +3483,7 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
     };
     let first_state = ApiState::new(
         AccountRegistry::with_postgres_url(&database.scoped_url)
-            .with_clock(postgres_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let account = prepare_postgres_due_account(&first_state, "recovery@example.com").await;
@@ -3486,10 +3502,10 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
     assert!(failed_preference.pending_delivery_key.is_some());
     assert!(failed_preference.next_retry_at_ms.is_some());
 
-    POSTGRES_RETRY_CLOCK.fetch_add(60_001, Ordering::SeqCst);
+    test_clock.fetch_add(60_001, Ordering::SeqCst);
     let restarted_state = ApiState::new(
         AccountRegistry::with_postgres_url(&database.scoped_url)
-            .with_clock(postgres_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(auth_config()),
     );
     let recovered = restarted_state
@@ -3508,8 +3524,8 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
     assert_eq!(payloads[0], payloads[1], "retry envelope remains stable");
 
     let slow_command = slow_provider_script(&store_root);
-    POSTGRES_RETRY_CLOCK.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
-    let reports = run_postgres_scheduler_contenders(&database.scoped_url, &slow_command);
+    test_clock.fetch_add(RETURN_NOTIFICATION_INTERVAL_MS + 1, Ordering::SeqCst);
+    let reports = run_postgres_scheduler_contenders(&database.scoped_url, &slow_command, test_now);
     assert_eq!(
         reports.iter().sum::<usize>(),
         1,
@@ -3527,11 +3543,11 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
 
 #[tokio::test]
 async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("unsubscribe-token-security");
     let outbox_path = store_root.join("auth-outbox.tsv");
     let registry = AccountRegistry::with_store_root(&store_root)
-        .with_clock(expiry_clock)
+        .with_clock(test_now)
         .with_auth_config(
             AuthConfig::allow_emails([
                 "owner@example.com".to_owned(),
@@ -3599,7 +3615,7 @@ async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
         .maybe_send_due_count_notification(&other, 1, true)
         .expect("other remains independently enabled"));
 
-    EXPIRY_CLOCK.fetch_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS + 1, Ordering::SeqCst);
     assert!(
         state.validate_return_notification_token(token).is_err(),
         "expired unsubscribe links must fail"
@@ -3608,14 +3624,19 @@ async fn unsubscribe_tokens_are_scoped_signed_expiring_and_get_is_read_only() {
 
 #[test]
 fn file_return_notification_claim_allows_one_concurrent_sender() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (_, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("return-notification-claim");
     let outbox_path = store_root.join("auth-outbox.tsv");
-    let registry = AccountRegistry::with_store_root(&store_root).with_auth_config(
-        AuthConfig::allow_emails(["claim@example.com".to_owned()])
-            .with_unsubscribe_secret("claim-secret")
-            .with_link_outbox(&outbox_path),
-    );
+    // The clock is actually injected now: this test used to store a shared
+    // test clock it never wired in, leaving the claim race running on wall
+    // time (memory-engine-101).
+    let registry = AccountRegistry::with_store_root(&store_root)
+        .with_clock(test_now)
+        .with_auth_config(
+            AuthConfig::allow_emails(["claim@example.com".to_owned()])
+                .with_unsubscribe_secret("claim-secret")
+                .with_link_outbox(&outbox_path),
+        );
     let state = ApiState::new(registry.clone());
     let created = state.create_account("claim@example.com").expect("account");
     let account = state.create_browser_session(&created).expect("session");
@@ -3655,12 +3676,12 @@ fn file_return_notification_claim_allows_one_concurrent_sender() {
 
 #[test]
 fn file_return_notification_retry_reuses_the_failed_provider_payload() {
-    FILE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("return-notification-retry");
     fs::create_dir_all(&store_root).expect("retry store root");
     let failing_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(file_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["retry@example.com".to_owned()])
                     .with_unsubscribe_secret("claim-secret")
@@ -3695,14 +3716,14 @@ fn file_return_notification_retry_reuses_the_failed_provider_payload() {
     assert!(retry_path.contains("pendingDeliveryKey"));
     let recovery_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(file_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["retry@example.com".to_owned()])
                     .with_unsubscribe_secret("claim-secret")
                     .with_mailer_command(retry_provider_script(&store_root)),
             ),
     );
-    FILE_RETRY_CLOCK.fetch_add(123_456, Ordering::SeqCst);
+    test_clock.fetch_add(123_456, Ordering::SeqCst);
     assert!(recovery_state
         .maybe_send_due_count_notification(&retry_account, 1, true)
         .expect("retry send"));
@@ -3728,12 +3749,12 @@ fn file_return_notification_retry_reuses_the_failed_provider_payload() {
 
 #[test]
 fn notification_retry_and_success_timestamps_sample_after_slow_provider_returns() {
-    FILE_RETRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("return-notification-provider-clock");
     fs::create_dir_all(&store_root).expect("provider clock root");
     let failing_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(file_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["clock@example.com".to_owned()])
                     .with_unsubscribe_secret("clock-secret")
@@ -3758,7 +3779,7 @@ fn notification_retry_and_success_timestamps_sample_after_slow_provider_returns(
         thread::sleep(Duration::from_millis(10));
     }
     let after_provider_started = DEFAULT_BETA_STUDY_NOW + 123_456;
-    FILE_RETRY_CLOCK.store(after_provider_started, Ordering::SeqCst);
+    test_clock.store(after_provider_started, Ordering::SeqCst);
     assert!(send.join().expect("slow failing sender").is_err());
     let failed = failing_state
         .load_return_notification_preference_for_test(account.account_id())
@@ -3768,14 +3789,14 @@ fn notification_retry_and_success_timestamps_sample_after_slow_provider_returns(
 
     let success_state = ApiState::new(
         AccountRegistry::with_store_root(&store_root)
-            .with_clock(file_retry_clock)
+            .with_clock(test_now)
             .with_auth_config(
                 AuthConfig::allow_emails(["clock@example.com".to_owned()])
                     .with_unsubscribe_secret("clock-secret")
                     .with_mailer_command(slow_provider_script(&store_root)),
             ),
     );
-    FILE_RETRY_CLOCK.store(
+    test_clock.store(
         failed.next_retry_at_ms.expect("retry time") + 1,
         Ordering::SeqCst,
     );
@@ -3787,8 +3808,8 @@ fn notification_retry_and_success_timestamps_sample_after_slow_provider_returns(
     while !store_root.join("slow-provider.tsv").exists() {
         thread::sleep(Duration::from_millis(10));
     }
-    let completed_at = FILE_RETRY_CLOCK.load(Ordering::SeqCst) + 222_222;
-    FILE_RETRY_CLOCK.store(completed_at, Ordering::SeqCst);
+    let completed_at = test_clock.load(Ordering::SeqCst) + 222_222;
+    test_clock.store(completed_at, Ordering::SeqCst);
     assert!(send.join().expect("slow success sender").is_ok());
     let completed = success_state
         .load_return_notification_preference_for_test(account.account_id())
@@ -8648,11 +8669,15 @@ async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::A
     account
 }
 
-fn run_postgres_scheduler_contenders(database_url: &str, mailer_command: &str) -> Vec<usize> {
+fn run_postgres_scheduler_contenders(
+    database_url: &str,
+    mailer_command: &str,
+    now_fn: fn() -> i64,
+) -> Vec<usize> {
     let make_state = || {
         ApiState::new(
             AccountRegistry::with_postgres_url(database_url)
-                .with_clock(postgres_retry_clock)
+                .with_clock(now_fn)
                 .with_auth_config(
                     AuthConfig::allow_emails(["recovery@example.com".to_owned()])
                         .with_unsubscribe_secret("postgres-recovery-secret")
@@ -9177,51 +9202,11 @@ fn default_registry_clock_is_wall_time() {
     );
 }
 
-static EXPIRY_CLOCK: AtomicI64 = AtomicI64::new(0);
-static SCHEDULED_CLOCK: AtomicI64 = AtomicI64::new(0);
-static RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
-static QUOTA_CLOCK: AtomicI64 = AtomicI64::new(0);
-static CONCURRENT_SCHEDULER_CLOCK: AtomicI64 = AtomicI64::new(0);
-static ROUTE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
-static FILE_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
-static POSTGRES_RETRY_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn expiry_clock() -> i64 {
-    EXPIRY_CLOCK.load(Ordering::SeqCst)
-}
-
-fn scheduled_clock() -> i64 {
-    SCHEDULED_CLOCK.load(Ordering::SeqCst)
-}
-
-fn retry_clock() -> i64 {
-    RETRY_CLOCK.load(Ordering::SeqCst)
-}
-
-fn quota_clock() -> i64 {
-    QUOTA_CLOCK.load(Ordering::SeqCst)
-}
-
-fn concurrent_scheduler_clock() -> i64 {
-    CONCURRENT_SCHEDULER_CLOCK.load(Ordering::SeqCst)
-}
-
-fn route_retry_clock() -> i64 {
-    ROUTE_RETRY_CLOCK.load(Ordering::SeqCst)
-}
-
-fn file_retry_clock() -> i64 {
-    FILE_RETRY_CLOCK.load(Ordering::SeqCst)
-}
-
-fn postgres_retry_clock() -> i64 {
-    POSTGRES_RETRY_CLOCK.load(Ordering::SeqCst)
-}
-
 #[test]
 fn file_store_magic_link_consumption_is_atomic() {
+    let (_, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let store_root = temp_store_root("magic-link-atomic");
-    let storage = super::StudyStorage::file(store_root.clone(), expiry_clock);
+    let storage = super::StudyStorage::file(store_root.clone(), test_now);
     storage
         .save_auth_challenge(
             "atomic-challenge",
@@ -9255,9 +9240,9 @@ fn file_store_magic_link_consumption_is_atomic() {
 
 #[test]
 fn magic_link_is_rejected_after_its_ttl_elapses() {
-    EXPIRY_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let registry = AccountRegistry::default()
-        .with_clock(expiry_clock)
+        .with_clock(test_now)
         .with_auth_config(
             AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
         );
@@ -9281,7 +9266,7 @@ fn magic_link_is_rejected_after_its_ttl_elapses() {
         .nth(1)
         .expect("token")
         .to_owned();
-    EXPIRY_CLOCK.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
+    test_clock.fetch_add(AUTH_CHALLENGE_TTL_MS + 1, Ordering::SeqCst);
 
     assert!(
         state.verify_magic_link(&stale_token).is_err(),
@@ -9289,23 +9274,11 @@ fn magic_link_is_rejected_after_its_ttl_elapses() {
     );
 }
 
-static SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn session_clock() -> i64 {
-    SESSION_CLOCK.load(Ordering::SeqCst)
-}
-
-static CONCEPT_SNOOZE_SESSION_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn concept_snooze_session_clock() -> i64 {
-    CONCEPT_SNOOZE_SESSION_CLOCK.load(Ordering::SeqCst)
-}
-
 #[test]
 fn browser_session_is_rejected_after_it_expires() {
-    SESSION_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let registry = AccountRegistry::default()
-        .with_clock(session_clock)
+        .with_clock(test_now)
         .with_auth_config(
             AuthConfig::allow_emails(["learner@example.com".to_owned()]).with_debug_links(true),
         );
@@ -9328,7 +9301,7 @@ fn browser_session_is_rejected_after_it_expires() {
         .require_browser_session(&headers, session.csrf_token())
         .is_ok());
 
-    SESSION_CLOCK.fetch_add(
+    test_clock.fetch_add(
         super::app_session_max_age_ms().saturating_add(1),
         Ordering::SeqCst,
     );
@@ -9346,16 +9319,10 @@ fn browser_session_is_rejected_after_it_expires() {
     );
 }
 
-static SCHEDULE_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn schedule_clock() -> i64 {
-    SCHEDULE_CLOCK.load(Ordering::SeqCst)
-}
-
 #[test]
 fn correct_answer_is_not_due_again_until_real_time_passes() {
-    SCHEDULE_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
-    let registry = AccountRegistry::default().with_clock(schedule_clock);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let registry = AccountRegistry::default().with_clock(test_now);
     let state = ApiState::new(registry);
     let account = state
         .create_account("learner@example.com")
@@ -9411,7 +9378,7 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
         "a correctly answered unit must not be due again at the same moment"
     );
 
-    SCHEDULE_CLOCK.fetch_add(30 * 86_400_000, Ordering::SeqCst);
+    test_clock.fetch_add(30 * 86_400_000, Ordering::SeqCst);
     let later = state
         .next_review(&account.account_id, &account.session_token)
         .expect("next review");
@@ -9419,18 +9386,6 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
         later.current.is_some(),
         "the unit must come due again once enough real time passes"
     );
-}
-
-static RESUBMIT_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn resubmit_clock() -> i64 {
-    RESUBMIT_CLOCK.load(Ordering::SeqCst)
-}
-
-static CONTENT_FEEDBACK_REVISION_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn content_feedback_revision_clock() -> i64 {
-    CONTENT_FEEDBACK_REVISION_CLOCK.load(Ordering::SeqCst)
 }
 
 #[tokio::test]
@@ -9442,8 +9397,8 @@ async fn answering_the_same_card_across_due_cycles_does_not_collide() {
     // repetition. The key must vary per attempt; the form now appends the
     // rep count. Drive one card through two due cycles under an advancing
     // clock and confirm the second review applies cleanly.
-    RESUBMIT_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
-    let registry = AccountRegistry::default().with_clock(resubmit_clock);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let registry = AccountRegistry::default().with_clock(test_now);
     let state = ApiState::new(registry);
     let app = router(state.clone());
 
@@ -9491,7 +9446,7 @@ async fn answering_the_same_card_across_due_cycles_does_not_collide() {
     );
 
     // Real time passes; the card comes due again.
-    RESUBMIT_CLOCK.fetch_add(86_400_000, Ordering::SeqCst);
+    test_clock.fetch_add(86_400_000, Ordering::SeqCst);
 
     // Second review of the same card: the key must differ from the first,
     // and the submit must apply cleanly rather than colliding.
@@ -9553,12 +9508,6 @@ async fn review_form_leaves_response_time_blank_for_honest_measurement() {
     );
 }
 
-static HONEST_TIMING_CLOCK: AtomicI64 = AtomicI64::new(0);
-
-fn honest_timing_clock() -> i64 {
-    HONEST_TIMING_CLOCK.load(Ordering::SeqCst)
-}
-
 /// Sign back in over the rendered magic-link flow and return the fresh
 /// browser session cookie and CSRF token. Maturing a card spans weeks of
 /// simulated clock, which outlives any single 14-day browser session — the
@@ -9598,6 +9547,7 @@ async fn refresh_login(app: &axum::Router, email: &str) -> (String, String) {
 async fn mature_cat_card_then_submit(
     app: &axum::Router,
     state: &ApiState,
+    clock: &AtomicI64,
     label: &str,
     timing: Option<&str>,
 ) -> String {
@@ -9661,7 +9611,7 @@ async fn mature_cat_card_then_submit(
         // Advance just past the card's next-review horizon so it is due
         // again, then sign back in: the horizon can outlive the fixed 14-day
         // browser session.
-        advance_clock_past_next_review(&response_text(graded).await);
+        advance_clock_past_next_review(clock, &response_text(graded).await);
         (cookie, csrf_token) = refresh_login(app, &email).await;
     }
 
@@ -9699,7 +9649,7 @@ async fn mature_cat_card_then_submit(
 /// the card is due again on the next cycle. Hour-scale (or missing) horizons
 /// advance one day; day-scale horizons advance one day beyond the rounded
 /// count to absorb the phrase's rounding.
-fn advance_clock_past_next_review(page: &str) {
+fn advance_clock_past_next_review(clock: &AtomicI64, page: &str) {
     let marker = "you'll see this again in ~";
     let days = page.find(marker).map_or(1, |start| {
         let rest = &page[start + marker.len()..];
@@ -9713,7 +9663,7 @@ fn advance_clock_past_next_review(page: &str) {
             1
         }
     });
-    HONEST_TIMING_CLOCK.fetch_add(days * 86_400_000, Ordering::SeqCst);
+    clock.fetch_add(days * 86_400_000, Ordering::SeqCst);
 }
 
 /// Parse the "~N days" horizon out of a graded page's next-review phrase.
@@ -9747,18 +9697,18 @@ async fn mature_correct_answers_rate_easy_only_when_genuinely_fast() {
     // (missing, blank, malformed, negative, zero, absurdly large) grades as
     // the slowest plausible answer: the same Good-rated interval as the slow
     // control, never the longer Easy interval.
-    HONEST_TIMING_CLOCK.store(DEFAULT_BETA_STUDY_NOW, Ordering::SeqCst);
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
     let registry = AccountRegistry::default()
-        .with_clock(honest_timing_clock)
+        .with_clock(test_now)
         .with_auth_config(AuthConfig::default().with_debug_links(true));
     let state = ApiState::new(registry);
     let app = router(state.clone());
 
-    let slow = mature_cat_card_then_submit(&app, &state, "slow", Some("6500")).await;
+    let slow = mature_cat_card_then_submit(&app, &state, test_clock, "slow", Some("6500")).await;
     assert!(slow.contains(r#"<span class="me-verdict">Correct</span>"#));
     let slow_days = next_review_days(&slow);
 
-    let fast = mature_cat_card_then_submit(&app, &state, "fast", Some("900")).await;
+    let fast = mature_cat_card_then_submit(&app, &state, test_clock, "fast", Some("900")).await;
     assert!(fast.contains(r#"<span class="me-verdict">Correct</span>"#));
     let fast_days = next_review_days(&fast);
     assert!(
@@ -9775,7 +9725,7 @@ async fn mature_correct_answers_rate_easy_only_when_genuinely_fast() {
         ("zero", Some("0")),
         ("huge", Some("99999999999999999999")),
     ] {
-        let graded = mature_cat_card_then_submit(&app, &state, label, dishonest).await;
+        let graded = mature_cat_card_then_submit(&app, &state, test_clock, label, dishonest).await;
         assert!(
             graded.contains(r#"<span class="me-verdict">Correct</span>"#),
             "dishonest timing {dishonest:?} must still grade the answer: {graded}"
