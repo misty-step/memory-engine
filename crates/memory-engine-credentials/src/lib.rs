@@ -22,6 +22,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,19 @@ pub fn default_credentials_path() -> PathBuf {
 /// found after the shared file already existed) is simply ignored from
 /// then on, never silently deleted.
 ///
+/// Cross-process safe: `memory-engine-review` and `memory-engine-mcp` can
+/// both start for the first time at once and race this function. The
+/// install onto the shared path is atomic ([`install_shared_credentials`]
+/// creates it via `hard_link`, which — unlike `rename` — fails instead of
+/// silently replacing a file another racer just created), so exactly one
+/// caller ever installs the shared file and no racer can overwrite a
+/// concurrently installed *different* session. Every other racer re-reads
+/// what is there: identical data is accepted as a benign double migration;
+/// different data is a genuine conflict, reported without touching either
+/// side. Legacy-file removal tolerates `NotFound` (a racer that already
+/// won the install may have removed it first), so losing a benign race
+/// never turns a successful migration into a spurious startup error.
+///
 /// Only default-path resolution goes through migration. An explicit
 /// credentials path (a CLI flag such as `memory-engine-review login
 /// --credentials-path`, or any future explicit override) must call
@@ -101,8 +115,11 @@ pub fn default_credentials_path() -> PathBuf {
 /// Returns an error naming every legacy path found, without their
 /// contents, when more than one exists and they disagree on
 /// account/session data — this never silently picks a winner. Also
-/// returns an error when a legacy file is malformed, or when the
-/// migration write or legacy-file removal fails.
+/// returns an error when a legacy file is malformed, when a concurrently
+/// installed shared file disagrees with the migrated data (naming only
+/// the shared path, never token values), or when the migration write or
+/// legacy-file removal fails for a reason other than the file already
+/// being gone.
 pub fn resolve_default_credentials_path() -> Result<PathBuf, String> {
     let shared = default_credentials_path();
     if shared.exists() {
@@ -134,15 +151,9 @@ pub fn resolve_default_credentials_path() -> Result<PathBuf, String> {
         ));
     }
 
-    write_credentials(&shared, first)?;
+    install_shared_credentials(&shared, first)?;
     for (path, _) in &found {
-        fs::remove_file(path).map_err(|error| {
-            format!(
-                "migrated legacy credentials to {} but could not remove {}: {error}",
-                shared.display(),
-                path.display()
-            )
-        })?;
+        remove_migrated_legacy_file(&shared, path)?;
     }
 
     Ok(shared)
@@ -157,6 +168,101 @@ fn legacy_credentials_paths() -> [PathBuf; 2] {
         home.join("review").join("credentials.json"),
         home.join("mcp").join("credentials.json"),
     ]
+}
+
+/// Atomically installs `credentials` at `shared` the first time it is
+/// created, so two processes racing to migrate the same (or agreeing)
+/// legacy files can never corrupt each other's write, and a shared file a
+/// third party installed concurrently with *different* data is never
+/// silently overwritten.
+///
+/// Writes `credentials` to a unique temporary file in `shared`'s directory
+/// first (mode `0600`, via [`write_credentials`]), then links it into
+/// place with [`fs::hard_link`]. Unlike [`fs::rename`], `hard_link` fails
+/// with [`std::io::ErrorKind::AlreadyExists`] instead of silently
+/// replacing a destination that already exists, so exactly one caller
+/// across every racing process gets to create `shared`. Every other
+/// caller re-reads what is now there: identical data is a benign
+/// double-migration (`Ok`); different data is a genuine conflict this
+/// function refuses to resolve by picking a winner (`Err`, naming only
+/// the path, never token values). The temporary file is removed in every
+/// case (best-effort).
+///
+/// # Errors
+///
+/// Returns an error when the temporary file cannot be written, when a
+/// concurrently installed `shared` cannot be read back afterward, or when
+/// it holds account/session data that disagrees with `credentials`.
+fn install_shared_credentials(
+    shared: &Path,
+    credentials: &StoredCredentials,
+) -> Result<(), String> {
+    // pid + nanosecond timestamp + a per-process monotonic counter: the
+    // counter is what actually guarantees uniqueness — two threads in the
+    // same process racing this function can land on the same
+    // `SystemTime::now()` nanosecond reading under a coarser OS clock, and
+    // a name collision there would let one thread's temp-file cleanup
+    // delete the file another thread is about to `hard_link` from.
+    static TMP_SUFFIX: AtomicU64 = AtomicU64::new(0);
+    let file_name = shared
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("credentials.json"));
+    let tmp_path = shared.with_file_name(format!(
+        "{}.tmp-{}-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+        TMP_SUFFIX.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    write_credentials(&tmp_path, credentials)?;
+
+    let outcome = match fs::hard_link(&tmp_path, shared) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_credentials(shared)? {
+                Some(installed) if &installed == credentials => Ok(()),
+                Some(_) => Err(format!(
+                    "another process concurrently installed {} with different \
+                     account/session data; migration never overwrites a conflicting shared \
+                     credential — resolve manually",
+                    shared.display()
+                )),
+                None => Err(format!(
+                    "{} was created concurrently and is no longer readable; retry",
+                    shared.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!("could not install {}: {error}", shared.display())),
+    };
+
+    let _ = fs::remove_file(&tmp_path);
+    outcome
+}
+
+/// Removes a legacy file this process has just migrated into `shared`.
+/// `NotFound` is treated as success: it means a process racing the same
+/// migration already won and removed it first, which is the same end
+/// state this call was trying to reach — so it must not turn an already
+/// successful migration into a spurious startup error.
+///
+/// # Errors
+///
+/// Returns an error for any removal failure other than the file already
+/// being gone.
+fn remove_migrated_legacy_file(shared: &Path, path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "migrated legacy credentials to {} but could not remove {}: {error}",
+            shared.display(),
+            path.display()
+        )),
+    }
 }
 
 #[must_use]
@@ -586,6 +692,199 @@ mod tests {
         assert!(
             legacy_path.exists(),
             "an ignored legacy file is left alone, not deleted, once the shared file already exists"
+        );
+    }
+
+    #[test]
+    fn concurrent_shared_install_from_agreeing_data_leaves_exactly_one_file() {
+        let dir = tempdir("concurrent-install-agree");
+        let shared = dir.join("credentials.json");
+        let credentials = StoredCredentials {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            account_id: "acct_concurrent".to_owned(),
+            session_token: "concurrent-token".to_owned(),
+        };
+
+        let thread_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let shared = shared.clone();
+                let credentials = credentials.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    install_shared_credentials(&shared, &credentials)
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread must not panic"))
+            .collect();
+
+        assert!(
+            results.iter().all(std::result::Result::is_ok),
+            "every racer installing identical data must succeed, never spuriously fail: {results:?}"
+        );
+
+        let installed = read_credentials(&shared)
+            .expect("read installed shared file")
+            .expect("shared file must exist after the race");
+        assert_eq!(installed, credentials);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&shared)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the one surviving shared file must stay 0600");
+        }
+
+        let leftover_tmp_files = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(
+            leftover_tmp_files, 0,
+            "every racer's temporary install file must be cleaned up"
+        );
+    }
+
+    #[test]
+    fn concurrent_shared_install_with_conflicting_data_never_overwrites_the_winner() {
+        let dir = tempdir("concurrent-install-conflict");
+        let shared = dir.join("credentials.json");
+        let credentials_a = StoredCredentials {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            account_id: "acct_a".to_owned(),
+            session_token: "token-a-secret".to_owned(),
+        };
+        let credentials_b = StoredCredentials {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            account_id: "acct_b".to_owned(),
+            session_token: "token-b-secret".to_owned(),
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handle_a = {
+            let shared = shared.clone();
+            let credentials = credentials_a.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                install_shared_credentials(&shared, &credentials)
+            })
+        };
+        let handle_b = {
+            let shared = shared.clone();
+            let credentials = credentials_b.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                install_shared_credentials(&shared, &credentials)
+            })
+        };
+
+        let result_a = handle_a.join().expect("thread a must not panic");
+        let result_b = handle_b.join().expect("thread b must not panic");
+        let results = [&result_a, &result_b];
+
+        let oks = results.iter().filter(|result| result.is_ok()).count();
+        let errs = results.iter().filter(|result| result.is_err()).count();
+        assert_eq!(
+            (oks, errs),
+            (1, 1),
+            "exactly one racer must win a conflicting install and the other must fail \
+             explicitly, never silently pick a winner: a={result_a:?} b={result_b:?}"
+        );
+
+        let error = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one side must have failed");
+        assert!(
+            error.contains(&shared.display().to_string()),
+            "the conflict error must name the shared path: {error}"
+        );
+        assert!(
+            !error.contains("token-a-secret") && !error.contains("token-b-secret"),
+            "the conflict error must never contain token values: {error}"
+        );
+
+        let installed = read_credentials(&shared)
+            .expect("read installed shared file")
+            .expect("shared file must exist");
+        assert!(
+            installed == credentials_a || installed == credentials_b,
+            "the installed file must be exactly one racer's data, never a mix: {installed:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_first_launch_migration_never_fails_spuriously_and_removes_legacy_files() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempdir("migrate-concurrent");
+        env::set_var("MEMORY_ENGINE_HOME", &home);
+
+        let review_path = home.join("review").join("credentials.json");
+        let mcp_path = home.join("mcp").join("credentials.json");
+        let credentials = StoredCredentials {
+            base_url: DEFAULT_BASE_URL.to_owned(),
+            account_id: "acct_concurrent_launch".to_owned(),
+            session_token: "concurrent-launch-token".to_owned(),
+        };
+        write_credentials(&review_path, &credentials).expect("seed review file");
+        write_credentials(&mcp_path, &credentials).expect("seed mcp file");
+
+        let thread_count = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_default_credentials_path()
+                })
+            })
+            .collect();
+        let results: Vec<Result<PathBuf, String>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread must not panic"))
+            .collect();
+        env::remove_var("MEMORY_ENGINE_HOME");
+
+        assert!(
+            results.iter().all(std::result::Result::is_ok),
+            "two clients racing a genuinely agreeing first launch must never fail spuriously: \
+             {results:?}"
+        );
+
+        let shared_path = home.join("credentials.json");
+        assert!(
+            results
+                .iter()
+                .all(|result| result.as_ref().unwrap() == &shared_path),
+            "every racer must resolve to the same one shared path"
+        );
+
+        let installed = read_credentials(&shared_path)
+            .expect("read shared")
+            .expect("shared file must exist after the race");
+        assert_eq!(installed, credentials);
+        assert!(
+            !review_path.exists(),
+            "the review legacy file must eventually be removed"
+        );
+        assert!(
+            !mcp_path.exists(),
+            "the mcp legacy file must eventually be removed"
         );
     }
 }
