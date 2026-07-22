@@ -93,7 +93,7 @@ pub fn default_credentials_path() -> PathBuf {
 ///
 /// Cross-process safe: `memory-engine-review` and `memory-engine-mcp` can
 /// both start for the first time at once and race this function. The
-/// install onto the shared path is atomic ([`install_shared_credentials`]
+/// install onto the shared path is atomic (an internal `install_shared_credentials` helper
 /// creates it via `hard_link`, which — unlike `rename` — fails instead of
 /// silently replacing a file another racer just created), so exactly one
 /// caller ever installs the shared file and no racer can overwrite a
