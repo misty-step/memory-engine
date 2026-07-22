@@ -1067,7 +1067,7 @@ mod tests {
                 &json!({"draftId": "study-run-1-draft-src-nato-1-nato-letter-a"}).to_string(),
             ),
         );
-        let kept: Value = serde_json::from_slice(&approved.body).expect("kept");
+        let kept: Value = serde_json::from_slice(&kept.body).expect("kept");
         assert_eq!(kept["status"], json!("answering"));
 
         let revealed = route(&mut session, &request("POST", "/reveal", "{}"));

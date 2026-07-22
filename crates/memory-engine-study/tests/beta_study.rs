@@ -1032,7 +1032,7 @@ fn bridge_material_creates_easier_due_items_before_the_parent() {
     assert_eq!(bridged.summary.attempt_count, 0);
     assert_eq!(bridged.summary.approved_review_unit_count, 2);
 
-    let bridged = study
+    study
         .keep_draft(&bridge_draft_ids[0])
         .expect("keep first bridge");
     let bridged = study
