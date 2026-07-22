@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{cell::Cell, fs, path::PathBuf};
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, GradeResult, GraderKind, ProgressionMetadata, Prompt, Rating,
@@ -722,6 +722,32 @@ fn snoozes_and_deletes_active_review_items_without_touching_schedule_history() {
 }
 
 #[test]
+fn archiving_source_preserves_provider_send_receipt_for_export() {
+    let directory = TempDirectory::new("archive-provider-receipt");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+
+    let archived = study.archive_source("src-nato").expect("archive source");
+    assert_eq!(archived.1, 0);
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(snapshot.source_documents[0].archived_at.is_some());
+    let run = snapshot
+        .generation_runs
+        .iter()
+        .find(|run| run.id == "study-run-1")
+        .expect("generation receipt");
+    assert_eq!(run.provider, "fixture");
+    assert_eq!(run.model, "deterministic-beta-generator");
+    assert_eq!(run.prompt_version, "v1");
+    assert_eq!(run.source_permissions[0].source_document_id, "src-nato");
+    assert!(run.source_permissions[0].consented);
+}
+
+#[test]
 fn skip_defers_current_item_without_recording_a_review_attempt() {
     let directory = TempDirectory::new("skip");
     let path = directory.path().join("study.json");
@@ -881,6 +907,100 @@ fn learn_more_generates_and_caches_concept_note_when_source_span_is_missing() {
 }
 
 #[test]
+fn local_only_source_blocks_model_reference_generation() {
+    let directory = TempDirectory::new("local-only-reference");
+    let path = directory.path().join("study.json");
+    seed_spanless_review(&path);
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.start().expect("start");
+    let error = study
+        .learn_more_with_provider(&PanicReferenceProvider)
+        .expect_err("local-only source must not reach reference provider");
+
+    assert!(error.to_string().contains("Local-only source"));
+}
+
+#[test]
+fn missing_referenced_source_blocks_reference_provider_invocation() {
+    let directory = TempDirectory::new("missing-active-source");
+    let path = directory.path().join("study.json");
+    seed_spanless_review(&path);
+
+    let store = BetaPersistenceStore::open(&path).expect("store");
+    let mut snapshot = store.snapshot();
+    snapshot
+        .generated_prompt_drafts
+        .first_mut()
+        .expect("draft")
+        .source_document_ids
+        .push("missing-source".to_owned());
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("persist missing source reference");
+    drop(store);
+
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.start().expect("start");
+    let provider = CountingReferenceProvider::default();
+    let error = study
+        .learn_more_with_provider(&provider)
+        .expect_err("missing referenced source must fail closed");
+    assert!(matches!(
+        error,
+        memory_engine_study::BetaStudyError::Generation(
+            memory_engine_generation::BetaGenerationError::UnknownSourceDocument(id)
+        ) if id == "missing-source"
+    ));
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn unknown_reference_span_fails_closed_before_reference_provider_invocation() {
+    let directory = TempDirectory::new("missing-reference-span");
+    let path = directory.path().join("study.json");
+    seed_spanless_review(&path);
+    let store = BetaPersistenceStore::open(&path).expect("store");
+    let mut snapshot = store.snapshot();
+    snapshot
+        .generated_prompt_drafts
+        .first_mut()
+        .expect("draft")
+        .reference_span_ids
+        .push("missing-reference-span".to_owned());
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("persist missing reference");
+    drop(store);
+
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.start().expect("start");
+    let provider = CountingReferenceProvider::default();
+    let error = study
+        .learn_more_with_provider(&provider)
+        .expect_err("unknown reference span must fail closed");
+    assert!(matches!(
+        error,
+        memory_engine_study::BetaStudyError::UnknownReferenceSpan(id)
+            if id == "missing-reference-span"
+    ));
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
 fn bridge_material_creates_easier_due_items_before_the_parent() {
     let directory = TempDirectory::new("bridge");
     let path = directory.path().join("study.json");
@@ -946,6 +1066,100 @@ fn bridge_material_creates_easier_due_items_before_the_parent() {
         bridge_rows.iter().all(|row| row.due < sibling_row.due),
         "bridge rows should sort ahead of existing due siblings: {:?}",
         bridged.queue
+    );
+}
+
+#[test]
+fn bridge_descendants_keep_local_only_provenance_and_block_provider_calls() {
+    let directory = TempDirectory::new("bridge-local-only-descendant");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("approve exercise");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve quiz sibling");
+    let _parent_id = approved.current.expect("parent").review_unit_id;
+
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+    drop(store);
+
+    study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("reopen");
+    study.start().expect("start");
+    let bridged = study.generate_bridge_material().expect("bridge");
+    assert!(
+        bridged.current.is_some(),
+        "bridge generation should keep a current item"
+    );
+
+    let provider = CountingBridgeProvider::default();
+    let error = study
+        .generate_bridge_material_with_provider(&provider)
+        .expect_err("local-only bridge descendant must not reach provider");
+    assert!(matches!(
+        error,
+        memory_engine_study::BetaStudyError::Generation(
+            memory_engine_generation::BetaGenerationError::LocalOnlySource(id)
+        ) if id == "src-nato"
+    ));
+    assert_eq!(provider.calls.get(), 0);
+    assert_eq!(
+        study
+            .view()
+            .expect("view")
+            .current
+            .expect("current")
+            .review_unit_id,
+        bridged.current.expect("bridge current").review_unit_id
+    );
+}
+
+#[test]
+fn local_only_source_blocks_model_bridge_generation() {
+    let directory = TempDirectory::new("local-only-bridge");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("approve");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+    drop(store);
+
+    study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("reopen");
+    study.start().expect("start");
+
+    let error = study
+        .generate_bridge_material_with_provider(&RejectedBridgeProvider)
+        .expect_err("local-only source must not reach bridge provider");
+
+    assert!(error.to_string().contains("Local-only source"));
+    assert_eq!(
+        study
+            .view()
+            .expect("view")
+            .current
+            .expect("current")
+            .review_unit_id,
+        parent_id
     );
 }
 
@@ -1030,6 +1244,7 @@ fn generates_drafts_from_arbitrary_prose_via_model_provider() {
                 .to_owned(),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         })
         .expect("source");
 
@@ -1066,6 +1281,7 @@ fn infers_a_title_when_capture_does_not_provide_one() {
                 .to_owned(),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         })
         .expect("source");
 
@@ -1091,6 +1307,7 @@ fn surfaces_a_human_readable_notice_when_a_source_yields_no_drafts() {
             body: "just some prose with no structured blocks".to_owned(),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         })
         .expect("source");
 
@@ -1110,6 +1327,37 @@ fn surfaces_a_human_readable_notice_when_a_source_yields_no_drafts() {
     );
 }
 
+#[test]
+fn generation_rejects_missing_and_archived_source_ids_instead_of_filtering_them() {
+    let directory = TempDirectory::new("generation-source-validation");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.start().expect("start");
+    study.add_source(source_input()).expect("source");
+
+    let missing = study
+        .generate(Some(vec!["missing-source".to_owned()]))
+        .expect_err("missing source id must fail closed");
+    assert!(matches!(
+        missing,
+        memory_engine_study::BetaStudyError::Generation(
+            memory_engine_generation::BetaGenerationError::UnknownSourceDocument(id)
+        ) if id == "missing-source"
+    ));
+
+    study.archive_source("src-nato").expect("archive");
+    let archived = study
+        .generate(Some(vec!["src-nato".to_owned()]))
+        .expect_err("archived source id must fail closed");
+    assert!(matches!(
+        archived,
+        memory_engine_study::BetaStudyError::Generation(
+            memory_engine_generation::BetaGenerationError::ArchivedSourceDocument(id)
+        ) if id == "src-nato"
+    ));
+}
+
 fn source_input() -> BetaStudySourceInput {
     BetaStudySourceInput {
         id: "src-nato".to_owned(),
@@ -1117,6 +1365,7 @@ fn source_input() -> BetaStudySourceInput {
         body: source_body(),
         project_key: None,
         ttl_expires_at: None,
+        permission: SourcePermission::ModelEligible,
     }
 }
 
@@ -1124,6 +1373,7 @@ fn concept_snooze_input() -> BetaStudySourceInput {
     BetaStudySourceInput {
         id: "src-concept-snooze".to_owned(),
         title: "Concept snooze practice".to_owned(),
+        permission: SourcePermission::ModelEligible,
         body: [
             "Concept: NATO letter A",
             "Activity: quiz",
@@ -1183,6 +1433,7 @@ fn shared_concept_input() -> BetaStudySourceInput {
         body: shared_concept_body(),
         project_key: None,
         ttl_expires_at: None,
+        permission: SourcePermission::ModelEligible,
     }
 }
 
@@ -1239,6 +1490,7 @@ fn variant_concept_input() -> BetaStudySourceInput {
         .join("\n"),
         project_key: None,
         ttl_expires_at: None,
+        permission: SourcePermission::ModelEligible,
     }
 }
 
@@ -1422,6 +1674,31 @@ fn seed_spanless_review(path: &std::path::Path) {
 
 struct PanicReferenceProvider;
 
+#[derive(Default)]
+struct CountingReferenceProvider {
+    calls: Cell<usize>,
+}
+
+impl ReferenceNoteProvider for CountingReferenceProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "counting-reference".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ProviderFailure::new(
+            "reference provider must not receive a missing-source request",
+        ))
+    }
+}
+
 impl ReferenceNoteProvider for PanicReferenceProvider {
     fn model(&self) -> GeneratedPromptModel {
         GeneratedPromptModel {
@@ -1442,6 +1719,11 @@ impl ReferenceNoteProvider for PanicReferenceProvider {
 }
 
 struct RejectedBridgeProvider;
+
+#[derive(Default)]
+struct CountingBridgeProvider {
+    calls: Cell<usize>,
+}
 
 impl ReferenceNoteProvider for RejectedBridgeProvider {
     fn model(&self) -> GeneratedPromptModel {
@@ -1470,13 +1752,14 @@ impl BridgeMaterialProvider for RejectedBridgeProvider {
     ) -> Result<BridgeMaterial, ProviderFailure> {
         Ok(BridgeMaterial {
             model: ReferenceNoteProvider::model(self),
-            reference_note: self.explain_concept(&ReferenceNoteRequest {
-                concept_key: request.concept_key.clone(),
-                concept_label: request.concept_label.clone(),
-                prompt: request.parent_prompt.clone(),
-                expected_answer: request.parent_expected_answer.clone(),
-                recent_performance: Vec::new(),
-            })?,
+            reference_note: self.explain_concept(&ReferenceNoteRequest::new(
+                request.concept_key.clone(),
+                request.concept_label.clone(),
+                request.parent_prompt.clone(),
+                request.parent_expected_answer.clone(),
+                Vec::new(),
+                request.authorization().clone(),
+            ))?,
             candidates: vec![DraftCandidate {
                 index: 1,
                 concept: request.concept_label.clone(),
@@ -1491,6 +1774,38 @@ impl BridgeMaterialProvider for RejectedBridgeProvider {
             }],
             usage: None,
         })
+    }
+}
+
+impl ReferenceNoteProvider for CountingBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "counting-bridge".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ProviderFailure::new(
+            "bridge provider must not receive a local-only descendant",
+        ))
+    }
+}
+
+impl BridgeMaterialProvider for CountingBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        _request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Err(ProviderFailure::new(
+            "bridge provider must not receive a local-only descendant",
+        ))
     }
 }
 

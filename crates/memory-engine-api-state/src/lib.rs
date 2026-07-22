@@ -27,8 +27,12 @@ use axum::{
     Json,
 };
 use hmac::Hmac;
+#[cfg(test)]
+use memory_engine_generation::DraftProvider;
 use memory_engine_generation::FallbackProvider;
-use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
+pub use memory_engine_openrouter::OpenRouterConfig;
+use memory_engine_openrouter::OpenRouterProvider;
+pub use memory_engine_persistence::SourcePermission;
 use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
 use memory_engine_persistence_postgres::{
     AccountScope, AccountStudyStore, PostgresStoreError, PostgresStudyStore,
@@ -327,6 +331,22 @@ impl ApiState {
         self.accounts.list_sources(account_id, session_token)
     }
 
+    /// Update an active source's model-sharing permission for an authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account, source, or persistence boundary rejects it.
+    pub fn update_source_permission(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .update_source_permission(account_id, session_token, source_id, permission)
+    }
+
     /// List saved material for a browser-authenticated account.
     ///
     /// # Errors
@@ -351,6 +371,25 @@ impl ApiState {
             account.account_id(),
             account.session_token(),
             Some(timings),
+        )
+    }
+
+    /// Update an active source's model-sharing permission for a browser account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the source is unknown, archived, or cannot be persisted.
+    pub fn update_app_source_permission(
+        &self,
+        account: &AppAccount,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.update_source_permission(
+            account.account_id(),
+            account.session_token(),
+            source_id,
+            permission,
         )
     }
 
@@ -1477,6 +1516,21 @@ impl AccountRegistry {
         self
     }
 
+    /// Inject the model-generation config used by the study routes.
+    ///
+    /// Production should set this from the environment; tests can pass an
+    /// explicit config to exercise the exact route-selection code path.
+    #[must_use]
+    pub fn with_generation_provider_config(
+        self,
+        generation_provider_config: Option<OpenRouterConfig>,
+    ) -> Self {
+        let mut data = self.lock_data();
+        data.generation_provider_config = generation_provider_config;
+        drop(data);
+        self
+    }
+
     /// Replace the wall-clock time source, for tests that control time.
     ///
     /// Production constructors default to wall-clock milliseconds; every
@@ -1569,6 +1623,7 @@ struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
+    generation_provider_config: Option<OpenRouterConfig>,
     storage: StudyStorageConfig,
     now_fn: fn() -> i64,
 }
@@ -1579,6 +1634,7 @@ impl Default for AccountRegistryData {
             accounts: BTreeMap::new(),
             browser_sessions: BTreeMap::new(),
             auth_config: AuthConfig::default(),
+            generation_provider_config: None,
             storage: StudyStorageConfig::default(),
             now_fn: wall_clock_ms,
         }
@@ -1624,6 +1680,8 @@ pub struct AccountCreated {
 pub struct CreateSourceRequest {
     pub title: String,
     pub body: String,
+    #[serde(default = "default_source_permission")]
+    pub permission: SourcePermission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1632,10 +1690,15 @@ pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
     pub body: String,
+    pub permission: SourcePermission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_expires_at: Option<i64>,
+}
+
+fn default_source_permission() -> SourcePermission {
+    SourcePermission::ModelEligible
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -2387,40 +2450,53 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Generate drafts for one source using the configured provider.
 ///
-/// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
-/// a [`FallbackProvider`] whose primary is the deterministic structured-block
-/// parser, so hand-written `Concept:/Question:/Answer:` blocks keep their free
-/// path. Without a key the structured parser runs alone, which is what CI and
-/// key-less deployments use.
+/// When `OPENROUTER_API_KEY` is set, `ModelEligible` arbitrary prose routes to
+/// the model via a [`FallbackProvider`] whose primary is the deterministic
+/// structured-block parser. `LocalOnly` sources always take the structured
+/// parser path, so they remain usable without model or network access.
 fn run_source_generation<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let run_id = format!("study-run-{:032x}", rand::random::<u128>());
-    run_source_generation_with_run_id(study, source_id, &run_id)
+    run_source_generation_with_run_id(study, source_id, &run_id, generation_provider_config)
 }
 
 pub(crate) fn run_source_generation_with_run_id<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
     run_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let ids = Some(vec![source_id.to_owned()]);
-    match OpenRouterConfig::from_env() {
-        Ok(config) => {
+    let local_only = study
+        .view()
+        .map_err(study_failure)?
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
+    if local_only {
+        return study
+            .generate_with_run_id(ids, run_id)
+            .map_err(study_failure);
+    }
+    match generation_provider_config {
+        Some(config) => {
             let model = OpenRouterProvider::new(config);
             let provider = FallbackProvider::new(&model);
             study.generate_with_provider_and_run_id(ids, &provider, run_id)
         }
-        Err(_) => study.generate_with_run_id(ids, run_id),
+        None => study.generate_with_run_id(ids, run_id),
     }
     .map_err(study_failure)
 }
@@ -2429,7 +2505,7 @@ where
 pub(crate) fn run_source_generation_with_provider<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
-    provider: &dyn memory_engine_generation::DraftProvider,
+    provider: Option<&dyn DraftProvider>,
 ) -> Result<
     BetaStudyView,
     memory_engine_study::BetaStudyError<<S as memory_engine_service::MemoryServiceStore>::Error>,
@@ -2437,53 +2513,68 @@ pub(crate) fn run_source_generation_with_provider<S>(
 where
     S: memory_engine_study::BetaStudyStore,
 {
-    study.generate_with_provider(Some(vec![source_id.to_owned()]), provider)
+    let local_only = study
+        .view()?
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
+    let ids = Some(vec![source_id.to_owned()]);
+    if local_only {
+        study.generate(ids)
+    } else if let Some(provider) = provider {
+        study.generate_with_provider(ids, provider)
+    } else {
+        study.generate(ids)
+    }
 }
 
-fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_reference_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.learn_more().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.learn_more().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.learn_more_with_provider(&model)
-            }
-            Err(_) => study.learn_more(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.learn_more_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.learn_more(),
     }
+    .map_err(study_failure)
 }
 
-fn run_bridge_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_bridge_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.generate_bridge_material().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.generate_bridge_material().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.generate_bridge_material_with_provider(&model)
-            }
-            Err(_) => study.generate_bridge_material(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.generate_bridge_material_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.generate_bridge_material(),
     }
+    .map_err(study_failure)
 }
 
 fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
@@ -2727,6 +2818,7 @@ fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
             source_id: source.id,
             title: source.title,
             body: source.body.unwrap_or_default(),
+            permission: source.permission,
             project_key: source.project_key,
             ttl_expires_at: source.ttl_expires_at,
         })
@@ -2794,6 +2886,38 @@ fn require_current_review_postgres(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountingConfiguredProvider {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl memory_engine_generation::DraftProvider for CountingConfiguredProvider {
+        fn model(&self) -> memory_engine_persistence::GeneratedPromptModel {
+            memory_engine_persistence::GeneratedPromptModel {
+                provider: "counting".to_owned(),
+                name: "configured".to_owned(),
+                version: "test".to_owned(),
+            }
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &memory_engine_persistence::SourceDocument,
+        ) -> Result<
+            memory_engine_generation::ProviderDrafts,
+            memory_engine_generation::ProviderFailure,
+        > {
+            self.calls.set(self.calls.get() + 1);
+            Ok(memory_engine_generation::ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: Vec::new(),
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     #[test]
     fn client_rate_limit_key_prefers_digitalocean_client_ip() {
         let mut headers = HeaderMap::new();
@@ -2845,5 +2969,92 @@ mod tests {
         assert_eq!(readiness.status, "not_ready");
         assert!(!readiness.worker_started);
         assert!(readiness.postgres);
+    }
+
+    #[test]
+    fn local_only_generation_uses_structured_path_when_external_provider_is_configured() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+        let provider = CountingConfiguredProvider::default();
+
+        let view = run_source_generation_with_provider(&mut study, "local-source", Some(&provider))
+            .expect("local generation");
+
+        assert!(!view.drafts.is_empty(), "local source should produce cards");
+        assert_eq!(
+            provider.calls.get(),
+            0,
+            "configured model must not be called"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn local_only_reference_and_bridge_ignore_the_runtime_generation_provider_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-reference-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+
+        let config = OpenRouterConfig {
+            api_key: "test-key".to_owned(),
+            model: "test-model".to_owned(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            timeout: std::time::Duration::from_millis(1),
+            prompt: memory_engine_openrouter::PromptVariant::Principled,
+            max_drafts: 1,
+            proxy_socket: None,
+        };
+
+        let generated = study.generate(None).expect("generate");
+        let draft_id = generated.drafts.first().expect("draft").id.clone();
+        study.approve_draft(&draft_id).expect("approve");
+        study.start().expect("start reference session");
+
+        let reference = run_reference_generation(&mut study, Some(config.clone()))
+            .expect("local reference generation");
+        assert!(
+            reference.current.is_some(),
+            "local reference should still render"
+        );
+
+        study.start().expect("start bridge session");
+        let bridge =
+            run_bridge_generation(&mut study, Some(config)).expect("local bridge generation");
+        assert!(bridge.current.is_some(), "local bridge should still render");
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

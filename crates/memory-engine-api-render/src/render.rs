@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent};
+use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, SourcePermission};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
@@ -760,6 +760,9 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
+<label class="ae-label" for="me-capture-permission">Permission</label>
+<select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
+<p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
 <div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
@@ -787,10 +790,37 @@ fn render_sources(
                 id = escape_html(&source.source_id),
             )
         };
+        let permission = match &source.permission {
+            SourcePermission::LocalOnly => {
+                "<span class=\"ae-dim me-source-permission\">Local only · never sent to a model</span>"
+            }
+            SourcePermission::ModelEligible => {
+                "<span class=\"ae-dim me-source-permission\">Model eligible</span>"
+            }
+        };
+        let edit_permission = format!(
+            r#"<form class="me-source-permission" action="/app/source/permission" method="post">{csrf}<input type="hidden" name="sourceId" value="{id}"><label class="ae-label" for="permission-{id_label}">Change permission</label><select class="ae-input" id="permission-{id_label}" name="permission" aria-label="Change permission for {title_attr}"><option value="model-eligible" {model_selected}>Allow model help</option><option value="local-only" {local_selected}>Keep local / Never send to a model</option></select><button class="ae-button-quiet ae-button-compact" type="submit">Save permission</button></form>"#,
+            csrf = hidden_csrf_input(account),
+            id = escape_html(&source.source_id),
+            id_label = escape_html(&source.source_id),
+            title_attr = escape_html(&source.title),
+            model_selected = if source.permission == SourcePermission::ModelEligible {
+                "selected"
+            } else {
+                ""
+            },
+            local_selected = if source.permission == SourcePermission::LocalOnly {
+                "selected"
+            } else {
+                ""
+            },
+        );
         let _ = write!(
             rows,
             r#"<article class="me-source">
 <p class="ae-item">{title}</p>
+{permission}
+{edit_permission}
 <div class="me-row-actions">
 {generate}
 <details class="me-remove-confirm">
@@ -801,6 +831,7 @@ fn render_sources(
 </div>
 </article>"#,
             title = escape_html(&source.title),
+            permission = permission,
             csrf_archive = hidden_csrf_input(account),
             id_archive = escape_html(&source.source_id),
         );
@@ -1680,8 +1711,9 @@ mod source_loading_tests {
     use std::cell::Cell;
 
     use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_persistence::SourcePermission;
 
-    use super::render_account_page_with_loaders;
+    use super::{render_account_page_with_loaders, render_capture};
 
     fn source_body() -> String {
         [
@@ -1709,6 +1741,7 @@ mod source_loading_tests {
                 &CreateSourceRequest {
                     title: "NATO practice notes".to_owned(),
                     body: source_body(),
+                    permission: SourcePermission::default(),
                 },
             )
             .unwrap();
@@ -1798,6 +1831,22 @@ mod source_loading_tests {
         );
         assert_eq!(workspace_source_loads.get(), 1);
         assert_eq!(workspace_job_loads.get(), 1);
+    }
+
+    #[test]
+    fn capture_form_exposes_an_accessible_permission_choice_and_default() {
+        let state = ApiState::default();
+        let account = state
+            .create_account("render-permission@example.com")
+            .and_then(|account| state.create_browser_session(&account))
+            .expect("account");
+        let html = render_capture(&account);
+
+        assert!(html.contains(r#"id="me-capture-permission" name="permission""#));
+        assert!(html.contains(r#"aria-describedby="me-capture-permission-hint""#));
+        assert!(html.contains(r#"value="model-eligible" selected"#));
+        assert!(html.contains("Keep local / Never send to a model"));
+        assert!(html.contains("prevent model providers from receiving this capture"));
     }
 }
 

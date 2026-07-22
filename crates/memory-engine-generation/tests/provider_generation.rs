@@ -20,6 +20,77 @@ tissue type. They are sometimes called the powerhouse of the cell because they p
 chemical energy.";
 
 #[test]
+fn fallback_provider_rejects_local_only_source_before_forwarding() {
+    let source = SourceDocument {
+        id: "src-local-only".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "Private notes".to_owned(),
+        project_key: None,
+        body: Some("private notes".to_owned()),
+        uri: None,
+        permission: SourcePermission::LocalOnly,
+        freshness: Some(NOW),
+        ttl_expires_at: None,
+        created_at: NOW,
+        archived_at: None,
+    };
+    let fallback = FallbackProvider::new(&FakeModelProvider);
+    let failure = fallback
+        .generate_drafts(&source)
+        .expect_err("local-only source must not reach either provider");
+
+    assert!(matches!(
+        failure.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id)
+            if id == "src-local-only"
+    ));
+
+    let failure = fallback
+        .repair_drafts(&source, &[])
+        .expect_err("local-only repair must not reach either provider");
+    assert!(matches!(
+        failure.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id)
+            if id == "src-local-only"
+    ));
+}
+
+#[test]
+fn fallback_provider_rejects_archived_source_before_forwarding() {
+    let mut source = SourceDocument {
+        id: "archived-source".to_owned(),
+        title: "Archived source".to_owned(),
+        kind: SourceDocumentKind::Text,
+        project_key: None,
+        body: Some("must never leave".to_owned()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        ttl_expires_at: None,
+        created_at: NOW,
+        archived_at: Some(123),
+    };
+    let provider = FallbackProvider::new(&FakeModelProvider);
+
+    let failure = provider
+        .generate_drafts(&source)
+        .expect_err("archived source must fail before forwarding");
+    assert!(matches!(
+        failure.kind(),
+        memory_engine_generation::ProviderFailureKind::ArchivedSource(id) if id == "archived-source"
+    ));
+
+    source.archived_at = Some(456);
+    let failure = provider
+        .repair_drafts(&source, &[])
+        .expect_err("archived repair source must fail before forwarding");
+    assert!(matches!(
+        failure.kind(),
+        memory_engine_generation::ProviderFailureKind::ArchivedSource(id) if id == "archived-source"
+    ));
+}
+
+#[test]
 fn fake_model_provider_generates_grounded_drafts_from_arbitrary_prose() {
     let directory = TempDirectory::new("fake-provider");
     let mut store = open_store_with_prose(&directory);

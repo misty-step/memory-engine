@@ -1,13 +1,14 @@
-use std::{fs, path::PathBuf};
+use std::{cell::Cell, fs, path::PathBuf};
 
 use memory_engine_core::{
     ExactPrompt, ExactPromptKind, ProgressionMetadata, Prompt, ReviewUnitId, ReviewUnitLifecycle,
 };
 use memory_engine_generation::{
-    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
-    BetaGenerationError, BetaGenerationRequest, BridgeGenerationRequest, BridgeMaterial,
-    BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection,
-    ProviderDrafts, ProviderFailure, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation,
+    run_bridge_generation_with_provider, BetaGenerationError, BetaGenerationRequest,
+    BridgeGenerationRequest, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
+    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, ProviderDrafts,
+    ProviderFailure, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
     ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
@@ -348,6 +349,109 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
 }
 
 #[test]
+fn model_provider_is_not_called_for_local_only_source() {
+    let directory = TempDirectory::new("local-only-provider-boundary");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-private".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Private notes".to_owned(),
+            project_key: None,
+            body: Some("Private notes must remain on this device.".to_owned()),
+            uri: None,
+            permission: SourcePermission::LocalOnly,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let provider = CountingProvider::default();
+    let error = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        BetaGenerationRequest {
+            run_id: "run-private".to_owned(),
+            source_document_ids: vec!["src-private".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("local-only source must fail closed before provider invocation");
+
+    assert!(error.to_string().contains("Local-only source"));
+    assert_eq!(provider.calls.get(), 0);
+    assert!(store.snapshot().generation_runs.is_empty());
+}
+
+#[test]
+fn model_provider_is_not_called_for_archived_source() {
+    let directory = TempDirectory::new("archived-provider");
+    let mut store = BetaPersistenceStore::open(directory.path().join("store.json")).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "archived-source".to_owned(),
+            title: "Archived source".to_owned(),
+            body: Some("must never leave".to_owned()),
+            kind: SourceDocumentKind::Text,
+            project_key: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            uri: None,
+            ttl_expires_at: None,
+            archived_at: Some(123),
+            created_at: NOW,
+        })
+        .expect("source");
+    let provider = CountingProvider::default();
+
+    let error = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        BetaGenerationRequest {
+            run_id: "archived-run".to_owned(),
+            source_document_ids: vec!["archived-source".to_owned()],
+            parent_review_unit_id: None,
+            started_at: 1,
+            completed_at: Some(1),
+            default_due: 0,
+            model: None,
+        },
+    )
+    .expect_err("archived source must fail before provider invocation");
+
+    assert_eq!(
+        error,
+        BetaGenerationError::ArchivedSourceDocument("archived-source".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+
+    let error = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "archived-local-run".to_owned(),
+            source_document_ids: vec!["archived-source".to_owned()],
+            parent_review_unit_id: None,
+            started_at: 1,
+            completed_at: Some(1),
+            default_due: 0,
+            model: None,
+        },
+    )
+    .expect_err("archived source must fail before the deterministic provider too");
+    assert_eq!(
+        error,
+        BetaGenerationError::ArchivedSourceDocument("archived-source".to_owned())
+    );
+}
+
+#[test]
 fn rejects_near_duplicate_questions_before_persistence_acceptance() {
     let directory = TempDirectory::new("near-duplicate");
     let path = directory.path().join("store.json");
@@ -621,6 +725,388 @@ fn bridge_generation_rejects_duplicate_of_manual_parent_review_unit() {
         bridge_draft.validation.reasons,
         ["Duplicate-ish generated draft"]
     );
+}
+
+#[test]
+fn arbitrary_bridge_provider_is_denied_before_local_only_source_context_is_sent() {
+    let directory = TempDirectory::new("local-only-bridge-provider");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-local-only-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Private bridge notes".to_owned(),
+            project_key: None,
+            body: Some(source_body()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+    let generated = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "local-only-bridge-run".to_owned(),
+            source_document_ids: vec!["src-local-only-bridge".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("generation");
+    let parent = store
+        .approve_generated_prompt_draft(
+            &generated.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("parent")
+        .review_unit_id;
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+
+    let provider = CountingBridgeProvider::default();
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "local-only-bridge-provider-run".to_owned(),
+            parent_review_unit_id: parent,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("arbitrary provider must be denied");
+
+    assert!(error.to_string().contains("Local-only source"));
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn missing_bridge_source_fails_before_provider_invocation() {
+    let directory = TempDirectory::new("missing-bridge-source");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-missing-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Bridge source".to_owned(),
+            project_key: None,
+            body: Some(source_body()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+    let generated = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "missing-bridge-parent-run".to_owned(),
+            source_document_ids: vec!["src-missing-bridge".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("parent generation");
+    let parent = store
+        .approve_generated_prompt_draft(
+            &generated.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("parent")
+        .review_unit_id;
+
+    let mut snapshot = store.snapshot();
+    snapshot.source_documents.clear();
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("remove source from persisted snapshot");
+    drop(store);
+    let mut store = BetaPersistenceStore::open(&path).expect("reopen store");
+
+    let provider = CountingBridgeProvider::default();
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "missing-bridge-source-run".to_owned(),
+            parent_review_unit_id: parent,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("missing referenced source must fail closed");
+
+    assert_eq!(
+        error,
+        BetaGenerationError::UnknownSourceDocument("src-missing-bridge".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn missing_manual_parent_queue_source_fails_before_provider_invocation() {
+    let directory = TempDirectory::new("missing-manual-parent-source");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+    let mut snapshot = store.snapshot();
+    snapshot.source_documents.clear();
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("remove manual source");
+    drop(store);
+    let mut store = BetaPersistenceStore::open(&path).expect("reopen store");
+    let provider = CountingBridgeProvider::default();
+
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "missing-manual-parent-source-run".to_owned(),
+            parent_review_unit_id: parent,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("missing manual queue source must fail closed");
+
+    assert_eq!(
+        error,
+        BetaGenerationError::UnknownSourceDocument("manual-source".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn local_only_manual_parent_queue_source_fails_before_provider_invocation() {
+    let directory = TempDirectory::new("local-only-manual-parent-source");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+    let mut source = store.snapshot().source_documents[0].clone();
+    source.permission = SourcePermission::LocalOnly;
+    store
+        .save_source_document(source)
+        .expect("local-only source");
+    let provider = CountingBridgeProvider::default();
+
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "local-only-manual-parent-source-run".to_owned(),
+            parent_review_unit_id: parent,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("local-only manual queue source must fail closed");
+
+    assert_eq!(
+        error,
+        BetaGenerationError::LocalOnlySource("manual-source".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+}
+
+#[test]
+fn archived_manual_parent_source_fails_before_any_bridge_provider_invocation() {
+    let directory = TempDirectory::new("archived-manual-parent-source");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    let parent = save_manual_parent(&mut store);
+    store
+        .archive_source_document("manual-source", NOW)
+        .expect("archive source");
+
+    let provider = CountingBridgeProvider::default();
+    let request = BridgeGenerationRequest {
+        run_id: "archived-manual-parent-source-run".to_owned(),
+        parent_review_unit_id: parent,
+        started_at: NOW,
+        completed_at: Some(NOW + 1_000),
+        default_due: NOW,
+        model: None,
+    };
+    let error = run_bridge_generation_with_provider(&mut store, &provider, request.clone())
+        .expect_err("archived manual queue source must fail closed");
+    assert_eq!(
+        error,
+        BetaGenerationError::ArchivedSourceDocument("manual-source".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+
+    let error = run_bridge_generation(&mut store, request)
+        .expect_err("archived source must also block the deterministic bridge path");
+    assert_eq!(
+        error,
+        BetaGenerationError::ArchivedSourceDocument("manual-source".to_owned())
+    );
+}
+
+#[test]
+fn bridge_descendants_preserve_full_provenance_and_fail_closed_once_provider_is_enabled() {
+    let (_directory, path, parent_review_unit_id) = seed_bridge_descendants_provenance_fixture();
+    let mut store = BetaPersistenceStore::open(&path).expect("reopen store");
+
+    let child_generation = run_bridge_generation(
+        &mut store,
+        BridgeGenerationRequest {
+            run_id: "bridge-descendants-child-run".to_owned(),
+            parent_review_unit_id: parent_review_unit_id.clone(),
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("child generation");
+    let child_review_unit_id = store
+        .approve_generated_prompt_draft(
+            &child_generation.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("child")
+        .review_unit_id;
+    let child_snapshot = store.snapshot();
+    let child_draft = child_snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == child_review_unit_id)
+        .expect("child draft");
+    assert_eq!(
+        child_draft.source_document_ids,
+        vec![
+            "src-local-only-bridge".to_owned(),
+            "src-secondary-bridge".to_owned()
+        ]
+    );
+    assert_eq!(
+        child_draft.queue.source_key.as_deref(),
+        Some("src-local-only-bridge")
+    );
+
+    let provider = CountingBridgeProvider::default();
+    let error = run_bridge_generation_with_provider(
+        &mut store,
+        &provider,
+        BridgeGenerationRequest {
+            run_id: "bridge-descendants-provider-run".to_owned(),
+            parent_review_unit_id: child_review_unit_id.clone(),
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect_err("local-only provenance must fail once provider is enabled");
+    assert_eq!(
+        error,
+        BetaGenerationError::LocalOnlySource("src-local-only-bridge".to_owned())
+    );
+    assert_eq!(provider.calls.get(), 0);
+}
+
+fn seed_bridge_descendants_provenance_fixture() -> (TempDirectory, PathBuf, ReviewUnitId) {
+    let directory = TempDirectory::new("bridge-descendants-provenance");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-local-only-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Private bridge notes".to_owned(),
+            project_key: None,
+            body: Some(source_body()),
+            uri: None,
+            permission: SourcePermission::LocalOnly,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("local-only source");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-secondary-bridge".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Secondary bridge notes".to_owned(),
+            project_key: None,
+            body: Some("Secondary bridge provenance note.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("secondary source");
+
+    let parent_generation = run_beta_generation(
+        &mut store,
+        BetaGenerationRequest {
+            run_id: "bridge-descendants-parent-run".to_owned(),
+            source_document_ids: vec!["src-local-only-bridge".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW,
+            model: None,
+        },
+    )
+    .expect("parent generation");
+    let parent_review_unit_id = store
+        .approve_generated_prompt_draft(
+            &parent_generation.accepted_draft_ids[0],
+            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
+        )
+        .expect("parent")
+        .review_unit_id;
+
+    let mut snapshot = store.snapshot();
+    let parent_draft = snapshot
+        .generated_prompt_drafts
+        .iter_mut()
+        .find(|draft| draft.review_unit_id == parent_review_unit_id)
+        .expect("parent draft");
+    parent_draft
+        .source_document_ids
+        .push("src-secondary-bridge".to_owned());
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&snapshot).expect("snapshot"),
+    )
+    .expect("persist multi-source provenance");
+
+    (directory, path, parent_review_unit_id)
 }
 
 #[test]
@@ -1116,6 +1602,21 @@ fn retrieval_depth_body() -> String {
 }
 
 fn save_manual_parent(store: &mut BetaPersistenceStore) -> ReviewUnitId {
+    store
+        .save_source_document(SourceDocument {
+            id: "manual-source".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Manual source".to_owned(),
+            project_key: None,
+            body: Some("Manual parent source notes.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("manual source");
     let review_unit_id = ReviewUnitId::new("manual-nato-cat-parent");
     let prompt = Prompt::Exact(ExactPrompt {
         kind: ExactPromptKind::ShortAnswer,
@@ -1157,6 +1658,34 @@ fn save_manual_parent(store: &mut BetaPersistenceStore) -> ReviewUnitId {
 }
 
 struct DuplicateParentBridgeProvider;
+
+#[derive(Default)]
+struct CountingBridgeProvider {
+    calls: Cell<usize>,
+}
+
+impl ReferenceNoteProvider for CountingBridgeProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        ReferenceNoteProvider::model(&FakeModelProvider)
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        FakeModelProvider.explain_concept(request)
+    }
+}
+
+impl BridgeMaterialProvider for CountingBridgeProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        FakeModelProvider.generate_bridge_material(request)
+    }
+}
 
 impl ReferenceNoteProvider for DuplicateParentBridgeProvider {
     fn model(&self) -> GeneratedPromptModel {
@@ -1438,6 +1967,32 @@ impl DraftProvider for RepairCapProvider {
             failures: Vec::new(),
             usage: None,
         }))
+    }
+}
+
+#[derive(Default)]
+struct CountingProvider {
+    calls: Cell<usize>,
+}
+
+impl DraftProvider for CountingProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "test".to_owned(),
+            name: "counting-provider".to_owned(),
+            version: "prompt-v1".to_owned(),
+        }
+    }
+
+    fn generate_drafts(&self, _source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(ProviderDrafts {
+            model: DraftProvider::model(self),
+            learning_intent: None,
+            candidates: Vec::new(),
+            failures: Vec::new(),
+            usage: None,
+        })
     }
 }
 

@@ -7,7 +7,7 @@ use memory_engine_persistence::{
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
     GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-    SourcePermission,
+    SourcePermission, SourcePermissionReceipt,
 };
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, ContentFeedbackSource, ContentFeedbackVerdict,
@@ -16,6 +16,51 @@ use memory_engine_service::{
 };
 
 const NOW: i64 = 1_779_989_400_000;
+
+#[test]
+fn reads_legacy_source_snapshot_without_permission_as_model_eligible() {
+    let directory = TempDirectory::new("legacy-permission");
+    let path = directory.path().join("store.json");
+    fs::write(
+        &path,
+        r#"{"version":1,"sourceDocuments":[{"id":"legacy-source","kind":"text","title":"Legacy source","body":"old notes","uri":null,"freshness":1779989400000,"createdAt":1779989400000}],"referenceSpans":[],"generatedPromptDrafts":[],"reviewUnits":[],"schedules":[],"attempts":[],"generationRuns":[],"appliedReviews":[],"conceptReferenceNotes":[]}"#,
+    )
+    .expect("legacy snapshot");
+
+    let store = BetaPersistenceStore::open(path).expect("legacy source loads");
+    assert_eq!(
+        store.snapshot().source_documents[0].permission,
+        SourcePermission::ModelEligible
+    );
+}
+
+#[test]
+fn updates_source_permission_but_rejects_archived_sources() {
+    let directory = TempDirectory::new("permission-update");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(path).expect("open store");
+    store
+        .save_source_document(source_document("editable-source"))
+        .expect("source");
+
+    let updated = store
+        .update_source_document_permission("editable-source", SourcePermission::LocalOnly)
+        .expect("permission update");
+    assert_eq!(updated.permission, SourcePermission::LocalOnly);
+    assert_eq!(
+        store.snapshot().source_documents[0].permission,
+        SourcePermission::LocalOnly
+    );
+    store
+        .archive_source_document("editable-source", NOW)
+        .expect("archive");
+    assert_eq!(
+        store.update_source_document_permission("editable-source", SourcePermission::ModelEligible),
+        Err(BetaStoreError::SourceDocumentArchived(
+            "editable-source".to_owned()
+        ))
+    );
+}
 
 #[test]
 fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
@@ -1270,6 +1315,15 @@ fn generation_run(id: &str, source_document_ids: &[&str], draft_ids: &[&str]) ->
         completed_at: Some(NOW),
         validation_failures: Vec::new(),
         usage: None,
+        source_permissions: source_document_ids
+            .iter()
+            .map(|source_document_id| SourcePermissionReceipt {
+                source_document_id: (*source_document_id).to_owned(),
+                permission: SourcePermission::ModelEligible,
+                consented: true,
+            })
+            .collect(),
+        prompt_version: "prompt-v1".to_owned(),
     }
 }
 

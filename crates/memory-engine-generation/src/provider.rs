@@ -11,7 +11,7 @@
 use std::{error::Error, fmt};
 
 use memory_engine_persistence::{
-    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
+    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument, SourcePermission,
 };
 
 /// One generated draft candidate before validation.
@@ -75,12 +75,120 @@ pub struct ReviewPerformanceContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceAuthorizationError {
+    ArchivedSourceDocument(String),
+}
+
+impl fmt::Display for SourceAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArchivedSourceDocument(id) => {
+                write!(
+                    formatter,
+                    "Archived source document cannot be authorized: {id}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for SourceAuthorizationError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedSourceDocument {
+    id: String,
+    permission: SourcePermission,
+}
+
+impl AuthorizedSourceDocument {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Explicit source authorization attached to every reference/bridge request.
+///
+/// The wrapper is intentionally constructed from active persisted source
+/// documents. A low-level provider therefore cannot receive an archived source
+/// request without the authorization step failing first.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceAuthorizationContext {
+    sources: Vec<AuthorizedSourceDocument>,
+}
+
+impl SourceAuthorizationContext {
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Authorize source documents for a local or external provider boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any source is archived.
+    pub fn from_sources(sources: &[SourceDocument]) -> Result<Self, SourceAuthorizationError> {
+        let mut authorized = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.archived_at.is_some() {
+                return Err(SourceAuthorizationError::ArchivedSourceDocument(
+                    source.id.clone(),
+                ));
+            }
+            authorized.push(AuthorizedSourceDocument {
+                id: source.id.clone(),
+                permission: source.permission.clone(),
+            });
+        }
+        Ok(Self {
+            sources: authorized,
+        })
+    }
+
+    #[must_use]
+    pub fn local_only_source_id(&self) -> Option<&str> {
+        self.sources
+            .iter()
+            .find(|source| source.permission == SourcePermission::LocalOnly)
+            .map(AuthorizedSourceDocument::id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceNoteRequest {
     pub concept_key: String,
     pub concept_label: String,
     pub prompt: String,
     pub expected_answer: String,
     pub recent_performance: Vec<ReviewPerformanceContext>,
+    authorization: SourceAuthorizationContext,
+}
+
+impl ReferenceNoteRequest {
+    #[must_use]
+    pub fn new(
+        concept_key: impl Into<String>,
+        concept_label: impl Into<String>,
+        prompt: impl Into<String>,
+        expected_answer: impl Into<String>,
+        recent_performance: Vec<ReviewPerformanceContext>,
+        authorization: SourceAuthorizationContext,
+    ) -> Self {
+        Self {
+            concept_key: concept_key.into(),
+            concept_label: concept_label.into(),
+            prompt: prompt.into(),
+            expected_answer: expected_answer.into(),
+            recent_performance,
+            authorization,
+        }
+    }
+
+    #[must_use]
+    pub fn authorization(&self) -> &SourceAuthorizationContext {
+        &self.authorization
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +207,40 @@ pub struct BridgeMaterialRequest {
     pub parent_stage_order: u32,
     pub cached_reference_note: Option<String>,
     pub recent_performance: Vec<ReviewPerformanceContext>,
+    authorization: SourceAuthorizationContext,
+}
+
+impl BridgeMaterialRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        concept_key: impl Into<String>,
+        concept_label: impl Into<String>,
+        parent_review_unit_id: memory_engine_core::ReviewUnitId,
+        parent_prompt: impl Into<String>,
+        parent_expected_answer: impl Into<String>,
+        parent_stage_order: u32,
+        cached_reference_note: Option<String>,
+        recent_performance: Vec<ReviewPerformanceContext>,
+        authorization: SourceAuthorizationContext,
+    ) -> Self {
+        Self {
+            concept_key: concept_key.into(),
+            concept_label: concept_label.into(),
+            parent_review_unit_id,
+            parent_prompt: parent_prompt.into(),
+            parent_expected_answer: parent_expected_answer.into(),
+            parent_stage_order,
+            cached_reference_note,
+            recent_performance,
+            authorization,
+        }
+    }
+
+    #[must_use]
+    pub fn authorization(&self) -> &SourceAuthorizationContext {
+        &self.authorization
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,9 +259,17 @@ pub struct BridgeMaterial {
 /// returned a 5xx/429) versus a permanent failure (a 4xx rejection, a malformed
 /// response) — so a caller can retry the former without re-classifying a string.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderFailureKind {
+    General,
+    LocalOnlySource(String),
+    ArchivedSource(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderFailure {
     message: String,
     transient: bool,
+    kind: ProviderFailureKind,
 }
 
 impl ProviderFailure {
@@ -130,6 +280,7 @@ impl ProviderFailure {
         Self {
             message: message.into(),
             transient: false,
+            kind: ProviderFailureKind::General,
         }
     }
 
@@ -140,7 +291,37 @@ impl ProviderFailure {
         Self {
             message: message.into(),
             transient: true,
+            kind: ProviderFailureKind::General,
         }
+    }
+
+    #[must_use]
+    pub fn local_only_source(source_document_id: impl Into<String>) -> Self {
+        let source_document_id = source_document_id.into();
+        Self {
+            message: format!(
+                "Local-only source {source_document_id} cannot be sent to the model provider."
+            ),
+            transient: false,
+            kind: ProviderFailureKind::LocalOnlySource(source_document_id),
+        }
+    }
+
+    #[must_use]
+    pub fn archived_source(source_document_id: impl Into<String>) -> Self {
+        let source_document_id = source_document_id.into();
+        Self {
+            message: format!(
+                "Archived source {source_document_id} cannot be sent to the model provider."
+            ),
+            transient: false,
+            kind: ProviderFailureKind::ArchivedSource(source_document_id),
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &ProviderFailureKind {
+        &self.kind
     }
 
     /// Whether an identical retry might succeed. See [`ProviderFailure::transient`].
@@ -348,12 +529,23 @@ impl<'a> FallbackProvider<'a> {
     }
 }
 
+fn ensure_external_source_allowed(source: &SourceDocument) -> Result<(), ProviderFailure> {
+    if source.archived_at.is_some() {
+        Err(ProviderFailure::archived_source(source.id.clone()))
+    } else if source.permission == SourcePermission::LocalOnly {
+        Err(ProviderFailure::local_only_source(source.id.clone()))
+    } else {
+        Ok(())
+    }
+}
+
 impl DraftProvider for FallbackProvider<'_> {
     fn model(&self) -> GeneratedPromptModel {
         self.fallback.model()
     }
 
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        ensure_external_source_allowed(source)?;
         let primary = StructuredBlockProvider.generate_drafts(source)?;
         if primary.candidates.is_empty() {
             self.fallback.generate_drafts(source)
@@ -367,6 +559,7 @@ impl DraftProvider for FallbackProvider<'_> {
         source: &SourceDocument,
         rejections: &[DraftRejection],
     ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        ensure_external_source_allowed(source)?;
         // Repair must stay on the provider that handled the first pass.
         // Re-run the deterministic primary router: falling through merely
         // because the primary has no repair implementation would let model
@@ -447,13 +640,14 @@ impl BridgeMaterialProvider for FakeModelProvider {
     ) -> Result<BridgeMaterial, ProviderFailure> {
         let note = request.cached_reference_note.as_ref().map_or_else(
             || {
-                self.explain_concept(&ReferenceNoteRequest {
-                    concept_key: request.concept_key.clone(),
-                    concept_label: request.concept_label.clone(),
-                    prompt: request.parent_prompt.clone(),
-                    expected_answer: request.parent_expected_answer.clone(),
-                    recent_performance: request.recent_performance.clone(),
-                })
+                self.explain_concept(&ReferenceNoteRequest::new(
+                    request.concept_key.clone(),
+                    request.concept_label.clone(),
+                    request.parent_prompt.clone(),
+                    request.parent_expected_answer.clone(),
+                    request.recent_performance.clone(),
+                    request.authorization().clone(),
+                ))
             },
             |body| {
                 Ok(ReferenceNoteDraft {

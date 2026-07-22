@@ -4,7 +4,7 @@ use std::{env, net::SocketAddr, process, time::Duration};
 
 use memory_engine_api::{
     init_error_reporting, router, shutdown_error_reporting, start_health_reporting_loop,
-    AccountRegistry, ApiState, AuthConfig,
+    AccountRegistry, ApiState, AuthConfig, OpenRouterConfig,
 };
 
 #[tokio::main]
@@ -41,7 +41,9 @@ async fn main() {
     };
     let state = if let Ok(database_url) = env::var("MEMORY_ENGINE_POSTGRES_URL") {
         ApiState::new(
-            AccountRegistry::with_postgres_url(database_url).with_auth_config(auth_config),
+            AccountRegistry::with_postgres_url(database_url)
+                .with_auth_config(auth_config)
+                .with_generation_provider_config(OpenRouterConfig::from_env().ok()),
         )
     } else if env::var("MEMORY_ENGINE_ENABLE_FILE_STORE").as_deref() == Ok("true") {
         let Ok(store_dir) = env::var("MEMORY_ENGINE_API_STORE_DIR") else {
@@ -50,7 +52,11 @@ async fn main() {
             );
             process::exit(1);
         };
-        ApiState::new(AccountRegistry::with_store_root(store_dir).with_auth_config(auth_config))
+        ApiState::new(
+            AccountRegistry::with_store_root(store_dir)
+                .with_auth_config(auth_config)
+                .with_generation_provider_config(OpenRouterConfig::from_env().ok()),
+        )
     } else {
         eprintln!("MEMORY_ENGINE_POSTGRES_URL is required for memory-engine-api");
         process::exit(1);
