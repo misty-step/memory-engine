@@ -16,12 +16,12 @@ managed-Postgres boundary. The file store described below was local-only.
 2. `GET /` at a 390 x 844 mobile viewport
 3. `POST /app/start`
 4. `POST /app/save-account`
-5. `POST /app/approve`
+5. `POST /app/keep`
 6. `POST /app/reveal`
 7. `POST /app/submit`
 8. `POST /app/next`
 9. `POST /app/logout`
-10. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/approve`,
+10. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/keep`,
    `/review/{review_unit_id}/reveal`, and `/review/{review_unit_id}/submit`
 
 Submit payloads must include `idempotencyKey`.
@@ -80,7 +80,7 @@ MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test 
 
 The test creates an isolated schema, starts the API with
 `AccountRegistry::with_postgres_url`, drives JSON `/accounts`, `/sources`,
-`/generate`, `/approve`, `/reveal`, and `/submit`, then recreates API state and
+`/generate`, `/keep`, `/reveal`, and `/submit`, then recreates API state and
 verifies source persistence after restart through the same Postgres schema.
 
 ## Archived staging receipt
@@ -120,7 +120,7 @@ returned:
 
 JSON route smoke drove `POST /accounts`, `POST /accounts/{account_id}/sources`,
 `POST /accounts/{account_id}/sources/{source_id}/generate`,
-`POST /accounts/{account_id}/drafts/{draft_id}/approve`,
+`POST /accounts/{account_id}/drafts/{draft_id}/keep`,
 `POST /accounts/{account_id}/review/{review_unit_id}/reveal`,
 `POST /accounts/{account_id}/review/{review_unit_id}/submit`, and
 `GET /accounts/{account_id}/review/next`.

@@ -1229,7 +1229,7 @@ mod tests {
                 .to_owned();
             client
                 .post_empty::<serde_json::Value>(&format!(
-                    "/v1/accounts/{}/drafts/{draft_id}/approve",
+                    "/v1/accounts/{}/drafts/{draft_id}/keep",
                     created.account_id
                 ))
                 .expect("approve draft");

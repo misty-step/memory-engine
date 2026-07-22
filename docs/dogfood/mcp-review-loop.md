@@ -25,7 +25,7 @@ error-handling shape).
 
 | Tool | Composes | Intent |
 |---|---|---|
-| `create_deck` | `POST project-decks` -> `POST sources/{id}/generate` -> `POST drafts/{id}/approve` (per accepted draft) | Capture material as a study deck that is immediately due, not just a saved source record. |
+| `create_deck` | `POST project-decks` -> `POST sources/{id}/generate` -> `POST drafts/{id}/keep` (per accepted draft) | Capture material as a study deck that is immediately due, not just a saved source record. |
 | `list_decks` | `GET sources`, filtered to `projectKey.is_some()` | Check what decks exist, or find a `deck_id` to invalidate. |
 | `invalidate_deck` | `POST project-decks/{id}/invalidate` | Retire every card from one deck after an external event (029's project-deck lifecycle). |
 | `list_due` | `POST review/next` | Lightweight status check: how many are due, one-line teaser of the next prompt. |
