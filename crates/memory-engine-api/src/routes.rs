@@ -38,12 +38,12 @@ use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
     html_with_cleared_browser_session, normalize_email, read_session_token,
     report_submit_browser_performance, report_submit_server_performance, AccountCreated,
-    ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
-    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
-    InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
-    ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
-    StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
-    SubmitViewport, WaitlistEntry,
+    ApiFailure, ApiState, AppAccount, BrowserSubmitReceipt, ContentFeedbackRequest,
+    CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome,
+    GenerationJob, HealthResponse, InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord,
+    ReadinessResponse, ScheduledReturnNotificationReport, SourceList, SourcePermission,
+    SourceRecord, StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest,
+    SubmitReviewTimings, SubmitViewport, WaitlistEntry,
 };
 
 #[cfg(test)]
@@ -1877,8 +1877,8 @@ async fn submit_app_review(
     let form = match form {
         Ok(Form(form)) => form,
         Err(rejection) => {
-            let render_started = Instant::now();
             let status = rejection.into_response().status();
+            let render_started = Instant::now();
             let response = submit_recovery_response(
                 status,
                 "Review not submitted",
@@ -1924,6 +1924,7 @@ async fn submit_app_review(
                 Err(error) => submit_outcome(error.status()),
             };
             let render_started = Instant::now();
+            let postgres_before_render = postgres;
             let response = Html(render_submit_action_result_html(
                 &state,
                 &account,
@@ -1933,7 +1934,8 @@ async fn submit_app_review(
                 &mut postgres,
             ))
             .into_response();
-            (response, bounded_request_ms(render_started), outcome)
+            let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
+            (response, render_ms, outcome)
         }
         Err(error) => {
             let outcome = submit_outcome(error.status());
@@ -1996,36 +1998,37 @@ fn submit_response_headers(
     (response, total_ms)
 }
 
+/// Postgres connect/operation and render are measured as disjoint,
+/// sequential phases; each is independently clamped to at least 1ms
+/// (`bounded_request_ms`), so their raw values are never rescaled or
+/// otherwise fabricated here. A request whose wall-clock `total_ms` came in
+/// under that floor-clamped phase sum (only possible on extremely fast
+/// requests where every phase rounds up to the 1ms floor) has its `total_ms`
+/// raised to the true phase sum instead: the reported total must always
+/// honestly bound its own parts, and raising the coarser aggregate is honest
+/// where shrinking the measured parts to fit would not be. Deliberately no
+/// upper cap is applied after the raise: each phase is already independently
+/// clamped to at most `60_000ms` by `bounded_request_ms`/`bounded_elapsed_ms`,
+/// so a request-wide `.min(60_000)` here could put `total_ms` back *below*
+/// `phase_sum` on a genuinely slow request (e.g. connect + operation + render
+/// each near the 60s ceiling) — reintroducing the exact fabrication this
+/// function exists to prevent.
 fn normalize_submit_durations(
     total_ms: u64,
     postgres: SubmitReviewTimings,
     render_ms: u64,
 ) -> (u64, Option<u64>, Option<u64>, u64) {
-    let mut phases = [
+    let phases = [
         postgres.postgres_connect_ms(),
         postgres.postgres_operation_ms(),
         Some(render_ms),
     ];
-    let phase_count = u64::try_from(phases.iter().flatten().count()).unwrap_or(u64::MAX);
-    let total_ms = total_ms.max(phase_count).min(60_000);
     let phase_sum = phases
         .iter()
         .flatten()
         .copied()
         .fold(0_u64, u64::saturating_add);
-    if phase_sum > total_ms {
-        let flexible_total = total_ms.saturating_sub(phase_count);
-        let flexible_sum = phase_sum.saturating_sub(phase_count);
-        for duration in phases.iter_mut().flatten() {
-            let scaled = if flexible_sum == 0 {
-                0
-            } else {
-                let numerator = u128::from(duration.saturating_sub(1)) * u128::from(flexible_total);
-                u64::try_from(numerator / u128::from(flexible_sum)).unwrap_or(u64::MAX)
-            };
-            *duration = 1_u64.saturating_add(scaled);
-        }
-    }
+    let total_ms = total_ms.max(phase_sum);
 
     (total_ms, phases[0], phases[1], phases[2].unwrap_or(1))
 }
@@ -2042,6 +2045,45 @@ fn bounded_request_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis())
         .unwrap_or(u64::MAX)
         .clamp(1, 60_000)
+}
+
+/// Wall-clock render duration with any Postgres time recorded *during* the
+/// render call subtracted out.
+///
+/// `render_submit_action_result_html` (via `render_submit_account_page`)
+/// performs timed reads — `app_study_view_with_timings`,
+/// `list_app_sources_with_timings`, `jobs_for_app_account_with_timings` — on
+/// the error/empty-queue path, inside this same wall-clock window, while
+/// accumulating their milliseconds into the shared `SubmitReviewTimings`.
+/// Without subtracting that nested time back out, `normalize_submit_durations`
+/// would count it twice: once as `pgconnect`/`pgop`, once folded into
+/// `render`. `before`/`after` MUST be snapshots of the same accumulating
+/// timings taken immediately before and after the render call; both counters
+/// only ever grow, so the delta can never underflow.
+fn render_only_ms(
+    render_started: Instant,
+    before: SubmitReviewTimings,
+    after: SubmitReviewTimings,
+) -> u64 {
+    bounded_request_ms(render_started)
+        .saturating_sub(nested_postgres_delta_ms(before, after))
+        .max(1)
+}
+
+/// Postgres connect+operation milliseconds recorded strictly after `before`
+/// was captured, given both are snapshots of the same monotonically
+/// accumulating [`SubmitReviewTimings`].
+fn nested_postgres_delta_ms(before: SubmitReviewTimings, after: SubmitReviewTimings) -> u64 {
+    after
+        .postgres_connect_ms()
+        .unwrap_or_default()
+        .saturating_sub(before.postgres_connect_ms().unwrap_or_default())
+        .saturating_add(
+            after
+                .postgres_operation_ms()
+                .unwrap_or_default()
+                .saturating_sub(before.postgres_operation_ms().unwrap_or_default()),
+        )
 }
 
 fn submit_outcome(status: StatusCode) -> SubmitPerformanceOutcome {
@@ -2076,7 +2118,16 @@ async fn record_submit_browser_performance(
         BrowserSubmitViewport::Tablet => SubmitViewport::Tablet,
         BrowserSubmitViewport::Desktop => SubmitViewport::Desktop,
     };
-    report_submit_browser_performance(event.tap_to_ack_ms, event.graded_visible_ms, viewport);
+    report_submit_browser_performance(BrowserSubmitReceipt {
+        request_id: &event.request_id,
+        trace_id: &event.trace_id,
+        tap_to_ack_ms: event.tap_to_ack_ms,
+        request_to_response_ms: event.request_to_response_ms,
+        transfer_ms: event.transfer_ms,
+        navigation_ms: event.navigation_ms,
+        graded_visible_ms: event.graded_visible_ms,
+        viewport,
+    });
     StatusCode::NO_CONTENT.into_response()
 }
 

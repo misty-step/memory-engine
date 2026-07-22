@@ -1877,6 +1877,24 @@ pub enum SubmitViewport {
     Desktop,
 }
 
+/// One browser-reported completion for a single `/app/submit` round trip:
+/// the five raw phase durations from tap to graded-visible, joined to the
+/// server request/trace ids, plus the viewport class. Groups what would
+/// otherwise be an eight-argument call into one coherent value so
+/// [`report_submit_browser_performance`] stays within clippy's
+/// `too_many_arguments` limit.
+#[derive(Clone, Copy, Debug)]
+pub struct BrowserSubmitReceipt<'a> {
+    pub request_id: &'a str,
+    pub trace_id: &'a str,
+    pub tap_to_ack_ms: u64,
+    pub request_to_response_ms: u64,
+    pub transfer_ms: u64,
+    pub navigation_ms: u64,
+    pub graded_visible_ms: u64,
+    pub viewport: SubmitViewport,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentFeedbackRequest {
@@ -2137,12 +2155,21 @@ pub fn report_submit_server_performance(duration_ms: u64, outcome: SubmitPerform
     report_performance_observation(marker, duration_ms);
 }
 
-pub fn report_submit_browser_performance(
-    tap_to_ack_ms: u64,
-    graded_visible_ms: u64,
-    viewport: SubmitViewport,
-) {
-    let viewport = match viewport {
+/// Emits the two Canary-aggregated completion phases plus a queryable,
+/// content-free receipt of the full five-duration decomposition.
+///
+/// `memory_engine_performance::CompletionPhase` is a frozen v1 contract
+/// (`cardinality_payload_and_rate_budgets_are_calculated_and_bounded` pins its
+/// series count; growing it requires a new schema version). Only
+/// `ImmediateAck` and `VisibleAfterTwoAnimationFrames` have a matching phase
+/// there, so those two remain the Canary-aggregated observations exactly as
+/// before. `request_to_response_ms`, `transfer_ms`, and `navigation_ms` are
+/// the intermediate breakdown of `graded_visible_ms` and have no phase to
+/// attach to under v1; [`report_browser_submit_durations_receipt`] keeps them
+/// queryable through the same production-log path the Canary batch export
+/// already relies on, without bumping the frozen series cardinality.
+pub fn report_submit_browser_performance(receipt: BrowserSubmitReceipt<'_>) {
+    let performance_viewport = match receipt.viewport {
         SubmitViewport::Mobile => memory_engine_performance::Viewport::Mobile,
         SubmitViewport::Tablet => memory_engine_performance::Viewport::Tablet,
         SubmitViewport::Desktop => memory_engine_performance::Viewport::Desktop,
@@ -2150,11 +2177,11 @@ pub fn report_submit_browser_performance(
     for (phase, duration_ms) in [
         (
             memory_engine_performance::CompletionPhase::ImmediateAck,
-            tap_to_ack_ms,
+            receipt.tap_to_ack_ms,
         ),
         (
             memory_engine_performance::CompletionPhase::VisibleAfterTwoAnimationFrames,
-            graded_visible_ms,
+            receipt.graded_visible_ms,
         ),
     ] {
         let marker = memory_engine_performance::CompletionMarker::browser(
@@ -2164,10 +2191,35 @@ pub fn report_submit_browser_performance(
             phase,
             memory_engine_performance::Outcome::Succeeded,
             memory_engine_performance::Navigation::FullPage,
-            viewport,
+            performance_viewport,
         );
         report_performance_observation(marker, duration_ms);
     }
+    println!("{}", report_browser_submit_durations_receipt(receipt));
+}
+
+/// Build (without printing) the queryable five-duration receipt for one
+/// browser submit completion. Pure and side-effect free so the full
+/// decomposition can be asserted on directly in tests; see
+/// [`report_submit_browser_performance`] for why this exists alongside the
+/// two Canary observations.
+fn report_browser_submit_durations_receipt(receipt: BrowserSubmitReceipt<'_>) -> serde_json::Value {
+    let viewport = match receipt.viewport {
+        SubmitViewport::Mobile => "mobile",
+        SubmitViewport::Tablet => "tablet",
+        SubmitViewport::Desktop => "desktop",
+    };
+    serde_json::json!({
+        "schema": "memory_engine.browser_submit_durations.v1",
+        "request_id": receipt.request_id,
+        "trace_id": receipt.trace_id,
+        "viewport": viewport,
+        "tap_to_ack_ms": receipt.tap_to_ack_ms,
+        "request_to_response_ms": receipt.request_to_response_ms,
+        "transfer_ms": receipt.transfer_ms,
+        "navigation_ms": receipt.navigation_ms,
+        "graded_visible_ms": receipt.graded_visible_ms,
+    })
 }
 
 fn report_performance_observation(
@@ -3132,5 +3184,38 @@ mod tests {
         assert!(bridge.current.is_some(), "local bridge should still render");
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn browser_submit_durations_receipt_retains_all_five_durations() {
+        // memory-engine-109 review finding: report_submit_browser_performance
+        // used to accept and forward only tap_to_ack_ms/graded_visible_ms,
+        // silently discarding request_to_response_ms/transfer_ms/navigation_ms
+        // at ingestion. The receipt must carry every one of the five raw
+        // values through unchanged, joined to the same request/trace ids.
+        let receipt = report_browser_submit_durations_receipt(BrowserSubmitReceipt {
+            request_id: "req_0123456789abcdef0123456789abcdef",
+            trace_id: "trace_0123456789abcdef0123456789abcdef",
+            tap_to_ack_ms: 11,
+            request_to_response_ms: 22,
+            transfer_ms: 33,
+            navigation_ms: 44,
+            graded_visible_ms: 99,
+            viewport: SubmitViewport::Mobile,
+        });
+        assert_eq!(
+            receipt,
+            serde_json::json!({
+                "schema": "memory_engine.browser_submit_durations.v1",
+                "request_id": "req_0123456789abcdef0123456789abcdef",
+                "trace_id": "trace_0123456789abcdef0123456789abcdef",
+                "viewport": "mobile",
+                "tap_to_ack_ms": 11,
+                "request_to_response_ms": 22,
+                "transfer_ms": 33,
+                "navigation_ms": 44,
+                "graded_visible_ms": 99,
+            })
+        );
     }
 }

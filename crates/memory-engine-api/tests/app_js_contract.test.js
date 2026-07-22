@@ -15,6 +15,20 @@ function browserHarness(options = {}) {
   let nextTimerId = 1;
   let performanceTraceInput = null;
   let prevented = 0;
+  // A monotonic clock that advances by `tick` on every read. Real browsers
+  // never return the same perf.now() value twice across a submit-to-landing
+  // trace; `tick: 0` (the default) keeps every pre-existing exact-value
+  // assertion unchanged, and `tick: 1` lets a test prove elapsed time is
+  // genuinely simulated end to end rather than frozen.
+  let clock = options.now ?? 100;
+  const tick = options.tick ?? 0;
+  // requestAnimationFrame is queued, never fired inline: one call to
+  // runAnimationFrame() below drains exactly the callbacks queued *before*
+  // that call, matching the browser's one-callback-per-paint semantics. A
+  // nested requestAnimationFrame scheduled while draining queues for the
+  // *next* runAnimationFrame(), never the current one.
+  let frameQueue = [];
+  let verdictPresent = options.verdict ?? false;
 
   const addListener = (listeners, name, handler) => {
     const handlers = listeners.get(name) ?? [];
@@ -49,8 +63,9 @@ function browserHarness(options = {}) {
       removeAttribute: (name) => rootAttributes.delete(name),
       hasAttribute: (name) => rootAttributes.has(name),
     },
+    visibilityState: options.visibilityState ?? "visible",
     addEventListener: (name, handler) => addListener(documentEvents, name, handler),
-    querySelector: (selector) => (selector === ".me-verdict" && options.verdict ? {} : null),
+    querySelector: (selector) => (selector === ".me-verdict" && verdictPresent ? {} : null),
     querySelectorAll(selector) {
       const match = selector.match(/^meta\[name="([^"]+)"\]$/);
       const value = match ? options.metas?.[match[1]] : undefined;
@@ -67,7 +82,11 @@ function browserHarness(options = {}) {
     sessionStorage,
     performance: {
       timeOrigin: 1_000_000,
-      now: () => options.now ?? 100,
+      now: () => {
+        const value = clock;
+        clock += tick;
+        return value;
+      },
       getEntriesByType: (type) =>
         type === "navigation" && options.navigation ? [options.navigation] : [],
     },
@@ -80,7 +99,10 @@ function browserHarness(options = {}) {
     innerWidth: 390,
     Uint8Array,
     addEventListener: (name, handler) => addListener(windowEvents, name, handler),
-    requestAnimationFrame: (handler) => handler(),
+    requestAnimationFrame: (handler) => {
+      frameQueue.push(handler);
+      return frameQueue.length;
+    },
     fetch(url, request) {
       fetches.push({ url, request });
       return { catch() {} };
@@ -123,11 +145,65 @@ function browserHarness(options = {}) {
       timers.delete(entry[0]);
       entry[1].handler();
     },
+    // Drains exactly the callbacks queued before this call — one real frame.
+    runAnimationFrame() {
+      const queue = frameQueue;
+      frameQueue = [];
+      for (const handler of queue) handler();
+    },
+    pendingFrames() {
+      return frameQueue.length;
+    },
+    advanceClock(ms) {
+      clock += ms;
+    },
+    setVerdictPresent(present) {
+      verdictPresent = present;
+    },
     storage,
     fetches,
     handoff: () => sessionStorage.getItem(HANDOFF_KEY),
     busy: () => document.documentElement.hasAttribute("data-busy"),
     prevented: () => prevented,
+  };
+}
+
+// Shared fixture: a source document that just submitted a review and left
+// the handoff behind in (shared) sessionStorage for a landing document to
+// consume, plus the strict request id the server would have rendered.
+function submittedHandoff(options = {}) {
+  const source = browserHarness(options);
+  source.dispatchSubmit();
+  const handoff = JSON.parse(source.handoff());
+  source.dispatchWindow("pagehide");
+  return { source, handoff, requestId: "req_0123456789abcdef0123456789abcdef" };
+}
+
+function matchingNavigation(requestId, traceToken) {
+  return {
+    type: "navigate",
+    startTime: 0,
+    responseStart: 110,
+    responseEnd: 120,
+    serverTiming: [
+      { name: "request", description: requestId },
+      { name: "handoff", description: traceToken },
+    ],
+  };
+}
+
+function matchingLandingOptions(source, handoff, requestId, extra = {}) {
+  return {
+    storage: source.storage,
+    now: 130,
+    verdict: true,
+    metas: {
+      "memory-engine-submit-request": requestId,
+      "memory-engine-submit-handoff": handoff.token,
+      "memory-engine-csrf-token": "csrf-test",
+    },
+    navigation: matchingNavigation(requestId, handoff.token),
+    ...extra,
   };
 }
 
@@ -174,35 +250,21 @@ test("every native form keeps instant acknowledgment and duplicate suppression",
   expect(browser.prevented()).toBe(1);
 });
 
-test("a second document consumes the handoff and emits one visible receipt", () => {
-  const source = browserHarness();
-  source.dispatchSubmit();
-  const handoff = JSON.parse(source.handoff());
-  source.dispatchWindow("pagehide");
+test("a second document consumes the handoff and emits one visible receipt only after two real animation frames", () => {
+  const { source, handoff, requestId } = submittedHandoff({ tick: 1 });
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId, { tick: 1 }));
 
-  const requestId = "req_0123456789abcdef0123456789abcdef";
-  const landing = browserHarness({
-    storage: source.storage,
-    now: 130,
-    verdict: true,
-    metas: {
-      "memory-engine-submit-request": requestId,
-      "memory-engine-submit-handoff": handoff.token,
-      "memory-engine-csrf-token": "csrf-test",
-    },
-    navigation: {
-      type: "navigate",
-      startTime: 0,
-      responseStart: 110,
-      responseEnd: 120,
-      serverTiming: [
-        { name: "request", description: requestId },
-        { name: "handoff", description: handoff.token },
-      ],
-    },
-  });
   landing.dispatchWindow("pageshow");
+  // The emission is genuinely deferred: nothing has fired yet.
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(1);
 
+  landing.runAnimationFrame();
+  // First frame only queues the second — still nothing emitted.
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(1);
+
+  landing.runAnimationFrame();
   expect(landing.handoff()).toBeNull();
   expect(landing.fetches).toHaveLength(1);
   expect(landing.fetches[0].url).toBe("/app/performance/submit");
@@ -210,13 +272,32 @@ test("a second document consumes the handoff and emits one visible receipt", () 
   expect(payload).toMatchObject({
     requestId,
     traceId: handoff.token,
-    tapToAckMs: 0,
-    requestToResponseMs: 10,
-    transferMs: 10,
-    navigationMs: 10,
-    gradedVisibleMs: 30,
     viewport: "mobile",
   });
+  // With a ticking clock the ack and visible durations are genuinely
+  // simulated elapsed time, not the frozen zero a static clock would give.
+  expect(payload.tapToAckMs).toBeGreaterThan(0);
+  expect(payload.gradedVisibleMs).toBeGreaterThan(payload.tapToAckMs);
+  expect(payload.requestToResponseMs + payload.transferMs + payload.navigationMs).toBe(
+    payload.gradedVisibleMs
+  );
+});
+
+test("graded-visible telemetry waits two real animation frames before emitting", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId));
+
+  landing.dispatchWindow("pageshow");
+  expect(landing.pendingFrames()).toBe(1);
+  expect(landing.fetches).toHaveLength(0);
+
+  landing.runAnimationFrame();
+  expect(landing.pendingFrames()).toBe(1);
+  expect(landing.fetches).toHaveLength(0);
+
+  landing.runAnimationFrame();
+  expect(landing.pendingFrames()).toBe(0);
+  expect(landing.fetches).toHaveLength(1);
 });
 
 test("a rejected landing consumes the handoff without emitting telemetry", () => {
@@ -329,4 +410,117 @@ test("waitlist join enhancement is a no-op once the button is already pending", 
   browser.button.textContent = "Joining… (server response pending)";
   browser.submit();
   expect(browser.button.textContent).toBe("Joining… (server response pending)");
+});
+
+test("a BFCache-restored landing clears the handoff and never schedules emission", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId));
+
+  landing.dispatchWindow("pageshow", { persisted: true });
+
+  expect(landing.handoff()).toBeNull();
+  expect(landing.busy()).toBeFalse();
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(0);
+});
+
+test("a two-RAF emission already queued before pagehide is invalidated, not fired stale after BFCache restore", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId));
+
+  landing.dispatchWindow("pageshow");
+  expect(landing.pendingFrames()).toBe(1);
+
+  // The tab is hidden and this document is frozen into BFCache before the
+  // first animation frame ever paints.
+  landing.dispatchWindow("pagehide");
+  landing.dispatchWindow("pageshow", { persisted: true });
+
+  // The already-queued frame callback (queued before pagehide) finally
+  // fires on resume. It must revalidate and refuse to schedule the second
+  // frame or emit anything — the landing it was scheduled for is stale.
+  landing.runAnimationFrame();
+  expect(landing.pendingFrames()).toBe(0);
+  expect(landing.fetches).toHaveLength(0);
+});
+
+test("a landing whose verdict disappears before the second frame never emits", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId));
+
+  landing.dispatchWindow("pageshow");
+  expect(landing.pendingFrames()).toBe(1);
+
+  // Document state changed between scheduling and the first frame (e.g. a
+  // failed re-render). The queued callback must revalidate, not trust the
+  // snapshot it captured at schedule time.
+  landing.setVerdictPresent(false);
+  landing.runAnimationFrame();
+
+  expect(landing.pendingFrames()).toBe(0);
+  expect(landing.fetches).toHaveLength(0);
+});
+
+test("an expired handoff at landing time is never scheduled for emission", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  // now (130000ms past timeOrigin via `now`) is well beyond startedAtMs +
+  // the 65s handoff TTL.
+  const landing = browserHarness(
+    matchingLandingOptions(source, handoff, requestId, { now: 70_000 })
+  );
+
+  landing.dispatchWindow("pageshow");
+
+  expect(landing.handoff()).toBeNull();
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(0);
+});
+
+test("a landing whose meta request id does not match the rendered Server-Timing never emits", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const mismatchedRequestId = "req_ffffffffffffffffffffffffffffffff";
+  const landing = browserHarness(
+    matchingLandingOptions(source, handoff, requestId, {
+      metas: {
+        "memory-engine-submit-request": mismatchedRequestId,
+        "memory-engine-submit-handoff": handoff.token,
+        "memory-engine-csrf-token": "csrf-test",
+      },
+    })
+  );
+
+  landing.dispatchWindow("pageshow");
+
+  expect(landing.handoff()).toBeNull();
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(0);
+});
+
+test("a landing document without Server-Timing on its own navigation entry never emits", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(
+    matchingLandingOptions(source, handoff, requestId, {
+      navigation: { type: "navigate", startTime: 0, responseStart: 110, responseEnd: 120 },
+    })
+  );
+
+  landing.dispatchWindow("pageshow");
+
+  expect(landing.handoff()).toBeNull();
+  expect(landing.fetches).toHaveLength(0);
+  expect(landing.pendingFrames()).toBe(0);
+});
+
+test("a second pageshow on the same landing document never emits a duplicate receipt", () => {
+  const { source, handoff, requestId } = submittedHandoff();
+  const landing = browserHarness(matchingLandingOptions(source, handoff, requestId));
+
+  landing.dispatchWindow("pageshow");
+  landing.runAnimationFrame();
+  landing.runAnimationFrame();
+  expect(landing.fetches).toHaveLength(1);
+
+  landing.dispatchWindow("pageshow");
+  expect(landing.pendingFrames()).toBe(0);
+  expect(landing.fetches).toHaveLength(1);
 });
