@@ -1,26 +1,42 @@
-# Memory Engine
+# Scry / Memory Engine
 
 [![CI](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml)
 
-`memory-engine` is a learning engine workspace for spaced repetition, answer
-grading, modular API design, and dogfood client experiments. It is now a Rust
-library/application stack; the former TypeScript runtime and Bun oracle tests
-were removed after Rust parity gates covered the package, service, persistence,
-generation, study, dogfood, QA, and benchmark surfaces.
+Scry is the consumer product: **Remember everything.** It helps people learn and
+memorize anything through a quiz-driven review loop. Memory Engine is the Rust
+engine beneath Scry, not a separate product category or a generic agent-memory
+store.
 
-It started as a framework-free kernel extracted from four learning apps:
+The product has five faces over one capability system:
 
-- Ruminatio
-- Scry
-- Caesar in a Year
-- Vault SRS
+- **PWA** — the primary, phone-first human surface
+- **CLI** — direct operator and power-user access
+- **skill** — a product-facing agent workflow
+- **MCP** — typed tools for agents and applications
+- **API** — the service boundary used by the PWA and other clients
 
-Scry and the Vault FSRS app are now decommission targets. The current product
-direction is a human-facing system for learning and memorizing anything without
-hand-designing cards or scheduling policy. The modular API, Rust kernel, and
-experimental clients exist to prove and support that product; they are not the
-category or the end state. Winning client contracts may be extracted only after
-repeated learner evidence.
+Beta access is invite-gated with a visible waitlist. Human sign-in uses magic
+links only; there is no OAuth path. Machine faces use operator-gated service
+sessions. Subscription is the intended business model. Public
+signup remains closed until generation costs are bounded and privacy, reliability,
+and Stripe billing are proven. Fast and smooth are product bars: p95 acknowledgement
+below 100 ms, p95 graded-visible feedback below 300 ms, and first quiz visible below
+20 s. See [VISION.md](./VISION.md) for the canonical product contract.
+
+Memory Engine keeps a pure Rust learning kernel and explicit boundary crates. The
+kernel owns deterministic scheduling, grading, progression, queue selection, and
+learning invariants. Boundary crates own persistence, generation, sessions, identity,
+API routes, rendering, deployment, and QA.
+
+The current production proof surface is the Rust `memory-engine-api` application on
+DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the Scry
+product domain. Deployment, environment, auth, storage, rollback, and smoke-test
+details live in [docs/runbook.md](./docs/runbook.md).
+
+Repository consolidation into the Scry repository is an approved later direction,
+but it is not executed here. Do not force-push, archive, repoint production, or
+change repository identity until active claims drain and the operator gives an
+explicit later go.
 
 ## What It Owns
 
@@ -54,12 +70,11 @@ The Rust migration is complete for the main runtime:
 - facade adapter/testkit modules
 - service, persistence, generation, study, and local HTTP app hosts
 - Rust QA and benchmark receipt runners
-- historical Scry and Vault SRS canary branches
 
-The sole current production dogfood surface is `memory-engine-api`, a Rust
-binary on DigitalOcean App Platform backed by Neon Postgres. Agent-facing
-deployment, environment, auth, storage, rollback, and smoke-test details live
-in [docs/runbook.md](./docs/runbook.md).
+The sole current production dogfood surface is `memory-engine-api`, the Rust
+binary on DigitalOcean App Platform backed by Neon Postgres. It serves the Scry
+product domain `scry.study`. Agent-facing deployment, environment, auth, storage,
+rollback, and smoke-test details live in [docs/runbook.md](./docs/runbook.md).
 
 Current strategy and verification docs:
 
@@ -77,9 +92,9 @@ active delivery oracles:
 - [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
 - [exemplars.md](./exemplars.md)
 
-The active Powder queue tracks production dogfood usefulness, service hardening,
-learning-science quality, input capture, and extraction decisions on top of the
-Rust stack.
+The active Powder queue tracks Scry production dogfood usefulness, service
+hardening, learning-science quality, input capture, and capability-boundary work
+on top of the Rust stack.
 
 ## Usage
 
