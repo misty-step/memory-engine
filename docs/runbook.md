@@ -462,10 +462,15 @@ Postgres/file claims provide the cross-instance concurrency bound and provider
 idempotency prevents duplicate logical sends.
 
 The file adapter's per-account notification lock is a persistent path with an
-OS descriptor lock acquired nonblockingly. It is never deleted as part of
-ownership release, so stale paths are harmless; a process crash releases the
-descriptor and a contending scheduler skips that account until it can acquire
-the lock. The same libc-backed helper protects the repository-owned file
+OS descriptor lock. Every writer (save/disable preference, claim, complete,
+release) acquires the lock with a blocking `flock`, so a contending writer
+waits for the lock instead of skipping the account outright; after acquiring
+it, the writer re-reads the account's current on-disk state and re-checks
+eligibility (enabled, claim ownership, retry timing) before mutating, so a
+recheck always sees the latest committed state rather than a stale in-memory
+view. The lock path is never deleted as part of ownership release, so stale
+paths are harmless, and a process crash releases the descriptor for the next
+waiter. The same libc-backed helper protects the repository-owned file
 outbox: it scans durable delivery keys while holding the descriptor lock and
 does not append a duplicate after a lease-expiry reclaim.
 
@@ -485,6 +490,20 @@ curl -fsS -X POST \
   -H "x-scheduler-token: ${MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN:?set token}" \
   "$base/internal/scheduler/return-notifications"
 ```
+
+**Production receipt gate (open):** the manual trigger above has been proven
+locally and against real Postgres, and `/healthz` confirms the deployed
+scheduler is live (`returnNotificationScheduler.enabled: true`), but no
+production-safe receipt has yet been executed proving the *deployed*
+scheduler — not a local run or a page render — initiated an allowlisted
+reminder end to end (provider send + delivery evidence). Card memory-engine-097
+criterion 6 stays open until an operator runs the manual trigger above against
+production with `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN`, against one
+allowlisted account with a genuinely due card, and links the resulting send
+receipt (provider log line and/or file-outbox `due-count` entry) to the card.
+Do not mark memory-engine-097 complete without that receipt.
+
+**Production probe receipt (2026-07-21, criterion 6 remains open):** A DigitalOcean App Platform console session on app `memory-engine-api` component `api` observed the in-process manual-token variable was absent (reported only as `token_absent`; no token bytes were printed or stored), so the guarded manual command refused before making an authenticated request. Independent production POST probes with an absent token and a known-invalid token both returned `403` with the same authorization error. The deployed `/healthz` returned `200` with `returnNotificationScheduler.enabled=true`, `running=false`, `lastRunAtMs=1784688531490`, `lastSuccessAtMs=1784688531490`, and `failureCount=0`. DigitalOcean run logs reported `return notification scheduler examined=0 due=0 sent=0 skipped=0 failed=0 truncated=false` for the observed sweeps. No allowlisted account was examined and no reminder was initiated, so this is a truthful liveness/zero-eligibility receipt, not proof of criterion 6; do not close memory-engine-097 until an operator configures the existing encrypted token and a genuinely due allowlisted account produces the required provider/outbox send evidence.
 
 A failed provider send releases the claim but preserves the complete 092
 delivery envelope and applies bounded exponential retry backoff (one minute,

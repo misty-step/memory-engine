@@ -778,7 +778,12 @@ impl ApiState {
             .auth_config
             .scheduler_manual_token
             .clone();
-        if configured.as_deref().is_none_or(|value| value != token) {
+        // Compare hashes, not raw strings: SHA-256 preimage resistance makes
+        // the non-constant-time equality useless to a timing attacker probing
+        // this privileged credential (same rationale as `verify_admin_token`).
+        if configured.as_deref().is_none_or(|configured| {
+            configured.is_empty() || secret_hash(configured) != secret_hash(token)
+        }) {
             return Err(ApiFailure::forbidden(
                 "Scheduled reminder trigger is not authorized.",
             ));
@@ -3057,6 +3062,38 @@ mod tests {
         );
 
         assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
+    }
+
+    #[test]
+    fn manual_scheduler_trigger_rejects_absent_and_wrong_token_but_accepts_configured_token() {
+        let state =
+            ApiState::new(AccountRegistry::default().with_auth_config(
+                AuthConfig::default().with_scheduler_manual_token("correct-token"),
+            ));
+
+        let absent = state.run_manual_return_notification_scheduler("");
+        let absent_error = absent.expect_err("empty token must fail closed");
+        assert_eq!(absent_error.status, StatusCode::FORBIDDEN);
+
+        let wrong = state.run_manual_return_notification_scheduler("wrong-token");
+        let wrong_error = wrong.expect_err("mismatched token must fail closed");
+        assert_eq!(wrong_error.status, StatusCode::FORBIDDEN);
+
+        let ok = state.run_manual_return_notification_scheduler("correct-token");
+        assert_eq!(
+            ok.expect("configured token starts the scheduler run")
+                .examined,
+            0
+        );
+    }
+
+    #[test]
+    fn manual_scheduler_trigger_fails_closed_when_unconfigured() {
+        let state = ApiState::default();
+        let error = state
+            .run_manual_return_notification_scheduler("anything")
+            .expect_err("no configured token must fail closed");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

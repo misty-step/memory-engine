@@ -48,12 +48,13 @@ async fn healthz_exposes_production_api_boundary() {
 }
 
 #[tokio::test]
-async fn manual_return_scheduler_requires_operator_token_and_reports_health() {
+async fn manual_return_scheduler_fails_closed_on_absent_and_wrong_token_and_starts_on_correct_token(
+) {
     let state = ApiState::new(AccountRegistry::default().with_auth_config(
         AuthConfig::default().with_scheduler_manual_token("operator-scheduler-token"),
     ));
     let app = router(state);
-    let unauthorized = app
+    let absent = app
         .clone()
         .oneshot(
             Request::builder()
@@ -64,7 +65,21 @@ async fn manual_return_scheduler_requires_operator_token_and_reports_health() {
         )
         .await
         .expect("manual scheduler response");
-    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+    assert_eq!(absent.status(), StatusCode::FORBIDDEN);
+
+    let wrong = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/scheduler/return-notifications")
+                .header("x-scheduler-token", "not-the-operator-token")
+                .body(Body::empty())
+                .expect("wrong-token scheduler request"),
+        )
+        .await
+        .expect("wrong-token scheduler response");
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
 
     let authorized = app
         .clone()
