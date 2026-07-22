@@ -1887,7 +1887,14 @@ mod source_loading_tests {
             EnqueueOutcome::Started(_)
         ));
         state.run_pending_jobs_blocking();
-        let active_view = state.next_app_review(&account).unwrap();
+        let pending_view = state.next_app_review(&account).unwrap();
+        let active_view = state
+            .keep_draft(
+                account.account_id(),
+                account.session_token(),
+                &pending_view.drafts[0].id,
+            )
+            .unwrap();
 
         let active_source_loads = Cell::new(0);
         let active_job_loads = Cell::new(0);
