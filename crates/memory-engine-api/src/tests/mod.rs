@@ -3074,6 +3074,106 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
 }
 
 #[tokio::test]
+async fn service_worker_serves_versioned_safe_shell_and_offline_fallback() {
+    let app = router(ApiState::default());
+    let worker = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/sw.js")
+                .body(Body::empty())
+                .expect("service worker request"),
+        )
+        .await
+        .expect("service worker response");
+    assert_eq!(worker.status(), StatusCode::OK);
+    assert_eq!(
+        worker
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(
+        worker
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let worker = response_text(worker).await;
+    for contract in [
+        "scry-shell-v1",
+        "self.skipWaiting()",
+        "self.clients.claim()",
+        "request.method !== \"GET\"",
+        "request.mode === \"navigate\"",
+        "/app/login/verify",
+        "/v1/",
+        "cache.put",
+        "caches.delete",
+    ] {
+        assert!(
+            worker.contains(contract),
+            "service worker contract missing {contract:?}: {worker}"
+        );
+    }
+
+    let offline = app
+        .oneshot(
+            Request::builder()
+                .uri("/offline.html")
+                .body(Body::empty())
+                .expect("offline request"),
+        )
+        .await
+        .expect("offline response");
+    assert_eq!(offline.status(), StatusCode::OK);
+    assert_eq!(
+        offline
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let offline = response_text(offline).await;
+    assert!(offline.contains("Scry"));
+    assert!(offline.contains("Try again"));
+    assert!(!offline.contains("quiz"));
+    assert!(!offline.contains("credential"));
+}
+
+#[tokio::test]
+async fn dynamic_html_and_api_responses_are_not_http_cacheable() {
+    let app = router(ApiState::default());
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_no_store_and_no_referrer(&home);
+
+    let api = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/accounts")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"email":"pwa@example.com"}"#))
+                .expect("account request"),
+        )
+        .await
+        .expect("account response");
+    assert_eq!(api.status(), StatusCode::CREATED);
+    assert_no_store_and_no_referrer(&api);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn due_count_return_channel_is_opt_in_and_disable_is_sticky() {
     let store_root = temp_store_root("return-notifications");

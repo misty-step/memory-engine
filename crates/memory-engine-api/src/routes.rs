@@ -5,11 +5,12 @@ use std::{
 };
 
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Form, Path, Query, Request, State},
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode,
     },
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
@@ -355,6 +356,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(app_home))
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
+        .route("/sw.js", get(static_service_worker))
+        .route("/offline.html", get(static_offline_html))
         .route("/manifest.webmanifest", get(static_manifest))
         .route("/favicon.png", get(static_favicon))
         .route("/icon-192.png", get(static_icon_192))
@@ -422,7 +425,9 @@ pub fn router(state: ApiState) -> Router {
             post(approve_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
-    mount_review_routes(router).with_state(state)
+    mount_review_routes(router)
+        .layer(middleware::from_fn(no_store_dynamic_responses))
+        .with_state(state)
 }
 
 /// The review "escape hatch" routes: reveal, cross-reference, skip, snooze,
@@ -463,6 +468,27 @@ fn mount_review_routes(router: Router<ApiState>) -> Router<ApiState> {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
+}
+
+async fn no_store_dynamic_responses(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if matches!(
+        path.as_str(),
+        "/static/ledger.css"
+            | "/static/app.js"
+            | "/sw.js"
+            | "/offline.html"
+            | "/manifest.webmanifest"
+            | "/favicon.png"
+            | "/icon-192.png"
+            | "/icon-512.png"
+            | "/apple-touch-icon.png"
+    ) {
+        response
+    } else {
+        no_store_response(response)
+    }
 }
 
 async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -510,6 +536,28 @@ async fn static_ledger_css() -> impl IntoResponse {
             (CACHE_CONTROL, "public, max-age=3600"),
         ],
         LEDGER_CSS,
+    )
+}
+
+async fn static_service_worker() -> impl IntoResponse {
+    const WORKER: &str = include_str!("../assets/service-worker.js");
+    (
+        [
+            (CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (CACHE_CONTROL, "no-cache"),
+        ],
+        WORKER,
+    )
+}
+
+async fn static_offline_html() -> impl IntoResponse {
+    const OFFLINE: &str = include_str!("../assets/offline.html");
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        OFFLINE,
     )
 }
 
