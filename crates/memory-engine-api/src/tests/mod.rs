@@ -6457,6 +6457,26 @@ async fn postgres_backend_browser_session_resumes_after_restart() {
     // Drain the enqueued job: generation runs and the accepted drafts remain pending until explicit keeps.
     restarted_state.run_pending_jobs_blocking();
 
+    let pending = restarted_app
+        .clone()
+        .oneshot(form_request_with_cookie("GET", "/", &cookie, &[]))
+        .await
+        .expect("pending after restart");
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending = response_text(pending).await;
+    let draft_id = html_value(&pending, "draftId");
+    let kept = restarted_app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/keep",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+        ))
+        .await
+        .expect("keep after restart");
+    assert_eq!(kept.status(), StatusCode::OK);
+
     let next = restarted_app
         .oneshot(form_request_with_cookie(
             "POST",
