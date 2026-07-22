@@ -10491,6 +10491,18 @@ async fn waitlist_admin_listing_requires_a_valid_admin_token() {
         .await
         .expect("missing token response");
     assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let missing_body = response_json(missing).await;
+    let missing_error = missing_body["error"].as_str().expect("error message");
+    assert!(
+        missing_error.to_ascii_lowercase().contains("admin token"),
+        "error must name admin-token authorization: {missing_error}"
+    );
+    assert!(
+        !missing_error
+            .to_ascii_lowercase()
+            .contains("session issuance"),
+        "error must not misdirect to service-session issuance: {missing_error}"
+    );
 
     let wrong = app
         .oneshot(
@@ -10504,6 +10516,82 @@ async fn waitlist_admin_listing_requires_a_valid_admin_token() {
         .await
         .expect("wrong token response");
     assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn waitlist_export_neutralizes_formula_leading_locals_and_quotes_carriage_returns() {
+    let store_root = temp_store_root("waitlist-export-csv-injection");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let dangerous_emails = [
+        "=2+5+cmd|'/c calc'!a0@example.com",
+        "+1+1@example.com",
+        "-1+1@example.com",
+        "cr\rinjected@example.com",
+    ];
+    for email in dangerous_emails {
+        let joined = app
+            .clone()
+            .oneshot(form_request("POST", "/app/waitlist", &[("email", email)]))
+            .await
+            .expect("join");
+        assert_eq!(joined.status(), StatusCode::OK);
+    }
+
+    // JSON keeps the raw, unmodified email: only the CSV encoding changes.
+    let listed = app
+        .clone()
+        .oneshot(waitlist_admin_request("GET", "/internal/waitlist", None))
+        .await
+        .expect("admin list");
+    let entries = response_json(listed).await;
+    let entries = entries.as_array().expect("waitlist array");
+    for email in dangerous_emails {
+        assert!(
+            entries.iter().any(|entry| entry["email"] == json!(email)),
+            "JSON must preserve the raw email {email:?} verbatim"
+        );
+    }
+
+    let exported = app
+        .oneshot(waitlist_admin_request(
+            "GET",
+            "/internal/waitlist/export",
+            None,
+        ))
+        .await
+        .expect("export");
+    let exported = response_text(exported).await;
+
+    // A formula-leading local part must be neutralized with a stable
+    // spreadsheet-safe prefix so opening the CSV cannot execute it.
+    assert!(
+        exported.contains("'=2+5+cmd|'/c calc'!a0@example.com,"),
+        "= must be neutralized with a leading prefix: {exported}"
+    );
+    assert!(
+        exported.contains("'+1+1@example.com,"),
+        "+ must be neutralized with a leading prefix: {exported}"
+    );
+    assert!(
+        exported.contains("'-1+1@example.com,"),
+        "- must be neutralized with a leading prefix: {exported}"
+    );
+    // A bare CR (not just LF) must still trigger RFC 4180 quoting so the
+    // row isn't corrupted by an unescaped control character.
+    assert!(
+        exported.contains("\"cr\rinjected@example.com\","),
+        "embedded CR must be quoted: {exported}"
+    );
+    // The raw, un-neutralized formula must never appear at the start of a
+    // CSV cell (i.e. right after a newline or the header terminator).
+    assert!(
+        !exported.contains("\n=2+5"),
+        "raw formula must never open a CSV cell unguarded: {exported}"
+    );
 }
 
 #[tokio::test]
@@ -10681,19 +10769,29 @@ fn waitlist_admin_request(method: &str, uri: &str, body: Option<&str>) -> Reques
 }
 
 #[tokio::test]
-async fn waitlist_join_acknowledges_well_under_a_hundred_milliseconds() {
+async fn waitlist_join_file_store_handler_overhead_is_negligible() {
     let store_root = temp_store_root("waitlist-latency");
     let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
 
-    // The join handler does one local flock + fsync'd write and nothing else
-    // (no network call, no model inference), so its floor latency is what
-    // the criterion cares about. A single sample is noisy under a shared
-    // test runner (first-poll scheduling, concurrent-test disk contention),
-    // so this takes the minimum of several samples: genuine systemic
-    // slowness (a stray network round trip, a retry loop) would slow down
-    // every sample, including the fastest, while one-off scheduler jitter
-    // only slows a subset. Stays under `WAITLIST_RATE_LIMIT_MAX_ATTEMPTS`
-    // (5, shared by IP) on a dedicated IP so the limiter never interferes.
+    // Regression guard only -- NOT proof of the "acknowledges valid input
+    // before durable completion" production criterion. This measures the
+    // file-store join handler's own floor latency (one local flock + fsync'd
+    // write, no network, no model inference). The Postgres-backed production
+    // path connects and runs its migration on every call (observed
+    // 161-700ms TTFB), so a same-process sub-100ms *server* round trip is
+    // not achievable there, and this test must not be read as one. The
+    // acknowledgment guarantee production actually relies on is client-side:
+    // app.js synchronously flips the waitlist button/aria-live status to
+    // "Joining…" on submit, before the native POST's response ever lands
+    // (proven by the Bun DOM contract in app_js_contract.test.js). This test
+    // only guards against the file store itself regressing into a
+    // bottleneck. A single sample is noisy under a shared test runner
+    // (first-poll scheduling, concurrent-test disk contention), so this
+    // takes the minimum of several samples: genuine systemic slowness (a
+    // stray network round trip, a retry loop) would slow down every sample,
+    // including the fastest, while one-off scheduler jitter only slows a
+    // subset. Stays under `WAITLIST_RATE_LIMIT_MAX_ATTEMPTS` (5, shared by
+    // IP) on a dedicated IP so the limiter never interferes.
     let sample_count = (WAITLIST_RATE_LIMIT_MAX_ATTEMPTS - 1) as usize;
     let mut samples = Vec::with_capacity(sample_count);
     for index in 0..sample_count {

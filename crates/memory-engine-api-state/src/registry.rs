@@ -357,9 +357,7 @@ impl AccountRegistry {
         if configured.as_deref().is_none_or(|configured| {
             configured.is_empty() || secret_hash(configured) != secret_hash(admin_token)
         }) {
-            return Err(ApiFailure::forbidden(
-                "Service session issuance is not authorized.",
-            ));
+            return Err(ApiFailure::forbidden("Admin token is not authorized."));
         }
         Ok(())
     }

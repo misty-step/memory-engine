@@ -1072,17 +1072,33 @@ async fn list_waitlist(
     ))
 }
 
+/// Encode one CSV cell so opening the export in a spreadsheet cannot
+/// execute attacker-controlled content as a formula (classic CSV/formula
+/// injection). Any value whose first character is `=`, `+`, `-`, or `@` is
+/// spreadsheet-formula-shaped in Excel/Sheets/LibreOffice, so it gets a
+/// stable, deterministic `'` prefix that forces text interpretation;
+/// applied uniformly regardless of which column carries attacker input.
+/// This only changes the CSV wire encoding -- storage and JSON keep the
+/// exact underlying value.
 fn csv_field(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
+    let mut value = value.to_owned();
+    if value.starts_with(['=', '+', '-', '@']) {
+        value.insert(0, '\'');
+    }
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_owned()
+        value
     }
 }
 
 /// Operator-only waitlist CSV export, gated by the admin token. Same
 /// listing as `GET /internal/waitlist`; only the wire format differs, so an
-/// operator can open the result directly in a spreadsheet.
+/// operator can open the result directly in a spreadsheet. Anonymous callers
+/// control the email column (`POST /app/waitlist`), so every cell runs
+/// through `csv_field`, which neutralizes formula-leading values and quotes
+/// CR/LF/comma/quote before the row is written -- opening this export can
+/// never execute attacker-controlled content as a spreadsheet formula.
 async fn export_waitlist(
     State(state): State<ApiState>,
     headers: HeaderMap,
