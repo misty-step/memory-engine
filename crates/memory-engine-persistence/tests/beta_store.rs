@@ -1195,6 +1195,101 @@ fn mastered_after_three_reviews(schedule: &ScheduleState) -> bool {
     schedule.state == ScheduleStatus::Review && schedule.reps >= 3
 }
 
+#[test]
+fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
+    let directory = TempDirectory::new("learner-trust-driver");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let source = store
+        .save_source_document(source_document("trust-source"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("trust-reference", &source.id))
+        .expect("reference");
+    let draft_ids = ["trust-keep", "trust-edit", "trust-reject"];
+    for (index, draft_id) in draft_ids.iter().enumerate() {
+        let run_id = format!("trust-run-{index}");
+        let draft = store
+            .save_generated_prompt_draft(accepted_draft(
+                draft_id,
+                &format!("trust-unit-{index}"),
+                &[source.id.as_str()],
+                &[reference.id.as_str()],
+                Some(&run_id),
+            ))
+            .expect("pending draft");
+        store
+            .save_generation_run(generation_run(
+                &run_id,
+                &[source.id.as_str()],
+                &[draft.id.as_str()],
+            ))
+            .expect("generation run");
+    }
+    let pending = store.snapshot();
+    assert!(
+        pending.review_units.is_empty(),
+        "generation must not promote drafts"
+    );
+    assert!(
+        pending.schedules.is_empty(),
+        "generation must not schedule drafts"
+    );
+
+    let kept = store
+        .keep_generated_prompt_draft(draft_ids[0], NOW)
+        .expect("keep");
+    let edited = store
+        .edit_and_keep_generated_prompt_draft(
+            draft_ids[1],
+            "Edited trust prompt",
+            "Edited trust answer",
+            NOW + 1,
+        )
+        .expect("edit and keep");
+    store
+        .reject_generated_prompt_draft(draft_ids[2], NOW + 2)
+        .expect("reject");
+
+    let due = store.list_queue_candidates().expect("due queue");
+    assert_eq!(due.len(), 2, "only kept and edited-kept drafts can be due");
+    assert_eq!(
+        due.iter()
+            .map(|candidate| candidate.review_unit_id.clone())
+            .collect::<Vec<_>>(),
+        vec![kept.review_unit_id, edited.review_unit_id]
+    );
+    let export = store
+        .export_learner_draft_decisions_json()
+        .expect("decision export");
+    let export: serde_json::Value = serde_json::from_str(&export).expect("export JSON");
+    assert_eq!(export.as_array().expect("export array").len(), 3);
+    assert!(export
+        .as_array()
+        .expect("export array")
+        .iter()
+        .all(
+            |entry| entry["sourceDocumentIds"] == serde_json::json!(["trust-source"])
+                && entry["referenceSpanIds"] == serde_json::json!(["trust-reference"])
+                && entry["generationRunId"].is_string()
+                && entry["provider"] == "fixture"
+                && entry["model"] == "deterministic-draft"
+        ));
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload");
+    let reloaded_due = reloaded
+        .list_queue_candidates()
+        .expect("reloaded due queue");
+    assert_eq!(reloaded_due, due);
+    let reloaded_export = reloaded
+        .export_learner_draft_decisions_json()
+        .expect("reloaded export");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reloaded_export).expect("reloaded export JSON"),
+        export
+    );
+}
+
 fn source_document(id: &str) -> SourceDocument {
     SourceDocument {
         id: id.to_owned(),

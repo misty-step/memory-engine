@@ -128,9 +128,9 @@ pub fn call_tool(client: &MemoryEngineClient, name: &str, args: &Value) -> Resul
             let title = required_str(args, "title")?;
             let body = required_str(args, "body")?;
             let ttl_expires_at = args["ttl_expires_at"].as_i64();
-            let (deck, approved_count) =
+            let (deck, kept_count) =
                 client.create_deck(project_key, title, body, ttl_expires_at)?;
-            json!({ "deck": deck, "approvedCardCount": approved_count })
+            json!({ "deck": deck, "keptCardCount": kept_count })
         }
         "list_decks" => {
             let project_key = args["project_key"].as_str();

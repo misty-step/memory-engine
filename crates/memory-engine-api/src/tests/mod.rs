@@ -246,25 +246,44 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
     assert_not_contains_any(&captured, &["Add all to reviews", ">Keep</button>"]);
 
     // Drain the background job: real generation leaves accepted candidates
-    // pending. Inspect the rendered candidates, then explicitly keep them.
+    // pending. Exercise edit-and-keep for one candidate and reject the other.
     state.run_pending_jobs_blocking();
     let workspace = workspace_html(&app, &cookie).await;
     assert_activity_succeeded_html(&workspace, 2);
-    for draft_id in html_values(&workspace, "draftId") {
-        let kept = app
-            .clone()
-            .oneshot(form_request_with_cookie(
-                "POST",
-                "/app/draft/keep",
-                &cookie,
-                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
-            ))
-            .await
-            .expect("keep pending draft");
-        assert_eq!(kept.status(), StatusCode::OK);
-    }
+    let draft_ids = html_values(&workspace, "draftId");
+    assert!(
+        draft_ids.len() >= 2,
+        "fixture must produce edit and reject candidates"
+    );
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/edit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("draftId", &draft_ids[0]),
+                ("prompt", "Edited SSR prompt"),
+                ("expectedAnswer", "Edited SSR answer"),
+            ],
+        ))
+        .await
+        .expect("edit pending draft");
+    assert_eq!(edited.status(), StatusCode::OK);
+    let rejected = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/reject",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("draftId", &draft_ids[1])],
+        ))
+        .await
+        .expect("reject pending draft");
+    assert_eq!(rejected.status(), StatusCode::OK);
 
-    // Only explicit keeps drive the review flow.
+    // Only explicit keeps or edits drive the review flow.
     let review = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -277,7 +296,7 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
         .expect("next");
     assert_eq!(review.status(), StatusCode::OK);
     let review = response_text(review).await;
-    assert!(review.contains("2 due"));
+    assert!(review.contains("1 due"));
     assert!(review.contains("Reveal answer"));
     assert!(!review.contains("Add all to reviews"));
 }
@@ -6406,6 +6425,97 @@ async fn postgres_review_actions_emit_latency_receipt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn v1_json_draft_decisions_are_idempotent_and_conflict_safe() {
+    let app = router(ApiState::default());
+    let account = create_account(&app, "trust-decisions@example.com").await;
+    let source = save_source(&app, &account, "Trust notes", &source_body()).await;
+    let source_id = source["sourceId"].as_str().expect("source id");
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, source_id).await;
+    assert!(
+        draft_ids.len() >= 2,
+        "fixture must produce independent decision candidates"
+    );
+
+    let keep_uri = format!(
+        "/v1/accounts/{}/drafts/{}/keep",
+        account.account_id, draft_ids[0]
+    );
+    let kept = app
+        .clone()
+        .oneshot(v1_empty_request("POST", &keep_uri, &account.session_token))
+        .await
+        .expect("keep draft");
+    assert_eq!(kept.status(), StatusCode::OK);
+    let kept_retry = app
+        .clone()
+        .oneshot(v1_empty_request("POST", &keep_uri, &account.session_token))
+        .await
+        .expect("matching keep retry");
+    assert_eq!(kept_retry.status(), StatusCode::OK);
+    let rejected_after_keep = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!(
+                "/v1/accounts/{}/drafts/{}/reject",
+                account.account_id, draft_ids[0]
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("conflicting reject");
+    assert_eq!(rejected_after_keep.status(), StatusCode::CONFLICT);
+
+    let edit_uri = format!(
+        "/v1/accounts/{}/drafts/{}/edit",
+        account.account_id, draft_ids[1]
+    );
+    let edit_body = json!({"prompt": "Edited prompt", "expectedAnswer": "Edited answer"});
+    let edited = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &edit_uri,
+            &account.session_token,
+            &edit_body,
+        ))
+        .await
+        .expect("edit draft");
+    assert_eq!(edited.status(), StatusCode::OK);
+    let edited_retry = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &edit_uri,
+            &account.session_token,
+            &edit_body,
+        ))
+        .await
+        .expect("matching edit retry");
+    assert_eq!(edited_retry.status(), StatusCode::OK);
+    let divergent_edit = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &edit_uri,
+            &account.session_token,
+            &json!({"prompt": "Different prompt", "expectedAnswer": "Different answer"}),
+        ))
+        .await
+        .expect("conflicting edit");
+    assert_eq!(divergent_edit.status(), StatusCode::CONFLICT);
+    let unknown = app
+        .oneshot(v1_empty_request(
+            "POST",
+            &format!("/v1/accounts/{}/drafts/missing/reject", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("unknown draft");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_backend_browser_session_resumes_after_restart() {
     let Some(database) = PostgresTestDatabase::new("browser_session") else {
         return;
@@ -8261,8 +8371,7 @@ async fn generate_source_queued(
         .study_view(account_id, session_token)
         .expect("queued study view");
     for draft in view.drafts.iter().filter(|draft| {
-        !draft.approved
-            && draft.learner_decision.is_none()
+        draft.learner_decision.is_none()
             && draft.validation_status == GeneratedPromptValidationStatus::Accepted
     }) {
         state
@@ -8776,7 +8885,7 @@ fn assert_activity_succeeded_html(body: &str, _expected_generated_cards: usize) 
         "activity log must show a succeeded job: {body}"
     );
     assert!(
-        body.contains("0 cards · pending your review"),
+        body.contains("0 scheduled cards · pending your review"),
         "generation activity must report zero scheduled cards before learner decisions: {body}"
     );
     assert!(body.contains(r#"<ul id="me-jobs""#));

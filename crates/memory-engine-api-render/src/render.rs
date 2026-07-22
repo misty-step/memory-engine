@@ -1056,7 +1056,7 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Running => "Generating cards…".to_owned(),
         JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
         JobStatus::Succeeded => format!(
-            "{} {} · pending your review",
+            "{} scheduled {} · pending your review",
             job.card_count,
             plural(job.card_count, "card", "cards")
         ),

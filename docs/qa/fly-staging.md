@@ -16,12 +16,12 @@ managed-Postgres boundary. The file store described below was local-only.
 2. `GET /` at a 390 x 844 mobile viewport
 3. `POST /app/start`
 4. `POST /app/save-account`
-5. `POST /app/keep`
+5. `POST /app/draft/keep`
 6. `POST /app/reveal`
 7. `POST /app/submit`
 8. `POST /app/next`
 9. `POST /app/logout`
-10. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/keep`,
+10. JSON equivalent through `/accounts`, `/sources`, `/generate`, `/drafts/{draft_id}/keep`,
    `/review/{review_unit_id}/reveal`, and `/review/{review_unit_id}/submit`
 
 Submit payloads must include `idempotencyKey`.
@@ -69,7 +69,7 @@ units, schedules, attempts, and applied-review receipts, then verifies duplicate
 review idempotency, account A snapshot reconstruction, and account B isolation
 before dropping the schema. It also runs `BetaStudySession` against an
 account-scoped Postgres store for source intake, deterministic generation,
-draft approval, reveal, graded submit, and persisted receipt reconstruction.
+draft keep/edit/reject, reveal, graded submit, and persisted receipt reconstruction.
 
 2026-06-06 local API/Postgres route contract: with the same
 `sploot-test-postgres` container, this command passed:
@@ -80,7 +80,7 @@ MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test 
 
 The test creates an isolated schema, starts the API with
 `AccountRegistry::with_postgres_url`, drives JSON `/accounts`, `/sources`,
-`/generate`, `/keep`, `/reveal`, and `/submit`, then recreates API state and
+`/generate`, `/drafts/{draft_id}/keep`, `/drafts/{draft_id}/edit`, `/drafts/{draft_id}/reject`, `/reveal`, and `/submit`, then recreates API state and
 verifies source persistence after restart through the same Postgres schema.
 
 ## Archived staging receipt
@@ -188,7 +188,7 @@ and final review state. Overflow checks reported
 `min_machines_running = 1` config change used image
 `memory-engine-api:deployment-01KTF8VG6WT38CZDSKE9QKJN95`. Deployed health
 returned `{"status":"ok","service":"memory-engine-api"}`. The JSON route smoke
-created `acct_ede61c543b71e396`, generated and approved
+created `acct_ede61c543b71e396`, generated and kept
 `generated-quiz-src-91fdb0ff98a73300-1-nato-letter-a`, submitted `ALFA`, then
 recreated API state and submitted the same client idempotency key with the
 original session token again. Both `attemptCount` and `duplicateAttemptCount`

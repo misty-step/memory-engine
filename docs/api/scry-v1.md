@@ -1,7 +1,7 @@
 # Scry v1 API handoff
 
-`memory-engine` owns memory science: source ingestion, draft generation,
-review-unit approval, due queue selection, answer reveal, grading, scheduling,
+`memory-engine` owns memory science: source ingestion, draft generation, learner keep/edit/reject decisions,
+due queue selection, answer reveal, grading, scheduling,
 and source archival. Scry owns the product experience: account UI, study
 layout, navigation, copy, reminders, and client-side state.
 
@@ -48,8 +48,9 @@ cargo run -p memory-engine-contract -- \
   --base-url https://memory-engine-api-i2xcr.ondigitalocean.app
 ```
 
-The runner creates a disposable source, generates drafts, keeps the first
-draft, selects the next review, reveals the answer, submits that answer,
+The runner creates a disposable source, generates drafts that remain pending,
+keeps the first draft explicitly, selects the next review, reveals the answer,
+submits that answer,
 archives the source, lists active sources, and emits a JSON receipt with the
 source absent from the active list.
 
@@ -60,6 +61,10 @@ phrasing, or scheduling meaning from IDs. The client can keep its own view
 state, but the current due item, projected multiple-choice choices, revealed
 answer, grade, attempt count, post-answer feedback, item history, concept
 health rollup, and schedule result come from the engine response.
+
+Generated drafts expose source spans and provider/model/prompt-version
+provenance before a keep or edit decision. Rejected drafts remain in the
+exported decision receipt but never enter the due queue.
 
 After a submit, `current.feedback` carries human-language result text, the
 expected answer, this item's attempt history (`lastSeen` plus

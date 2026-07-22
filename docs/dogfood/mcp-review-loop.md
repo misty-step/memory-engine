@@ -143,11 +143,11 @@ identical to the table above rendered as JSON Schema):
 ```
 
 **3. `create_deck`** — one call saves the source, generates a quiz card, and
-approves it. `approvedCardCount: 1` proves the composition, not a bare save:
+keeps it explicitly. `keptCardCount: 1` proves the composition, not a bare save:
 
 ```json
 >>> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_deck","arguments":{"project_key":"nato-onboarding","title":"NATO letter A fixture","body":"Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA."}}}
-<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"approvedCardCount\": 1,\n  \"deck\": {\n    \"deckId\": \"deck_0d32f2a69298d5d8\",\n    \"projectKey\": \"nato-onboarding\",\n    \"source\": {\"sourceId\": \"deck_0d32f2a69298d5d8\", \"title\": \"NATO letter A fixture\", ...}\n  }\n}"}]}}
+<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"keptCardCount\": 1,\n  \"deck\": {\n    \"deckId\": \"deck_0d32f2a69298d5d8\",\n    \"projectKey\": \"nato-onboarding\",\n    \"source\": {\"sourceId\": \"deck_0d32f2a69298d5d8\", \"title\": \"NATO letter A fixture\", ...}\n  }\n}"}]}}
 ```
 
 **4. `list_decks`** — the new deck is visible, scoped to its `project_key`:

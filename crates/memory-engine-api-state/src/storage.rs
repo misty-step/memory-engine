@@ -13,15 +13,16 @@ use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
-    persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
-    postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation,
-    run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
-    with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
-    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings,
+    browser_session_path, file_content_feedback_failure, file_study_failure,
+    persisted_project_deck_exists, persisted_source_exists, persisted_sources,
+    postgres_content_feedback_failure, postgres_failure, postgres_study_failure, rate_limit_path,
+    require_current_review, require_current_review_postgres, run_bridge_generation,
+    run_reference_generation, run_source_generation, run_source_generation_with_run_id,
+    secret_hash, study_failure, with_postgres_account, with_postgres_account_timed,
+    with_postgres_store, with_postgres_store_timed, with_postgres_study, write_atomic, ApiFailure,
+    BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    SubmitReviewTimings,
 };
 
 #[derive(Clone, Debug)]
@@ -1653,7 +1654,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
-            let view = study.keep_draft(draft_id).map_err(study_failure)?;
+            let view = study.keep_draft(draft_id).map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -1669,7 +1670,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         self.with_locked_study(store_path, |study| {
             let view = study
                 .edit_and_keep_draft(draft_id, prompt, expected_answer)
-                .map_err(study_failure)?;
+                .map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -1681,7 +1682,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
-            let view = study.reject_draft(draft_id).map_err(study_failure)?;
+            let view = study.reject_draft(draft_id).map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2486,7 +2487,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = study.keep_draft(draft_id).map_err(study_failure)?;
+            let view = study.keep_draft(draft_id).map_err(postgres_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2503,7 +2504,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let mut study = BetaStudySession::from_store(account, self.now);
             let view = study
                 .edit_and_keep_draft(draft_id, prompt, expected_answer)
-                .map_err(study_failure)?;
+                .map_err(postgres_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2516,7 +2517,9 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = study.reject_draft(draft_id).map_err(study_failure)?;
+            let view = study
+                .reject_draft(draft_id)
+                .map_err(postgres_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }

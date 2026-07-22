@@ -345,7 +345,7 @@
     "/v1/accounts/{account_id}/generation-jobs/{job_id}": {
       "get": {
         "summary": "Observe one account-scoped generation job",
-        "description": "Poll until status is succeeded or failed. cardCount reports how many accepted cards were scheduled and may be zero when no draft passed validation.",
+        "description": "Poll until status is succeeded or failed. cardCount reports scheduled cards created by the job (zero until a learner keeps or edits a draft); generation itself creates no review units or schedules.",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -692,6 +692,56 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         }
       }
@@ -727,6 +777,56 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
           }
         }
       }
@@ -749,6 +849,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -1230,10 +1380,15 @@
           "activityKind",
           "activityStage",
           "prompt",
+          "answer",
+          "conceptLabel",
           "validationStatus",
           "validationReasons",
           "workedSolution",
-          "approved"
+          "approved",
+          "learnerDecision",
+          "sourceSpans",
+          "provenance"
         ],
         "properties": {
           "id": {
@@ -1272,6 +1427,38 @@
           },
           "approved": {
             "type": "boolean"
+          },
+          "answer": {
+            "type": "string"
+          },
+          "conceptLabel": {
+            "type": "string"
+          },
+          "learnerDecision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LearnerDraftDecision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sourceSpans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StudyReferenceSpan"
+            }
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StudyGenerationProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -1745,6 +1932,109 @@
           },
           "expectedAnswer": {
             "type": "string"
+          }
+        }
+      },
+      "LearnerDraftDecision": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/KeptLearnerDraftDecision"
+          },
+          {
+            "$ref": "#/components/schemas/RejectedLearnerDraftDecision"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind"
+        }
+      },
+      "KeptLearnerDraftDecision": {
+        "type": "object",
+        "required": [
+          "kind",
+          "edited",
+          "decidedAt"
+        ],
+        "properties": {
+          "kind": {
+            "const": "kept"
+          },
+          "edited": {
+            "type": "boolean"
+          },
+          "decidedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "RejectedLearnerDraftDecision": {
+        "type": "object",
+        "required": [
+          "kind",
+          "decidedAt"
+        ],
+        "properties": {
+          "kind": {
+            "const": "rejected"
+          },
+          "decidedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "StudyReferenceSpan": {
+        "type": "object",
+        "required": [
+          "id",
+          "sourceDocumentId",
+          "label",
+          "text",
+          "locator"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "sourceDocumentId": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "locator": {
+            "type": "string"
+          }
+        }
+      },
+      "StudyGenerationProvenance": {
+        "type": "object",
+        "required": [
+          "generationRunId",
+          "provider",
+          "model",
+          "promptVersion"
+        ],
+        "properties": {
+          "generationRunId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "promptVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }

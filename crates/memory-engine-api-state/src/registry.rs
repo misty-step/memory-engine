@@ -1026,7 +1026,8 @@ impl AccountRegistry {
             ));
         }
         let _view = storage.study_view(account_id, &store_path)?;
-        // Generation reports scheduled cards, and generation never schedules.
+        // card_count is the number of scheduled cards, and generation never
+        // schedules. Pending accepted drafts are visible in the study view.
         Ok(0)
     }
 

@@ -26,8 +26,8 @@ overhead.
 
 Sustained value is shown by repeated session behavior, not one-off fixture parse success:
 
-1. `crates/memory-engine-study/tests/beta_study.rs`: resume without regeneration preserves approved units, attempts, and queue state across restart.
-2. `crates/memory-engine-beta-app` tests: Rust HTTP routes run source -> generate -> approve -> reveal -> submit -> restart/resume through the study boundary.
+1. `crates/memory-engine-study/tests/beta_study.rs`: resume without regeneration preserves kept units, attempts, and queue state across restart.
+2. `crates/memory-engine-beta-app` tests: Rust HTTP routes run source -> generate -> keep/edit/reject -> reveal -> submit -> restart/resume through the study boundary.
 3. Rust study and beta-app tests keep reveal semantics, duplicate-submit handling, and review-state projection aligned.
 4. `docs/beta/mobile-study.md` browser smoke (May 22, 2026): mobile viewport loop proved reveal/submit behavior and persisted attempt/review counts.
 
@@ -46,7 +46,7 @@ readiness alone):
 
 - `BetaPersistenceStore` snapshot/write model;
 - source parsing and generation orchestration;
-- draft approval choreography;
+- draft keep/edit/reject choreography;
 - reveal UI state, worked-solution presentation, and activity-stage copy.
 
 ## Revisit Gate (Extract Only If All Pass)

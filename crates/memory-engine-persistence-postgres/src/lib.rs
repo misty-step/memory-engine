@@ -23,7 +23,8 @@ use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     parse_strict_boolean_answer, AppliedReviewReceipt, BetaReviewUnitRecord, BetaStoreSnapshot,
     ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus, GenerationRun,
-    LearnerDraftDecision, ReferenceSpan, ScheduleRecord, SourceDocument, SourcePermission,
+    LearnerDraftDecision, LearnerDraftDecisionExport, ReferenceSpan, ScheduleRecord,
+    SourceDocument, SourcePermission,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -3381,6 +3382,31 @@ impl AccountStudyStore<'_> {
         let snapshot = self.snapshot()?;
         memory_engine_persistence::export_content_feedback_json(&snapshot)
             .map_err(|error| PostgresStoreError::StudySession(error.to_string()))
+    }
+
+    /// Export every durable learner draft decision with source and model provenance.
+    ///
+    /// The query is account-scoped and uses the same export contract as the file
+    /// store, so calibration receipts remain portable between backends.
+    ///
+    /// # Errors
+    /// Returns PostgresStoreError when the scoped snapshot cannot be read or
+    /// a decision cannot resolve its generation-run provenance.
+    pub fn export_learner_draft_decisions(
+        &self,
+    ) -> Result<Vec<LearnerDraftDecisionExport>, PostgresStoreError> {
+        let snapshot = self.snapshot()?;
+        memory_engine_persistence::export_learner_draft_decisions(&snapshot)
+            .map_err(|error| PostgresStoreError::StudySession(error.to_string()))
+    }
+
+    /// Export durable learner draft decisions as JSON.
+    ///
+    /// # Errors
+    /// Returns PostgresStoreError when snapshot reads or JSON encoding fail.
+    pub fn export_learner_draft_decisions_json(&self) -> Result<String, PostgresStoreError> {
+        serde_json::to_string_pretty(&self.export_learner_draft_decisions()?)
+            .map_err(PostgresStoreError::Json)
     }
 
     /// Set or clear the schedule for a review unit in the scoped account.

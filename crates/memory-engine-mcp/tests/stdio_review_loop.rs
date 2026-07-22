@@ -120,7 +120,7 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     );
     let deck_payload = tool_payload(&created_deck);
     assert!(
-        deck_payload["approvedCardCount"].as_u64().unwrap_or(0) >= 1,
+        deck_payload["keptCardCount"].as_u64().unwrap_or(0) >= 1,
         "create_deck must generate and keep at least one card: {deck_payload}"
     );
     let deck_id = deck_payload["deck"]["deckId"]

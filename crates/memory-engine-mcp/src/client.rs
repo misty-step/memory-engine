@@ -50,7 +50,12 @@ pub struct ProjectDeckRecord {
 pub struct DraftRow {
     pub id: String,
     pub validation_status: String,
-    pub approved: bool,
+    #[serde(default)]
+    pub learner_decision: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source_spans: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -109,8 +114,8 @@ impl MemoryEngineClient {
         &self.account_id
     }
 
-    /// Create a project-scoped deck, generate its review cards, and approve
-    /// every accepted draft, so the deck is immediately due for study. This
+    /// Create a project-scoped deck, generate its review cards, and explicitly keep
+    /// every undecided accepted draft, so the deck is immediately due for study. This
     /// composes three v1 calls (`project-decks`, `sources/{id}/generate`,
     /// `drafts/{id}/keep`) behind one agent-intent verb: an agent asking
     /// to "capture this as a deck" wants reviewable cards, not a bare saved
@@ -146,10 +151,12 @@ impl MemoryEngineClient {
         let pending = view
             .drafts
             .iter()
-            .filter(|draft| draft.validation_status == "accepted" && !draft.approved)
+            .filter(|draft| {
+                draft.validation_status == "accepted" && draft.learner_decision.is_none()
+            })
             .map(|draft| draft.id.clone())
             .collect::<Vec<_>>();
-        let approved_count = pending.len();
+        let kept_count = pending.len();
         for draft_id in pending {
             let _: StudyView = self.post_empty(&format!(
                 "/v1/accounts/{}/drafts/{draft_id}/keep",
@@ -157,7 +164,7 @@ impl MemoryEngineClient {
             ))?;
         }
 
-        Ok((deck, approved_count))
+        Ok((deck, kept_count))
     }
 
     /// List saved sources that belong to a project deck (`project_key` set),

@@ -2945,7 +2945,64 @@ fn migrate_postgres_store(
     Ok(())
 }
 
+trait LearnerDecisionApiError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure>;
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence::BetaStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer | Self::AttemptAnswerBlank => Some(
+                ApiFailure::bad_request("The learner decision request is invalid."),
+            ),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence_postgres::PostgresStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer => Some(ApiFailure::bad_request(
+                "The learner decision request is invalid.",
+            )),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
+    if let Some(failure) = error.learner_decision_api_failure() {
+        return failure;
+    }
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
@@ -3039,6 +3096,30 @@ fn study_failure<E: std::fmt::Display>(
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
+}
+
+fn file_study_failure(
+    error: memory_engine_study::BetaStudyError<memory_engine_persistence::BetaStoreError>,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
+}
+
+fn postgres_study_failure(
+    error: memory_engine_study::BetaStudyError<
+        memory_engine_persistence_postgres::PostgresStoreError,
+    >,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
 }
 
 fn require_current_review(

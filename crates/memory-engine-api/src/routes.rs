@@ -1708,16 +1708,22 @@ async fn keep_app_draft(
             Ok(account) => account,
             Err(error) => return app_failure_response(error),
         };
-    Html(render_action_result_html(
-        &state,
-        &account,
-        state.keep_draft(
-            account.account_id(),
-            account.session_token(),
-            &form.draft_id,
-        ),
-    ))
-    .into_response()
+    let result = state.keep_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn edit_app_draft(
@@ -1760,16 +1766,22 @@ async fn reject_app_draft(
             Ok(account) => account,
             Err(error) => return app_failure_response(error),
         };
-    Html(render_action_result_html(
-        &state,
-        &account,
-        state.reject_pending_draft(
-            account.account_id(),
-            account.session_token(),
-            &form.draft_id,
-        ),
-    ))
-    .into_response()
+    let result = state.reject_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn next_app_review(

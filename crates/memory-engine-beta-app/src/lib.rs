@@ -160,8 +160,23 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
             Err(error) => HttpResponse::bad_request(&error),
         },
         ("POST", "/generate") => response_for(request, generate_all_sources(session)),
-        ("POST", "/keep") => match read_required_string(&request.body, "draftId") {
+        ("POST", "/keep" | "/draft/keep") => match read_required_string(&request.body, "draftId") {
             Ok(draft_id) => response_for(request, session.keep_draft(&draft_id)),
+            Err(error) => HttpResponse::bad_request(&error),
+        },
+        ("POST", "/draft/edit") => match read_draft_revision(&request.body) {
+            Ok(revision) => response_for(
+                request,
+                session.edit_and_keep_draft(
+                    &revision.draft_id,
+                    &revision.prompt,
+                    &revision.expected_answer,
+                ),
+            ),
+            Err(error) => HttpResponse::bad_request(&error),
+        },
+        ("POST", "/draft/reject") => match read_required_string(&request.body, "draftId") {
+            Ok(draft_id) => response_for(request, session.reject_draft(&draft_id)),
             Err(error) => HttpResponse::bad_request(&error),
         },
         ("POST", "/learn-more" | "/current/learn-more") => {
@@ -512,6 +527,12 @@ struct RevisionPayload {
     expected_answer: String,
 }
 
+struct DraftRevisionPayload {
+    draft_id: String,
+    prompt: String,
+    expected_answer: String,
+}
+
 fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
     if !looks_like_json(body) {
         let fields = parse_form(body)?;
@@ -624,6 +645,14 @@ fn read_required_string(body: &[u8], key: &str) -> Result<String, String> {
 
 fn read_revision(body: &[u8]) -> Result<RevisionPayload, String> {
     Ok(RevisionPayload {
+        prompt: read_required_string(body, "prompt")?,
+        expected_answer: read_required_string(body, "expectedAnswer")?,
+    })
+}
+
+fn read_draft_revision(body: &[u8]) -> Result<DraftRevisionPayload, String> {
+    Ok(DraftRevisionPayload {
+        draft_id: read_required_string(body, "draftId")?,
         prompt: read_required_string(body, "prompt")?,
         expected_answer: read_required_string(body, "expectedAnswer")?,
     })
@@ -864,7 +893,7 @@ fn render_feedback(html: &mut String, current: &BetaStudyCurrent) {
 fn render_summary(html: &mut String, view: &BetaStudyView) {
     html.push_str("<section class=\"panel\"><h2>State</h2><dl><dt>Sources</dt><dd>");
     html.push_str(&view.summary.source_count.to_string());
-    html.push_str("</dd><dt>Keepd</dt><dd>");
+    html.push_str("</dd><dt>Kept review units</dt><dd>");
     html.push_str(&view.summary.approved_review_unit_count.to_string());
     html.push_str("</dd><dt>Attempts</dt><dd>");
     html.push_str(&view.summary.attempt_count.to_string());
@@ -903,20 +932,71 @@ fn snooze_until() -> i64 {
 fn render_drafts(html: &mut String, view: &BetaStudyView) {
     html.push_str("<section class=\"panel\"><h2>Drafts</h2><ul>");
     for draft in &view.drafts {
-        html.push_str("<li><strong>");
+        html.push_str("<li class=\"draft\"><strong>");
         html.push_str(&escape_html(&draft.prompt));
-        html.push_str("</strong>");
+        html.push_str("</strong><p>Concept: ");
+        html.push_str(&escape_html(&draft.concept_label));
+        html.push_str("</p><p>Expected answer: ");
+        html.push_str(&escape_html(&draft.answer));
+        html.push_str("</p><p>");
         html.push_str(&escape_html(&format!(
             "{:?} - {}",
             draft.activity_kind, draft.activity_stage
         )));
-        html.push_str("<form method=\"post\" action=\"/keep\"><input type=\"hidden\" name=\"draftId\" value=\"");
-        html.push_str(&escape_html(&draft.id));
-        html.push_str("\"><button type=\"submit\" class=\"secondary\">Keep</button></form></li>");
+        html.push_str("</p>");
+        if draft.learner_decision.is_some() {
+            html.push_str("<p class=\"decision\">Learner decision recorded; this draft is no longer awaiting review.</p>");
+        } else {
+            html.push_str("<div class=\"actions\"><form method=\"post\" action=\"/draft/keep\"><input type=\"hidden\" name=\"draftId\" value=\"");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\"><button type=\"submit\" class=\"secondary\">Keep</button></form><form method=\"post\" action=\"/draft/reject\"><input type=\"hidden\" name=\"draftId\" value=\"");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\"><button type=\"submit\" class=\"secondary danger\">Reject</button></form></div><form class=\"edit\" method=\"post\" action=\"/draft/edit\"><input type=\"hidden\" name=\"draftId\" value=\"");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\"><label for=\"draft-prompt-");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\">Edit prompt</label><textarea id=\"draft-prompt-");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\" name=\"prompt\">");
+            html.push_str(&escape_html(&draft.prompt));
+            html.push_str("</textarea><label for=\"draft-answer-");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\">Edit expected answer</label><input id=\"draft-answer-");
+            html.push_str(&escape_html(&draft.id));
+            html.push_str("\" name=\"expectedAnswer\" value=\"");
+            html.push_str(&escape_html(&draft.answer));
+            html.push_str(
+                "\"><button type=\"submit\" class=\"secondary\">Edit and keep</button></form>",
+            );
+        }
+        if !draft.source_spans.is_empty() {
+            html.push_str("<details><summary>Source spans</summary><ul>");
+            for span in &draft.source_spans {
+                html.push_str("<li><strong>");
+                html.push_str(&escape_html(&span.label));
+                html.push_str("</strong>: ");
+                html.push_str(&escape_html(&span.text));
+                html.push_str(" <small>(");
+                html.push_str(&escape_html(&span.locator));
+                html.push_str(")</small></li>");
+            }
+            html.push_str("</ul></details>");
+        }
+        if let Some(provenance) = &draft.provenance {
+            html.push_str("<p class=\"provenance\">Generated by ");
+            html.push_str(&escape_html(&provenance.provider));
+            html.push_str(" / ");
+            html.push_str(&escape_html(&provenance.model));
+            if let Some(prompt_version) = &provenance.prompt_version {
+                html.push_str(" / prompt ");
+                html.push_str(&escape_html(prompt_version));
+            }
+            html.push_str("</p>");
+        }
+        html.push_str("</li>");
     }
     html.push_str("</ul></section>");
 }
-
 fn render_queue(html: &mut String, view: &BetaStudyView) {
     html.push_str("<section class=\"panel\"><h2>Queue</h2><ol>");
     for row in &view.queue {
@@ -1833,6 +1913,113 @@ mod tests {
             ),
         );
         route(session, &request("POST", "/generate", "{}"));
+    }
+
+    #[test]
+    fn draft_decision_routes_keep_edit_reject_and_render_provenance() {
+        let directory = TempDirectory::new("draft-decisions");
+        let mut study_session = session(directory.path().join("study.json"));
+        let source = route(
+            &mut study_session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-trust",
+                    "title": "Trust notes",
+                    "body": source_body()
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(source.status, 200);
+        let generated = route(&mut study_session, &request("POST", "/generate", "{}"));
+        let generated: Value = serde_json::from_slice(&generated.body).expect("generated");
+        let drafts = generated["drafts"].as_array().expect("draft array");
+        assert!(
+            !drafts.is_empty(),
+            "fixture must produce a decision candidate"
+        );
+        assert!(drafts[0]["sourceSpans"].as_array().is_some());
+        assert!(drafts[0]["provenance"].is_object());
+        let html = route(&mut study_session, &request("GET", "/", ""));
+        let html = String::from_utf8(html.body).expect("html");
+        for marker in [
+            "Source spans",
+            "Generated by",
+            "/draft/keep",
+            "/draft/edit",
+            "/draft/reject",
+        ] {
+            assert!(
+                html.contains(marker),
+                "draft trust marker missing: {marker}"
+            );
+        }
+
+        let edited = route(
+            &mut study_session,
+            &request(
+                "POST",
+                "/draft/edit",
+                &json!({
+                    "draftId": drafts[0]["id"],
+                    "prompt": "Edited trust prompt",
+                    "expectedAnswer": "Edited trust answer"
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(edited.status, 200);
+        let state = route(&mut study_session, &request("GET", "/state", ""));
+        let state: Value = serde_json::from_slice(&state.body).expect("state");
+        assert!(state["drafts"]
+            .as_array()
+            .expect("state drafts")
+            .iter()
+            .any(|draft| draft["learnerDecision"]["kind"] == json!("kept")));
+        assert_eq!(state["dueCount"], json!(1));
+
+        let reject_directory = TempDirectory::new("draft-reject");
+        let mut reject_session = session(reject_directory.path().join("study.json"));
+        let rejected_source = route(
+            &mut reject_session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-reject",
+                    "title": "Reject notes",
+                    "body": source_body()
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(rejected_source.status, 200);
+        let rejected_generated = route(&mut reject_session, &request("POST", "/generate", "{}"));
+        let rejected_generated: Value =
+            serde_json::from_slice(&rejected_generated.body).expect("rejected generated");
+        let rejected_drafts = rejected_generated["drafts"]
+            .as_array()
+            .expect("rejected drafts");
+        let rejected = route(
+            &mut reject_session,
+            &request(
+                "POST",
+                "/draft/reject",
+                &json!({"draftId": rejected_drafts[0]["id"]}).to_string(),
+            ),
+        );
+        assert_eq!(rejected.status, 200);
+        let rejected_state = route(&mut reject_session, &request("GET", "/state", ""));
+        let rejected_state: Value =
+            serde_json::from_slice(&rejected_state.body).expect("rejected state");
+        assert!(rejected_state["drafts"]
+            .as_array()
+            .expect("rejected state drafts")
+            .iter()
+            .any(|draft| draft["learnerDecision"]["kind"] == json!("rejected")));
+        assert_eq!(rejected_state["dueCount"], json!(0));
     }
 
     fn keep_draft(session: &mut BetaStudySession, draft_id: &str) {
