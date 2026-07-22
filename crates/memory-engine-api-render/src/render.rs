@@ -582,10 +582,11 @@ fn render_signed_out(notice: Option<&str>) -> String {
 </section>
 <section class="ae-group me-capture-hero">
 <p class="me-kicker">New here?</p>
-<form action="/app/waitlist" method="post">
+<form class="me-waitlist-form" action="/app/waitlist" method="post">
 <label class="ae-label" for="me-waitlist-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
 <div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
+<p class="me-waitlist-status ae-dim" aria-live="polite"></p>
 </form>
 </section>
 </div>"#,
