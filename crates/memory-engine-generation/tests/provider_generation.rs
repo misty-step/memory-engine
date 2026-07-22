@@ -20,6 +20,33 @@ tissue type. They are sometimes called the powerhouse of the cell because they p
 chemical energy.";
 
 #[test]
+fn title_only_verbatim_cue_does_not_activate_exhaustive_policy() {
+    let source = SourceDocument {
+        id: "src-title-only-verbatim".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "Apostles' Creed verbatim sequence".to_owned(),
+        project_key: None,
+        body: Some(String::new()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        ttl_expires_at: None,
+        created_at: NOW,
+        archived_at: None,
+    };
+
+    let classification = classify_learning_intent(&source);
+    assert!(
+        !matches!(
+            classification.intent,
+            LearningIntent::EnumerableSet | LearningIntent::VerbatimMemorization
+        ),
+        "title-only prose must not activate exhaustive enumerable/verbatim policy: {:?}",
+        classification.intent
+    );
+}
+
+#[test]
 fn fallback_provider_rejects_local_only_source_before_forwarding() {
     let source = SourceDocument {
         id: "src-local-only".to_owned(),
@@ -967,6 +994,110 @@ fn prose_repair_stays_with_the_model_fallback() {
         !result.accepted_draft_ids.is_empty(),
         "the fallback's repaired draft must pass the shared gate: {:?}",
         result.validation_failures
+    );
+}
+
+#[test]
+fn verbatim_repair_reapplies_policy_and_recitation_intent() {
+    struct RepairingVerbatim {
+        repaired: Cell<bool>,
+    }
+
+    impl DraftProvider for RepairingVerbatim {
+        fn model(&self) -> GeneratedPromptModel {
+            test_model("repairing-verbatim")
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            Ok(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: "wrong provider shape".to_owned(),
+                    question: "What should be repaired?".to_owned(),
+                    answer: "the exact source".to_owned(),
+                    evidence: Some("fabricated evidence".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                }],
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+
+        fn repair_drafts(
+            &self,
+            _source: &SourceDocument,
+            _rejections: &[DraftRejection],
+        ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+            self.repaired.set(true);
+            Ok(Some(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: "repair shape".to_owned(),
+                    question: "Recite the repaired line exactly.".to_owned(),
+                    answer: "Alpha line.".to_owned(),
+                    evidence: Some("Alpha line.".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: Some("The exact source line is: Alpha line.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "free-recall".to_owned(),
+                    unsupported: false,
+                }],
+                failures: Vec::new(),
+                usage: None,
+            }))
+        }
+    }
+
+    let directory = TempDirectory::new("verbatim-repair-policy");
+    let mut store = BetaPersistenceStore::open(directory.path().join("store.json")).expect("store");
+    store
+        .save_source_document(source_document(
+            "src-verbatim-repair",
+            "Source text verbatim",
+            "Alpha line.\nBeta line.\nGamma line.",
+        ))
+        .expect("source");
+    let provider = RepairingVerbatim {
+        repaired: Cell::new(false),
+    };
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        request("run-verbatim-repair", "src-verbatim-repair"),
+    )
+    .expect("generation");
+
+    assert!(
+        provider.repaired.get(),
+        "verbatim rejection must enter repair"
+    );
+    assert_eq!(result.accepted_draft_ids.len(), 2);
+    let drafts = store.snapshot().generated_prompt_drafts;
+    assert_eq!(
+        drafts.len(),
+        4,
+        "three policy drafts plus one repaired draft"
+    );
+    assert!(
+        drafts.iter().all(|draft| {
+            matches!(
+                &draft.prompt,
+                Prompt::Exact(exact) if exact.kind == ExactPromptKind::Recitation
+            )
+        }),
+        "initial and repaired verbatim drafts must retain Recitation intent"
     );
 }
 

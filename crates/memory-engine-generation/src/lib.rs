@@ -401,6 +401,7 @@ where
             return Ok(None);
         }
     };
+    let drafts = enforce_content_policy(source, drafts);
     validation_failures.extend(drafts.failures);
     // Stamp drafts with the provider that actually generated them, not the
     // composite's declared identity. A caller override still wins.
@@ -415,6 +416,7 @@ where
     // expansion grounded in the captured topic itself.
     let mut source_rejections = Vec::new();
     let mut max_candidate_index = 0;
+    let learning_intent = drafts.learning_intent;
     persist_candidates(
         store,
         source,
@@ -429,6 +431,7 @@ where
             rejected_draft_ids,
             source_rejections: &mut source_rejections,
             max_candidate_index: &mut max_candidate_index,
+            learning_intent,
         },
     )?;
 
@@ -495,8 +498,10 @@ where
             return Ok(None);
         }
     };
+    let repair = enforce_content_policy(source, repair);
     validation_failures.extend(repair.failures);
     let usage = repair.usage;
+    let learning_intent = repair.learning_intent;
     let repair_model = request.model.clone().unwrap_or(repair.model);
     if !repair.candidates.is_empty() && !producing_models.contains(&repair_model) {
         producing_models.push(repair_model.clone());
@@ -524,6 +529,7 @@ where
             rejected_draft_ids,
             source_rejections: &mut repair_rejections,
             max_candidate_index,
+            learning_intent,
         },
     )?;
 
@@ -556,6 +562,7 @@ struct PersistCandidatesContext<'a> {
     rejected_draft_ids: &'a mut Vec<String>,
     source_rejections: &'a mut Vec<DraftRejection>,
     max_candidate_index: &'a mut usize,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn persist_candidates<S>(
@@ -609,6 +616,7 @@ where
                 duplicate: false,
                 grounded,
                 quote_verified: !grounded || source_contains_quote(source, evidence),
+                learning_intent: context.learning_intent,
             },
         )?;
 
@@ -1008,6 +1016,7 @@ struct PersistParams<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 /// Save one candidate's reference span and draft, returning the stored draft.
@@ -1053,6 +1062,7 @@ where
                 duplicate: params.duplicate,
                 grounded: params.grounded,
                 quote_verified: params.quote_verified,
+                learning_intent: params.learning_intent,
             },
         ))
         .map_err(BetaGenerationError::Store)
@@ -1199,6 +1209,7 @@ struct DraftContext<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn merge_usage(
@@ -1357,7 +1368,7 @@ fn build_draft(
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        prompt: build_prompt(candidate, &unit_id, context.learning_intent),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due,
@@ -1443,7 +1454,10 @@ fn bridge_draft(
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        // Bridge material is an easier derivative, not the original source's
+        // verbatim intent; keep its exercise tolerant unless a future typed
+        // bridge contract explicitly opts into recitation.
+        prompt: build_prompt(candidate, &unit_id, None),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due.saturating_add(i64::from(stage_order)),
@@ -1497,7 +1511,11 @@ fn bridge_validation_reasons(
     reasons
 }
 
-fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
+fn build_prompt(
+    candidate: &DraftCandidate,
+    review_unit_id: &ReviewUnitId,
+    learning_intent: Option<LearningIntent>,
+) -> Prompt {
     if candidate.activity_kind == GeneratedLearningActivityKind::Quiz
         && candidate.distractors.len() >= 2
     {
@@ -1514,10 +1532,15 @@ fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Pr
     }
 
     Prompt::Exact(ExactPrompt {
-        kind: if candidate.activity_kind == GeneratedLearningActivityKind::Exercise {
-            ExactPromptKind::Recitation
-        } else {
-            ExactPromptKind::ShortAnswer
+        kind: match learning_intent {
+            Some(LearningIntent::VerbatimMemorization) => ExactPromptKind::Recitation,
+            Some(
+                LearningIntent::EnumerableSet
+                | LearningIntent::ConceptUnderstanding
+                | LearningIntent::FactRecall
+                | LearningIntent::ProcedureProcess,
+            )
+            | None => ExactPromptKind::ShortAnswer,
         },
         review_unit_id: review_unit_id.clone(),
         prompt: candidate.question.clone(),

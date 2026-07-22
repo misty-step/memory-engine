@@ -451,6 +451,7 @@ pub struct LearningIntentClassification {
 #[must_use]
 pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassification {
     let body = source.body.as_deref().unwrap_or_default();
+    let has_source_body = !body.trim().is_empty();
     let normalized = format!("{} {}", source.title, body).to_lowercase();
     let lines = non_empty_lines(body);
     let list_facts = count_fact_sentences(body);
@@ -458,7 +459,7 @@ pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassi
     let process = looks_process(&normalized);
     let explicit_verbatim = looks_explicit_verbatim(&normalized);
     let ordered_process = looks_ordered_process(&normalized, &lines);
-    if explicit_verbatim {
+    if has_source_body && explicit_verbatim {
         return LearningIntentClassification {
             intent: LearningIntent::VerbatimMemorization,
             rationale: "source explicitly calls for exact sequential memorization".to_owned(),
@@ -481,7 +482,7 @@ pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassi
                 .to_owned(),
         };
     }
-    if looks_verbatim(&normalized, &lines) {
+    if has_source_body && looks_verbatim(&normalized, &lines) {
         return LearningIntentClassification {
             intent: LearningIntent::VerbatimMemorization,
             rationale: "source reads like a quoted passage or line-broken text".to_owned(),

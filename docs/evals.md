@@ -77,12 +77,18 @@ Run against the deterministic fake provider (the CI-safe default — no network)
 cargo run -p memory-engine-bench -- generation
 ```
 
-Run a live model field comparison (requires `OPENROUTER_API_KEY`):
+Run a live model field comparison through Mint's credential-safe egress path:
 
 ```sh
+# MINT_BASE_URL and the runtime credential alias are private environment inputs.
+OPENROUTER_BASE_URL="${MINT_BASE_URL}/proxy/https/openrouter.ai/api/v1" \
+OPENROUTER_PROXY_TOKEN="${OPENROUTER_MINT_ALIAS:?private runtime alias required}" \
 cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
   --prompt principled --out docs/evals/generation-<model>-<date>.md
 ```
+
+Never commit the private base URL or runtime credential alias. The dated
+Mint-routed field receipt is [`generation-061-live-mint-2026-07-21.md`](evals/generation-061-live-mint-2026-07-21.md).
 
 `--max-drafts <n>` changes the model draft budget for field sweeps. Keep the
 runtime prompt on `prompt-principled` unless a shaped ticket adds and proves a
