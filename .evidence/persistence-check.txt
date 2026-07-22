@@ -1,3 +1,0 @@
-    Checking memory-engine-generation v0.0.0 (/private/tmp/memory-engine-091-trust/crates/memory-engine-generation)
-    Checking memory-engine-study v0.0.0 (/private/tmp/memory-engine-091-trust/crates/memory-engine-study)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.45s
