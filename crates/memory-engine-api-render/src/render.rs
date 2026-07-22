@@ -337,14 +337,9 @@ fn render_app_shell_with_head(
     head: &str,
 ) -> String {
     let inner = match account {
-        Some(account) => render_signed_in(
-            account,
-            sources,
-            view,
-            jobs,
-            notice,
-            SignedInSurface::Home,
-        ),
+        Some(account) => {
+            render_signed_in(account, sources, view, jobs, notice, SignedInSurface::Home)
+        }
         None => render_signed_out(notice),
     };
     document_with_head(&inner, head)
@@ -354,11 +349,7 @@ fn render_app_shell_with_head(
 /// (memory-engine-087). Capture is one job-to-be-done — it never shares a
 /// scroll with source management or analytics.
 #[must_use]
-pub fn render_create_page(
-    state: &ApiState,
-    account: &AppAccount,
-    notice: Option<&str>,
-) -> String {
+pub fn render_create_page(state: &ApiState, account: &AppAccount, notice: Option<&str>) -> String {
     let view = state.app_study_view(account).ok();
     let jobs = state.jobs_for_app_account(account);
     let inner = render_signed_in(
@@ -817,7 +808,9 @@ fn render_home_body(account: &AppAccount, view: Option<&StudyViewResponse>) -> S
     if let Some(view) = view {
         html.push_str(&render_review_status(account, view));
     }
-    if view.is_none() || view.is_some_and(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0) {
+    if view.is_none()
+        || view.is_some_and(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0)
+    {
         html.push_str(
             r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
         );
@@ -904,8 +897,16 @@ fn render_library_sources(
             id = escape_html(&source.source_id),
             id_label = escape_html(&source.source_id),
             title_attr = escape_html(&source.title),
-            model_selected = if source.permission == SourcePermission::ModelEligible { "selected" } else { "" },
-            local_selected = if source.permission == SourcePermission::LocalOnly { "selected" } else { "" },
+            model_selected = if source.permission == SourcePermission::ModelEligible {
+                "selected"
+            } else {
+                ""
+            },
+            local_selected = if source.permission == SourcePermission::LocalOnly {
+                "selected"
+            } else {
+                ""
+            },
         );
         let _ = write!(
             rows,

@@ -32,8 +32,8 @@ use memory_engine_api_render::{
     render_library_page, render_login_requested, render_return_notification_confirmation,
     render_return_notification_disabled, render_return_notification_recovery,
     render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
-    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
+    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions,
+    ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -1477,8 +1477,7 @@ async fn capture_app_source(
             }
         }
         Err(error) => {
-            return Html(render_create_page(&state, &account, Some(&error.message)))
-                .into_response()
+            return Html(render_create_page(&state, &account, Some(&error.message))).into_response()
         }
     };
 

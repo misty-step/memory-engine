@@ -649,7 +649,8 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
 
     // Analytics has nav with Analytics current.
     let view = view(vec![], None, vec![], 0, vec![]);
-    let analytics = crate::render_analytics_page(&acct, &view, crate::AnalyticsViewOptions::default());
+    let analytics =
+        crate::render_analytics_page(&acct, &view, crate::AnalyticsViewOptions::default());
     assert!(
         analytics.contains(r#"<nav class="me-nav" aria-label="Views">"#),
         "Analytics must carry persistent nav: {analytics}"

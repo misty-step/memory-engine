@@ -438,43 +438,79 @@ async fn focused_views_render_only_their_owned_job_with_persistent_nav() {
 
     // ── Home: due hero + nav, no capture/sources/analytics ──
     let home = get_view_html(&app, "/", &cookie).await;
-    assert!(home.contains(r#"href="/" aria-current="page">Home</a>"#), "Home nav current");
+    assert!(
+        home.contains(r#"href="/" aria-current="page">Home</a>"#),
+        "Home nav current"
+    );
     assert!(home.contains("Start review"), "Home due hero: {home}");
-    assert_not_contains_any(&home, &[
-        "What do you want to remember?",  // capture form
-        "Saved material",                   // sources
-        "Concept health",                   // analytics
-    ]);
+    assert_not_contains_any(
+        &home,
+        &[
+            "What do you want to remember?", // capture form
+            "Saved material",                // sources
+            "Concept health",                // analytics
+        ],
+    );
 
     // ── Create: capture form + nav, no due hero/sources/analytics ──
     let create = get_view_html(&app, "/app/create", &cookie).await;
-    assert!(create.contains(r#"href="/app/create" aria-current="page">Create</a>"#), "Create nav current");
-    assert!(create.contains("What do you want to remember?"), "Create capture form: {create}");
-    assert_not_contains_any(&create, &[
-        "Start review",       // due hero
-        "Saved material",     // sources
-        "Concept health",     // analytics
-    ]);
+    assert!(
+        create.contains(r#"href="/app/create" aria-current="page">Create</a>"#),
+        "Create nav current"
+    );
+    assert!(
+        create.contains("What do you want to remember?"),
+        "Create capture form: {create}"
+    );
+    assert_not_contains_any(
+        &create,
+        &[
+            "Start review",   // due hero
+            "Saved material", // sources
+            "Concept health", // analytics
+        ],
+    );
 
     // ── Library: sources + counts + nav, no capture/due hero/analytics ──
     let library = get_view_html(&app, "/app/library", &cookie).await;
-    assert!(library.contains(r#"href="/app/library" aria-current="page">Library</a>"#), "Library nav current");
-    assert!(library.contains("Saved material"), "Library sources: {library}");
-    assert!(library.contains("NATO practice notes"), "Library source title: {library}");
-    assert_not_contains_any(&library, &[
-        "What do you want to remember?",  // capture form
-        "Start review",                    // due hero
-        "Concept health",                  // analytics
-    ]);
+    assert!(
+        library.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "Library nav current"
+    );
+    assert!(
+        library.contains("Saved material"),
+        "Library sources: {library}"
+    );
+    assert!(
+        library.contains("NATO practice notes"),
+        "Library source title: {library}"
+    );
+    assert_not_contains_any(
+        &library,
+        &[
+            "What do you want to remember?", // capture form
+            "Start review",                  // due hero
+            "Concept health",                // analytics
+        ],
+    );
 
     // ── Analytics: concept health + nav, no capture/sources/due hero ──
     let analytics = get_view_html(&app, "/app/analytics", &cookie).await;
-    assert!(analytics.contains(r#"href="/app/analytics" aria-current="page">Analytics</a>"#), "Analytics nav current");
-    assert!(analytics.contains("Concept health"), "Analytics concept health: {analytics}");
-    assert_not_contains_any(&analytics, &[
-        "What do you want to remember?",  // capture form
-        "Saved material",                  // sources
-    ]);
+    assert!(
+        analytics.contains(r#"href="/app/analytics" aria-current="page">Analytics</a>"#),
+        "Analytics nav current"
+    );
+    assert!(
+        analytics.contains("Concept health"),
+        "Analytics concept health: {analytics}"
+    );
+    assert_not_contains_any(
+        &analytics,
+        &[
+            "What do you want to remember?", // capture form
+            "Saved material",                // sources
+        ],
+    );
 
     // ── Every standing view carries the persistent nav ──
     for (label, html) in [
@@ -514,12 +550,15 @@ async fn review_is_full_bleed_without_nav_or_workspace_sections() {
     assert_eq!(review.status(), StatusCode::OK);
     let review = response_text(review).await;
     assert!(review.contains("Reveal answer"), "review card: {review}");
-    assert_not_contains_any(&review, &[
-        r#"<nav class="me-nav""#,      // no nav
-        "Saved material",               // no sources
-        "What do you want to remember?", // no capture
-        "Concept health",                // no analytics
-    ]);
+    assert_not_contains_any(
+        &review,
+        &[
+            r#"<nav class="me-nav""#,        // no nav
+            "Saved material",                // no sources
+            "What do you want to remember?", // no capture
+            "Concept health",                // no analytics
+        ],
+    );
 }
 
 /// memory-engine-087: POST capture returns to the Create view, not the
@@ -10677,7 +10716,6 @@ async fn saved_material_hides_generate_once_a_job_is_in_flight_or_done() {
         "a source with a job already queued must not offer to generate again: {queued}"
     );
     state.run_pending_jobs_blocking();
-
 
     let succeeded = library_html(&app, &cookie).await;
     assert!(succeeded.contains(r#"data-status="succeeded""#));
