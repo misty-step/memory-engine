@@ -1980,6 +1980,10 @@ mod tests {
             .any(|draft| draft["learnerDecision"]["kind"] == json!("kept")));
         assert_eq!(state["dueCount"], json!(1));
 
+        assert_reject_route();
+    }
+
+    fn assert_reject_route() {
         let reject_directory = TempDirectory::new("draft-reject");
         let mut reject_session = session(reject_directory.path().join("study.json"));
         let rejected_source = route(

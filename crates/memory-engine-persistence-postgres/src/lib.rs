@@ -3390,7 +3390,7 @@ impl AccountStudyStore<'_> {
     /// store, so calibration receipts remain portable between backends.
     ///
     /// # Errors
-    /// Returns PostgresStoreError when the scoped snapshot cannot be read or
+    /// Returns `PostgresStoreError` when the scoped snapshot cannot be read or
     /// a decision cannot resolve its generation-run provenance.
     pub fn export_learner_draft_decisions(
         &self,
@@ -3403,7 +3403,7 @@ impl AccountStudyStore<'_> {
     /// Export durable learner draft decisions as JSON.
     ///
     /// # Errors
-    /// Returns PostgresStoreError when snapshot reads or JSON encoding fail.
+    /// Returns `PostgresStoreError` when snapshot reads or JSON encoding fail.
     pub fn export_learner_draft_decisions_json(&self) -> Result<String, PostgresStoreError> {
         serde_json::to_string_pretty(&self.export_learner_draft_decisions()?)
             .map_err(PostgresStoreError::Json)
