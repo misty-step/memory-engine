@@ -417,6 +417,17 @@ pub fn render_login_requested(debug_link: Option<&str>) -> String {
 }
 
 #[must_use]
+pub fn render_waitlist_joined() -> String {
+    let view = r#"<div class="me-cover">
+<p class="me-kicker">You're on the list</p>
+<h1 class="me-display">Thanks for joining.</h1>
+<p class="ae-lede ae-dim me-support">We’ll email you when a spot opens. No account was created and nothing else happens until then.</p>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#;
+    document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
 pub fn render_auth_recovery(title: &str, message: &str) -> String {
     let view = format!(
         r#"<div class="me-cover">
@@ -478,7 +489,7 @@ pub fn render_return_notification_disabled() -> String {
 <p class="me-kicker">Return gently</p>
 <h1 class="me-display">Reminders are off.</h1>
 <p class="ae-lede ae-dim me-support">You will not receive further due-count reminders. You can opt in again from your study space.</p>
-<p><a class="ae-accent" href="/">Back to Memory Engine</a></p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
 }
@@ -501,7 +512,7 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<title>Memory Engine</title>
+<title>Scry</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/favicon.png" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
@@ -534,7 +545,7 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
     format!(
         r#"<div class="ae-screen">
 <header class="ae-bar">
-<a class="ae-name" href="/">MEMORY ENGINE</a>
+<a class="ae-name" href="/">SCRY</a>
 {header_right}
 </header>
 <main class="{stage}">
@@ -552,19 +563,30 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
 fn render_signed_out(notice: Option<&str>) -> String {
     // Onboarding is auth-first. Accounts are required (the magic-link
     // allowlist), so anonymous visitors never see the capture form — they would
-    // only dead-end on it. The display promise leads, then one action: enter an
-    // email and get a sign-in link. Capture and review live behind auth.
+    // only dead-end on it. The display promise leads, then two actions: sign in
+    // with an allowlisted email, or join the invite-beta waitlist below it. Both
+    // forms read identically to a visitor who doesn't know their own allowlist
+    // state, so neither response can be used to probe it.
     let view = format!(
         r#"<div class="me-cover">
 {notice}
-<p class="me-kicker">Spaced repetition, made effortless</p>
-<h1 class="me-display">Read it once.<br>Remember it for good.</h1>
+<p class="me-kicker">Scry</p>
+<h1 class="me-display">Remember everything.</h1>
 <p class="ae-lede ae-dim me-support">Capture anything worth remembering. We bring it back when it matters.</p>
 <section class="ae-group me-capture-hero">
 <form action="/app/account" method="post">
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
 <div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
+</form>
+</section>
+<section class="ae-group me-capture-hero">
+<p class="me-kicker">New here?</p>
+<form class="me-waitlist-form" action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
+<p class="me-waitlist-status ae-dim" aria-live="polite"></p>
 </form>
 </section>
 </div>"#,
@@ -1683,7 +1705,7 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">A memory instrument</span>"#;
+const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">Scry — Remember everything</span>"#;
 
 // Lucide icons (ISC), inlined for `.ae-icon`: 1.5px stroke, currentColor, no
 // fill. Status hue rides the glyph; the sentence stays ink.

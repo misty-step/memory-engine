@@ -30,8 +30,9 @@ use memory_engine_api_render::{
     render_auth_recovery, render_content_feedback_recovery_html,
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
-    AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
+    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
+    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
+    LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -42,7 +43,7 @@ use memory_engine_api_state::{
     InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
     ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
     StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
-    SubmitViewport,
+    SubmitViewport, WaitlistEntry,
 };
 
 #[cfg(test)]
@@ -363,12 +364,17 @@ pub fn router(state: ApiState) -> Router {
             "/internal/scheduler/return-notifications",
             post(run_return_notification_scheduler),
         )
+        .route("/internal/waitlist", get(list_waitlist))
+        .route("/internal/waitlist/export", get(export_waitlist))
+        .route("/internal/waitlist/invite", post(invite_waitlist))
+        .route("/internal/waitlist/delete", post(delete_waitlist))
         .route("/accounts", post(create_account));
 
-    mount_v1_routes(router)
+    let router = mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/analytics", get(app_analytics))
         .route("/app/account", post(create_app_account))
+        .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
         .route(
@@ -415,7 +421,16 @@ pub fn router(state: ApiState) -> Router {
             "/accounts/{account_id}/drafts/{draft_id}/approve",
             post(approve_draft),
         )
-        .route("/accounts/{account_id}/review/next", get(next_review))
+        .route("/accounts/{account_id}/review/next", get(next_review));
+    mount_review_routes(router).with_state(state)
+}
+
+/// The review "escape hatch" routes: reveal, cross-reference, skip, snooze,
+/// snooze-concept, bridge, submit, and content-feedback for one review unit.
+/// Split out of [`router`] to keep that function under the workspace line
+/// budget; these routes share no state setup with the rest of the router.
+fn mount_review_routes(router: Router<ApiState>) -> Router<ApiState> {
+    router
         .route(
             "/accounts/{account_id}/review/{review_unit_id}/reveal",
             post(reveal_review),
@@ -448,7 +463,6 @@ pub fn router(state: ApiState) -> Router {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
-        .with_state(state)
 }
 
 async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -501,8 +515,9 @@ async fn static_ledger_css() -> impl IntoResponse {
 
 async fn static_manifest() -> impl IntoResponse {
     const MANIFEST: &str = r##"{
-  "name": "Memory Engine",
-  "short_name": "Memory Engine",
+  "name": "Scry",
+  "short_name": "Scry",
+  "description": "Remember everything",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
@@ -880,6 +895,12 @@ struct AppAccountForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct AppWaitlistForm {
+    email: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct AppLoginVerifyQuery {
     token: String,
 }
@@ -1017,6 +1038,122 @@ async fn create_app_account(
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
         Err(error) => app_failure_response(error),
     })
+}
+
+async fn create_app_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppWaitlistForm>,
+) -> Response {
+    let result = state.join_waitlist(&form.email, "first-run", &client_rate_limit_key(&headers));
+
+    no_store_response(match result {
+        Ok(()) => Html(render_waitlist_joined()).into_response(),
+        Err(error) => app_failure_response(error),
+    })
+}
+
+fn admin_token_from_headers(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+/// Operator-only waitlist readout, gated by the admin token. Not part of the
+/// versioned `/v1` contract — like the return-notification scheduler route,
+/// this is internal tooling, not a public API surface.
+async fn list_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WaitlistEntry>>, ApiFailure> {
+    Ok(Json(
+        state.list_waitlist(admin_token_from_headers(&headers))?,
+    ))
+}
+
+/// Encode one CSV cell so opening the export in a spreadsheet cannot
+/// execute attacker-controlled content as a formula (classic CSV/formula
+/// injection). Any value whose first character is `=`, `+`, `-`, or `@` is
+/// spreadsheet-formula-shaped in Excel/Sheets/LibreOffice, so it gets a
+/// stable, deterministic `'` prefix that forces text interpretation;
+/// applied uniformly regardless of which column carries attacker input.
+/// This only changes the CSV wire encoding -- storage and JSON keep the
+/// exact underlying value.
+fn csv_field(value: &str) -> String {
+    let mut value = value.to_owned();
+    if value.starts_with(['=', '+', '-', '@']) {
+        value.insert(0, '\'');
+    }
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value
+    }
+}
+
+/// Operator-only waitlist CSV export, gated by the admin token. Same
+/// listing as `GET /internal/waitlist`; only the wire format differs, so an
+/// operator can open the result directly in a spreadsheet. Anonymous callers
+/// control the email column (`POST /app/waitlist`), so every cell runs
+/// through `csv_field`, which neutralizes formula-leading values and quotes
+/// CR/LF/comma/quote before the row is written -- opening this export can
+/// never execute attacker-controlled content as a spreadsheet formula.
+async fn export_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiFailure> {
+    let entries = state.list_waitlist(admin_token_from_headers(&headers))?;
+    let mut csv = String::from("email,createdAtMs,updatedAtMs,source,invitedAtMs\n");
+    for entry in entries {
+        let invited_at_ms = entry
+            .invited_at_ms
+            .map_or_else(String::new, |value| value.to_string());
+        let _ = writeln!(
+            csv,
+            "{},{},{},{},{invited_at_ms}",
+            csv_field(&entry.email),
+            entry.created_at_ms,
+            entry.updated_at_ms,
+            csv_field(&entry.source),
+        );
+    }
+    Ok(([(CONTENT_TYPE, "text/csv; charset=utf-8")], csv).into_response())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WaitlistEmailRequest {
+    email: String,
+}
+
+/// Operator-only waitlist invite transition, gated by the admin token.
+/// Idempotent: inviting an already-invited address again returns its
+/// existing `invitedAtMs` unchanged.
+async fn invite_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WaitlistEmailRequest>,
+) -> Result<Json<WaitlistEntry>, ApiFailure> {
+    Ok(Json(state.mark_waitlist_invited(
+        admin_token_from_headers(&headers),
+        &request.email,
+    )?))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WaitlistDeleteResponse {
+    deleted: bool,
+}
+
+/// Operator-only waitlist delete, gated by the admin token. Removes only the
+/// operational row; the append-only audit trail is unaffected.
+async fn delete_waitlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<WaitlistEmailRequest>,
+) -> Result<Json<WaitlistDeleteResponse>, ApiFailure> {
+    state.delete_waitlist_entry(admin_token_from_headers(&headers), &request.email)?;
+    Ok(Json(WaitlistDeleteResponse { deleted: true }))
 }
 
 async fn verify_app_login(

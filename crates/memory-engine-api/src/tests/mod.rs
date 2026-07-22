@@ -23,7 +23,7 @@ use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 use super::{
     router, routes, AccountRegistry, ApiFailure, ApiState, AuthConfig, CreateSourceRequest,
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
 };
 use memory_engine_api_state::{
     ContentFeedbackRequest, EnqueueOutcome, RETURN_NOTIFICATION_INTERVAL_MS,
@@ -165,8 +165,8 @@ async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
     assert!(body.contains(r#"name="email""#));
     assert!(body.contains(r#"placeholder="you@example.com""#));
     assert!(body.contains("Get started"));
-    assert!(body.contains("Spaced repetition, made effortless"));
-    assert!(body.contains("Remember it for good."));
+    assert!(body.contains("Scry"));
+    assert!(body.contains("Remember everything."));
     // Regression: the anonymous home must NOT offer the guest capture form,
     // which dead-ends on the account allowlist ("not allowed to register").
     assert!(!body.contains(r#"action="/app/start""#));
@@ -2991,7 +2991,7 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
         .expect("manifest response");
     assert_eq!(manifest.status(), StatusCode::OK);
     let manifest = response_json(manifest).await;
-    assert_eq!(manifest["name"], json!("Memory Engine"));
+    assert_eq!(manifest["name"], json!("Scry"));
     assert_eq!(manifest["display"], json!("standalone"));
     assert_eq!(manifest["start_url"], json!("/"));
     assert_eq!(manifest["icons"][0]["src"], json!("/icon-192.png"));
@@ -10248,4 +10248,733 @@ async fn saved_material_remove_reports_how_many_cards_were_retired() {
         !archived.contains("Source removed.</p>") || archived.contains("2 cards retired"),
         "a generic notice with no count no longer satisfies the disclosure requirement: {archived}"
     );
+}
+
+// --- memory-engine-beta-waitlist: invite-beta waitlist first-run slice ---
+
+#[tokio::test]
+async fn waitlist_join_persists_entry_creates_no_session_and_is_reachable_by_admin() {
+    let store_root = temp_store_root("waitlist-join-persist");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let joined = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "new-here@example.com")],
+        ))
+        .await
+        .expect("waitlist join");
+    assert_eq!(joined.status(), StatusCode::OK);
+    assert!(joined.headers().get(SET_COOKIE).is_none());
+    let joined = response_text(joined).await;
+    assert!(joined.contains("Thanks for joining."));
+
+    let admin_request = Request::builder()
+        .method("GET")
+        .uri("/internal/waitlist")
+        .header("x-admin-token", "op-token")
+        .body(Body::empty())
+        .expect("admin request");
+    let listed = app.oneshot(admin_request).await.expect("admin list");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let entries = response_json(listed).await;
+    let entries = entries.as_array().expect("waitlist array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["email"], json!("new-here@example.com"));
+    assert_eq!(entries[0]["source"], json!("first-run"));
+    assert!(entries[0]["invitedAtMs"].is_null());
+}
+
+#[tokio::test]
+async fn waitlist_join_is_idempotent_for_duplicate_normalized_email() {
+    let store_root = temp_store_root("waitlist-join-idempotent");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let first = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "Repeat@Example.com")],
+        ))
+        .await
+        .expect("first join");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_text(first).await;
+
+    let second = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "repeat@example.com")],
+        ))
+        .await
+        .expect("second join");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = response_text(second).await;
+
+    assert_eq!(
+        first, second,
+        "a repeat join must read identically to the first"
+    );
+
+    let admin_request = Request::builder()
+        .method("GET")
+        .uri("/internal/waitlist")
+        .header("x-admin-token", "op-token")
+        .body(Body::empty())
+        .expect("admin request");
+    let listed = app.oneshot(admin_request).await.expect("admin list");
+    let entries = response_json(listed).await;
+    let entries = entries.as_array().expect("waitlist array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "normalized duplicates must collapse to one row"
+    );
+    assert_eq!(entries[0]["email"], json!("repeat@example.com"));
+}
+
+#[tokio::test]
+async fn waitlist_join_does_not_reveal_allowlist_or_account_state() {
+    let store_root = temp_store_root("waitlist-join-enumeration");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root).with_auth_config(
+            AuthConfig::allow_emails(["allowlisted@example.com".to_owned()])
+                .with_admin_token("op-token"),
+        ),
+    ));
+
+    let allowlisted = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "allowlisted@example.com")],
+        ))
+        .await
+        .expect("allowlisted join");
+    assert_eq!(allowlisted.status(), StatusCode::OK);
+    assert!(allowlisted.headers().get(SET_COOKIE).is_none());
+    let allowlisted = response_text(allowlisted).await;
+
+    let stranger = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "stranger@example.com")],
+        ))
+        .await
+        .expect("stranger join");
+    assert_eq!(stranger.status(), StatusCode::OK);
+    assert!(stranger.headers().get(SET_COOKIE).is_none());
+    let stranger = response_text(stranger).await;
+
+    assert_eq!(
+        allowlisted, stranger,
+        "an allowlisted address and a stranger must get the identical response"
+    );
+    assert!(!allowlisted.contains("allowlisted@example.com"));
+    assert!(!stranger.contains("stranger@example.com"));
+
+    let admin_request = Request::builder()
+        .method("GET")
+        .uri("/internal/waitlist")
+        .header("x-admin-token", "op-token")
+        .body(Body::empty())
+        .expect("admin request");
+    let listed = app.oneshot(admin_request).await.expect("admin list");
+    let entries = response_json(listed).await;
+    assert_eq!(entries.as_array().expect("waitlist array").len(), 2);
+}
+
+#[tokio::test]
+async fn waitlist_join_rejects_malformed_email_without_persisting() {
+    let store_root = temp_store_root("waitlist-join-malformed");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let rejected = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "not-an-email")],
+        ))
+        .await
+        .expect("malformed join");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let admin_request = Request::builder()
+        .method("GET")
+        .uri("/internal/waitlist")
+        .header("x-admin-token", "op-token")
+        .body(Body::empty())
+        .expect("admin request");
+    let listed = app.oneshot(admin_request).await.expect("admin list");
+    let entries = response_json(listed).await;
+    assert!(entries.as_array().expect("waitlist array").is_empty());
+}
+
+#[tokio::test]
+async fn waitlist_rate_limits_by_email_and_ip() {
+    let store_root = temp_store_root("waitlist-rate-limit");
+    let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+
+    for _ in 0..WAITLIST_RATE_LIMIT_MAX_ATTEMPTS {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_ip(
+                "POST",
+                "/app/waitlist",
+                "203.0.113.30",
+                &[("email", "quota@example.com")],
+            ))
+            .await
+            .expect("allowed join");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let same_email_new_ip = app
+        .clone()
+        .oneshot(form_request_with_ip(
+            "POST",
+            "/app/waitlist",
+            "203.0.113.31",
+            &[("email", "quota@example.com")],
+        ))
+        .await
+        .expect("email limited");
+    assert_eq!(same_email_new_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let same_ip_new_email = app
+        .oneshot(form_request_with_ip(
+            "POST",
+            "/app/waitlist",
+            "203.0.113.30",
+            &[("email", "other-quota@example.com")],
+        ))
+        .await
+        .expect("ip limited");
+    assert_eq!(same_ip_new_email.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn waitlist_admin_listing_requires_a_valid_admin_token() {
+    let store_root = temp_store_root("waitlist-admin-gate");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/internal/waitlist")
+                .body(Body::empty())
+                .expect("no-token request"),
+        )
+        .await
+        .expect("missing token response");
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    let missing_body = response_json(missing).await;
+    let missing_error = missing_body["error"].as_str().expect("error message");
+    assert!(
+        missing_error.to_ascii_lowercase().contains("admin token"),
+        "error must name admin-token authorization: {missing_error}"
+    );
+    assert!(
+        !missing_error
+            .to_ascii_lowercase()
+            .contains("session issuance"),
+        "error must not misdirect to service-session issuance: {missing_error}"
+    );
+
+    let wrong = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/internal/waitlist")
+                .header("x-admin-token", "not-the-token")
+                .body(Body::empty())
+                .expect("wrong-token request"),
+        )
+        .await
+        .expect("wrong token response");
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn waitlist_export_neutralizes_formula_leading_locals_and_quotes_carriage_returns() {
+    let store_root = temp_store_root("waitlist-export-csv-injection");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let dangerous_emails = [
+        "=2+5+cmd|'/c calc'!a0@example.com",
+        "+1+1@example.com",
+        "-1+1@example.com",
+        "cr\rinjected@example.com",
+    ];
+    for email in dangerous_emails {
+        let joined = app
+            .clone()
+            .oneshot(form_request("POST", "/app/waitlist", &[("email", email)]))
+            .await
+            .expect("join");
+        assert_eq!(joined.status(), StatusCode::OK);
+    }
+
+    // JSON keeps the raw, unmodified email: only the CSV encoding changes.
+    let listed = app
+        .clone()
+        .oneshot(waitlist_admin_request("GET", "/internal/waitlist", None))
+        .await
+        .expect("admin list");
+    let entries = response_json(listed).await;
+    let entries = entries.as_array().expect("waitlist array");
+    for email in dangerous_emails {
+        assert!(
+            entries.iter().any(|entry| entry["email"] == json!(email)),
+            "JSON must preserve the raw email {email:?} verbatim"
+        );
+    }
+
+    let exported = app
+        .oneshot(waitlist_admin_request(
+            "GET",
+            "/internal/waitlist/export",
+            None,
+        ))
+        .await
+        .expect("export");
+    let exported = response_text(exported).await;
+
+    // A formula-leading local part must be neutralized with a stable
+    // spreadsheet-safe prefix so opening the CSV cannot execute it.
+    assert!(
+        exported.contains("'=2+5+cmd|'/c calc'!a0@example.com,"),
+        "= must be neutralized with a leading prefix: {exported}"
+    );
+    assert!(
+        exported.contains("'+1+1@example.com,"),
+        "+ must be neutralized with a leading prefix: {exported}"
+    );
+    assert!(
+        exported.contains("'-1+1@example.com,"),
+        "- must be neutralized with a leading prefix: {exported}"
+    );
+    // A bare CR (not just LF) must still trigger RFC 4180 quoting so the
+    // row isn't corrupted by an unescaped control character.
+    assert!(
+        exported.contains("\"cr\rinjected@example.com\","),
+        "embedded CR must be quoted: {exported}"
+    );
+    // The raw, un-neutralized formula must never appear at the start of a
+    // CSV cell (i.e. right after a newline or the header terminator).
+    assert!(
+        !exported.contains("\n=2+5"),
+        "raw formula must never open a CSV cell unguarded: {exported}"
+    );
+}
+
+#[tokio::test]
+async fn waitlist_home_page_offers_both_signin_and_join_actions() {
+    let home = router(ApiState::default())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_eq!(home.status(), StatusCode::OK);
+    let home = response_text(home).await;
+    assert!(home.contains(r#"action="/app/account""#));
+    assert!(home.contains("Get started"));
+    assert!(home.contains(r#"action="/app/waitlist""#));
+    assert!(home.contains("Join the waitlist"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waitlist_postgres_backed_registry_joins_and_lists_durably() {
+    let Some(database) = PostgresTestDatabase::new("waitlist_join") else {
+        return;
+    };
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(database.scoped_url.clone())
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    );
+    let app = router(state);
+
+    // Joining against a Postgres-backed registry now persists durably; the
+    // production path no longer fails closed with 503.
+    let joined = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "postgres-learner@example.com")],
+        ))
+        .await
+        .expect("postgres join");
+    assert_eq!(joined.status(), StatusCode::OK);
+    let joined = response_text(joined).await;
+    assert!(joined.contains("Thanks for joining."));
+
+    // A duplicate join stays idempotent through the Postgres path too.
+    let duplicate = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "postgres-learner@example.com")],
+        ))
+        .await
+        .expect("postgres duplicate join");
+    assert_eq!(duplicate.status(), StatusCode::OK);
+
+    let listed = app
+        .clone()
+        .oneshot(waitlist_admin_request("GET", "/internal/waitlist", None))
+        .await
+        .expect("admin list");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let entries = response_json(listed).await;
+    let entries = entries.as_array().expect("waitlist array");
+    assert_eq!(
+        entries.len(),
+        1,
+        "normalized duplicates must collapse to one row"
+    );
+    assert_eq!(entries[0]["email"], json!("postgres-learner@example.com"));
+    assert!(entries[0]["invitedAtMs"].is_null());
+
+    let exported = app
+        .oneshot(waitlist_admin_request(
+            "GET",
+            "/internal/waitlist/export",
+            None,
+        ))
+        .await
+        .expect("admin export");
+    assert_eq!(exported.status(), StatusCode::OK);
+    let exported = response_text(exported).await;
+    assert!(exported.starts_with("email,createdAtMs,updatedAtMs,source,invitedAtMs\n"));
+    assert!(exported.contains("postgres-learner@example.com"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waitlist_postgres_backed_registry_supports_invite_and_delete() {
+    let Some(database) = PostgresTestDatabase::new("waitlist_invite_delete") else {
+        return;
+    };
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(database.scoped_url.clone())
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    );
+    let app = router(state);
+    app.clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "postgres-learner@example.com")],
+        ))
+        .await
+        .expect("postgres join");
+
+    let invited = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/invite",
+            Some(r#"{"email":"postgres-learner@example.com"}"#),
+        ))
+        .await
+        .expect("admin invite");
+    assert_eq!(invited.status(), StatusCode::OK);
+    let invited = response_json(invited).await;
+    assert!(invited["invitedAtMs"].is_number());
+
+    // Inviting again is idempotent: the timestamp does not move.
+    let invited_again = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/invite",
+            Some(r#"{"email":"postgres-learner@example.com"}"#),
+        ))
+        .await
+        .expect("admin invite again");
+    let invited_again = response_json(invited_again).await;
+    assert_eq!(invited["invitedAtMs"], invited_again["invitedAtMs"]);
+
+    let deleted = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/delete",
+            Some(r#"{"email":"postgres-learner@example.com"}"#),
+        ))
+        .await
+        .expect("admin delete");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted = response_json(deleted).await;
+    assert_eq!(deleted["deleted"], json!(true));
+
+    let listed_after_delete = app
+        .oneshot(waitlist_admin_request("GET", "/internal/waitlist", None))
+        .await
+        .expect("admin list after delete");
+    let entries = response_json(listed_after_delete).await;
+    assert!(
+        entries.as_array().expect("waitlist array").is_empty(),
+        "delete must remove the operational row"
+    );
+}
+
+/// Build an admin-token-gated request. `body` is `None` for a `GET`
+/// (no request body); `Some(json)` sends a JSON body with the matching
+/// content-type header for the `POST` mutation routes.
+fn waitlist_admin_request(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-admin-token", "op-token");
+    match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_owned()))
+            .expect("admin json request"),
+        None => builder.body(Body::empty()).expect("admin request"),
+    }
+}
+
+#[tokio::test]
+async fn waitlist_join_file_store_handler_overhead_is_negligible() {
+    let store_root = temp_store_root("waitlist-latency");
+    let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+
+    // Regression guard only -- NOT proof of the "acknowledges valid input
+    // before durable completion" production criterion. This measures the
+    // file-store join handler's own floor latency (one local flock + fsync'd
+    // write, no network, no model inference). The Postgres-backed production
+    // path connects and runs its migration on every call (observed
+    // 161-700ms TTFB), so a same-process sub-100ms *server* round trip is
+    // not achievable there, and this test must not be read as one. The
+    // acknowledgment guarantee production actually relies on is client-side:
+    // app.js synchronously flips the waitlist button/aria-live status to
+    // "Joining…" on submit, before the native POST's response ever lands
+    // (proven by the Bun DOM contract in app_js_contract.test.js). This test
+    // only guards against the file store itself regressing into a
+    // bottleneck. A single sample is noisy under a shared test runner
+    // (first-poll scheduling, concurrent-test disk contention), so this
+    // takes the minimum of several samples: genuine systemic slowness (a
+    // stray network round trip, a retry loop) would slow down every sample,
+    // including the fastest, while one-off scheduler jitter only slows a
+    // subset. Stays under `WAITLIST_RATE_LIMIT_MAX_ATTEMPTS` (5, shared by
+    // IP) on a dedicated IP so the limiter never interferes.
+    let sample_count = (WAITLIST_RATE_LIMIT_MAX_ATTEMPTS - 1) as usize;
+    let mut samples = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let started = Instant::now();
+        let joined = app
+            .clone()
+            .oneshot(form_request_with_ip(
+                "POST",
+                "/app/waitlist",
+                "203.0.113.99",
+                &[("email", &format!("fast-ack-{index}@example.com"))],
+            ))
+            .await
+            .expect("waitlist join");
+        samples.push(started.elapsed());
+        assert_eq!(joined.status(), StatusCode::OK);
+    }
+    let fastest = samples.iter().min().copied().expect("at least one sample");
+    assert!(
+        fastest < Duration::from_millis(100),
+        "fastest of {} waitlist joins took {fastest:?}, want under 100ms; all samples: {samples:?}",
+        samples.len(),
+    );
+}
+
+#[tokio::test]
+async fn waitlist_admin_can_export_invite_and_delete_through_the_file_store() {
+    let store_root = temp_store_root("waitlist-admin-lifecycle");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    app.clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "operator-flow@example.com")],
+        ))
+        .await
+        .expect("join");
+
+    let exported = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "GET",
+            "/internal/waitlist/export",
+            None,
+        ))
+        .await
+        .expect("export");
+    assert_eq!(exported.status(), StatusCode::OK);
+    assert_eq!(
+        exported
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/csv; charset=utf-8")
+    );
+    let exported = response_text(exported).await;
+    let mut lines = exported.lines();
+    assert_eq!(
+        lines.next(),
+        Some("email,createdAtMs,updatedAtMs,source,invitedAtMs")
+    );
+    let row = lines.next().expect("one exported row");
+    assert!(row.starts_with("operator-flow@example.com,"));
+    assert!(row.ends_with(",first-run,"), "row: {row}");
+
+    let invited = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/invite",
+            Some(r#"{"email":"Operator-Flow@Example.com"}"#),
+        ))
+        .await
+        .expect("invite");
+    assert_eq!(invited.status(), StatusCode::OK);
+    let invited = response_json(invited).await;
+    assert_eq!(invited["email"], json!("operator-flow@example.com"));
+    assert!(invited["invitedAtMs"].is_number());
+
+    let deleted = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/delete",
+            Some(r#"{"email":"operator-flow@example.com"}"#),
+        ))
+        .await
+        .expect("delete");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(response_json(deleted).await["deleted"], json!(true));
+
+    let listed = app
+        .oneshot(waitlist_admin_request("GET", "/internal/waitlist", None))
+        .await
+        .expect("list after delete");
+    assert!(response_json(listed)
+        .await
+        .as_array()
+        .expect("waitlist array")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn waitlist_admin_invite_and_delete_reject_an_unknown_email() {
+    let store_root = temp_store_root("waitlist-admin-unknown");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+
+    let invited = app
+        .clone()
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/invite",
+            Some(r#"{"email":"nobody@example.com"}"#),
+        ))
+        .await
+        .expect("invite unknown");
+    assert_eq!(invited.status(), StatusCode::NOT_FOUND);
+
+    let deleted = app
+        .oneshot(waitlist_admin_request(
+            "POST",
+            "/internal/waitlist/delete",
+            Some(r#"{"email":"nobody@example.com"}"#),
+        ))
+        .await
+        .expect("delete unknown");
+    assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn waitlist_admin_export_invite_and_delete_require_a_valid_admin_token() {
+    let store_root = temp_store_root("waitlist-admin-gate-mutations");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::default().with_admin_token("op-token")),
+    ));
+    app.clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "gate-check@example.com")],
+        ))
+        .await
+        .expect("join");
+
+    for (method, uri, body) in [
+        ("GET", "/internal/waitlist/export", None),
+        (
+            "POST",
+            "/internal/waitlist/invite",
+            Some(r#"{"email":"gate-check@example.com"}"#),
+        ),
+        (
+            "POST",
+            "/internal/waitlist/delete",
+            Some(r#"{"email":"gate-check@example.com"}"#),
+        ),
+    ] {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = match body {
+            Some(json) => builder.body(Body::from(json.to_owned())),
+            None => builder.body(Body::empty()),
+        }
+        .expect("ungated request");
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("ungated response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must require the admin token"
+        );
+    }
 }
