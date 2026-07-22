@@ -1075,8 +1075,11 @@ impl AccountRegistry {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         let store_lock = self.store_lock(account_id);
-        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.storage().keep_draft(account_id, &account.store_path, draft_id)
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage()
+            .keep_draft(account_id, &account.store_path, draft_id)
     }
 
     pub(crate) fn edit_pending_draft(
@@ -1089,8 +1092,16 @@ impl AccountRegistry {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         let store_lock = self.store_lock(account_id);
-        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.storage().edit_pending_draft(account_id, &account.store_path, draft_id, prompt, expected_answer)
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage().edit_pending_draft(
+            account_id,
+            &account.store_path,
+            draft_id,
+            prompt,
+            expected_answer,
+        )
     }
 
     pub(crate) fn reject_pending_draft(
@@ -1101,8 +1112,11 @@ impl AccountRegistry {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         let store_lock = self.store_lock(account_id);
-        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.storage().reject_pending_draft(account_id, &account.store_path, draft_id)
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage()
+            .reject_pending_draft(account_id, &account.store_path, draft_id)
     }
 
     pub(crate) fn next_review(

@@ -520,18 +520,43 @@ impl ApiState {
     }
 
     /// Keep an accepted generated draft and schedule it for review.
-    pub fn keep_draft(&self, account_id: &str, session_token: &str, draft_id: &str) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.keep_draft(account_id, session_token, draft_id)
+    pub fn keep_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .keep_draft(account_id, session_token, draft_id)
     }
 
     /// Edit and keep an accepted generated draft.
-    pub fn edit_pending_draft(&self, account_id: &str, session_token: &str, draft_id: &str, prompt: &str, expected_answer: &str) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.edit_pending_draft(account_id, session_token, draft_id, prompt, expected_answer)
+    pub fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.edit_pending_draft(
+            account_id,
+            session_token,
+            draft_id,
+            prompt,
+            expected_answer,
+        )
     }
 
     /// Reject an accepted generated draft without scheduling it.
-    pub fn reject_pending_draft(&self, account_id: &str, session_token: &str, draft_id: &str) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.reject_pending_draft(account_id, session_token, draft_id)
+    pub fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .reject_pending_draft(account_id, session_token, draft_id)
     }
 
     /// Fetch the next due review.
@@ -3234,9 +3259,15 @@ mod tests {
         study.start().expect("start bridge session");
         let bridge =
             run_bridge_generation(&mut study, Some(config)).expect("local bridge generation");
-        assert!(bridge.current.is_none(), "local bridge generation must remain pending");
         assert!(
-            bridge.drafts.iter().any(|draft| draft.review_unit_id.as_str().starts_with("bridge-")),
+            bridge.current.is_none(),
+            "local bridge generation must remain pending"
+        );
+        assert!(
+            bridge
+                .drafts
+                .iter()
+                .any(|draft| draft.review_unit_id.as_str().starts_with("bridge-")),
             "local bridge drafts should remain inspectable"
         );
 

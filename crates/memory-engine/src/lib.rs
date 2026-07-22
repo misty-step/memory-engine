@@ -18,12 +18,11 @@ pub mod beta {
 
     pub mod persistence {
         pub use memory_engine_persistence::{
-            AppliedReviewReceipt, BetaPersistenceStore,
-            BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot, ConceptReferenceNote,
-            GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
-            GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
-            PersistedQueueCandidate, ReferenceSpan, ScheduleRecord, SourceDocument,
-            SourceDocumentKind, SourcePermission,
+            AppliedReviewReceipt, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
+            BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind,
+            GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
+            GeneratedPromptValidationStatus, GenerationRun, PersistedQueueCandidate, ReferenceSpan,
+            ScheduleRecord, SourceDocument, SourceDocumentKind, SourcePermission,
         };
     }
 

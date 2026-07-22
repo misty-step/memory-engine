@@ -112,7 +112,7 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
     );
 
     let review_unit = store
-        .keep_generated_prompt_draft(            "run-nato-draft-src-nato-2-nato-cat-composition", 0)
+        .keep_generated_prompt_draft("run-nato-draft-src-nato-2-nato-cat-composition", 0)
         .expect("keep");
     let queue =
         memory_engine_service::MemoryServiceStore::list_queue_candidates(&store).expect("queue");
@@ -850,7 +850,7 @@ fn arbitrary_bridge_provider_is_denied_before_local_only_source_context_is_sent(
     )
     .expect("generation");
     let parent = store
-        .keep_generated_prompt_draft(            &generated.accepted_draft_ids[0], 0)
+        .keep_generated_prompt_draft(&generated.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
     let mut source = store.snapshot().source_documents[0].clone();
@@ -912,7 +912,7 @@ fn missing_bridge_source_fails_before_provider_invocation() {
     )
     .expect("parent generation");
     let parent = store
-        .keep_generated_prompt_draft(            &generated.accepted_draft_ids[0], 0)
+        .keep_generated_prompt_draft(&generated.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
 
@@ -1073,7 +1073,7 @@ fn bridge_descendants_preserve_full_provenance_and_fail_closed_once_provider_is_
     )
     .expect("child generation");
     let child_review_unit_id = store
-        .keep_generated_prompt_draft(            &child_generation.accepted_draft_ids[0], 0)
+        .keep_generated_prompt_draft(&child_generation.accepted_draft_ids[0], 0)
         .expect("child")
         .review_unit_id;
     let child_snapshot = store.snapshot();
@@ -1164,7 +1164,7 @@ fn seed_bridge_descendants_provenance_fixture() -> (TempDirectory, PathBuf, Revi
     )
     .expect("parent generation");
     let parent_review_unit_id = store
-        .keep_generated_prompt_draft(            &parent_generation.accepted_draft_ids[0], 0)
+        .keep_generated_prompt_draft(&parent_generation.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
 

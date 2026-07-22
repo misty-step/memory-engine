@@ -28,8 +28,8 @@ use memory_engine_generation::{
     SourceAuthorizationError,
 };
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
+    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptValidationStatus, LearnerDraftDecision, SourceDocument, SourceDocumentKind,
 };
 use memory_engine_service::{
@@ -497,7 +497,11 @@ impl BetaStudyStore for BetaPersistenceStore {
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         BetaPersistenceStore::edit_and_keep_generated_prompt_draft(
-            self, draft_id, prompt_text, expected_answer, decided_at,
+            self,
+            draft_id,
+            prompt_text,
+            expected_answer,
+            decided_at,
         )
     }
 
@@ -1867,10 +1871,7 @@ fn review_unit_has_active_source(
         .is_none_or(|draft| draft_has_active_source(&draft, active_source_ids))
 }
 
-fn draft_row(
-    draft: &GeneratedPromptDraft,
-    snapshot: &BetaStoreSnapshot,
-) -> BetaStudyDraftRow {
+fn draft_row(draft: &GeneratedPromptDraft, snapshot: &BetaStoreSnapshot) -> BetaStudyDraftRow {
     BetaStudyDraftRow {
         id: draft.id.clone(),
         review_unit_id: draft.review_unit_id.clone(),
@@ -1900,14 +1901,17 @@ fn draft_row(
             })
             .collect(),
         provenance: draft.generation_run_id.as_ref().and_then(|run_id| {
-            snapshot.generation_runs.iter().find(|run| &run.id == run_id).map(|run| {
-                BetaStudyGenerationProvenance {
+            snapshot
+                .generation_runs
+                .iter()
+                .find(|run| &run.id == run_id)
+                .map(|run| BetaStudyGenerationProvenance {
                     generation_run_id: Some(run.id.clone()),
                     provider: run.provider.clone(),
                     model: run.model.clone(),
-                    prompt_version: (!run.prompt_version.is_empty()).then(|| run.prompt_version.clone()),
-                }
-            })
+                    prompt_version: (!run.prompt_version.is_empty())
+                        .then(|| run.prompt_version.clone()),
+                })
         }),
     }
 }

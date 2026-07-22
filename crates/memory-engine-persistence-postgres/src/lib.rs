@@ -21,10 +21,9 @@ use memory_engine_core::{
 };
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
-    parse_strict_boolean_answer, AppliedReviewReceipt,
-    BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, GenerationRun, LearnerDraftDecision, ReferenceSpan, ScheduleRecord, SourceDocument,
-    SourcePermission,
+    parse_strict_boolean_answer, AppliedReviewReceipt, BetaReviewUnitRecord, BetaStoreSnapshot,
+    ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus, GenerationRun,
+    LearnerDraftDecision, ReferenceSpan, ScheduleRecord, SourceDocument, SourcePermission,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -2237,7 +2236,14 @@ fn waitlist_entry_from_row(row: &postgres::Row) -> PostgresWaitlistEntry {
     }
 }
 
-enum PostgresLearnerDecision { Keep, Edit { prompt_text: String, expected_answer: String }, Reject }
+enum PostgresLearnerDecision {
+    Keep,
+    Edit {
+        prompt_text: String,
+        expected_answer: String,
+    },
+    Reject,
+}
 
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
@@ -2484,29 +2490,52 @@ impl AccountStudyStore<'_> {
         })
     }
 
-    pub fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+    pub fn keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
         self.decide_learner_draft(draft_id, PostgresLearnerDecision::Keep, decided_at)?
             .1
             .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
     }
 
-    pub fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+    pub fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
         self.decide_learner_draft(
             draft_id,
-            PostgresLearnerDecision::Edit { prompt_text: prompt_text.to_owned(), expected_answer: expected_answer.to_owned() },
+            PostgresLearnerDecision::Edit {
+                prompt_text: prompt_text.to_owned(),
+                expected_answer: expected_answer.to_owned(),
+            },
             decided_at,
         )?
         .1
         .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
     }
 
-    pub fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, PostgresStoreError> {
+    pub fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, PostgresStoreError> {
         self.decide_learner_draft(draft_id, PostgresLearnerDecision::Reject, decided_at)?
             .0
             .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))
     }
 
-    fn decide_learner_draft(&mut self, draft_id: &str, decision: PostgresLearnerDecision, decided_at: i64) -> Result<(Option<GeneratedPromptDraft>, Option<BetaReviewUnitRecord>), PostgresStoreError> {
+    fn decide_learner_draft(
+        &mut self,
+        draft_id: &str,
+        decision: PostgresLearnerDecision,
+        decided_at: i64,
+    ) -> Result<(Option<GeneratedPromptDraft>, Option<BetaReviewUnitRecord>), PostgresStoreError>
+    {
         let account_id = self.scope.account_id.clone();
         let draft_id = draft_id.to_owned();
         self.with_account_transaction(|transaction| {
@@ -3434,15 +3463,35 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         AccountStudyStore::update_source_document_permission(self, source_document_id, permission)
     }
 
-    fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+    fn keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::keep_generated_prompt_draft(self, draft_id, decided_at)
     }
 
-    fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
-        AccountStudyStore::edit_and_keep_generated_prompt_draft(self, draft_id, prompt_text, expected_answer, decided_at)
+    fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::edit_and_keep_generated_prompt_draft(
+            self,
+            draft_id,
+            prompt_text,
+            expected_answer,
+            decided_at,
+        )
     }
 
-    fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error> {
+    fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::reject_generated_prompt_draft(self, draft_id, decided_at)
     }
 
@@ -4025,11 +4074,22 @@ fn reject_archived(review_unit: &BetaReviewUnitRecord) -> Result<(), PostgresSto
         .ok_or_else(|| PostgresStoreError::ReviewUnitArchived(review_unit.review_unit_id.clone()))
 }
 
-fn learner_decision_matches(draft: &GeneratedPromptDraft, recorded: &LearnerDraftDecision, requested: &PostgresLearnerDecision) -> bool {
+fn learner_decision_matches(
+    draft: &GeneratedPromptDraft,
+    recorded: &LearnerDraftDecision,
+    requested: &PostgresLearnerDecision,
+) -> bool {
     match (recorded, requested) {
         (LearnerDraftDecision::Kept { edited: false, .. }, PostgresLearnerDecision::Keep) => true,
-        (LearnerDraftDecision::Kept { edited: true, .. }, PostgresLearnerDecision::Edit { prompt_text, expected_answer }) => {
-            prompt_text_for_export(&draft.prompt) == prompt_text.trim() && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
+        (
+            LearnerDraftDecision::Kept { edited: true, .. },
+            PostgresLearnerDecision::Edit {
+                prompt_text,
+                expected_answer,
+            },
+        ) => {
+            prompt_text_for_export(&draft.prompt) == prompt_text.trim()
+                && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
         }
         (LearnerDraftDecision::Rejected { .. }, PostgresLearnerDecision::Reject) => true,
         _ => false,
@@ -6366,7 +6426,7 @@ mod tests {
         generation_run_id: Option<&str>,
     ) -> GeneratedPromptDraft {
         GeneratedPromptDraft {
-        learner_decision: None,
+            learner_decision: None,
             id: id.to_owned(),
             source_document_ids: source_document_ids
                 .iter()

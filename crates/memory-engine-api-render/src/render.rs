@@ -834,9 +834,13 @@ fn render_capture(account: &AppAccount) -> String {
 }
 
 fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>) -> String {
-    let Some(view) = view else { return String::new(); };
+    let Some(view) = view else {
+        return String::new();
+    };
     let pending = view.drafts.iter().filter(|draft| {
-        !draft.approved && draft.learner_decision.is_none() && draft.validation_status == GeneratedPromptValidationStatus::Accepted
+        !draft.approved
+            && draft.learner_decision.is_none()
+            && draft.validation_status == GeneratedPromptValidationStatus::Accepted
     });
     let mut rows = String::new();
     for draft in pending {
@@ -845,16 +849,30 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
         } else {
             let mut rendered = String::from("<ul class=\"me-provenance-spans\">");
             for span in &draft.source_spans {
-                let _ = write!(rendered, "<li><strong>{}</strong> · {} <span class=\"ae-dim\">{}</span></li>", escape_html(&span.label), escape_html(&span.text), escape_html(&span.locator));
+                let _ = write!(
+                    rendered,
+                    "<li><strong>{}</strong> · {} <span class=\"ae-dim\">{}</span></li>",
+                    escape_html(&span.label),
+                    escape_html(&span.text),
+                    escape_html(&span.locator)
+                );
             }
             rendered.push_str("</ul>");
             rendered
         };
-        let provenance = draft.provenance.as_ref().map_or_else(String::new, |p| format!(
-            "<p class=\"ae-dim me-draft-provenance\">Provider: {} · Model: {}{}</p>",
-            escape_html(&p.provider), escape_html(&p.model), p.prompt_version.as_deref().map_or_else(String::new, |v| format!(" · Prompt {}", escape_html(v)))
-        ));
-        let _ = write!(rows, r#"<article class="me-pending-draft">
+        let provenance = draft.provenance.as_ref().map_or_else(String::new, |p| {
+            format!(
+                "<p class=\"ae-dim me-draft-provenance\">Provider: {} · Model: {}{}</p>",
+                escape_html(&p.provider),
+                escape_html(&p.model),
+                p.prompt_version
+                    .as_deref()
+                    .map_or_else(String::new, |v| format!(" · Prompt {}", escape_html(v)))
+            )
+        });
+        let _ = write!(
+            rows,
+            r#"<article class="me-pending-draft">
 <p class="me-kicker">Pending draft</p>
 <h3 class="ae-h">{}</h3>
 <p class="me-prompt">{}</p>
@@ -863,9 +881,29 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
 {}
 <form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
 <div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
-</article>"#, escape_html(&draft.concept_label), escape_html(&draft.prompt), escape_html(&draft.answer), provenance, spans, hidden_csrf_input(account), escape_html(&draft.id), escape_html(&draft.id), escape_html(&draft.id), escape_html(&draft.prompt), escape_html(&draft.id), escape_html(&draft.id), escape_html(&draft.answer), hidden_csrf_input(account), escape_html(&draft.id), hidden_csrf_input(account), escape_html(&draft.id));
+</article>"#,
+            escape_html(&draft.concept_label),
+            escape_html(&draft.prompt),
+            escape_html(&draft.answer),
+            provenance,
+            spans,
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.prompt),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.answer),
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            hidden_csrf_input(account),
+            escape_html(&draft.id)
+        );
     }
-    if rows.is_empty() { return String::new(); }
+    if rows.is_empty() {
+        return String::new();
+    }
     format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
 }
 

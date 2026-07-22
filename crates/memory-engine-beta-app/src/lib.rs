@@ -912,9 +912,7 @@ fn render_drafts(html: &mut String, view: &BetaStudyView) {
         )));
         html.push_str("<form method=\"post\" action=\"/approve\"><input type=\"hidden\" name=\"draftId\" value=\"");
         html.push_str(&escape_html(&draft.id));
-        html.push_str(
-            "\"><button type=\"submit\" class=\"secondary\">Keep</button></form></li>",
-        );
+        html.push_str("\"><button type=\"submit\" class=\"secondary\">Keep</button></form></li>");
     }
     html.push_str("</ul></section>");
 }
@@ -1840,11 +1838,7 @@ mod tests {
     fn keep_draft(session: &mut BetaStudySession, draft_id: &str) {
         route(
             session,
-            &request(
-                "POST",
-                "/keep",
-                &json!({"draftId": draft_id}).to_string(),
-            ),
+            &request("POST", "/keep", &json!({"draftId": draft_id}).to_string()),
         );
     }
 

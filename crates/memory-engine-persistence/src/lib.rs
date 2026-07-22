@@ -114,14 +114,9 @@ pub enum GeneratedLearningActivityKind {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum LearnerDraftDecision {
     #[serde(rename = "kept")]
-    Kept {
-        edited: bool,
-        decided_at: i64,
-    },
+    Kept { edited: bool, decided_at: i64 },
     #[serde(rename = "rejected")]
-    Rejected {
-        decided_at: i64,
-    },
+    Rejected { decided_at: i64 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -627,7 +622,14 @@ pub struct BetaPersistenceStore {
     fail_next_commit: bool,
 }
 
-enum LearnerDraftDecisionInput<'a> { Keep, Edit { prompt_text: &'a str, expected_answer: &'a str }, Reject }
+enum LearnerDraftDecisionInput<'a> {
+    Keep,
+    Edit {
+        prompt_text: &'a str,
+        expected_answer: &'a str,
+    },
+    Reject,
+}
 
 impl BetaPersistenceStore {
     /// Open or create a beta persistence store at a JSON file path.
@@ -925,27 +927,63 @@ impl BetaPersistenceStore {
     /// # Errors
     ///
     /// Returns [`BetaStoreError`] for validation or commit failures.
-    pub fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+    pub fn keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
         self.decide_generated_prompt_draft(draft_id, LearnerDraftDecisionInput::Keep, decided_at)
     }
 
-    pub fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-        self.decide_generated_prompt_draft(draft_id, LearnerDraftDecisionInput::Edit { prompt_text, expected_answer }, decided_at)
+    pub fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+        self.decide_generated_prompt_draft(
+            draft_id,
+            LearnerDraftDecisionInput::Edit {
+                prompt_text,
+                expected_answer,
+            },
+            decided_at,
+        )
     }
 
-    pub fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, BetaStoreError> {
-        self.transact(|snapshot| record_learner_draft_decision(snapshot, draft_id, LearnerDraftDecisionInput::Reject, decided_at))
+    pub fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, BetaStoreError> {
+        self.transact(|snapshot| {
+            record_learner_draft_decision(
+                snapshot,
+                draft_id,
+                LearnerDraftDecisionInput::Reject,
+                decided_at,
+            )
+        })
     }
 
-    pub fn export_learner_draft_decisions(&self) -> Result<Vec<LearnerDraftDecisionExport>, BetaStoreError> {
+    pub fn export_learner_draft_decisions(
+        &self,
+    ) -> Result<Vec<LearnerDraftDecisionExport>, BetaStoreError> {
         export_learner_draft_decisions(&self.snapshot())
     }
 
     pub fn export_learner_draft_decisions_json(&self) -> Result<String, BetaStoreError> {
-        serde_json::to_string_pretty(&self.export_learner_draft_decisions()?).map_err(BetaStoreError::Json)
+        serde_json::to_string_pretty(&self.export_learner_draft_decisions()?)
+            .map_err(BetaStoreError::Json)
     }
 
-    fn decide_generated_prompt_draft(&mut self, draft_id: &str, input: LearnerDraftDecisionInput<'_>, decided_at: i64) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+    fn decide_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        input: LearnerDraftDecisionInput<'_>,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
         self.transact(|snapshot| {
             let draft = record_learner_draft_decision(snapshot, draft_id, input, decided_at)?;
             promote_generated_prompt_draft(snapshot, &draft)
@@ -1256,12 +1294,39 @@ impl MemoryServiceStore for BetaPersistenceStore {
 ///
 /// Returns [`BetaStoreError`] when a feedback row cannot resolve its review
 /// unit, draft, or generation run provenance.
-pub fn export_learner_draft_decisions(snapshot: &BetaStoreSnapshot) -> Result<Vec<LearnerDraftDecisionExport>, BetaStoreError> {
-    snapshot.generated_prompt_drafts.iter().filter_map(|draft| draft.learner_decision.as_ref().map(|decision| (draft, decision))).map(|(draft, decision)| {
-        let run_id = draft.generation_run_id.clone();
-        let run = run_id.as_ref().and_then(|id| find_by_id(&snapshot.generation_runs, id)).ok_or_else(|| BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
-        Ok(LearnerDraftDecisionExport { draft_id: draft.id.clone(), decision: decision.clone(), prompt: prompt_text_for_export(&draft.prompt), expected_answer: prompt_expected_answer_for_export(&draft.prompt), source_document_ids: draft.source_document_ids.clone(), reference_span_ids: draft.reference_span_ids.clone(), generation_run_id: run_id, provider: run.provider.clone(), model: run.model.clone(), prompt_version: (!run.prompt_version.is_empty()).then(|| run.prompt_version.clone()) })
-    }).collect()
+pub fn export_learner_draft_decisions(
+    snapshot: &BetaStoreSnapshot,
+) -> Result<Vec<LearnerDraftDecisionExport>, BetaStoreError> {
+    snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter_map(|draft| {
+            draft
+                .learner_decision
+                .as_ref()
+                .map(|decision| (draft, decision))
+        })
+        .map(|(draft, decision)| {
+            let run_id = draft.generation_run_id.clone();
+            let run = run_id
+                .as_ref()
+                .and_then(|id| find_by_id(&snapshot.generation_runs, id))
+                .ok_or_else(|| BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
+            Ok(LearnerDraftDecisionExport {
+                draft_id: draft.id.clone(),
+                decision: decision.clone(),
+                prompt: prompt_text_for_export(&draft.prompt),
+                expected_answer: prompt_expected_answer_for_export(&draft.prompt),
+                source_document_ids: draft.source_document_ids.clone(),
+                reference_span_ids: draft.reference_span_ids.clone(),
+                generation_run_id: run_id,
+                provider: run.provider.clone(),
+                model: run.model.clone(),
+                prompt_version: (!run.prompt_version.is_empty())
+                    .then(|| run.prompt_version.clone()),
+            })
+        })
+        .collect()
 }
 
 fn export_content_feedback(
@@ -1696,17 +1761,37 @@ fn prompt_review_unit_id(prompt: &Prompt) -> &ReviewUnitId {
     }
 }
 
-fn record_learner_draft_decision(snapshot: &mut BetaStoreSnapshot, draft_id: &str, input: LearnerDraftDecisionInput<'_>, decided_at: i64) -> Result<GeneratedPromptDraft, BetaStoreError> {
-    let index = snapshot.generated_prompt_drafts.iter().position(|draft| draft.id == draft_id).ok_or_else(|| BetaStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))?;
+fn record_learner_draft_decision(
+    snapshot: &mut BetaStoreSnapshot,
+    draft_id: &str,
+    input: LearnerDraftDecisionInput<'_>,
+    decided_at: i64,
+) -> Result<GeneratedPromptDraft, BetaStoreError> {
+    let index = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .position(|draft| draft.id == draft_id)
+        .ok_or_else(|| BetaStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))?;
     let draft = &mut snapshot.generated_prompt_drafts[index];
-    if draft.validation.status != GeneratedPromptValidationStatus::Accepted { return Err(BetaStoreError::RejectedGeneratedPromptDraft); }
+    if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
+        return Err(BetaStoreError::RejectedGeneratedPromptDraft);
+    }
     if let Some(recorded) = draft.learner_decision.as_ref() {
         let matches = match (recorded, &input) {
-            (LearnerDraftDecision::Kept { edited: false, .. }, LearnerDraftDecisionInput::Keep) => true,
-            (LearnerDraftDecision::Kept { edited: true, .. }, LearnerDraftDecisionInput::Edit { prompt_text, expected_answer }) => {
+            (LearnerDraftDecision::Kept { edited: false, .. }, LearnerDraftDecisionInput::Keep) => {
+                true
+            }
+            (
+                LearnerDraftDecision::Kept { edited: true, .. },
+                LearnerDraftDecisionInput::Edit {
+                    prompt_text,
+                    expected_answer,
+                },
+            ) => {
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
-                prompt_text_for_export(&draft.prompt) == prompt_text.trim() && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
+                prompt_text_for_export(&draft.prompt) == prompt_text.trim()
+                    && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
             }
             (LearnerDraftDecision::Rejected { .. }, LearnerDraftDecisionInput::Reject) => true,
             _ => false,
@@ -1714,18 +1799,43 @@ fn record_learner_draft_decision(snapshot: &mut BetaStoreSnapshot, draft_id: &st
         if matches {
             return Ok(draft.clone());
         }
-        return Err(BetaStoreError::LearnerDraftDecisionAlreadyRecorded(draft_id.to_owned()));
+        return Err(BetaStoreError::LearnerDraftDecisionAlreadyRecorded(
+            draft_id.to_owned(),
+        ));
     }
-    if draft.generation_run_id.as_ref().is_none_or(|run_id| find_by_id(&snapshot.generation_runs, run_id).is_none()) { return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft); }
+    if draft
+        .generation_run_id
+        .as_ref()
+        .is_none_or(|run_id| find_by_id(&snapshot.generation_runs, run_id).is_none())
+    {
+        return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
+    }
     let decision = match input {
-        LearnerDraftDecisionInput::Keep => LearnerDraftDecision::Kept { edited: false, decided_at },
-        LearnerDraftDecisionInput::Edit { prompt_text, expected_answer } => {
+        LearnerDraftDecisionInput::Keep => LearnerDraftDecision::Kept {
+            edited: false,
+            decided_at,
+        },
+        LearnerDraftDecisionInput::Edit {
+            prompt_text,
+            expected_answer,
+        } => {
             assert_non_blank(prompt_text, "Learner prompt")?;
             assert_non_blank(expected_answer, "Learner expected answer")?;
             replace_prompt_text(&mut draft.prompt, prompt_text);
             replace_prompt_answer(&mut draft.prompt, expected_answer)?;
-            if !draft.critique_notes.iter().any(|note| note == "Learner edited pending wording.") { draft.critique_notes.push("Learner edited pending wording.".to_owned()); }
-            LearnerDraftDecision::Kept { edited: true, decided_at }
+            if !draft
+                .critique_notes
+                .iter()
+                .any(|note| note == "Learner edited pending wording.")
+            {
+                draft
+                    .critique_notes
+                    .push("Learner edited pending wording.".to_owned());
+            }
+            LearnerDraftDecision::Kept {
+                edited: true,
+                decided_at,
+            }
         }
         LearnerDraftDecisionInput::Reject => LearnerDraftDecision::Rejected { decided_at },
     };
@@ -1733,9 +1843,29 @@ fn record_learner_draft_decision(snapshot: &mut BetaStoreSnapshot, draft_id: &st
     Ok(draft.clone())
 }
 
-fn promote_generated_prompt_draft(snapshot: &mut BetaStoreSnapshot, draft: &GeneratedPromptDraft) -> Result<BetaReviewUnitRecord, BetaStoreError> {
-    if let Some(existing) = snapshot.review_units.iter().find(|unit| unit.review_unit_id == draft.review_unit_id) { return Ok(existing.clone()); }
-    let review_unit = BetaReviewUnitRecord { review_unit_id: draft.review_unit_id.clone(), prompt_id: draft.prompt_id.clone(), prompt: draft.prompt.clone(), queue: draft.queue.clone(), reference_span_ids: draft.reference_span_ids.clone(), concept_reference_note_key: draft.concept_reference_note_key.clone(), generated_prompt_draft_id: Some(draft.id.clone()), archived_at: None, snoozed_until: None, created_at: draft.created_at };
+fn promote_generated_prompt_draft(
+    snapshot: &mut BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+) -> Result<BetaReviewUnitRecord, BetaStoreError> {
+    if let Some(existing) = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == draft.review_unit_id)
+    {
+        return Ok(existing.clone());
+    }
+    let review_unit = BetaReviewUnitRecord {
+        review_unit_id: draft.review_unit_id.clone(),
+        prompt_id: draft.prompt_id.clone(),
+        prompt: draft.prompt.clone(),
+        queue: draft.queue.clone(),
+        reference_span_ids: draft.reference_span_ids.clone(),
+        concept_reference_note_key: draft.concept_reference_note_key.clone(),
+        generated_prompt_draft_id: Some(draft.id.clone()),
+        archived_at: None,
+        snoozed_until: None,
+        created_at: draft.created_at,
+    };
     snapshot.review_units.push(review_unit.clone());
     Ok(review_unit)
 }

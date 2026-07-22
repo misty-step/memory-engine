@@ -302,9 +302,18 @@ impl V1Route {
                 method: "GET",
                 path: V1_GENERATION_JOB_PATH,
             }],
-            Self::Keep => &[V1ContractOperation { method: "POST", path: V1_KEEP_PATH }],
-            Self::EditDraft => &[V1ContractOperation { method: "POST", path: V1_EDIT_DRAFT_PATH }],
-            Self::RejectDraft => &[V1ContractOperation { method: "POST", path: V1_REJECT_DRAFT_PATH }],
+            Self::Keep => &[V1ContractOperation {
+                method: "POST",
+                path: V1_KEEP_PATH,
+            }],
+            Self::EditDraft => &[V1ContractOperation {
+                method: "POST",
+                path: V1_EDIT_DRAFT_PATH,
+            }],
+            Self::RejectDraft => &[V1ContractOperation {
+                method: "POST",
+                path: V1_REJECT_DRAFT_PATH,
+            }],
             Self::Next => &[V1ContractOperation {
                 method: "POST",
                 path: V1_NEXT_PATH,
@@ -778,7 +787,11 @@ async fn keep_draft(
     headers: HeaderMap,
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
-    Ok(Json(state.keep_draft(&account_id, session_token, &draft_id)?))
+    Ok(Json(state.keep_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+    )?))
 }
 
 async fn edit_draft(
@@ -788,7 +801,13 @@ async fn edit_draft(
     Json(request): Json<EditDraftRequest>,
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
-    Ok(Json(state.edit_pending_draft(&account_id, session_token, &draft_id, &request.prompt, &request.expected_answer)?))
+    Ok(Json(state.edit_pending_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+        &request.prompt,
+        &request.expected_answer,
+    )?))
 }
 
 async fn reject_draft(
@@ -797,7 +816,11 @@ async fn reject_draft(
     headers: HeaderMap,
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
-    Ok(Json(state.reject_pending_draft(&account_id, session_token, &draft_id)?))
+    Ok(Json(state.reject_pending_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+    )?))
 }
 
 async fn next_review(
@@ -1723,17 +1746,26 @@ async fn static_app_js() -> impl IntoResponse {
     )
 }
 
-
 async fn keep_app_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Form(form): Form<AppDraftActionForm>,
 ) -> Response {
-    let account = match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-        Ok(account) => account,
-        Err(error) => return app_failure_response(error),
-    };
-    Html(render_action_result_html(&state, &account, state.keep_draft(account.account_id(), account.session_token(), &form.draft_id))).into_response()
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    Html(render_action_result_html(
+        &state,
+        &account,
+        state.keep_draft(
+            account.account_id(),
+            account.session_token(),
+            &form.draft_id,
+        ),
+    ))
+    .into_response()
 }
 
 async fn edit_app_draft(
@@ -1741,16 +1773,27 @@ async fn edit_app_draft(
     headers: HeaderMap,
     Form(form): Form<AppDraftEditForm>,
 ) -> Response {
-    let account = match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-        Ok(account) => account,
-        Err(error) => return app_failure_response(error),
-    };
-    let result = state.edit_pending_draft(account.account_id(), account.session_token(), &form.draft_id, &form.prompt, &form.expected_answer);
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.edit_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+        &form.prompt,
+        &form.expected_answer,
+    );
     match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
-            (status, Html(render_action_result_html(&state, &account, Err(error)))).into_response()
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
         }
     }
 }
@@ -1760,11 +1803,21 @@ async fn reject_app_draft(
     headers: HeaderMap,
     Form(form): Form<AppDraftActionForm>,
 ) -> Response {
-    let account = match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-        Ok(account) => account,
-        Err(error) => return app_failure_response(error),
-    };
-    Html(render_action_result_html(&state, &account, state.reject_pending_draft(account.account_id(), account.session_token(), &form.draft_id))).into_response()
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    Html(render_action_result_html(
+        &state,
+        &account,
+        state.reject_pending_draft(
+            account.account_id(),
+            account.session_token(),
+            &form.draft_id,
+        ),
+    ))
+    .into_response()
 }
 
 async fn next_app_review(

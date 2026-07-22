@@ -3,11 +3,11 @@ use memory_engine_core::{
     ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
 };
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
-    GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
-    GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-    SourcePermission, SourcePermissionReceipt,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, ConceptReferenceNote,
+    GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
+    GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
+    PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind, SourcePermission,
+    SourcePermissionReceipt,
 };
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, ContentFeedbackSource, ContentFeedbackVerdict,
@@ -124,7 +124,10 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
     assert_eq!(snapshot.generated_prompt_drafts[0].id, draft.id);
     assert_eq!(
         snapshot.generated_prompt_drafts[0].learner_decision,
-        Some(memory_engine_persistence::LearnerDraftDecision::Kept { edited: false, decided_at: NOW }),
+        Some(memory_engine_persistence::LearnerDraftDecision::Kept {
+            edited: false,
+            decided_at: NOW
+        }),
     );
     assert_eq!(snapshot.generation_runs.len(), 1);
     assert_eq!(snapshot.attempts, [review.attempt]);

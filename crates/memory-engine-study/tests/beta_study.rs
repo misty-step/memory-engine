@@ -1623,7 +1623,7 @@ fn seed_spanless_review(path: &std::path::Path) {
     });
     store
         .save_generated_prompt_draft(GeneratedPromptDraft {
-        learner_decision: None,
+            learner_decision: None,
             id: "spanless-draft".to_owned(),
             source_document_ids: vec!["src-spanless".to_owned()],
             reference_span_ids: Vec::new(),

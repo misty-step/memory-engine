@@ -448,15 +448,25 @@ impl StudyStorage {
     }
 
     pub(crate) fn edit_pending_draft(
-        &self, account_id: &str, store_path: &FsPath, draft_id: &str, prompt: &str, expected_answer: &str,
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner.edit_pending_draft(account_id, store_path, draft_id, prompt, expected_answer)
+        self.inner
+            .edit_pending_draft(account_id, store_path, draft_id, prompt, expected_answer)
     }
 
     pub(crate) fn reject_pending_draft(
-        &self, account_id: &str, store_path: &FsPath, draft_id: &str,
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner.reject_pending_draft(account_id, store_path, draft_id)
+        self.inner
+            .reject_pending_draft(account_id, store_path, draft_id)
     }
 
     pub(crate) fn next_review(
@@ -775,10 +785,18 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn edit_pending_draft(
-        &self, account_id: &str, store_path: &FsPath, draft_id: &str, prompt: &str, expected_answer: &str,
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn reject_pending_draft(
-        &self, account_id: &str, store_path: &FsPath, draft_id: &str,
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn next_review(
         &self,
@@ -1610,14 +1628,28 @@ impl StudyStorageAdapter for FileStudyStorage {
         })
     }
 
-    fn edit_pending_draft(&self, _account_id: &str, store_path: &FsPath, draft_id: &str, prompt: &str, expected_answer: &str) -> Result<StudyViewResponse, ApiFailure> {
+    fn edit_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
-            let view = study.edit_and_keep_draft(draft_id, prompt, expected_answer).map_err(study_failure)?;
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
 
-    fn reject_pending_draft(&self, _account_id: &str, store_path: &FsPath, draft_id: &str) -> Result<StudyViewResponse, ApiFailure> {
+    fn reject_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
             let view = study.reject_draft(draft_id).map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
@@ -2411,15 +2443,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         })
     }
 
-    fn edit_pending_draft(&self, account_id: &str, _store_path: &FsPath, draft_id: &str, prompt: &str, expected_answer: &str) -> Result<StudyViewResponse, ApiFailure> {
+    fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = study.edit_and_keep_draft(draft_id, prompt, expected_answer).map_err(study_failure)?;
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
 
-    fn reject_pending_draft(&self, account_id: &str, _store_path: &FsPath, draft_id: &str) -> Result<StudyViewResponse, ApiFailure> {
+    fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             let mut study = BetaStudySession::from_store(account, self.now);
             let view = study.reject_draft(draft_id).map_err(study_failure)?;
@@ -2970,11 +3016,7 @@ mod tests {
         // This is the foreground operation that used to receive a spurious
         // 409 while generation held the descriptor across provider work.
         storage
-            .keep_draft(
-                "acct",
-                &root.join("acct").join("study.json"),
-                &draft_id,
-            )
+            .keep_draft("acct", &root.join("acct").join("study.json"), &draft_id)
             .expect("foreground keep must commit while provider is running");
         storage
             .save_source(

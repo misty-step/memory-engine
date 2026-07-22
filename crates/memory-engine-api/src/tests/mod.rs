@@ -2286,7 +2286,11 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     assert_eq!(bridged.status(), StatusCode::OK);
     let bridged = response_text(bridged).await;
     let bridge_draft_ids = html_values(&bridged, "draftId");
-    assert_eq!(bridge_draft_ids.len(), 2, "bridge candidates remain pending");
+    assert_eq!(
+        bridge_draft_ids.len(),
+        2,
+        "bridge candidates remain pending"
+    );
     for draft_id in bridge_draft_ids {
         let kept = app
             .clone()
@@ -4712,7 +4716,10 @@ async fn job_history_survives_a_restart_through_the_file_backed_host() {
         .job(&job_id)
         .expect("the job must be restored after a restart");
     assert_eq!(restored.status.as_str(), "succeeded");
-    assert_eq!(restored.card_count, 0, "restored job records zero scheduled cards");
+    assert_eq!(
+        restored.card_count, 0,
+        "restored job records zero scheduled cards"
+    );
     assert_eq!(restored.account_id, account_id);
     assert_eq!(
         restarted.jobs_for_account_id(&account_id).len(),
@@ -4849,7 +4856,10 @@ async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
         "every capture must have produced a job"
     );
     assert_eq!(reported, 0, "generation must not schedule cards");
-    assert_eq!(persisted, 0, "no review units exist before learner decisions");
+    assert_eq!(
+        persisted, 0,
+        "no review units exist before learner decisions"
+    );
     assert!(
         study["generatedPromptDrafts"]
             .as_array()
@@ -7806,7 +7816,10 @@ async fn v1_json_api_exposes_review_escape_hatches() {
         })
         .collect::<Vec<_>>();
     assert_eq!(bridge_draft_ids.len(), 2);
-    assert!(bridged["current"].is_null(), "bridge candidates remain pending");
+    assert!(
+        bridged["current"].is_null(),
+        "bridge candidates remain pending"
+    );
     let mut bridge_id = String::new();
     for draft_id in bridge_draft_ids {
         bridge_id = keep_draft_v1(&app, &account, &draft_id).await;
@@ -8348,10 +8361,7 @@ async fn keep_draft_v1(app: &axum::Router, account: &TestAccount, draft_id: &str
         .clone()
         .oneshot(v1_empty_request(
             "POST",
-            &format!(
-                "/v1/accounts/{}/drafts/{draft_id}/keep",
-                account.account_id
-            ),
+            &format!("/v1/accounts/{}/drafts/{draft_id}/keep", account.account_id),
             &account.session_token,
         ))
         .await
