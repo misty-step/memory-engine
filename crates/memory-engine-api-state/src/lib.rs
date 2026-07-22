@@ -2811,25 +2811,16 @@ fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, A
     Ok(store)
 }
 
+/// Delegates to [`PostgresStudyStore::migrate_once`], which owns the one
+/// process-wide "already migrated" cache shared with the background
+/// generation worker (`jobs.rs`) — not a private cache of its own, so this
+/// call site and the worker's can never each independently believe they
+/// are the first to see `database_url`.
 fn migrate_postgres_store(
     database_url: &str,
     store: &mut PostgresStudyStore,
 ) -> Result<(), ApiFailure> {
-    static MIGRATED_URLS: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::BTreeSet<String>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
-
-    let migrated = &*MIGRATED_URLS;
-    // A panic while migrating must not poison every later request into a
-    // panic; the set is a plain string collection, safe to keep using.
-    let mut migrated = migrated
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !migrated.contains(database_url) {
-        store.migrate().map_err(postgres_failure)?;
-        migrated.insert(database_url.to_owned());
-    }
-    Ok(())
+    store.migrate_once(database_url).map_err(postgres_failure)
 }
 
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
