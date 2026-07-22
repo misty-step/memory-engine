@@ -116,7 +116,7 @@ probe:
 `crates/memory-engine-beta-app` now ports the local beta-study HTTP host:
 
 - serves a phone-friendly HTML/form interface rendered by the Rust binary;
-- exposes the existing `/state`, `/source`, `/generate`, `/approve`, `/reveal`,
+- exposes the existing `/state`, `/source`, `/generate`, `/keep`, `/edit`, `/reject`, `/reveal,
   `/answer`, and `/next` routes over the Rust `memory-engine-study` session;
 - validates malformed JSON payloads before touching session state;
 - accepts URL-encoded form submissions for browser flows while preserving the

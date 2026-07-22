@@ -646,7 +646,7 @@ fn candidate_rejection(candidate: &DraftCandidate, reasons: Vec<String>) -> Draf
     }
 }
 
-/// Generate bridge material for one approved parent review unit.
+/// Generate bridge material for one kept parent review unit.
 ///
 /// Bridge generation is concept-backed rather than source-backed: if the
 /// concept has no cached reference note, the provider writes one first; easier
@@ -1361,6 +1361,7 @@ fn build_draft(
     };
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: generated_id(context.run_id, "draft", &source.id, candidate),
         source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
@@ -1442,6 +1443,7 @@ fn bridge_draft(
         .unwrap_or_else(|| context.concept_key.to_owned());
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: bridge_generated_id(
             context.run_id,
             "draft",

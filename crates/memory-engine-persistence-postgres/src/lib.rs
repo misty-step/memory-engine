@@ -21,9 +21,9 @@ use memory_engine_core::{
 };
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
-    parse_strict_boolean_answer, AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions,
+    parse_strict_boolean_answer, AppliedReviewReceipt,
     BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, ScheduleRecord, SourceDocument,
+    GeneratedPromptValidationStatus, GenerationRun, LearnerDraftDecision, ReferenceSpan, ScheduleRecord, SourceDocument,
     SourcePermission,
 };
 use memory_engine_service::{
@@ -2237,6 +2237,8 @@ fn waitlist_entry_from_row(row: &postgres::Row) -> PostgresWaitlistEntry {
     }
 }
 
+enum PostgresLearnerDecision { Keep, Edit { prompt_text: String, expected_answer: String }, Reject }
+
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
     client: &'a RefCell<CountingClient>,
@@ -2482,28 +2484,35 @@ impl AccountStudyStore<'_> {
         })
     }
 
-    /// Promote an accepted generated draft into a review unit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected, or has
-    /// no saved generation run.
-    pub fn approve_generated_prompt_draft(
-        &mut self,
-        draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
-    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let ApproveGeneratedPromptDraftOptions {
-            initial_schedule_state,
-        } = options;
+    pub fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+        self.decide_learner_draft(draft_id, PostgresLearnerDecision::Keep, decided_at)?
+            .1
+            .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
+    }
+
+    pub fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+        self.decide_learner_draft(
+            draft_id,
+            PostgresLearnerDecision::Edit { prompt_text: prompt_text.to_owned(), expected_answer: expected_answer.to_owned() },
+            decided_at,
+        )?
+        .1
+        .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
+    }
+
+    pub fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, PostgresStoreError> {
+        self.decide_learner_draft(draft_id, PostgresLearnerDecision::Reject, decided_at)?
+            .0
+            .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))
+    }
+
+    fn decide_learner_draft(&mut self, draft_id: &str, decision: PostgresLearnerDecision, decided_at: i64) -> Result<(Option<GeneratedPromptDraft>, Option<BetaReviewUnitRecord>), PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         let draft_id = draft_id.to_owned();
         self.with_account_transaction(|transaction| {
-            let draft: GeneratedPromptDraft = transaction
+            let mut draft: GeneratedPromptDraft = transaction
                 .query_opt(
-                    "SELECT draft FROM memory_engine_generated_prompt_drafts
-                     WHERE account_id = $1 AND draft_id = $2
-                     FOR UPDATE",
+                    "SELECT draft FROM memory_engine_generated_prompt_drafts WHERE account_id = $1 AND draft_id = $2 FOR UPDATE",
                     &[&account_id, &draft_id],
                 )?
                 .map(|row| {
@@ -2515,24 +2524,50 @@ impl AccountStudyStore<'_> {
             if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
                 return Err(PostgresStoreError::RejectedGeneratedPromptDraft);
             }
-            let generation_run_exists = draft
-                .generation_run_id
-                .as_ref()
-                .map(|run_id| {
-                    transaction
-                        .query_opt(
-                            "SELECT 1 FROM memory_engine_generation_runs
-                             WHERE account_id = $1 AND generation_run_id = $2",
-                            &[&account_id, run_id],
-                        )
-                        .map(|row| row.is_some())
-                })
-                .transpose()?
-                .unwrap_or(false);
-            if !generation_run_exists {
+            if let Some(recorded) = draft.learner_decision.as_ref() {
+                if learner_decision_matches(&draft, recorded, &decision) {
+                    if matches!(decision, PostgresLearnerDecision::Reject) {
+                        return Ok((Some(draft), None));
+                    }
+                    let existing = review_unit_from_transaction(transaction, &account_id, &draft.review_unit_id)?;
+                    return Ok((Some(draft), Some(existing)));
+                }
+                return Err(PostgresStoreError::LearnerDraftDecisionAlreadyRecorded(draft_id.clone()));
+            }
+            let run_id = draft.generation_run_id.as_ref().ok_or(PostgresStoreError::MissingGenerationRunForAcceptedDraft)?;
+            let run_exists = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_engine_generation_runs WHERE account_id = $1 AND generation_run_id = $2",
+                    &[&account_id, run_id],
+                )?
+                .is_some();
+            if !run_exists {
                 return Err(PostgresStoreError::MissingGenerationRunForAcceptedDraft);
             }
-
+            let reject = matches!(&decision, PostgresLearnerDecision::Reject);
+            let edited = matches!(&decision, PostgresLearnerDecision::Edit { .. });
+            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = &decision {
+                assert_non_blank(prompt_text, "Learner prompt")?;
+                assert_non_blank(expected_answer, "Learner expected answer")?;
+                replace_prompt_text(&mut draft.prompt, prompt_text);
+                replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+                if !draft.critique_notes.iter().any(|note| note == "Learner edited pending wording.") {
+                    draft.critique_notes.push("Learner edited pending wording.".to_owned());
+                }
+            }
+            draft.learner_decision = Some(if reject {
+                LearnerDraftDecision::Rejected { decided_at }
+            } else {
+                LearnerDraftDecision::Kept { edited, decided_at }
+            });
+            let draft_value = serde_json::to_value(&draft)?;
+            transaction.execute(
+                "UPDATE memory_engine_generated_prompt_drafts SET draft = $3 WHERE account_id = $1 AND draft_id = $2",
+                &[&account_id, &draft_id, &draft_value],
+            )?;
+            if reject {
+                return Ok((Some(draft), None));
+            }
             let review_unit = BetaReviewUnitRecord {
                 review_unit_id: draft.review_unit_id.clone(),
                 prompt_id: draft.prompt_id.clone(),
@@ -2547,45 +2582,22 @@ impl AccountStudyStore<'_> {
             };
             let value = serde_json::to_value(&review_unit)?;
             let inserted = transaction.execute(
-                "INSERT INTO memory_engine_review_units
-                    (account_id, review_unit_id, record, created_at_ms, archived_at_ms)
-                 VALUES ($1, $2, $3, $4, NULL)
-                 ON CONFLICT (account_id, review_unit_id) DO NOTHING",
-                &[
-                    &account_id,
-                    &review_unit.review_unit_id.as_str(),
-                    &value,
-                    &review_unit.created_at,
-                ],
+                "INSERT INTO memory_engine_review_units (account_id, review_unit_id, record, created_at_ms, archived_at_ms) VALUES ($1, $2, $3, $4, NULL) ON CONFLICT (account_id, review_unit_id) DO NOTHING",
+                &[&account_id, &review_unit.review_unit_id.as_str(), &value, &review_unit.created_at],
             )?;
             if inserted == 0 {
-                return review_unit_from_transaction(
-                    transaction,
-                    &account_id,
-                    &review_unit.review_unit_id,
-                );
+                return Ok((Some(draft), Some(review_unit_from_transaction(transaction, &account_id, &review_unit.review_unit_id)?)));
             }
-            if let Some(schedule_state) = initial_schedule_state.as_ref() {
-                let schedule_value = serde_json::to_value(schedule_state)?;
-                transaction.execute(
-                    "INSERT INTO memory_engine_schedules
-                        (account_id, review_unit_id, state, updated_at_ms)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (account_id, review_unit_id) DO UPDATE
-                     SET state = EXCLUDED.state,
-                         updated_at_ms = EXCLUDED.updated_at_ms",
-                    &[
-                        &account_id,
-                        &review_unit.review_unit_id.as_str(),
-                        &schedule_value,
-                        &draft.created_at,
-                    ],
-                )?;
-            }
-            Ok(review_unit)
+            Ok((Some(draft), Some(review_unit)))
         })
     }
 
+    /// Promote an accepted generated draft into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected, or has
+    /// no saved generation run.
     /// Replace review prompt text while preserving the same review unit.
     ///
     /// # Errors
@@ -2631,11 +2643,11 @@ impl AccountStudyStore<'_> {
                 if !draft
                     .critique_notes
                     .iter()
-                    .any(|note| note == "Learner edited approved wording.")
+                    .any(|note| note == "Learner edited kept wording.")
                 {
                     draft
                         .critique_notes
-                        .push("Learner edited approved wording.".to_owned());
+                        .push("Learner edited kept wording.".to_owned());
                 }
                 let draft_value = serde_json::to_value(draft)?;
                 transaction.execute(
@@ -3422,12 +3434,16 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         AccountStudyStore::update_source_document_permission(self, source_document_id, permission)
     }
 
-    fn approve_generated_prompt_draft(
-        &mut self,
-        draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
-    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
-        AccountStudyStore::approve_generated_prompt_draft(self, draft_id, options)
+    fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::keep_generated_prompt_draft(self, draft_id, decided_at)
+    }
+
+    fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::edit_and_keep_generated_prompt_draft(self, draft_id, prompt_text, expected_answer, decided_at)
+    }
+
+    fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::reject_generated_prompt_draft(self, draft_id, decided_at)
     }
 
     fn update_review_unit_prompt_text(
@@ -3823,6 +3839,7 @@ pub enum PostgresStoreError {
     ReviewUnitArchived(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
     RejectedGeneratedPromptDraft,
+    LearnerDraftDecisionAlreadyRecorded(String),
     MissingGenerationRunForAcceptedDraft,
     ReviewUnitMismatch,
     ScheduleLastReviewMismatch,
@@ -3862,6 +3879,9 @@ impl fmt::Display for PostgresStoreError {
             }
             Self::RejectedGeneratedPromptDraft => {
                 formatter.write_str("Generated prompt draft is not accepted")
+            }
+            Self::LearnerDraftDecisionAlreadyRecorded(id) => {
+                write!(formatter, "Learner decision already recorded for draft: {id}")
             }
             Self::MissingGenerationRunForAcceptedDraft => {
                 formatter.write_str("Accepted generated prompt draft requires a generation run")
@@ -3922,6 +3942,7 @@ impl Error for PostgresStoreError {
             | Self::ReviewUnitArchived(_)
             | Self::UnknownGeneratedPromptDraft(_)
             | Self::RejectedGeneratedPromptDraft
+            | Self::LearnerDraftDecisionAlreadyRecorded(_)
             | Self::MissingGenerationRunForAcceptedDraft
             | Self::ReviewUnitMismatch
             | Self::ScheduleLastReviewMismatch
@@ -4002,6 +4023,32 @@ fn reject_archived(review_unit: &BetaReviewUnitRecord) -> Result<(), PostgresSto
         .is_none()
         .then_some(())
         .ok_or_else(|| PostgresStoreError::ReviewUnitArchived(review_unit.review_unit_id.clone()))
+}
+
+fn learner_decision_matches(draft: &GeneratedPromptDraft, recorded: &LearnerDraftDecision, requested: &PostgresLearnerDecision) -> bool {
+    match (recorded, requested) {
+        (LearnerDraftDecision::Kept { edited: false, .. }, PostgresLearnerDecision::Keep) => true,
+        (LearnerDraftDecision::Kept { edited: true, .. }, PostgresLearnerDecision::Edit { prompt_text, expected_answer }) => {
+            prompt_text_for_export(&draft.prompt) == prompt_text.trim() && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
+        }
+        (LearnerDraftDecision::Rejected { .. }, PostgresLearnerDecision::Reject) => true,
+        _ => false,
+    }
+}
+
+fn prompt_text_for_export(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt.clone(),
+        Prompt::Exact(prompt) => prompt.prompt.clone(),
+    }
+}
+
+fn prompt_expected_answer_for_export(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Mcq { correct_choice, .. } => correct_choice.clone(),
+        Prompt::Boolean { correct_answer, .. } => correct_answer.to_string(),
+        Prompt::Exact(prompt) => prompt.accepted_answers.first().cloned().unwrap_or_default(),
+    }
 }
 
 fn replace_prompt_text(prompt: &mut Prompt, text: &str) {
@@ -5957,7 +6004,7 @@ mod tests {
         assert!(edited_draft
             .critique_notes
             .iter()
-            .any(|note| note == "Learner edited approved wording."));
+            .any(|note| note == "Learner edited kept wording."));
         account.archive_review_unit(&review_unit_id, NOW + 1_000)?;
         assert!(matches!(
             account.update_review_unit_prompt_text(
@@ -6062,7 +6109,7 @@ mod tests {
             assert_eq!(generated.summary.accepted_draft_count, 2);
 
             let approved =
-                study.approve_draft("study-run-1-draft-src-nato-live-2-nato-cat-composition")?;
+                study.keep_draft("study-run-1-draft-src-nato-live-2-nato-cat-composition")?;
             assert_eq!(approved.status, BetaStudyStatus::Answering);
             assert_eq!(approved.summary.approved_review_unit_count, 1);
 
@@ -6140,7 +6187,7 @@ mod tests {
             assert!(edited_draft
                 .critique_notes
                 .iter()
-                .any(|note| note == "Learner edited approved wording."));
+                .any(|note| note == "Learner edited kept wording."));
             assert_eq!(
                 edited_draft.validation.status,
                 GeneratedPromptValidationStatus::Accepted
@@ -6319,6 +6366,7 @@ mod tests {
         generation_run_id: Option<&str>,
     ) -> GeneratedPromptDraft {
         GeneratedPromptDraft {
+        learner_decision: None,
             id: id.to_owned(),
             source_document_ids: source_document_ids
                 .iter()

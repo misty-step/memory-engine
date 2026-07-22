@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use memory_engine_core::{QueueCandidate, ReviewUnitId, ReviewUnitLifecycle, ScheduleState};
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
-    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord,
+    BetaPersistenceStore, BetaReviewUnitRecord,
     BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GenerationRun, ReferenceSpan,
     SourceDocument, SourcePermission,
 };
@@ -125,12 +125,16 @@ impl memory_engine_study::BetaStudyStore for SnapshotCountingStore {
             .update_source_document_permission(source_document_id, permission)
     }
 
-    fn approve_generated_prompt_draft(
-        &mut self,
-        draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
-    ) -> Result<BetaReviewUnitRecord, StoreError> {
-        self.inner.approve_generated_prompt_draft(draft_id, options)
+    fn keep_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, StoreError> {
+        self.inner.keep_generated_prompt_draft(draft_id, decided_at)
+    }
+
+    fn edit_and_keep_generated_prompt_draft(&mut self, draft_id: &str, prompt_text: &str, expected_answer: &str, decided_at: i64) -> Result<BetaReviewUnitRecord, StoreError> {
+        self.inner.edit_and_keep_generated_prompt_draft(draft_id, prompt_text, expected_answer, decided_at)
+    }
+
+    fn reject_generated_prompt_draft(&mut self, draft_id: &str, decided_at: i64) -> Result<GeneratedPromptDraft, StoreError> {
+        self.inner.reject_generated_prompt_draft(draft_id, decided_at)
     }
 
     fn update_review_unit_prompt_text(
@@ -262,8 +266,8 @@ fn seed_review(path: &Path) {
         .expect("source");
     let generated = study.generate(None).expect("generate");
     study
-        .approve_draft(&generated.drafts[0].id)
-        .expect("approve");
+        .keep_draft(&generated.drafts[0].id)
+        .expect("keep");
 }
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);

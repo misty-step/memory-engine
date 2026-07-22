@@ -2,11 +2,10 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
-use memory_engine_persistence::{GeneratedPromptValidationStatus, SourcePermission};
+use memory_engine_persistence::SourcePermission;
 use memory_engine_persistence_postgres::PostgresWaitlistEntry;
 use memory_engine_service::RecordContentFeedbackCommand;
 
-use crate::storage::GenerationCommitFence;
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
     new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
@@ -959,9 +958,9 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
-    /// Run a queued generation job end to end on a worker thread: generate from
-    /// the already-saved source, then optimistically approve (schedule) every
-    /// accepted card. Returns how many cards were scheduled.
+    /// Run a queued generation job end to end on a worker thread. Accepted
+    /// drafts remain pending until the learner explicitly keeps or edits them.
+    /// Returns how many accepted pending drafts were generated.
     ///
     /// Session-free by design — enqueueing was already authorized in the request
     /// that created the job, and the background worker is trusted, so it keys off
@@ -996,34 +995,10 @@ impl AccountRegistry {
             ));
         }
         let view = storage.study_view(account_id, &store_path)?;
-        let pending = view
-            .drafts
-            .iter()
-            .filter(|draft| {
-                draft.validation_status == GeneratedPromptValidationStatus::Accepted
-                    && !draft.approved
-            })
-            .map(|draft| draft.id.clone())
-            .collect::<Vec<_>>();
-        let card_count = pending.len();
-        for draft_id in pending {
-            if !lease_valid() {
-                return Err(ApiFailure::conflict(
-                    "Generation lease lost before cards could be committed.",
-                ));
-            }
-            storage.approve_draft(
-                account_id,
-                &store_path,
-                &draft_id,
-                Some(GenerationCommitFence {
-                    generation_run_id: run_id,
-                    generation_attempt,
-                    lease_token,
-                }),
-            )?;
-        }
-        Ok(card_count)
+        // Generation reports scheduled cards, and generation never schedules.
+        // Keep the lease parameters in the signature for worker fencing.
+        let _ = (view, generation_attempt, lease_token);
+        Ok(0)
     }
 
     /// Runs the typed content-feedback command for one authenticated account.
@@ -1092,7 +1067,7 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
-    pub(crate) fn approve_draft(
+    pub(crate) fn keep_draft(
         &self,
         account_id: &str,
         session_token: &str,
@@ -1100,18 +1075,36 @@ impl AccountRegistry {
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         let store_lock = self.store_lock(account_id);
-        let _guard = store_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.storage()
-            .approve_draft(account_id, &account.store_path, draft_id, None)
+        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage().keep_draft(account_id, &account.store_path, draft_id)
     }
 
-    /// Runs an API registry operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when auth, storage, or study state rejects the operation.
+    pub(crate) fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage().edit_pending_draft(account_id, &account.store_path, draft_id, prompt, expected_answer)
+    }
+
+    pub(crate) fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage().reject_pending_draft(account_id, &account.store_path, draft_id)
+    }
+
     pub(crate) fn next_review(
         &self,
         account_id: &str,

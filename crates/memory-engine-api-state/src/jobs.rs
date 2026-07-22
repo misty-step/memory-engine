@@ -3,7 +3,7 @@
 //! Creating material no longer blocks the request. A capture enqueues a
 //! `GenerationJob`, the handler returns immediately, and an in-process worker
 //! runs the (synchronous, ~20s) model call on a blocking thread, then
-//! optimistically approves and schedules the resulting cards. Job status
+//! persists generated candidates for explicit learner decisions. Job status
 //! (`queued → running → succeeded | failed`) is held in memory and pushed to
 //! the browser over SSE; failed jobs can be retried.
 //!
@@ -1485,8 +1485,22 @@ mod tests {
                 || true,
             )
             .expect("replayed generation");
-        assert!(first > 0, "fixture must produce scheduled material");
+        assert_eq!(first, 0, "successful generation must leave accepted drafts pending");
         assert_eq!(second, 0, "a replay must not schedule duplicate material");
+        let study = memory_engine_persistence::BetaPersistenceStore::open(
+            &registry.storage().account_store_path(&account.account_id),
+        )
+        .expect("study store");
+        let snapshot = study.snapshot();
+        assert!(snapshot.review_units.is_empty(), "generation must not create review units");
+        assert!(snapshot.schedules.is_empty(), "generation must not create due schedules");
+        assert!(
+            snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|draft| draft.validation.status == memory_engine_persistence::GeneratedPromptValidationStatus::Accepted),
+            "accepted generated drafts must remain inspectable"
+        );
     }
 
     #[test]

@@ -1,0 +1,21 @@
+
+running 1 test
+test jobs::tests::rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule ... FAILED
+
+failures:
+
+---- jobs::tests::rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule stdout ----
+
+thread 'jobs::tests::rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule' (74880452) panicked at crates/memory-engine-api-state/src/jobs.rs:1488:9:
+assertion `left == right` failed: successful generation must leave accepted drafts pending
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    jobs::tests::rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p memory-engine-api-state --lib`

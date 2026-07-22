@@ -3,7 +3,7 @@ use memory_engine_core::{
     ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
 };
 use memory_engine_persistence::{
-    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
     GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
@@ -91,13 +91,14 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
         ))
         .expect("run");
     store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
-            },
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("keep");
+    store
+        .set_schedule_state(
+            &draft.review_unit_id,
+            Some(schedule_state(2, ScheduleStatus::Review)),
         )
-        .expect("approve");
+        .expect("schedule kept draft");
 
     let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
     let review = service
@@ -120,7 +121,11 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
 
     assert_eq!(snapshot.source_documents, [source]);
     assert_eq!(snapshot.reference_spans, [reference]);
-    assert_eq!(snapshot.generated_prompt_drafts, [draft]);
+    assert_eq!(snapshot.generated_prompt_drafts[0].id, draft.id);
+    assert_eq!(
+        snapshot.generated_prompt_drafts[0].learner_decision,
+        Some(memory_engine_persistence::LearnerDraftDecision::Kept { edited: false, decided_at: NOW }),
+    );
     assert_eq!(snapshot.generation_runs.len(), 1);
     assert_eq!(snapshot.attempts, [review.attempt]);
     assert_eq!(
@@ -497,6 +502,7 @@ fn validates_generated_drafts_before_promotion() {
         .expect("reference");
 
     let rejected = GeneratedPromptDraft {
+        learner_decision: None,
         validation: GeneratedPromptValidation {
             status: GeneratedPromptValidationStatus::Rejected,
             reasons: vec!["Unsupported claim.".to_owned()],
@@ -514,15 +520,13 @@ fn validates_generated_drafts_before_promotion() {
         .expect("rejected draft persists");
     assert_eq!(
         store
-            .approve_generated_prompt_draft(
-                &rejected.id,
-                ApproveGeneratedPromptDraftOptions::default()
-            )
-            .expect_err("cannot approve rejected"),
+            .keep_generated_prompt_draft(&rejected.id, NOW)
+            .expect_err("cannot keep rejected"),
         BetaStoreError::RejectedGeneratedPromptDraft
     );
 
     let missing_reference = GeneratedPromptDraft {
+        learner_decision: None,
         id: "draft-missing-reference".to_owned(),
         reference_span_ids: vec!["missing-reference".to_owned()],
         ..accepted_draft(
@@ -568,10 +572,7 @@ fn validates_generated_drafts_before_promotion() {
         .expect("accepted draft");
     assert_eq!(
         store
-            .approve_generated_prompt_draft(
-                &accepted_without_run.id,
-                ApproveGeneratedPromptDraftOptions::default()
-            )
+            .keep_generated_prompt_draft(&accepted_without_run.id, NOW)
             .expect_err("missing generation run"),
         BetaStoreError::MissingGenerationRunForAcceptedDraft
     );
@@ -612,7 +613,7 @@ fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history(
             .critique_notes
             .last()
             .map(String::as_str),
-        Some("Learner edited approved wording.")
+        Some("Learner edited kept wording.")
     );
     assert_eq!(
         prompt_text(
@@ -1081,8 +1082,8 @@ fn boolean_prompt_edit_rejects_invalid_answer_without_mutation() {
 }
 
 #[test]
-fn repeated_draft_approval_returns_existing_record_without_rewriting_schedule() {
-    let directory = TempDirectory::new("repeat-approval");
+fn repeated_draft_keep_returns_existing_record_without_rewriting_schedule() {
+    let directory = TempDirectory::new("repeat-keep");
     let path = directory.path().join("store.json");
     let (mut store, draft) = lifecycle_store(&path);
     let unit_id = draft.review_unit_id.clone();
@@ -1103,17 +1104,12 @@ fn repeated_draft_approval_returns_existing_record_without_rewriting_schedule() 
         .set_schedule_state(&unit_id, Some(newer_schedule.clone()))
         .expect("newer schedule");
 
-    let reapproved = store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(1, ScheduleStatus::New)),
-            },
-        )
-        .expect("repeat approval");
-    assert_eq!(reapproved.prompt, newer_prompt.prompt);
-    assert_eq!(reapproved.queue.lifecycle, newer_lifecycle.queue.lifecycle);
-    assert_eq!(reapproved.snoozed_until, newer_snooze.snoozed_until);
+    let rekept = store
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("repeat keep");
+    assert_eq!(rekept.prompt, newer_prompt.prompt);
+    assert_eq!(rekept.queue.lifecycle, newer_lifecycle.queue.lifecycle);
+    assert_eq!(rekept.snoozed_until, newer_snooze.snoozed_until);
 
     let snapshot = store.snapshot();
     assert_eq!(
@@ -1152,13 +1148,14 @@ fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPr
         ))
         .expect("run");
     store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
-            },
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("keep");
+    store
+        .set_schedule_state(
+            &draft.review_unit_id,
+            Some(schedule_state(2, ScheduleStatus::Review)),
         )
-        .expect("approve");
+        .expect("schedule kept draft");
 
     (store, draft)
 }
@@ -1242,6 +1239,7 @@ fn save_concept_backed_bridge_draft(store: &mut BetaPersistenceStore) {
         .save_concept_reference_note(concept_reference_note("nato-letter-a"))
         .expect("concept note");
     let concept_backed_bridge = GeneratedPromptDraft {
+        learner_decision: None,
         source_document_ids: Vec::new(),
         reference_span_ids: Vec::new(),
         concept_reference_note_key: Some("nato-letter-a".to_owned()),
@@ -1268,6 +1266,7 @@ fn accepted_draft(
     let review_unit_id = review_unit_id(unit_id);
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: id.to_owned(),
         source_document_ids: source_document_ids
             .iter()

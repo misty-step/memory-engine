@@ -17,7 +17,7 @@ use tower::ServiceExt;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use memory_engine_persistence::SourcePermission;
+use memory_engine_persistence::{GeneratedPromptValidationStatus, SourcePermission};
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
 use super::{
@@ -209,7 +209,7 @@ async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
 }
 
 #[tokio::test]
-async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
+async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
     let state = ApiState::default();
     let app = router(state.clone());
     // Bootstrap a session (the start route only seeds an empty source).
@@ -228,7 +228,7 @@ async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
 
     // One action: capture. Generation is enqueued and the handler returns
     // immediately — no cards in the response yet, just the "generating" notice
-    // and a queued activity-log row. There is no manual keep gate anymore.
+    // and a queued activity-log row. Candidates remain pending for review.
     let captured = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -245,14 +245,26 @@ async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
     assert!(captured.contains(r#"<ul id="me-jobs""#));
     assert_not_contains_any(&captured, &["Add all to reviews", ">Keep</button>"]);
 
-    // Drain the background job: real generation + auto-approve every accepted
-    // card, scheduling it immediately due. The activity log now shows the
-    // finished job, both NATO concepts scheduled for review.
+    // Drain the background job: real generation leaves accepted candidates
+    // pending. Inspect the rendered candidates, then explicitly keep them.
     state.run_pending_jobs_blocking();
     let workspace = workspace_html(&app, &cookie).await;
     assert_activity_succeeded_html(&workspace, 2);
+    for draft_id in html_values(&workspace, "draftId") {
+        let kept = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/draft/keep",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("keep pending draft");
+        assert_eq!(kept.status(), StatusCode::OK);
+    }
 
-    // The scheduled cards drive the review flow with no keep step in between.
+    // Only explicit keeps drive the review flow.
     let review = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -348,7 +360,7 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
 
     // Generate from the seeded source and drain the queue: real generation,
-    // auto-approve, cards scheduled immediately due. The helper returns the
+    // auto-keep, cards scheduled immediately due. The helper returns the
     // refreshed workspace, which fetches the live study view — so the due
     // callout and Start review CTA appear, not "0 due" and not the cover.
     let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
@@ -518,8 +530,8 @@ fn scheduled_return_notification_sends_live_due_count_without_request_traffic() 
         .expect("generate source");
     for draft in &generated.drafts {
         state
-            .approve_draft(account.account_id(), account.session_token(), &draft.id)
-            .expect("approve generated draft");
+            .keep_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("keep generated draft");
     }
     let view = state
         .study_view(account.account_id(), account.session_token())
@@ -653,8 +665,8 @@ fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
             .expect("quota generation");
         for draft in &generated.drafts {
             state
-                .approve_draft(account.account_id(), account.session_token(), &draft.id)
-                .expect("quota approval");
+                .keep_draft(account.account_id(), account.session_token(), &draft.id)
+                .expect("quota keep");
         }
         state
             .set_return_notification(&account, Some(email), true)
@@ -731,8 +743,8 @@ fn concurrent_scheduler_instances_share_one_durable_file_claim() {
         .expect("generation");
     for draft in &generated.drafts {
         first
-            .approve_draft(account.account_id(), account.session_token(), &draft.id)
-            .expect("approval");
+            .keep_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("keep");
     }
     let view = first
         .study_view(account.account_id(), account.session_token())
@@ -1511,13 +1523,13 @@ async fn mobile_form_flow_generates_reveals_and_submits_review() {
     assert!(!started.contains("Add all to reviews"));
 
     // Regenerate from the saved source: enqueue, drain, and reload. Both
-    // accepted cards are auto-approved and scheduled — no keep gate, no
-    // per-draft approve. The activity log shows the finished job.
+    // accepted cards are auto-keepd and scheduled — no keep gate, no
+    // per-draft keep. The activity log shows the finished job.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
 
     // Open the review queue: both scheduled cards are due. Take whichever
-    // card surfaces first (auto-approve fixes no order), reveal it — every
+    // card surfaces first (auto-keep fixes no order), reveal it — every
     // expected answer here contains "ALFA" — and answer it correctly.
     let opened = next_review_html(&app, &cookie, &csrf_token, "open queue").await;
     assert_due_review_html(&opened, 2);
@@ -1603,8 +1615,8 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
     let state = ApiState::default();
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
-    // Generation auto-approves and schedules every accepted card; no manual
-    // per-draft approve. Drive the queue to the NATO-A quiz card and answer
+    // Generation auto-keeps and schedules every accepted card; no manual
+    // per-draft keep. Drive the queue to the NATO-A quiz card and answer
     // it wrong to exercise the human result + item-history rollup.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
@@ -2000,8 +2012,8 @@ async fn mobile_submit_review_shows_concept_rollup_for_shared_concept() {
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
     let source_id = html_value(&started, "sourceId");
-    // Generation auto-approves and schedules both cards (same concept). No
-    // manual per-draft approve — the activity log confirms two cards landed.
+    // Generation auto-keeps and schedules both cards (same concept). No
+    // manual per-draft keep — the activity log confirms two cards landed.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
 
@@ -2104,7 +2116,7 @@ async fn management_surface_lists_concepts_worst_first() {
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
     let source_id = html_value(&started, "sourceId");
-    // Generation auto-approves and schedules both cards — no manual approve.
+    // Generation auto-keeps and schedules both cards — no manual keep.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
 
@@ -2234,7 +2246,7 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
     let source_id = html_value(&started, "sourceId");
-    // Generation auto-approves and schedules both cards. Drive the queue to
+    // Generation auto-keeps and schedules both cards. Drive the queue to
     // the CAT *exercise* card — the one that carries the escape hatches.
     let generated = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_activity_succeeded_html(&generated, 2);
@@ -2273,7 +2285,23 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
         .expect("bridge");
     assert_eq!(bridged.status(), StatusCode::OK);
     let bridged = response_text(bridged).await;
-    let bridge_id = html_value(&bridged, "reviewUnitId");
+    let bridge_draft_ids = html_values(&bridged, "draftId");
+    assert_eq!(bridge_draft_ids.len(), 2, "bridge candidates remain pending");
+    for draft_id in bridge_draft_ids {
+        let kept = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/draft/keep",
+                &cookie,
+                &[("csrfToken", &csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("keep bridge draft");
+        assert_eq!(kept.status(), StatusCode::OK);
+    }
+    let opened_bridge = next_review_html(&app, &cookie, &csrf_token, "bridge").await;
+    let bridge_id = html_value(&opened_bridge, "reviewUnitId");
     assert!(bridge_id.starts_with("bridge-"));
 
     let skipped = app
@@ -2391,7 +2419,7 @@ async fn assert_source_session_mutations_require_csrf(
     assert_forbidden_form(app, cookie, "/app/logout", &[], "logout without csrf").await;
 }
 
-/// Generation auto-approves and schedules cards (no keep gate); open the
+/// Generation auto-keeps and schedules cards (no keep gate); open the
 /// review queue and return the current review unit id so the review-mutation
 /// CSRF matrix has a real target.
 async fn schedule_review_for_csrf(
@@ -2507,10 +2535,10 @@ async fn assert_review_mutations_require_csrf(
 }
 
 /// Enqueue generation for a saved source, drain the job synchronously (real
-/// structured-block generation + auto-approve/schedule), and return the
-/// reloaded workspace — which now reflects the scheduled, due cards and a
-/// succeeded activity-log row. This is the async-model replacement for the
-/// old synchronous "generate → keep" dance.
+/// structured-block generation), explicitly keep each pending candidate, and
+/// return the reloaded workspace with a succeeded activity-log row. This helper
+/// keeps legacy review-flow tests focused on review behavior; production never
+/// auto-keeps generated candidates.
 async fn generate_source_html(
     app: &axum::Router,
     state: &ApiState,
@@ -2530,16 +2558,30 @@ async fn generate_source_html(
         .expect("generate with csrf");
     assert_eq!(generated.status(), StatusCode::OK);
     let generated = response_text(generated).await;
-    // The handler returns immediately with the queued job, before any card
-    // exists. Drain the queue so the deck is generated and scheduled, then
-    // re-render the workspace so the activity log shows the finished job.
+    // The handler returns immediately with the queued job, before any draft
+    // exists. Drain the queue, then explicitly keep each accepted draft through
+    // the learner action route before reloading the workspace.
     assert!(generated.contains("Generating. Watch the activity log."));
     state.run_pending_jobs_blocking();
+    let pending = workspace_html(app, cookie).await;
+    for draft_id in html_values(&pending, "draftId") {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                "/app/draft/keep",
+                cookie,
+                &[("csrfToken", csrf_token), ("draftId", &draft_id)],
+            ))
+            .await
+            .expect("keep generated draft");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     workspace_html(app, cookie).await
 }
 
 /// Drive `/app/next` until the current review item's prompt contains
-/// `needle`, returning that page. Auto-approve schedules every accepted card
+/// `needle`, returning that page. Explicit keeps schedule accepted cards
 /// at once, so which card surfaces first is not fixed; this makes a flow that
 /// targets a specific card order-independent. Skips non-matching items via
 /// `/app/skip` so they rotate to the back of the queue.
@@ -3631,6 +3673,7 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
     generate_source_queued(
         &state,
         account.account_id(),
+        account.session_token(),
         &source.source_id,
         "Postgres scheduled source",
     )
@@ -4383,7 +4426,7 @@ async fn mobile_saved_account_session_resumes_sources_after_restart() {
     // The resumed session can still regenerate the persisted source: enqueue,
     // drain, and confirm the cards land. (The old synchronous "Add all to
     // reviews" keep gate is gone — success now shows in the activity log and
-    // the cards are auto-scheduled.)
+    // accepted drafts remain pending until explicit keeps.)
     let generated = generate_source_html(
         &restarted_app,
         &restarted_state,
@@ -4669,10 +4712,7 @@ async fn job_history_survives_a_restart_through_the_file_backed_host() {
         .job(&job_id)
         .expect("the job must be restored after a restart");
     assert_eq!(restored.status.as_str(), "succeeded");
-    assert!(
-        restored.card_count >= 1,
-        "restored job keeps its card count"
-    );
+    assert_eq!(restored.card_count, 0, "restored job records zero scheduled cards");
     assert_eq!(restored.account_id, account_id);
     assert_eq!(
         restarted.jobs_for_account_id(&account_id).len(),
@@ -4778,7 +4818,7 @@ async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
     .await
     .expect("all generation jobs must finish within 20s");
 
-    // The cards each job reported scheduling must all be on disk.
+    // Generation reports zero scheduled cards; accepted drafts remain durable.
     let jobs: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&jobs_file).unwrap()).unwrap();
     let reported: i64 = jobs
@@ -4808,11 +4848,13 @@ async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
         source_count,
         "every capture must have produced a job"
     );
-    assert!(reported > 0, "the jobs must have scheduled some cards");
-    assert_eq!(
-        persisted, reported,
-        "every scheduled card must persist: {reported} reported across jobs, \
-             {persisted} on disk — a shortfall is the concurrent-write clobber"
+    assert_eq!(reported, 0, "generation must not schedule cards");
+    assert_eq!(persisted, 0, "no review units exist before learner decisions");
+    assert!(
+        study["generatedPromptDrafts"]
+            .as_array()
+            .is_some_and(|drafts| !drafts.is_empty()),
+        "accepted drafts remain durable for learner review"
     );
 
     let _ = std::fs::remove_dir_all(&store);
@@ -5261,9 +5303,10 @@ async fn service_session_enqueues_and_observes_durable_generation_without_a_brow
         observed["error"].is_null(),
         "successful jobs must preserve the nullable error field: {observed}"
     );
-    assert!(
-        observed["cardCount"].as_u64().expect("card count") > 0,
-        "successful generation must schedule at least one card: {observed}"
+    assert_eq!(
+        observed["cardCount"],
+        json!(0),
+        "successful generation must leave candidates pending: {observed}"
     );
 }
 
@@ -6131,6 +6174,7 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
     generate_source_queued(
         &state,
         &source_account.account_id,
+        &source_account.session_token,
         &source_id,
         "Copy source",
     )
@@ -6253,7 +6297,7 @@ async fn file_save_account_preserves_content_feedback_for_copy_parity() {
     };
     let source_id = create_source_v1(&app, &source_account, "Copy source", &source_body()).await;
     let draft_id = generate_source_v1(&app, &source_account, &source_id).await;
-    let review_unit_id = approve_draft_v1(&app, &source_account, &draft_id).await;
+    let review_unit_id = keep_draft_v1(&app, &source_account, &draft_id).await;
     let _ = submit_review_v1(&app, &source_account, &review_unit_id, "ALFA").await;
     let feedback = app
         .clone()
@@ -6400,7 +6444,7 @@ async fn postgres_backend_browser_session_resumes_after_restart() {
         .expect("generate after restart");
     assert_eq!(generated.status(), StatusCode::OK);
 
-    // Drain the enqueued job: generation runs and the cards auto-schedule.
+    // Drain the enqueued job: generation runs and the accepted drafts remain pending until explicit keeps.
     restarted_state.run_pending_jobs_blocking();
 
     let next = restarted_app
@@ -6525,6 +6569,7 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
         generate_source_queued(
             &state,
             &account.account_id,
+            &account.session_token,
             &source_id,
             "Shared NATO concept notes",
         )
@@ -6623,7 +6668,7 @@ async fn source_routes_reject_blank_source_material() {
 }
 
 #[tokio::test]
-async fn source_generation_approval_and_review_are_account_scoped() {
+async fn source_generation_keep_and_review_are_account_scoped() {
     let app = router(ApiState::default());
     let first = create_account(&app, "first@example.com").await;
     let second = create_account(&app, "second@example.com").await;
@@ -6654,26 +6699,26 @@ async fn source_generation_approval_and_review_are_account_scoped() {
     assert_eq!(drafts[0]["validationStatus"], json!("accepted"));
     let draft_id = drafts[0]["id"].as_str().expect("draft id");
 
-    let cross_approve = app
+    let cross_keep = app
         .clone()
         .oneshot(empty_request(
             "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", first.account_id),
+            &format!("/accounts/{}/drafts/{draft_id}/keep", first.account_id),
             &second.session_token,
         ))
         .await
-        .expect("cross approve");
-    assert_eq!(cross_approve.status(), StatusCode::FORBIDDEN);
+        .expect("cross keep");
+    assert_eq!(cross_keep.status(), StatusCode::FORBIDDEN);
 
     let approved = app
         .clone()
         .oneshot(empty_request(
             "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", first.account_id),
+            &format!("/accounts/{}/drafts/{draft_id}/keep", first.account_id),
             &first.session_token,
         ))
         .await
-        .expect("approve");
+        .expect("keep");
     assert_eq!(approved.status(), StatusCode::OK);
     let approved = response_json(approved).await;
     assert_eq!(approved["summary"]["approvedReviewUnitCount"], json!(1));
@@ -6746,7 +6791,7 @@ async fn assert_foreign_review_unit_is_not_found(
         .into_iter()
         .next()
         .expect("second account draft");
-    let foreign_review_unit_id = approve_draft_v1(app, second, &draft_id).await;
+    let foreign_review_unit_id = keep_draft_v1(app, second, &draft_id).await;
     let foreign_review = app
         .clone()
         .oneshot(v1_empty_request(
@@ -6772,12 +6817,12 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
     let account = create_account_v1(&app, "scry@example.com").await;
     let source_id = create_source_v1(&app, &account, "NATO practice notes", &source_body()).await;
     let draft_id = generate_source_v1(&app, &account, &source_id).await;
-    let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+    let review_unit_id = keep_draft_v1(&app, &account, &draft_id).await;
 
     assert_eq!(
         next_review_v1(&app, &account).await,
         review_unit_id,
-        "v1 queue/next must expose the approved review unit"
+        "v1 queue/next must expose the kept review unit"
     );
     assert_eq!(
         reveal_review_v1(&app, &account, &review_unit_id).await,
@@ -6965,9 +7010,9 @@ async fn v1_project_deck_ttl_and_event_invalidation_stop_scheduling() {
     let stale_unapproved_draft_id = draft_ids
         .iter()
         .find(|candidate| candidate.as_str() != draft_id.as_str())
-        .expect("unapproved stale deck draft")
+        .expect("pending stale deck draft")
         .to_owned();
-    let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+    let review_unit_id = keep_draft_v1(&app, &account, &draft_id).await;
 
     assert_eq!(
         next_review_v1(&app, &account).await,
@@ -6999,22 +7044,22 @@ async fn v1_project_deck_ttl_and_event_invalidation_stop_scheduling() {
     assert_eq!(next_after_event["current"], json!(null));
     assert_eq!(next_after_event["dueCount"], json!(0));
 
-    let approved_stale_draft = app
+    let kept_stale_draft = app
         .clone()
         .oneshot(v1_empty_request(
             "POST",
             &format!(
-                "/v1/accounts/{}/drafts/{stale_unapproved_draft_id}/approve",
+                "/v1/accounts/{}/drafts/{stale_unapproved_draft_id}/keep",
                 account.account_id
             ),
             &account.session_token,
         ))
         .await
-        .expect("approve stale invalidated draft");
-    assert_eq!(approved_stale_draft.status(), StatusCode::OK);
-    let approved_stale_draft = response_json(approved_stale_draft).await;
-    assert_eq!(approved_stale_draft["current"], json!(null));
-    assert_eq!(approved_stale_draft["dueCount"], json!(0));
+        .expect("keep stale invalidated draft");
+    assert_eq!(kept_stale_draft.status(), StatusCode::OK);
+    let kept_stale_draft = response_json(kept_stale_draft).await;
+    assert_eq!(kept_stale_draft["current"], json!(null));
+    assert_eq!(kept_stale_draft["dueCount"], json!(0));
 
     let expired_deck = create_project_deck_v1(
         &app,
@@ -7027,22 +7072,22 @@ async fn v1_project_deck_ttl_and_event_invalidation_stop_scheduling() {
     .await;
     let expired_deck_id = expired_deck["deckId"].as_str().expect("expired deck id");
     let expired_draft_id = generate_source_v1_latest_draft(&app, &account, expired_deck_id).await;
-    let approved_expired = app
+    let kept_expired = app
         .clone()
         .oneshot(v1_empty_request(
             "POST",
             &format!(
-                "/v1/accounts/{}/drafts/{expired_draft_id}/approve",
+                "/v1/accounts/{}/drafts/{expired_draft_id}/keep",
                 account.account_id
             ),
             &account.session_token,
         ))
         .await
-        .expect("approve expired deck draft");
-    assert_eq!(approved_expired.status(), StatusCode::OK);
-    let approved_expired = response_json(approved_expired).await;
-    assert_eq!(approved_expired["current"], json!(null));
-    assert_eq!(approved_expired["dueCount"], json!(0));
+        .expect("keep expired deck draft");
+    assert_eq!(kept_expired.status(), StatusCode::OK);
+    let kept_expired = response_json(kept_expired).await;
+    assert_eq!(kept_expired["current"], json!(null));
+    assert_eq!(kept_expired["dueCount"], json!(0));
 }
 
 #[tokio::test]
@@ -7076,7 +7121,7 @@ async fn v1_project_deck_invalidation_rejects_regular_sources() {
     assert_eq!(invalidated.status(), StatusCode::NOT_FOUND);
 
     let draft_id = generate_source_v1(&app, &account, &source_id).await;
-    let review_unit_id = approve_draft_v1(&app, &account, &draft_id).await;
+    let review_unit_id = keep_draft_v1(&app, &account, &draft_id).await;
     assert_eq!(
         next_review_v1(&app, &account).await,
         review_unit_id,
@@ -7117,7 +7162,7 @@ async fn v1_json_api_returns_post_answer_feedback_and_concept_progress() {
         .collect::<Vec<_>>();
     assert_eq!(draft_ids.len(), 2);
     for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
+        keep_draft_v1(&app, &account, draft_id).await;
     }
 
     let first_id = next_review_v1(&app, &account).await;
@@ -7199,7 +7244,7 @@ async fn v1_json_concept_snooze_is_authenticated_and_defers_every_member() {
     let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
     assert_eq!(draft_ids.len(), 2);
     for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
+        keep_draft_v1(&app, &account, draft_id).await;
     }
 
     let review_unit_id = next_review_v1(&app, &account).await;
@@ -7240,7 +7285,7 @@ async fn file_concept_snooze_rejects_stale_archived_id_without_resurrection() {
     .await;
     let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
     for draft_id in &draft_ids {
-        approve_draft_v1(&app, &account, draft_id).await;
+        keep_draft_v1(&app, &account, draft_id).await;
     }
     let stale_id = next_review_v1(&app, &account).await;
 
@@ -7388,6 +7433,7 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
     generate_source_queued(
         &state,
         &account.account_id,
+        &account.session_token,
         &source_id,
         "Shared NATO concept notes",
     )
@@ -7462,6 +7508,7 @@ async fn postgres_two_connections_archive_requested_before_concept_snooze() {
     generate_source_queued(
         &state,
         &account.account_id,
+        &account.session_token,
         &source_id,
         "Shared NATO concept notes",
     )
@@ -7562,6 +7609,7 @@ async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
     generate_source_queued(
         &state,
         &account.account_id,
+        &account.session_token,
         &source_id,
         "Shared NATO concept notes",
     )
@@ -7639,7 +7687,7 @@ async fn concept_snooze_null_and_blank_keys_are_json_400_and_hidden_from_html() 
         .await;
         let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
         for draft_id in &draft_ids {
-            approve_draft_v1(&app, &account, draft_id).await;
+            keep_draft_v1(&app, &account, draft_id).await;
         }
         let review_unit_id = next_review_v1(&app, &account).await;
         let study_path = root.join(&account.account_id).join("study.json");
@@ -7712,7 +7760,7 @@ async fn v1_json_api_exposes_review_escape_hatches() {
             id.contains("nato-cat-composition").then_some(id.to_owned())
         })
         .expect("exercise draft");
-    let parent_id = approve_draft_v1(&app, &account, &exercise_draft_id);
+    let parent_id = keep_draft_v1(&app, &account, &exercise_draft_id);
     let parent_id = parent_id.await;
 
     let referenced = app
@@ -7748,9 +7796,21 @@ async fn v1_json_api_exposes_review_escape_hatches() {
         .expect("bridge");
     assert_eq!(bridged.status(), StatusCode::OK);
     let bridged = response_json(bridged).await;
-    let bridge_id = bridged["current"]["reviewUnitId"]
-        .as_str()
-        .expect("bridge id");
+    let bridge_draft_ids = bridged["drafts"]
+        .as_array()
+        .expect("bridge drafts")
+        .iter()
+        .filter_map(|draft| {
+            let id = draft["id"].as_str()?;
+            id.starts_with("bridge-").then_some(id.to_owned())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bridge_draft_ids.len(), 2);
+    assert!(bridged["current"].is_null(), "bridge candidates remain pending");
+    let mut bridge_id = String::new();
+    for draft_id in bridge_draft_ids {
+        bridge_id = keep_draft_v1(&app, &account, &draft_id).await;
+    }
     assert!(bridge_id.starts_with("bridge-"));
     assert_eq!(bridged["summary"]["attemptCount"], json!(0));
 
@@ -7890,11 +7950,11 @@ async fn duplicate_review_submit_does_not_double_count_attempts() {
         .clone()
         .oneshot(empty_request(
             "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
+            &format!("/accounts/{}/drafts/{draft_id}/keep", account.account_id),
             &account.session_token,
         ))
         .await
-        .expect("approve");
+        .expect("keep");
     let approved = response_json(approved).await;
     let review_unit_id = approved["current"]["reviewUnitId"]
         .as_str()
@@ -8023,11 +8083,11 @@ async fn review_submit_requires_an_idempotency_key() {
         .clone()
         .oneshot(empty_request(
             "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
+            &format!("/accounts/{}/drafts/{draft_id}/keep", account.account_id),
             &account.session_token,
         ))
         .await
-        .expect("approve");
+        .expect("keep");
     let approved = response_json(approved).await;
     let review_unit_id = approved["current"]["reviewUnitId"]
         .as_str()
@@ -8206,9 +8266,15 @@ async fn generate_source_v1_draft_ids(
 /// and drain it synchronously off the async runtime. Production
 /// (Postgres-backed) states reject the direct synchronous generate route with
 /// 409, so Postgres tests must set up scheduled cards through the same durable
-/// job path the deployed worker uses; the worker approves every accepted
+/// job path the deployed worker uses; the helper keeps every accepted
 /// draft as part of the job.
-async fn generate_source_queued(state: &ApiState, account_id: &str, source_id: &str, title: &str) {
+async fn generate_source_queued(
+    state: &ApiState,
+    account_id: &str,
+    session_token: &str,
+    source_id: &str,
+    title: &str,
+) {
     let blocking_state = state.clone();
     let account = account_id.to_owned();
     let source = source_id.to_owned();
@@ -8224,6 +8290,18 @@ async fn generate_source_queued(state: &ApiState, account_id: &str, source_id: &
     })
     .await
     .expect("queued generation drain");
+    let view = state
+        .study_view(account_id, session_token)
+        .expect("queued study view");
+    for draft in view.drafts.iter().filter(|draft| {
+        !draft.approved
+            && draft.learner_decision.is_none()
+            && draft.validation_status == GeneratedPromptValidationStatus::Accepted
+    }) {
+        state
+            .keep_draft(account_id, session_token, &draft.id)
+            .expect("keep queued generated draft");
+    }
     let succeeded = state
         .jobs_for_account_id(account_id)
         .iter()
@@ -8265,19 +8343,19 @@ async fn generate_source_v1_latest_draft(
         .to_owned()
 }
 
-async fn approve_draft_v1(app: &axum::Router, account: &TestAccount, draft_id: &str) -> String {
+async fn keep_draft_v1(app: &axum::Router, account: &TestAccount, draft_id: &str) -> String {
     let response = app
         .clone()
         .oneshot(v1_empty_request(
             "POST",
             &format!(
-                "/v1/accounts/{}/drafts/{draft_id}/approve",
+                "/v1/accounts/{}/drafts/{draft_id}/keep",
                 account.account_id
             ),
             &account.session_token,
         ))
         .await
-        .expect("approve draft");
+        .expect("keep draft");
     assert_eq!(response.status(), StatusCode::OK);
 
     response_json(response).await["current"]["reviewUnitId"]
@@ -8582,6 +8660,24 @@ fn form_escape(value: &str) -> String {
         .collect()
 }
 
+fn html_values(html: &str, name: &str) -> Vec<String> {
+    let marker = format!(r#"name="{name}" value=""#);
+    let mut values = Vec::new();
+    let mut remaining = html;
+    while let Some(start) = remaining.find(&marker) {
+        let value_start = start + marker.len();
+        let Some(end) = remaining[value_start..].find('"') else {
+            break;
+        };
+        let value = &remaining[value_start..value_start + end];
+        if !values.iter().any(|existing| existing == value) {
+            values.push(value.to_owned());
+        }
+        remaining = &remaining[value_start + end + 1..];
+    }
+    values
+}
+
 fn html_value(html: &str, name: &str) -> String {
     let marker = format!(r#"name="{name}" value=""#);
     let start = html.find(&marker).expect("field marker") + marker.len();
@@ -8676,21 +8772,18 @@ async fn submit_content_feedback_conflict(
 /// the workspace shows a finished activity-log row (a succeeded job with a
 /// card count, already scheduled for review) rather than a manual keep gate.
 /// `expected_cards` pins how many cards the generation scheduled.
-fn assert_activity_succeeded_html(body: &str, expected_cards: usize) {
+fn assert_activity_succeeded_html(body: &str, _expected_generated_cards: usize) {
     assert!(
         body.contains(r#"data-status="succeeded""#),
         "activity log must show a succeeded job: {body}"
     );
     assert!(
-        body.contains(&format!(
-            "{expected_cards} {} · scheduled for review",
-            if expected_cards == 1 { "card" } else { "cards" }
-        )),
-        "activity meta must report {expected_cards} cards scheduled for review: {body}"
+        body.contains("0 cards · pending your review"),
+        "generation activity must report zero scheduled cards before learner decisions: {body}"
     );
     assert!(body.contains(r#"<ul id="me-jobs""#));
-    // The keep gate is gone: no manual "Add all to reviews" / per-card Keep,
-    // and no raw generation internals leak into the learner-facing markup.
+    // Generation exposes candidates for explicit learner decisions; raw
+    // generation internals must not leak into learner-facing markup.
     assert_not_contains_any(
         body,
         &[
@@ -8707,7 +8800,6 @@ fn assert_activity_succeeded_html(body: &str, expected_cards: usize) {
         ],
     );
 }
-
 fn assert_due_review_html(body: &str, due_count: usize) {
     assert!(body.contains(&format!("{due_count} due")));
     assert!(body.contains("Reveal answer"));
@@ -8772,7 +8864,7 @@ fn management_answer_for_prompt(body: &str) -> &'static str {
 /// The *correct* answer for whichever `source_body` card the page is showing:
 /// the CAT spelling exercise expects "CHARLIE ALFA TANGO", the NATO-A quiz
 /// expects "ALFA". Lets a flow answer the current card correctly without
-/// pinning the queue order auto-approve leaves unspecified.
+/// pinning the queue order auto-keep leaves unspecified.
 fn correct_answer_for_prompt(body: &str) -> &'static str {
     if body.contains("Spell CAT over the phone") {
         "CHARLIE ALFA TANGO"
@@ -8862,6 +8954,7 @@ async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::A
     generate_source_queued(
         state,
         account.account_id(),
+        account.session_token(),
         &source.source_id,
         "Postgres recovery source",
     )
@@ -9008,11 +9101,11 @@ async fn prepare_review_unit(app: &axum::Router, account: &TestAccount) -> Strin
         .clone()
         .oneshot(empty_request(
             "POST",
-            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
+            &format!("/accounts/{}/drafts/{draft_id}/keep", account.account_id),
             &account.session_token,
         ))
         .await
-        .expect("approve");
+        .expect("keep");
     assert_eq!(approved.status(), StatusCode::OK);
     let approved = response_json(approved).await;
 
@@ -9548,13 +9641,13 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
         .expect("generate");
     let draft_id = generated.drafts.first().expect("draft").id.clone();
     state
-        .approve_draft(&account.account_id, &account.session_token, &draft_id)
-        .expect("approve");
+        .keep_draft(&account.account_id, &account.session_token, &draft_id)
+        .expect("keep");
 
     let due = state
         .next_review(&account.account_id, &account.session_token)
         .expect("next review");
-    let current = due.current.expect("approved unit is due");
+    let current = due.current.expect("kept unit is due");
     let review_unit_id = current.review_unit_id.to_string();
     let answered = state
         .submit_review(

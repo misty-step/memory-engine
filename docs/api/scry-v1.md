@@ -48,7 +48,7 @@ cargo run -p memory-engine-contract -- \
   --base-url https://memory-engine-api-i2xcr.ondigitalocean.app
 ```
 
-The runner creates a disposable source, generates drafts, approves the first
+The runner creates a disposable source, generates drafts, keeps the first
 draft, selects the next review, reveals the answer, submits that answer,
 archives the source, lists active sources, and emits a JSON receipt with the
 source absent from the active list.

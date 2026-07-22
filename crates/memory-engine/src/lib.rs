@@ -18,7 +18,7 @@ pub mod beta {
 
     pub mod persistence {
         pub use memory_engine_persistence::{
-            AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions, BetaPersistenceStore,
+            AppliedReviewReceipt, BetaPersistenceStore,
             BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot, ConceptReferenceNote,
             GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
             GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,

@@ -160,8 +160,8 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
             Err(error) => HttpResponse::bad_request(&error),
         },
         ("POST", "/generate") => response_for(request, generate_all_sources(session)),
-        ("POST", "/approve") => match read_required_string(&request.body, "draftId") {
-            Ok(draft_id) => response_for(request, session.approve_draft(&draft_id)),
+        ("POST", "/keep") => match read_required_string(&request.body, "draftId") {
+            Ok(draft_id) => response_for(request, session.keep_draft(&draft_id)),
             Err(error) => HttpResponse::bad_request(&error),
         },
         ("POST", "/learn-more" | "/current/learn-more") => {
@@ -864,7 +864,7 @@ fn render_feedback(html: &mut String, current: &BetaStudyCurrent) {
 fn render_summary(html: &mut String, view: &BetaStudyView) {
     html.push_str("<section class=\"panel\"><h2>State</h2><dl><dt>Sources</dt><dd>");
     html.push_str(&view.summary.source_count.to_string());
-    html.push_str("</dd><dt>Approved</dt><dd>");
+    html.push_str("</dd><dt>Keepd</dt><dd>");
     html.push_str(&view.summary.approved_review_unit_count.to_string());
     html.push_str("</dd><dt>Attempts</dt><dd>");
     html.push_str(&view.summary.attempt_count.to_string());
@@ -913,7 +913,7 @@ fn render_drafts(html: &mut String, view: &BetaStudyView) {
         html.push_str("<form method=\"post\" action=\"/approve\"><input type=\"hidden\" name=\"draftId\" value=\"");
         html.push_str(&escape_html(&draft.id));
         html.push_str(
-            "\"><button type=\"submit\" class=\"secondary\">Approve</button></form></li>",
+            "\"><button type=\"submit\" class=\"secondary\">Keep</button></form></li>",
         );
     }
     html.push_str("</ul></section>");
@@ -1059,16 +1059,16 @@ mod tests {
             json!("study-run-1-draft-src-nato-1-nato-letter-a")
         );
 
-        let approved = route(
+        let kept = route(
             &mut session,
             &request(
                 "POST",
-                "/approve",
+                "/keep",
                 &json!({"draftId": "study-run-1-draft-src-nato-1-nato-letter-a"}).to_string(),
             ),
         );
-        let approved: Value = serde_json::from_slice(&approved.body).expect("approved");
-        assert_eq!(approved["status"], json!("answering"));
+        let kept: Value = serde_json::from_slice(&approved.body).expect("kept");
+        assert_eq!(kept["status"], json!("answering"));
 
         let revealed = route(&mut session, &request("POST", "/reveal", "{}"));
         let revealed: Value = serde_json::from_slice(&revealed.body).expect("revealed");
@@ -1104,7 +1104,7 @@ mod tests {
             let directory = TempDirectory::new(&format!("json-timing-{index}"));
             let mut session = session(directory.path().join("study.json"));
             seed_nato_source_and_generate(&mut session);
-            approve_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
+            keep_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
 
             let answered = route(
                 &mut session,
@@ -1130,7 +1130,7 @@ mod tests {
         let directory = TempDirectory::new("honest-timing-markup");
         let mut session = session(directory.path().join("study.json"));
         seed_nato_source_and_generate(&mut session);
-        approve_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
+        keep_draft(&mut session, "study-run-1-draft-src-nato-1-nato-letter-a");
 
         let html = String::from_utf8(route(&mut session, &request("GET", "/", "")).body)
             .expect("review html");
@@ -1151,11 +1151,11 @@ mod tests {
         let directory = TempDirectory::new("lifecycle");
         let mut lifecycle_session = session(directory.path().join("study.json"));
         seed_nato_source_and_generate(&mut lifecycle_session);
-        approve_draft(
+        keep_draft(
             &mut lifecycle_session,
             "study-run-1-draft-src-nato-2-nato-cat-composition",
         );
-        approve_draft(
+        keep_draft(
             &mut lifecycle_session,
             "study-run-1-draft-src-nato-1-nato-letter-a",
         );
@@ -1202,7 +1202,7 @@ mod tests {
 
         let mut snooze_session = session(directory.path().join("snooze-study.json"));
         seed_nato_source_and_generate(&mut snooze_session);
-        approve_draft(
+        keep_draft(
             &mut snooze_session,
             "study-run-1-draft-src-nato-1-nato-letter-a",
         );
@@ -1503,7 +1503,7 @@ mod tests {
             &mut session,
             &request(
                 "POST",
-                "/approve",
+                "/keep",
                 &json!({"draftId": "study-run-1-draft-src-nato-1-nato-letter-a"}).to_string(),
             ),
         );
@@ -1837,12 +1837,12 @@ mod tests {
         route(session, &request("POST", "/generate", "{}"));
     }
 
-    fn approve_draft(session: &mut BetaStudySession, draft_id: &str) {
+    fn keep_draft(session: &mut BetaStudySession, draft_id: &str) {
         route(
             session,
             &request(
                 "POST",
-                "/approve",
+                "/keep",
                 &json!({"draftId": draft_id}).to_string(),
             ),
         );

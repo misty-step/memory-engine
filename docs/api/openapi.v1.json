@@ -304,8 +304,8 @@
           }
         ],
         "responses": {
-          "202": {
-            "description": "Generation job accepted",
+          "200": {
+            "description": "Existing in-flight generation job",
             "content": {
               "application/json": {
                 "schema": {
@@ -314,8 +314,8 @@
               }
             }
           },
-          "200": {
-            "description": "Existing in-flight generation job",
+          "202": {
+            "description": "Generation job accepted",
             "content": {
               "application/json": {
                 "schema": {
@@ -376,31 +376,6 @@
           },
           "503": {
             "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/accounts/{account_id}/drafts/{draft_id}/approve": {
-      "post": {
-        "summary": "Keep one generated draft as a review unit",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/AccountId"
-          },
-          {
-            "$ref": "#/components/parameters/DraftId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Study view with current review when due",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StudyViewResponse"
-                }
-              }
-            }
           }
         }
       }
@@ -695,6 +670,91 @@
           }
         }
       }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/keep": {
+      "post": {
+        "summary": "Keep one generated draft as a review unit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/edit": {
+      "post": {
+        "summary": "Edit and keep one generated draft as a review unit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditDraftRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/reject": {
+      "post": {
+        "summary": "Reject one generated draft without scheduling it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -943,7 +1003,13 @@
           },
           "status": {
             "type": "string",
-            "enum": ["queued", "running", "retry", "succeeded", "failed"]
+            "enum": [
+              "queued",
+              "running",
+              "retry",
+              "succeeded",
+              "failed"
+            ]
           },
           "cardCount": {
             "type": "integer",
@@ -957,7 +1023,10 @@
             "type": "boolean"
           },
           "error": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "createdAt": {
             "type": "integer"
@@ -1033,16 +1102,25 @@
         "properties": {
           "verdict": {
             "type": "string",
-            "enum": ["kept", "dropped"]
+            "enum": [
+              "kept",
+              "dropped"
+            ]
           },
           "rationale": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "idempotencyKey": {
             "type": "string"
           },
           "supersedesId": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -1057,14 +1135,43 @@
           "occurredAt"
         ],
         "properties": {
-          "id": {"type": "string"},
-          "reviewUnitId": {"type": "string"},
-          "verdict": {"type": "string", "enum": ["kept", "dropped"]},
-          "rationale": {"type": ["string", "null"]},
-          "source": {"type": "string", "enum": ["human"]},
-          "accountId": {"type": "string"},
-          "occurredAt": {"type": "integer"},
-          "supersedesId": {"type": ["string", "null"]}
+          "id": {
+            "type": "string"
+          },
+          "reviewUnitId": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "kept",
+              "dropped"
+            ]
+          },
+          "rationale": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "human"
+            ]
+          },
+          "accountId": {
+            "type": "string"
+          },
+          "occurredAt": {
+            "type": "integer"
+          },
+          "supersedesId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       },
       "StudyViewResponse": {
@@ -1621,6 +1728,22 @@
         ],
         "properties": {
           "error": {
+            "type": "string"
+          }
+        }
+      },
+      "EditDraftRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt",
+          "expectedAnswer"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string"
+          },
+          "expectedAnswer": {
             "type": "string"
           }
         }
