@@ -31,8 +31,8 @@ use memory_engine_api_render::{
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
     render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
-    LEDGER_CSS,
+    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions,
+    ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
@@ -1049,8 +1049,33 @@ async fn create_app_waitlist(
 
     no_store_response(match result {
         Ok(()) => Html(render_waitlist_joined()).into_response(),
-        Err(error) => app_failure_response(error),
+        Err(error) => waitlist_failure_response(&error),
     })
+}
+
+fn waitlist_failure_response(error: &ApiFailure) -> Response {
+    let status = match error.status() {
+        StatusCode::BAD_REQUEST => StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let (title, message) = match status {
+        StatusCode::BAD_REQUEST => (
+            "Check the email address",
+            "That email address is not valid. Check it and try again.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Please try again later",
+            "We’re taking a short break from new joins. Please wait a little while, then try again.",
+        ),
+        _ => (
+            "We couldn’t save that",
+            "We couldn’t save your request right now. Please try again shortly.",
+        ),
+    };
+    let mut response = Html(render_waitlist_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    response
 }
 
 fn admin_token_from_headers(headers: &HeaderMap) -> &str {
