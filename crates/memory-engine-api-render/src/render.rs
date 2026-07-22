@@ -428,6 +428,28 @@ pub fn render_waitlist_joined() -> String {
 }
 
 #[must_use]
+pub fn render_waitlist_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Waitlist</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<section class="ae-group me-capture-hero">
+<form action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-recovery-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button" type="submit">Try again</button></div>
+</form>
+</section>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
+#[must_use]
 pub fn render_auth_recovery(title: &str, message: &str) -> String {
     let view = format!(
         r#"<div class="me-cover">

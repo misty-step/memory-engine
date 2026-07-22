@@ -166,7 +166,7 @@ async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
     assert!(body.contains(r#"placeholder="you@example.com""#));
     assert!(body.contains("Get started"));
     assert!(body.contains("Scry"));
-    assert!(body.contains("Remember everything."));
+    assert!(body.contains("Remember everything"));
     // Regression: the anonymous home must NOT offer the guest capture form,
     // which dead-ends on the account allowlist ("not allowed to register").
     assert!(!body.contains(r#"action="/app/start""#));
@@ -8687,6 +8687,38 @@ fn assert_no_store_and_no_referrer(response: &axum::response::Response) {
     );
 }
 
+async fn assert_waitlist_recovery_response(
+    response: axum::response::Response,
+    expected_status: StatusCode,
+    submitted_email: &str,
+) -> String {
+    assert_eq!(response.status(), expected_status);
+    assert_no_store_and_no_referrer(&response);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = response_text(response).await;
+    assert!(body.contains("Scry"));
+    assert!(body.contains("Remember everything"));
+    assert!(body.contains("Try again"));
+    assert!(body.contains("Back to start"));
+    assert!(body.contains(r#"action="/app/waitlist" method="post""#));
+    assert!(!body.contains("{\"error\":"));
+    assert!(!body.contains(submitted_email));
+    let lower = body.to_ascii_lowercase();
+    for forbidden in ["allowlist", "registered", "account state", "invite state"] {
+        assert!(
+            !lower.contains(forbidden),
+            "waitlist recovery must not reveal {forbidden}: {body}"
+        );
+    }
+    body
+}
+
 fn read_return_notification_preference(store_root: &FsPath) -> String {
     fs::read_dir(store_root)
         .expect("store root")
@@ -10483,7 +10515,9 @@ async fn waitlist_join_rejects_malformed_email_without_persisting() {
         ))
         .await
         .expect("malformed join");
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let rejected_body =
+        assert_waitlist_recovery_response(rejected, StatusCode::BAD_REQUEST, "not-an-email").await;
+    assert!(!rejected_body.to_ascii_lowercase().contains("allowlist"));
 
     let admin_request = Request::builder()
         .method("GET")
@@ -10494,6 +10528,34 @@ async fn waitlist_join_rejects_malformed_email_without_persisting() {
     let listed = app.oneshot(admin_request).await.expect("admin list");
     let entries = response_json(listed).await;
     assert!(entries.as_array().expect("waitlist array").is_empty());
+}
+
+#[tokio::test]
+async fn waitlist_storage_failure_renders_branded_503_without_leaking_email() {
+    let store_root = temp_store_root("waitlist-storage-failure");
+    fs::create_dir_all(&store_root).expect("storage failure root");
+    // A directory at the waitlist file path makes the real file store return an
+    // I/O error without mocking the storage boundary or touching unrelated state.
+    fs::create_dir_all(store_root.join("_waitlist.json")).expect("blocking waitlist path");
+    let app = router(ApiState::new(AccountRegistry::with_store_root(&store_root)));
+
+    let response = app
+        .oneshot(form_request(
+            "POST",
+            "/app/waitlist",
+            &[("email", "storage-failure@example.com")],
+        ))
+        .await
+        .expect("storage failure response");
+
+    let body = assert_waitlist_recovery_response(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "storage-failure@example.com",
+    )
+    .await;
+    assert!(!body.contains("Is a directory"));
+    assert!(!body.contains("waitlist store"));
 }
 
 #[tokio::test]
@@ -10525,7 +10587,12 @@ async fn waitlist_rate_limits_by_email_and_ip() {
         ))
         .await
         .expect("email limited");
-    assert_eq!(same_email_new_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+    let _ = assert_waitlist_recovery_response(
+        same_email_new_ip,
+        StatusCode::TOO_MANY_REQUESTS,
+        "quota@example.com",
+    )
+    .await;
 
     let same_ip_new_email = app
         .oneshot(form_request_with_ip(
