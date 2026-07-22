@@ -81,7 +81,7 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     );
     assert_eq!(init["result"]["serverInfo"]["name"], "memory-engine");
 
-    // 2. tools/list — six agent-intent tools, not REST-route echoes.
+    // 2. tools/list — nine agent-intent tools, including explicit draft decisions.
     let list = rpc(
         &mut stdin,
         &rx,
@@ -96,12 +96,11 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(tool_names.len(), 6);
+    assert_eq!(tool_names.len(), 9);
     assert!(tool_names.contains(&"create_deck".to_owned()));
 
-    // 3. create_deck — one call composes save+generate+keep; the deck is
-    //    immediately due, proving the tool is intent-shaped, not a 1:1 wrapper
-    //    around POST /project-decks.
+    // 3. create_deck — save+generate leaves accepted drafts pending for
+    //    explicit learner decisions rather than silently scheduling them.
     let deck_body = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\n\
          Question: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\n\
          Distractors: BRAVO, CHARLIE\n\
@@ -119,38 +118,55 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         }),
     );
     let deck_payload = tool_payload(&created_deck);
-    assert!(
-        deck_payload["keptCardCount"].as_u64().unwrap_or(0) >= 1,
-        "create_deck must generate and keep at least one card: {deck_payload}"
-    );
+    let pending_draft = deck_payload["pendingDrafts"]
+        .as_array()
+        .and_then(|drafts| drafts.first())
+        .expect("pending draft");
+    assert!(pending_draft["sourceSpans"].is_array());
+    assert!(pending_draft["provenance"].is_object());
+    let pending_draft_id = pending_draft["id"]
+        .as_str()
+        .expect("pending draft id")
+        .to_owned();
     let deck_id = deck_payload["deck"]["deckId"]
         .as_str()
         .expect("deckId")
         .to_owned();
 
-    // 4. list_decks — the new deck is visible, scoped to its project_key.
-    let listed_decks = call_tool(
+    // 4. keep_draft — only the explicit keep promotes one accepted draft.
+    let kept = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
         4,
+        "keep_draft",
+        &json!({"draft_id": pending_draft_id}),
+    );
+    assert!(tool_payload(&kept)["drafts"].is_array());
+
+    // 5. list_decks — the new deck is visible, scoped to its project_key.
+    let listed_decks = call_tool(
+        &mut stdin,
+        &rx,
+        &mut transcript,
+        5,
         "list_decks",
         &json!({"project_key": "nato-onboarding"}),
     );
     let listed_decks_payload = tool_payload(&listed_decks);
     assert_eq!(listed_decks_payload.as_array().map(Vec::len), Some(1));
 
-    // 5. list_due — a lightweight status check before committing to review.
-    let due = call_tool(&mut stdin, &rx, &mut transcript, 5, "list_due", &json!({}));
+    // 6. list_due — the explicitly kept card is now due.
+    let due = call_tool(&mut stdin, &rx, &mut transcript, 6, "list_due", &json!({}));
     let due_payload = tool_payload(&due);
     assert_eq!(due_payload["dueCount"], 1);
 
-    // 6. review_next — full detail needed to actually answer.
+    // 7. review_next — full detail needed to actually answer.
     let next = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        6,
+        7,
         "review_next",
         &json!({}),
     );
@@ -164,12 +180,12 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         .unwrap_or_default()
         .contains("NATO phonetic alphabet word for A"));
 
-    // 7. submit_answer — grades the card and advances the schedule.
+    // 8. submit_answer — grades the card and advances the schedule.
     let submitted = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        7,
+        8,
         "submit_answer",
         &json!({"review_unit_id": review_unit_id, "answer": "ALFA"}),
     );
@@ -177,12 +193,12 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     assert_eq!(submitted_payload["current"]["grade"]["verdict"], "correct");
     assert_eq!(submitted_payload["dueCount"], 0);
 
-    // 8. invalidate_deck — retires the deck; due count stays at 0.
+    // 9. invalidate_deck — retires the deck; due count stays at 0.
     let invalidated = call_tool(
         &mut stdin,
         &rx,
         &mut transcript,
-        8,
+        9,
         "invalidate_deck",
         &json!({"deck_id": deck_id, "event": "onboarding project closed"}),
     );
@@ -195,8 +211,8 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
     server.abort();
 
     assert!(
-        transcript.len() >= 8,
-        "expected at least 8 request/response pairs in the transcript, got {}",
+        transcript.len() >= 9,
+        "expected at least 9 request/response pairs in the transcript, got {}",
         transcript.len()
     );
 }

@@ -22,8 +22,23 @@ pub struct ToolDef {
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_deck",
-        description: "Capture material as a project-scoped study deck: saves the text, generates review cards from it, and keeps every accepted card so the deck is immediately due for study. Use project_key to group decks by the project/source they came from, so the whole deck can be invalidated later in one call when that material goes stale.",
+        description: "Capture material as a project-scoped study deck and generate review drafts that remain pending until you explicitly keep, edit, or reject them. Use project_key to group decks by project/source so the whole deck can be invalidated when material goes stale.",
         input_schema: r#"{"type":"object","required":["project_key","title","body"],"properties":{"project_key":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"ttl_expires_at":{"type":"integer","description":"Optional epoch-ms expiry after which the deck is eligible for cleanup."}}}"#,
+    },
+    ToolDef {
+        name: "keep_draft",
+        description: "Keep one accepted generated draft after inspecting its source-grounded provenance; only this explicit decision makes it due for study.",
+        input_schema: r#"{"type":"object","required":["draft_id"],"properties":{"draft_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "edit_draft",
+        description: "Edit one accepted generated draft's prompt and expected answer, then keep the edited card for study.",
+        input_schema: r#"{"type":"object","required":["draft_id","prompt","expected_answer"],"properties":{"draft_id":{"type":"string"},"prompt":{"type":"string"},"expected_answer":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "reject_draft",
+        description: "Reject one accepted generated draft; the terminal decision is exported and never scheduled.",
+        input_schema: r#"{"type":"object","required":["draft_id"],"properties":{"draft_id":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_decks",
@@ -128,9 +143,26 @@ pub fn call_tool(client: &MemoryEngineClient, name: &str, args: &Value) -> Resul
             let title = required_str(args, "title")?;
             let body = required_str(args, "body")?;
             let ttl_expires_at = args["ttl_expires_at"].as_i64();
-            let (deck, kept_count) =
+            let (deck, pending_drafts) =
                 client.create_deck(project_key, title, body, ttl_expires_at)?;
-            json!({ "deck": deck, "keptCardCount": kept_count })
+            json!({
+                "deck": deck,
+                "pendingDrafts": pending_drafts,
+            })
+        }
+        "keep_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            json!(client.keep_draft(draft_id)?)
+        }
+        "edit_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            let prompt = required_str(args, "prompt")?;
+            let expected_answer = required_str(args, "expected_answer")?;
+            json!(client.edit_draft(draft_id, prompt, expected_answer)?)
+        }
+        "reject_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            json!(client.reject_draft(draft_id)?)
         }
         "list_decks" => {
             let project_key = args["project_key"].as_str();
@@ -198,7 +230,7 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 6);
+        assert_eq!(TOOLS.len(), 9);
         assert!(names.contains(&"create_deck"));
         assert!(names.contains(&"list_decks"));
         assert!(names.contains(&"invalidate_deck"));

@@ -930,12 +930,57 @@ impl BetaPersistenceStore {
     /// Returns [`BetaStoreError`] when the rollback cannot be committed.
     pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), BetaStoreError> {
         self.transact(|snapshot| {
+            // Keep a draft that was explicitly decided while the worker lease
+            // was being fenced. The learner action committed under this same
+            // file lock, so removing only undecided output cannot orphan its
+            // review unit or provenance.
+            let stale_draft_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| {
+                    draft.generation_run_id.as_deref() == Some(run_id)
+                        && draft.learner_decision.is_none()
+                })
+                .map(|draft| draft.id.clone())
+                .collect::<BTreeSet<_>>();
+            let stale_reference_span_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| stale_draft_ids.contains(&draft.id))
+                .flat_map(|draft| draft.reference_span_ids.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            snapshot.review_units.retain(|unit| {
+                unit.generated_prompt_draft_id
+                    .as_ref()
+                    .is_none_or(|draft_id| !stale_draft_ids.contains(draft_id))
+            });
             snapshot
                 .generated_prompt_drafts
-                .retain(|draft| draft.generation_run_id.as_deref() != Some(run_id));
-            snapshot
-                .generation_runs
-                .retain(|run| run.id.as_str() != run_id);
+                .retain(|draft| !stale_draft_ids.contains(&draft.id));
+            let run_still_has_decided_draft = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|draft| draft.generation_run_id.as_deref() == Some(run_id));
+            if !run_still_has_decided_draft {
+                snapshot
+                    .generation_runs
+                    .retain(|run| run.id.as_str() != run_id);
+            }
+            let referenced_span_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .flat_map(|draft| draft.reference_span_ids.iter().cloned())
+                .chain(
+                    snapshot
+                        .review_units
+                        .iter()
+                        .flat_map(|unit| unit.reference_span_ids.iter().cloned()),
+                )
+                .collect::<BTreeSet<_>>();
+            snapshot.reference_spans.retain(|span| {
+                !stale_reference_span_ids.contains(&span.id)
+                    || referenced_span_ids.contains(&span.id)
+            });
             Ok(())
         })
     }

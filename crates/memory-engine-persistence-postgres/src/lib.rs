@@ -3255,16 +3255,82 @@ impl AccountStudyStore<'_> {
     pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
-            transaction.execute(
-                "DELETE FROM memory_engine_generated_prompt_drafts
-                 WHERE account_id = $1 AND draft->>'generationRunId' = $2",
+            // Keep a draft that was explicitly decided while the worker lease
+            // was being fenced. The advisory transaction lock serializes this
+            // rollback with learner keep/edit/reject decisions on every replica.
+            let stale = transaction.query(
+                "SELECT draft_id, review_unit_id, draft->'referenceSpanIds'
+                 FROM memory_engine_generated_prompt_drafts
+                 WHERE account_id = $1
+                   AND draft->>'generationRunId' = $2
+                   AND draft->'learnerDecision' IS NULL",
                 &[&account_id, &run_id],
             )?;
-            transaction.execute(
-                "DELETE FROM memory_engine_generation_runs
-                 WHERE account_id = $1 AND generation_run_id = $2",
-                &[&account_id, &run_id],
-            )?;
+            let mut stale_draft_ids = Vec::with_capacity(stale.len());
+            let mut stale_reference_span_ids = std::collections::BTreeSet::new();
+            for row in stale {
+                let draft_id: String = row.get(0);
+                let review_unit_id: String = row.get(1);
+                let references: serde_json::Value = row.get(2);
+                stale_draft_ids.push(draft_id);
+                for reference in references.as_array().into_iter().flatten() {
+                    if let Some(reference_id) = reference.as_str() {
+                        stale_reference_span_ids.insert(reference_id.to_owned());
+                    }
+                }
+                transaction.execute(
+                    "DELETE FROM memory_engine_review_units
+                     WHERE account_id = $1 AND review_unit_id = $2",
+                    &[&account_id, &review_unit_id],
+                )?;
+            }
+            for draft_id in &stale_draft_ids {
+                transaction.execute(
+                    "DELETE FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1 AND draft_id = $2",
+                    &[&account_id, draft_id],
+                )?;
+            }
+            let run_has_decided_draft = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1 AND draft->>'generationRunId' = $2
+                     LIMIT 1",
+                    &[&account_id, &run_id],
+                )?
+                .is_some();
+            if !run_has_decided_draft {
+                transaction.execute(
+                    "DELETE FROM memory_engine_generation_runs
+                     WHERE account_id = $1 AND generation_run_id = $2",
+                    &[&account_id, &run_id],
+                )?;
+            }
+            for reference_id in stale_reference_span_ids {
+                let referenced_by_draft = transaction
+                    .query_opt(
+                        "SELECT 1 FROM memory_engine_generated_prompt_drafts
+                         WHERE account_id = $1 AND draft->'referenceSpanIds' ? $2
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                let referenced_by_review = transaction
+                    .query_opt(
+                        "SELECT 1 FROM memory_engine_review_units
+                         WHERE account_id = $1 AND record->'referenceSpanIds' ? $2
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                if !referenced_by_draft && !referenced_by_review {
+                    transaction.execute(
+                        "DELETE FROM memory_engine_reference_spans
+                         WHERE account_id = $1 AND reference_span_id = $2",
+                        &[&account_id, &reference_id],
+                    )?;
+                }
+            }
             Ok(())
         })
     }
@@ -5206,6 +5272,123 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres store contract");
+    }
+
+    #[test]
+    fn live_postgres_generation_discard_serializes_with_second_instance_keep() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres generation race; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_race_{}_{}",
+            std::process::id(),
+            NOW + 2
+        );
+        let mut admin =
+            crate::connect_client(&database_url).expect("connect generation race admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create generation race schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-race");
+            let reference = reference_span("reference-generation-race", &source.id);
+            let draft = accepted_draft(
+                "draft-generation-race",
+                &ReviewUnitId::new("unit-generation-race"),
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-race"),
+            );
+            let run = generation_run("run-generation-race", &[&source.id], &[&draft.id]);
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-generation-race")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+            }
+            drop(setup);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let draft_id = draft.id.clone();
+            let run_id = run.id.clone();
+            let keep_url = scoped_url.clone();
+            let discard_url = scoped_url.clone();
+            let (keep_result, discard_result) = std::thread::scope(|scope| {
+                let keep_barrier = barrier.clone();
+                let keep = scope.spawn(move || -> Result<_, super::PostgresStoreError> {
+                    let mut store = super::PostgresStudyStore::connect(&keep_url)?;
+                    let mut account = store.for_account(AccountScope::new("acct-generation-race")?);
+                    keep_barrier.wait();
+                    account.keep_generated_prompt_draft(&draft_id, NOW)
+                });
+                let discard_barrier = barrier;
+                let discard = scope.spawn(move || -> Result<(), super::PostgresStoreError> {
+                    let mut store = super::PostgresStudyStore::connect(&discard_url)?;
+                    let mut account = store.for_account(AccountScope::new("acct-generation-race")?);
+                    discard_barrier.wait();
+                    account.discard_generation_run(&run_id)
+                });
+                (
+                    keep.join().expect("keep race thread"),
+                    discard.join().expect("discard race thread"),
+                )
+            });
+            assert!(
+                discard_result.is_ok(),
+                "discard race must commit: {discard_result:?}"
+            );
+            assert!(
+                keep_result.is_ok()
+                    || matches!(
+                        keep_result,
+                        Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))
+                    ),
+                "keep race must either win or observe an atomic discard: {keep_result:?}"
+            );
+
+            let mut verify = super::PostgresStudyStore::connect(&scoped_url)?;
+            let account = verify.for_account(AccountScope::new("acct-generation-race")?);
+            let snapshot = account.snapshot()?;
+            let draft_present = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|item| item.id == draft.id);
+            let unit_present = snapshot
+                .review_units
+                .iter()
+                .any(|item| item.review_unit_id == draft.review_unit_id);
+            let run_present = snapshot
+                .generation_runs
+                .iter()
+                .any(|item| item.id == run.id);
+            let reference_present = snapshot
+                .reference_spans
+                .iter()
+                .any(|item| item.id == reference.id);
+            assert_eq!(
+                (draft_present, unit_present, run_present, reference_present),
+                (
+                    keep_result.is_ok(),
+                    keep_result.is_ok(),
+                    keep_result.is_ok(),
+                    keep_result.is_ok()
+                ),
+                "race rollback must preserve or remove the complete provenance closure",
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop generation race schema");
+        result.expect("generation discard race contract");
     }
 
     #[test]

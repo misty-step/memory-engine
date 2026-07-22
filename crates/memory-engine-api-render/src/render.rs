@@ -1055,11 +1055,9 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
         JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
-        JobStatus::Succeeded => format!(
-            "{} scheduled {} · pending your review",
-            job.card_count,
-            plural(job.card_count, "card", "cards")
-        ),
+        JobStatus::Succeeded => {
+            "Generation succeeded; accepted drafts are pending your review.".to_owned()
+        }
         JobStatus::Failed => escape_html(
             job.error
                 .as_deref()

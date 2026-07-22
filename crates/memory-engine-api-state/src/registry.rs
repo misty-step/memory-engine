@@ -958,13 +958,6 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
-    /// Run a queued generation job end to end on a worker thread. Accepted
-    /// drafts remain pending until the learner explicitly keeps or edits them.
-    /// Returns how many accepted pending drafts were generated.
-    ///
-    /// Session-free by design — enqueueing was already authorized in the request
-    /// that created the job, and the background worker is trusted, so it keys off
-    /// the account id alone rather than carrying a credential.
     fn postgres_generation_lease_is_valid(
         &self,
         account_id: &str,
@@ -988,6 +981,17 @@ impl AccountRegistry {
         })
     }
 
+    /// Runs a queued generation job end to end on a worker thread. Accepted
+    /// drafts remain pending until the learner explicitly keeps or edits them.
+    /// Returns the scheduled review-card count, which is zero until a decision
+    /// promotes a draft.
+    ///
+    /// Session-free by design — enqueueing was already authorized in the request
+    /// that created the job, and the background worker is trusted, so it keys off
+    /// the account id alone rather than carrying a credential.
+    /// # Errors
+    ///
+    /// Returns an API failure when auth, storage, or study state rejects the operation.
     pub(crate) fn run_generation_job(
         &self,
         account_id: &str,
@@ -1006,9 +1010,16 @@ impl AccountRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
+        let discard_stale = || {
+            if let Err(error) = storage.discard_generation_run(account_id, &store_path, run_id) {
+                eprintln!(
+                    "failed to discard stale generation run {run_id} for {account_id}: {error:?}"
+                );
+            }
+        };
         storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
         if !lease_valid() {
-            let _ = storage.discard_generation_run(account_id, &store_path, run_id);
+            discard_stale();
             return Err(ApiFailure::conflict(
                 "Generation lease lost before cards could be committed.",
             ));
@@ -1021,13 +1032,13 @@ impl AccountRegistry {
         ) {
             Ok(true) => {}
             Ok(false) => {
-                let _ = storage.discard_generation_run(account_id, &store_path, run_id);
+                discard_stale();
                 return Err(ApiFailure::conflict(
                     "Generation lease lost before cards could be committed.",
                 ));
             }
             Err(error) => {
-                let _ = storage.discard_generation_run(account_id, &store_path, run_id);
+                discard_stale();
                 return Err(error);
             }
         }
@@ -1127,6 +1138,8 @@ impl AccountRegistry {
         expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
+        let prompt = normalize_required_text(prompt, "Learner prompt")?;
+        let expected_answer = normalize_required_text(expected_answer, "Learner expected answer")?;
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
@@ -1135,8 +1148,8 @@ impl AccountRegistry {
             account_id,
             &account.store_path,
             draft_id,
-            prompt,
-            expected_answer,
+            &prompt,
+            &expected_answer,
         )
     }
 

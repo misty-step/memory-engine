@@ -593,8 +593,7 @@
       case "retry":
         return "Retrying after a temporary failure…";
       case "succeeded":
-        var n = job.cardCount || 0;
-        return n + " " + (n === 1 ? "card" : "cards") + " · pending your review";
+        return "Generation succeeded; accepted drafts are pending your review.";
       case "failed":
         return job.error || "Generation failed. Try again.";
       default:

@@ -366,22 +366,19 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
 
 #[tokio::test]
 async fn signed_in_home_surfaces_review_cta_after_generation() {
-    // Regression: a learner who generated cards could see "scheduled for
-    // review" in the activity log but had no way to start reviewing. Two gaps
-    // fed it. Workspace re-renders passed no study view, so the header read
-    // "0 due" and the "Start review" button — gated on due_count > 0 — never
-    // rendered. And GET / ignored the session entirely, always serving the
-    // signed-out cover. After draining a real generation job, the signed-in
-    // workspace must surface the due count and Start review CTA on both the
-    // POST refresh and a plain GET /.
+    // Regression: a learner who generated drafts could see pending material in
+    // the activity log but had no way to inspect or explicitly keep it. Workspace
+    // re-renders must preserve the signed-in session, expose the pending draft
+    // decision controls, and show the due count only after this helper explicitly
+    // keeps the accepted drafts through the learner action route.
     let state = ApiState::default();
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
 
-    // Generate from the seeded source and drain the queue: real generation,
-    // auto-keep, cards scheduled immediately due. The helper returns the
-    // refreshed workspace, which fetches the live study view — so the due
-    // callout and Start review CTA appear, not "0 due" and not the cover.
+    // Generate from the seeded source and drain the queue: real generation leaves
+    // accepted drafts pending. The helper then explicitly keeps each draft and
+    // reloads the live study view, so the due callout and Start review CTA appear
+    // only after the learner decision, not from generation itself.
     let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert!(
         workspace.contains("Start review"),
@@ -8342,9 +8339,9 @@ async fn generate_source_v1_draft_ids(
 /// Generate through the production queued workflow: enqueue the durable job
 /// and drain it synchronously off the async runtime. Production
 /// (Postgres-backed) states reject the direct synchronous generate route with
-/// 409, so Postgres tests must set up scheduled cards through the same durable
-/// job path the deployed worker uses; the helper keeps every accepted
-/// draft as part of the job.
+/// 409, so Postgres tests use the same durable job path as the deployed worker.
+/// Generation leaves accepted drafts pending; this helper explicitly keeps each
+/// accepted draft through the learner decision API before assertions inspect due cards.
 async fn generate_source_queued(
     state: &ApiState,
     account_id: &str,
@@ -8876,17 +8873,17 @@ async fn submit_content_feedback_conflict(
 }
 
 /// The async-model successor to `assert_keep_flow_html`: after a job drains,
-/// the workspace shows a finished activity-log row (a succeeded job with a
-/// card count, already scheduled for review) rather than a manual keep gate.
-/// `expected_cards` pins how many cards the generation scheduled.
+/// the workspace shows a finished activity-log row while accepted drafts remain
+/// pending explicit learner decisions.
+/// `_expected_generated_cards` is retained by existing callers for fixture clarity.
 fn assert_activity_succeeded_html(body: &str, _expected_generated_cards: usize) {
     assert!(
         body.contains(r#"data-status="succeeded""#),
         "activity log must show a succeeded job: {body}"
     );
     assert!(
-        body.contains("0 scheduled cards · pending your review"),
-        "generation activity must report zero scheduled cards before learner decisions: {body}"
+        body.contains("Generation succeeded; accepted drafts are pending your review."),
+        "generation activity must report accepted drafts pending learner decisions: {body}"
     );
     assert!(body.contains(r#"<ul id="me-jobs""#));
     // Generation exposes candidates for explicit learner decisions; raw

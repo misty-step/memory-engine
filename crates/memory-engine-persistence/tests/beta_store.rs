@@ -1226,6 +1226,45 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
             ))
             .expect("generation run");
     }
+    let stale_reference = store
+        .save_reference_span(reference_span("stale-reference", &source.id))
+        .expect("stale reference");
+    let stale_draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "stale-draft",
+            "stale-unit",
+            &[source.id.as_str()],
+            &[stale_reference.id.as_str()],
+            Some("stale-run"),
+        ))
+        .expect("stale draft");
+    store
+        .save_generation_run(generation_run(
+            "stale-run",
+            &[source.id.as_str()],
+            &[stale_draft.id.as_str()],
+        ))
+        .expect("stale run");
+    store
+        .discard_generation_run("stale-run")
+        .expect("discard stale run");
+    store
+        .discard_generation_run("stale-run")
+        .expect("repeat stale discard");
+    let after_discard = store.snapshot();
+    assert!(!after_discard
+        .generated_prompt_drafts
+        .iter()
+        .any(|draft| draft.id == stale_draft.id));
+    assert!(!after_discard
+        .generation_runs
+        .iter()
+        .any(|run| run.id == "stale-run"));
+    assert!(!after_discard
+        .reference_spans
+        .iter()
+        .any(|span| span.id == stale_reference.id));
+
     let pending = store.snapshot();
     assert!(
         pending.review_units.is_empty(),

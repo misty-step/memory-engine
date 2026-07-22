@@ -111,6 +111,8 @@ pub struct GenerationJob {
     pub source_id: String,
     pub title: String,
     pub status: JobStatus,
+    /// Number of scheduled review cards created by this job. Trust-gated
+    /// generation leaves this at zero until a learner keeps or edits a draft.
     pub card_count: usize,
     pub attempts: u32,
     /// False once the bounded attempt budget is exhausted. This is sent over
