@@ -2551,7 +2551,11 @@ impl AccountStudyStore<'_> {
             let run_id = draft.generation_run_id.as_ref().ok_or(PostgresStoreError::MissingGenerationRunForAcceptedDraft)?;
             let run_exists = transaction
                 .query_opt(
-                    "SELECT 1 FROM memory_engine_generation_runs WHERE account_id = $1 AND generation_run_id = $2",
+                    "SELECT 1
+                     FROM memory_engine_generation_runs
+                     WHERE account_id = $1 AND generation_run_id = $2
+                       AND (run->>'status' = 'finalized'
+                            OR (run->>'status' IS NULL AND (run->>'completedAt') IS NOT NULL))",
                     &[&account_id, run_id],
                 )?
                 .is_some();
@@ -3262,6 +3266,25 @@ impl AccountStudyStore<'_> {
         })
     }
 
+    /// Mark a queued generation run pending until its worker lease fence commits.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when the transaction cannot be committed.
+    pub fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE memory_engine_generation_runs
+                 SET run = jsonb_set(
+                     jsonb_set(run, '{completedAt}', 'null'::JSONB, true),
+                     '{status}', '\"pending\"'::JSONB, true)
+                 WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
+                &[&account_id, &run_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Atomically fence a generation attempt and remove its complete stale
     /// output closure when the lease is no longer owned.
     ///
@@ -3281,10 +3304,9 @@ impl AccountStudyStore<'_> {
     ) -> Result<bool, PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
-            let owns_lease = lease_valid
-                && transaction
-                    .query_opt(
-                        "SELECT 1
+            let lease_row = if lease_valid {
+                transaction.query_opt(
+                    "SELECT attempt.job_id
                          FROM memory_engine_generation_job_attempts attempt
                          JOIN memory_engine_generation_jobs job
                            ON job.account_id = attempt.account_id
@@ -3300,11 +3322,57 @@ impl AccountStudyStore<'_> {
                            AND job.lease_expires_at_ms > $5::BIGINT
                          FOR UPDATE OF attempt, job
                          LIMIT 1",
-                        &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
-                    )?
-                    .is_some();
-            if owns_lease {
-                return Ok(true);
+                    &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
+                )?
+            } else {
+                None
+            };
+            if let Some(lease_row) = lease_row {
+                let job_id: String = lease_row.get(0);
+                let updated = transaction.execute(
+                    "UPDATE memory_engine_generation_runs
+                     SET run = jsonb_set(
+                         jsonb_set(run, '{completedAt}', to_jsonb($3::BIGINT), true),
+                         '{status}', '\"finalized\"'::JSONB, true)
+                     WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
+                    &[&account_id, &run_id, &now_ms],
+                )?;
+                if updated != 1 {
+                    return Ok(false);
+                }
+                let attempt_updated = transaction.execute(
+                    "UPDATE memory_engine_generation_job_attempts
+                     SET status = 'succeeded', cost_usd_micros = COALESCE(
+                         (SELECT COALESCE((run->'usage'->>'costUsdMicros')::BIGINT, 0::BIGINT)
+                          FROM memory_engine_generation_runs
+                          WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT),
+                         0::BIGINT),
+                         reserved_cost_usd_micros = 0::BIGINT, error = NULL::TEXT,
+                         completed_at_ms = $3::BIGINT, updated_at_ms = $3::BIGINT
+                     WHERE account_id = $1::TEXT AND job_id = $4::TEXT
+                       AND attempt = $5::INTEGER AND lease_token = $6::TEXT
+                       AND status = 'running'",
+                    &[
+                        &account_id,
+                        &run_id,
+                        &now_ms,
+                        &job_id,
+                        &attempt,
+                        &lease_token,
+                    ],
+                )?;
+                let job_updated = transaction.execute(
+                    "UPDATE memory_engine_generation_jobs
+                     SET status = 'succeeded', card_count = 0, error = NULL::TEXT,
+                         retry_at_ms = NULL::BIGINT, lease_owner = NULL::TEXT,
+                         lease_expires_at_ms = NULL::BIGINT, lease_token = NULL::TEXT,
+                         reserved_cost_usd_micros = 0::BIGINT, updated_at_ms = $2::BIGINT
+                     WHERE account_id = $1::TEXT AND job_id = $3::TEXT
+                       AND attempts = $4::INTEGER AND lease_token = $5::TEXT
+                       AND status = 'running'",
+                    &[&account_id, &now_ms, &job_id, &attempt, &lease_token],
+                )?;
+                return Ok(attempt_updated == 1 && job_updated == 1);
             }
 
             let stale = transaction.query(
@@ -3609,6 +3677,10 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
 
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
         AccountStudyStore::discard_generation_run(self, run_id)
+    }
+
+    fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        AccountStudyStore::mark_generation_run_pending(self, run_id)
     }
 
     fn finalize_generation_run(
@@ -5339,6 +5411,96 @@ mod tests {
     }
 
     #[test]
+    fn live_postgres_finalized_run_allows_second_connection_decision() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres finalized publication; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_publication_{}_{}",
+            std::process::id(),
+            NOW + 4
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect publication admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create publication schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-publication");
+            let reference = reference_span("reference-generation-publication", &source.id);
+            let unit = ReviewUnitId::new("unit-generation-publication");
+            let draft = accepted_draft(
+                "draft-generation-publication",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-publication"),
+            );
+            let run = generation_run("run-generation-publication", &[&source.id], &[&draft.id]);
+            let (attempt, token) = {
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-publication")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-publication",
+                    "job-generation-publication",
+                    &source.id,
+                    "Publication",
+                    "model-publication",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-publication", NOW, 10, 0, 1, 3)?
+                    .expect("publication claim");
+                let token = claimed.lease_token.clone().expect("publication token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-publication",
+                    "job-generation-publication",
+                    claimed.attempts,
+                    &token,
+                    &run.id,
+                )?);
+                (
+                    i32::try_from(claimed.attempts).expect("attempt fits i32"),
+                    token,
+                )
+            };
+            let mut publisher = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut account =
+                publisher.for_account(AccountScope::new("acct-generation-publication")?);
+            assert!(account.finalize_generation_run(&run.id, attempt, &token, NOW + 1, true)?);
+            drop(account);
+            let mut learner_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut learner =
+                learner_store.for_account(AccountScope::new("acct-generation-publication")?);
+            learner.keep_generated_prompt_draft(&draft.id, NOW + 2)?;
+            let snapshot = learner.snapshot()?;
+            assert_eq!(snapshot.generation_runs[0].completed_at, Some(NOW + 1));
+            assert!(snapshot.generated_prompt_drafts[0]
+                .learner_decision
+                .is_some());
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop publication schema");
+        result.expect("generation publication contract");
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn live_postgres_stale_finalizer_wins_against_second_connection_decisions() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
@@ -5394,6 +5556,7 @@ mod tests {
                 account.save_generation_run(&run)?;
                 account.save_generated_prompt_draft(&keep_draft)?;
                 account.save_generated_prompt_draft(&edit_draft)?;
+                account.mark_generation_run_pending(&run.id)?;
                 drop(account);
                 let started = setup.enqueue_generation_job(
                     "acct-generation-finalizer",
@@ -5434,17 +5597,23 @@ mod tests {
             let mut keep_store = super::PostgresStudyStore::connect(&scoped_url)?;
             let mut keep_account =
                 keep_store.for_account(AccountScope::new("acct-generation-finalizer")?);
-            keep_account.keep_generated_prompt_draft(&keep_draft.id, NOW + 17)?;
+            assert!(matches!(
+                keep_account.keep_generated_prompt_draft(&keep_draft.id, NOW + 17),
+                Err(super::PostgresStoreError::MissingGenerationRunForAcceptedDraft)
+            ));
             drop(keep_account);
             let mut edit_store = super::PostgresStudyStore::connect(&scoped_url)?;
             let mut edit_account =
                 edit_store.for_account(AccountScope::new("acct-generation-finalizer")?);
-            edit_account.edit_and_keep_generated_prompt_draft(
-                &edit_draft.id,
-                "Edited stale prompt",
-                "Edited stale answer",
-                NOW + 18,
-            )?;
+            assert!(matches!(
+                edit_account.edit_and_keep_generated_prompt_draft(
+                    &edit_draft.id,
+                    "Edited stale prompt",
+                    "Edited stale answer",
+                    NOW + 18,
+                ),
+                Err(super::PostgresStoreError::MissingGenerationRunForAcceptedDraft)
+            ));
             drop(edit_account);
 
             let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;

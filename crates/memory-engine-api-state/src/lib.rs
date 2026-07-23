@@ -2653,7 +2653,7 @@ where
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let run_id = format!("study-run-{:032x}", rand::random::<u128>());
-    run_source_generation_with_run_id(study, source_id, &run_id, generation_provider_config)
+    run_source_generation_inner(study, source_id, &run_id, generation_provider_config, false)
 }
 
 pub(crate) fn run_source_generation_with_run_id<S>(
@@ -2661,6 +2661,20 @@ pub(crate) fn run_source_generation_with_run_id<S>(
     source_id: &str,
     run_id: &str,
     generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    run_source_generation_inner(study, source_id, run_id, generation_provider_config, true)
+}
+
+fn run_source_generation_inner<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    run_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
+    mark_pending: bool,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
@@ -2674,20 +2688,25 @@ where
         .iter()
         .find(|source| source.id == source_id)
         .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
-    if local_only {
-        return study
-            .generate_with_run_id(ids, run_id)
-            .map_err(study_failure);
-    }
-    match generation_provider_config {
-        Some(config) => {
-            let model = OpenRouterProvider::new(config);
-            let provider = FallbackProvider::new(&model);
-            study.generate_with_provider_and_run_id(ids, &provider, run_id)
+    let generated = if local_only {
+        study.generate_with_run_id(ids, run_id)
+    } else {
+        match generation_provider_config {
+            Some(config) => {
+                let model = OpenRouterProvider::new(config);
+                let provider = FallbackProvider::new(&model);
+                study.generate_with_provider_and_run_id(ids, &provider, run_id)
+            }
+            None => study.generate_with_run_id(ids, run_id),
         }
-        None => study.generate_with_run_id(ids, run_id),
+    };
+    let view = generated.map_err(study_failure)?;
+    if mark_pending {
+        study
+            .mark_generation_run_pending(run_id)
+            .map_err(study_failure)?;
     }
-    .map_err(study_failure)
+    Ok(view)
 }
 
 #[cfg(test)]

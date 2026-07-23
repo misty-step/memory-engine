@@ -1248,13 +1248,13 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
         .expect("stale run");
     assert!(
         !store
-            .finalize_generation_run("stale-run", false)
+            .finalize_generation_run("stale-run", NOW, false)
             .expect("finalize stale run"),
         "stale file finalizer must reject the lost lease"
     );
     assert!(
         !store
-            .finalize_generation_run("stale-run", false)
+            .finalize_generation_run("stale-run", NOW, false)
             .expect("repeat stale finalizer"),
         "repeated stale finalization remains idempotent"
     );

@@ -158,6 +158,8 @@ pub struct GeneratedPromptDraft {
     pub created_at: i64,
 }
 
+const PENDING_GENERATION_COMPLETION: i64 = i64::MIN;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationRun {
@@ -463,7 +465,7 @@ impl fmt::Display for BetaStoreError {
                 formatter.write_str("Only accepted generated prompt drafts can be kept")
             }
             Self::MissingGenerationRunForAcceptedDraft => formatter.write_str(
-                "Accepted generated prompt drafts require a generation run before approval",
+                "Accepted generated prompt drafts require a finalized generation run before a learner decision",
             ),
             Self::LearnerDraftDecisionAlreadyRecorded(id) => {
                 write!(formatter, "Learner decision already recorded for draft: {id}")
@@ -985,6 +987,24 @@ impl BetaPersistenceStore {
         })
     }
 
+    /// Mark a queued generation run pending until its worker lease fence commits.
+    ///
+    /// # Errors
+    /// Returns [`BetaStoreError`] when the run cannot be persisted.
+    pub fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), BetaStoreError> {
+        self.transact(|snapshot| {
+            let Some(run) = snapshot
+                .generation_runs
+                .iter_mut()
+                .find(|run| run.id == run_id)
+            else {
+                return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
+            };
+            run.completed_at = Some(PENDING_GENERATION_COMPLETION);
+            Ok(())
+        })
+    }
+
     /// Atomically finalize a generation run at the worker lease fence.
     ///
     /// A failed fence removes the complete run closure, including any learner
@@ -997,10 +1017,19 @@ impl BetaPersistenceStore {
     pub fn finalize_generation_run(
         &mut self,
         run_id: &str,
+        now_ms: i64,
         lease_valid: bool,
     ) -> Result<bool, BetaStoreError> {
         self.transact(|snapshot| {
             if lease_valid {
+                let Some(run) = snapshot
+                    .generation_runs
+                    .iter_mut()
+                    .find(|run| run.id == run_id)
+                else {
+                    return Ok(false);
+                };
+                run.completed_at = Some(now_ms);
                 return Ok(true);
             }
             let stale_draft_ids = snapshot
@@ -1956,11 +1985,13 @@ fn record_learner_draft_decision(
             draft_id.to_owned(),
         ));
     }
-    if draft
+    let run_id = draft
         .generation_run_id
         .as_ref()
-        .is_none_or(|run_id| find_by_id(&snapshot.generation_runs, run_id).is_none())
-    {
+        .ok_or(BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
+    let run = find_by_id(&snapshot.generation_runs, run_id)
+        .ok_or(BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
+    if run.completed_at == Some(PENDING_GENERATION_COMPLETION) {
         return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
     }
     let decision = match *input {

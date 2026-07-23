@@ -912,6 +912,19 @@ where
             .map_err(BetaStudyError::Store)
     }
 
+    /// Mark a queued generation run pending until its worker lease fence commits.
+    ///
+    /// # Errors
+    /// Returns the underlying store error when the state cannot be persisted.
+    pub fn mark_generation_run_pending(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .mark_generation_run_pending(run_id)
+            .map_err(BetaStudyError::Store)
+    }
+
     /// Atomically fence a generation run and remove stale output when needed.
     /// The persistence adapter performs this under its account-scoped lock.
     ///

@@ -207,6 +207,11 @@ pub trait BetaGenerationStore {
         Ok(())
     }
 
+    /// Mark a queued generation run pending until its durable lease fence commits.
+    fn mark_generation_run_pending(&mut self, _run_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Atomically fence a run and remove all stale output when the lease is lost.
     ///
     /// # Errors
@@ -259,15 +264,19 @@ impl BetaGenerationStore for BetaPersistenceStore {
         BetaPersistenceStore::discard_generation_run(self, run_id)
     }
 
+    fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        BetaPersistenceStore::mark_generation_run_pending(self, run_id)
+    }
+
     fn finalize_generation_run(
         &mut self,
         run_id: &str,
         _generation_attempt: i32,
         _lease_token: &str,
-        _now_ms: i64,
+        now_ms: i64,
         lease_valid: bool,
     ) -> Result<bool, Self::Error> {
-        BetaPersistenceStore::finalize_generation_run(self, run_id, lease_valid)
+        BetaPersistenceStore::finalize_generation_run(self, run_id, now_ms, lease_valid)
     }
 }
 
