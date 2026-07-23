@@ -988,7 +988,8 @@ impl BetaPersistenceStore {
     /// Atomically finalize a generation run at the worker lease fence.
     ///
     /// A failed fence removes the complete run closure, including any learner
-    /// decision that raced with the stale worker. The account file lock held by
+    /// decision that raced with the stale worker. This keeps file storage
+    /// behavior aligned with the Postgres adapter. The account file lock held by
     /// `transact` serializes this operation with every learner mutation.
     ///
     /// # Errors

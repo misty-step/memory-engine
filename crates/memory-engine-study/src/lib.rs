@@ -913,6 +913,7 @@ where
     }
 
     /// Atomically fence a generation run and remove stale output when needed.
+    /// The persistence adapter performs this under its account-scoped lock.
     ///
     /// # Errors
     /// Returns the underlying store error when finalization cannot commit.
