@@ -987,7 +987,14 @@ impl AccountRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
-        storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
+        storage.generate_source_with_run_id(
+            account_id,
+            &store_path,
+            source_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        )?;
         // Evaluate the in-memory cancellation fence first. The durable adapter
         // then validates the exact Postgres attempt/lease under the same account
         // advisory transaction lock, or commits the file rollback under its lock.

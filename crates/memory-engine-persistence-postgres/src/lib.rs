@@ -1607,6 +1607,7 @@ impl PostgresStudyStore {
         AccountStudyStore {
             client: &self.client,
             scope,
+            generation_lease_fence: None,
         }
     }
 
@@ -2409,12 +2410,28 @@ enum PostgresLearnerDecision {
 }
 
 #[derive(Clone)]
+struct GenerationLeaseFence {
+    run_id: String,
+    attempt: i32,
+    lease_token: String,
+}
+
+#[derive(Clone)]
 pub struct AccountStudyStore<'a> {
     client: &'a RefCell<CountingClient>,
     scope: AccountScope,
+    generation_lease_fence: Option<GenerationLeaseFence>,
 }
 
 impl AccountStudyStore<'_> {
+    pub fn set_generation_lease_fence(&mut self, run_id: &str, attempt: i32, lease_token: &str) {
+        self.generation_lease_fence = Some(GenerationLeaseFence {
+            run_id: run_id.to_owned(),
+            attempt,
+            lease_token: lease_token.to_owned(),
+        });
+    }
+
     /// Serialize every per-account study mutation across Postgres connections.
     ///
     /// The concept selector takes this same key before reading review units,
@@ -2432,6 +2449,35 @@ impl AccountStudyStore<'_> {
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&account_id],
         )?;
+        if let Some(fence) = self.generation_lease_fence.as_ref() {
+            let valid = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM memory_engine_generation_job_attempts attempt
+                     JOIN memory_engine_generation_jobs job
+                       ON job.account_id = attempt.account_id
+                      AND job.job_id = attempt.job_id
+                     WHERE attempt.account_id = $1::TEXT
+                       AND attempt.generation_run_id = $2::TEXT
+                       AND attempt.attempt = $3::INTEGER
+                       AND attempt.lease_token = $4::TEXT
+                       AND attempt.status = 'running'
+                       AND job.status = 'running'
+                       AND job.attempts = attempt.attempt
+                       AND job.lease_token = attempt.lease_token
+                     LIMIT 1",
+                    &[
+                        &account_id,
+                        &fence.run_id,
+                        &fence.attempt,
+                        &fence.lease_token,
+                    ],
+                )?
+                .is_some();
+            if !valid {
+                return Err(PostgresStoreError::GenerationLeaseLost);
+            }
+        }
         let result = operation(&mut transaction)?;
         transaction.commit()?;
         Ok(result)
@@ -4276,6 +4322,7 @@ pub enum PostgresStoreError {
     RejectedGeneratedPromptDraft,
     LearnerDraftDecisionAlreadyRecorded(String),
     MissingGenerationRunForAcceptedDraft,
+    GenerationLeaseLost,
     ReviewUnitMismatch,
     ScheduleLastReviewMismatch,
     DuplicateAppliedReview(String),
@@ -4321,6 +4368,7 @@ impl fmt::Display for PostgresStoreError {
             Self::MissingGenerationRunForAcceptedDraft => {
                 formatter.write_str("Accepted generated prompt draft requires a generation run")
             }
+            Self::GenerationLeaseLost => formatter.write_str("Generation lease lost before persistence"),
             Self::ReviewUnitMismatch => formatter.write_str("Review unit ids must match"),
             Self::ScheduleLastReviewMismatch => {
                 formatter.write_str("Schedule last_review must match the attempt timestamp")
@@ -4379,6 +4427,7 @@ impl Error for PostgresStoreError {
             | Self::RejectedGeneratedPromptDraft
             | Self::LearnerDraftDecisionAlreadyRecorded(_)
             | Self::MissingGenerationRunForAcceptedDraft
+            | Self::GenerationLeaseLost
             | Self::ReviewUnitMismatch
             | Self::ScheduleLastReviewMismatch
             | Self::DuplicateAppliedReview(_)
@@ -5712,6 +5761,17 @@ mod tests {
                 "reclaim must remove the bound unfinalized generation run"
             );
             drop(reclaimed_account);
+
+            let mut stale_writer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            stale_writer_store.migrate()?;
+            let mut stale_writer =
+                stale_writer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            stale_writer.set_generation_lease_fence(&run.id, old_attempt, &old_token);
+            assert!(matches!(
+                stale_writer.save_generation_run(&run),
+                Err(super::PostgresStoreError::GenerationLeaseLost)
+            ));
+            drop(stale_writer);
 
             // A retry may publish a fresh pending run after reclaim; it must not
             // inherit the orphaned attempt's drafts or create duplicate candidates.

@@ -410,9 +410,17 @@ impl StudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .generate_source_with_run_id(account_id, store_path, source_id, run_id)
+        self.inner.generate_source_with_run_id(
+            account_id,
+            store_path,
+            source_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -784,6 +792,8 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let _ = run_id;
         self.generate_source(account_id, store_path, source_id)
@@ -1604,6 +1614,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         if !persisted_source_exists(store_path, source_id)? {
             return Err(ApiFailure::not_found("Source not found."));
@@ -2415,26 +2427,34 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         _store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if !account
-                .snapshot()
-                .map_err(postgres_failure)?
-                .source_documents
-                .iter()
-                .any(|source| source.id == source_id && source.archived_at.is_none())
-            {
-                return Err(ApiFailure::not_found("Source not found."));
-            }
-            let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation_with_run_id(
-                &mut study,
-                source_id,
-                run_id,
-                self.generation_provider_config.clone(),
-            )?;
-            Ok(StudyViewResponse::from_view(view))
-        })
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account.set_generation_lease_fence(run_id, generation_attempt, lease_token);
+                if !account
+                    .snapshot()
+                    .map_err(postgres_failure)?
+                    .source_documents
+                    .iter()
+                    .any(|source| source.id == source_id && source.archived_at.is_none())
+                {
+                    return Err(ApiFailure::not_found("Source not found."));
+                }
+                let mut study = BetaStudySession::from_store(account, self.now);
+                let view = run_source_generation_with_run_id(
+                    &mut study,
+                    source_id,
+                    run_id,
+                    self.generation_provider_config.clone(),
+                )?;
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
     }
 
     fn finalize_generation_run(
