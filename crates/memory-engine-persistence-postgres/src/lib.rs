@@ -1977,23 +1977,6 @@ impl PostgresStudyStore {
             )?;
         }
         let stale_run_rows = transaction.query(
-            "SELECT DISTINCT attempt.account_id, attempt.generation_run_id
-             FROM memory_engine_generation_job_attempts attempt
-             JOIN memory_engine_generation_jobs job
-               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
-             JOIN memory_engine_generation_runs run
-               ON run.account_id = attempt.account_id
-              AND run.generation_run_id = attempt.generation_run_id
-             WHERE job.status = 'running' AND job.attempts = attempt.attempt
-               AND job.lease_token = attempt.lease_token
-               AND (job.lease_expires_at_ms IS NULL
-                    OR job.lease_expires_at_ms + $2::BIGINT < $1::BIGINT)
-               AND attempt.status = 'running'
-               AND attempt.generation_run_id IS NOT NULL
-               AND COALESCE(run->>'status', '') <> 'finalized'",
-            &[&now_ms, &reclaim_grace_ms],
-        )?;
-        transaction.execute(
             "UPDATE memory_engine_generation_job_attempts attempt
              SET status = 'stale',
                  cost_usd_micros = CASE
@@ -2019,13 +2002,25 @@ impl PostgresStudyStore {
                AND job.lease_token = attempt.lease_token
                AND (job.lease_expires_at_ms IS NULL
                     OR job.lease_expires_at_ms + $2::BIGINT < $1::BIGINT)
-               AND attempt.status = 'running'",
+               AND attempt.status = 'running'
+             RETURNING attempt.account_id, attempt.generation_run_id",
             &[&now_ms, &reclaim_grace_ms],
         )?;
         for row in stale_run_rows {
             let account_id: String = row.get(0);
-            let run_id: String = row.get(1);
-            cleanup_generation_run(&mut transaction, &account_id, &run_id)?;
+            let run_id: Option<String> = row.get(1);
+            let Some(run_id) = run_id else { continue };
+            let unfinalized = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_engine_generation_runs
+                     WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT
+                       AND COALESCE(run->>'status', '') <> 'finalized'",
+                    &[&account_id, &run_id],
+                )?
+                .is_some();
+            if unfinalized {
+                cleanup_generation_run(&mut transaction, &account_id, &run_id)?;
+            }
         }
         transaction.execute(
             "UPDATE memory_engine_generation_jobs
