@@ -39,7 +39,12 @@ static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
              WHERE account_id = $1::TEXT AND job_id = $2::TEXT AND lease_token = $3::TEXT
-               AND status = 'running' AND lease_expires_at_ms > $4::BIGINT";
+               AND status = 'running' AND lease_expires_at_ms > $4::BIGINT
+               AND EXISTS (
+                   SELECT 1 FROM memory_engine_generation_job_attempts attempt
+                   WHERE attempt.account_id = $1::TEXT AND attempt.job_id = $2::TEXT
+                     AND attempt.lease_token = $3::TEXT AND attempt.status = 'running'
+               )";
 
 const FINISH_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET status = CASE
@@ -1818,10 +1823,17 @@ impl PostgresStudyStore {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<bool, PostgresStoreError> {
-        let changed = self.client.borrow_mut().execute(
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+            &[&account_id],
+        )?;
+        let changed = transaction.execute(
             RENEW_GENERATION_JOB_SQL,
             &[&account_id, &job_id, &lease_token, &now_ms, &lease_ms],
         )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
