@@ -635,12 +635,24 @@
   }
 
   var source = new EventSource("/app/jobs/events");
+  var terminalNavigationStarted = false;
   // EventSource reconnects automatically; no manual retry needed.
   source.addEventListener("job", function (event) {
     try {
-      apply(JSON.parse(event.data));
+      var job = JSON.parse(event.data);
+      apply(job);
+      if (
+        !terminalNavigationStarted &&
+        (job.status === "succeeded" || job.status === "failed")
+      ) {
+        terminalNavigationStarted = true;
+        // The POST response may be this document. Navigate with GET rather
+        // than reload so capture is never submitted twice. SSR refreshes the
+        // authoritative pending-draft/review surface and retry controls.
+        window.location.assign("/");
+      }
     } catch (err) {
-      /* ignore a malformed frame; the next event or reload corrects it */
+      /* ignore a malformed frame; the next event or navigation corrects it */
     }
   });
 })();

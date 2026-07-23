@@ -1624,3 +1624,79 @@ impl Drop for TempDirectory {
     }
 }
 use std::{fs, path::PathBuf};
+
+#[test]
+fn stale_finalizer_preserves_replacement_run_reusing_review_unit_id() {
+    let directory = TempDirectory::new("stale-finalizer-owner");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let source = store
+        .save_source_document(source_document("owner-source"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("owner-reference", &source.id))
+        .expect("reference");
+    let old_draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "owner-old-draft",
+            "owner-unit",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("owner-old-run"),
+        ))
+        .expect("old draft");
+    store
+        .save_generation_run(generation_run(
+            "owner-old-run",
+            &[source.id.as_str()],
+            &[old_draft.id.as_str()],
+        ))
+        .expect("old run");
+    let replacement = store
+        .save_generated_prompt_draft(accepted_draft(
+            "owner-replacement-draft",
+            "owner-unit",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("owner-replacement-run"),
+        ))
+        .expect("replacement draft");
+    store
+        .save_generation_run(generation_run(
+            "owner-replacement-run",
+            &[source.id.as_str()],
+            &[replacement.id.as_str()],
+        ))
+        .expect("replacement run");
+    let kept = store
+        .keep_generated_prompt_draft(&replacement.id, NOW)
+        .expect("keep replacement");
+    store
+        .set_schedule_state(
+            &kept.review_unit_id,
+            Some(schedule_state(1, ScheduleStatus::Review)),
+        )
+        .expect("schedule replacement");
+
+    assert!(!store
+        .finalize_generation_run("owner-old-run", NOW + 1, false)
+        .expect("stale finalizer"));
+    let snapshot = store.snapshot();
+    assert!(snapshot
+        .generated_prompt_drafts
+        .iter()
+        .any(|draft| draft.id == replacement.id));
+    assert!(snapshot
+        .review_units
+        .iter()
+        .any(|unit| unit.review_unit_id == kept.review_unit_id));
+    assert!(snapshot
+        .schedules
+        .iter()
+        .any(|schedule| schedule.review_unit_id == kept.review_unit_id));
+    assert!(store
+        .list_queue_candidates()
+        .expect("replacement queue")
+        .iter()
+        .any(|candidate| candidate.review_unit_id == kept.review_unit_id));
+}

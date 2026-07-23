@@ -922,7 +922,7 @@ fn cleanup_generation_run<T: TransactionOps>(
     run_id: &str,
 ) -> Result<(), PostgresStoreError> {
     let stale = transaction.query(
-        "SELECT draft_id, review_unit_id, draft->'referenceSpanIds'
+        "SELECT draft_id, draft->'referenceSpanIds'
          FROM memory_engine_generated_prompt_drafts
          WHERE account_id = $1::TEXT
            AND draft->>'generationRunId' = $2::TEXT",
@@ -933,14 +933,24 @@ fn cleanup_generation_run<T: TransactionOps>(
     let mut stale_reference_span_ids = std::collections::BTreeSet::new();
     for row in stale {
         let draft_id: String = row.get(0);
-        let review_unit_id: String = row.get(1);
-        let references: serde_json::Value = row.get(2);
+        let references: serde_json::Value = row.get(1);
         stale_draft_ids.push(draft_id);
-        stale_review_unit_ids.insert(review_unit_id);
         for reference in references.as_array().into_iter().flatten() {
             if let Some(reference_id) = reference.as_str() {
                 stale_reference_span_ids.insert(reference_id.to_owned());
             }
+        }
+    }
+    if !stale_draft_ids.is_empty() {
+        let owned_units = transaction.query(
+            "SELECT review_unit_id
+             FROM memory_engine_review_units
+             WHERE account_id = $1::TEXT
+               AND record->>'generatedPromptDraftId' = ANY($2::TEXT[])",
+            &[&account_id, &stale_draft_ids],
+        )?;
+        for row in owned_units {
+            stale_review_unit_ids.insert(row.get::<_, String>(0));
         }
     }
     for review_unit_id in &stale_review_unit_ids {
@@ -2168,14 +2178,14 @@ impl PostgresStudyStore {
         let run_cost = generation_run_id.as_deref().and_then(|run_id| {
             transaction
                 .query_opt(
-                    "SELECT COALESCE((run->'usage'->>'costUsdMicros')::BIGINT, 0)::BIGINT
+                    "SELECT (run->'usage'->>'costUsdMicros')::BIGINT
                      FROM memory_engine_generation_runs
                      WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
                     &[&account_id, &run_id],
                 )
                 .ok()
                 .flatten()
-                .map(|row| row.get(0))
+                .and_then(|row| row.get::<_, Option<i64>>(0))
         });
         let current = transaction.query_opt(
             "SELECT status, lease_token, lease_expires_at_ms
@@ -3468,7 +3478,7 @@ impl AccountStudyStore<'_> {
             // was being fenced. The advisory transaction lock serializes this
             // rollback with learner keep/edit/reject decisions on every replica.
             let stale = transaction.query(
-                "SELECT draft_id, review_unit_id, draft->'referenceSpanIds'
+                "SELECT draft_id, draft->'referenceSpanIds'
                  FROM memory_engine_generated_prompt_drafts
                  WHERE account_id = $1
                    AND draft->>'generationRunId' = $2
@@ -3479,19 +3489,32 @@ impl AccountStudyStore<'_> {
             let mut stale_reference_span_ids = std::collections::BTreeSet::new();
             for row in stale {
                 let draft_id: String = row.get(0);
-                let review_unit_id: String = row.get(1);
-                let references: serde_json::Value = row.get(2);
+                let references: serde_json::Value = row.get(1);
                 stale_draft_ids.push(draft_id);
                 for reference in references.as_array().into_iter().flatten() {
                     if let Some(reference_id) = reference.as_str() {
                         stale_reference_span_ids.insert(reference_id.to_owned());
                     }
                 }
-                transaction.execute(
-                    "DELETE FROM memory_engine_review_units
-                     WHERE account_id = $1 AND review_unit_id = $2",
-                    &[&account_id, &review_unit_id],
+                // Review-unit ownership is stored on the promoted record.
+                // The draft's deterministic review_unit_id can be reused by
+                // another run and is not a safe deletion key.
+            }
+            if !stale_draft_ids.is_empty() {
+                let owned_units = transaction.query(
+                    "SELECT review_unit_id
+                     FROM memory_engine_review_units
+                     WHERE account_id = $1
+                       AND record->>'generatedPromptDraftId' = ANY($2::TEXT[])",
+                    &[&account_id, &stale_draft_ids],
                 )?;
+                for row in owned_units {
+                    transaction.execute(
+                        "DELETE FROM memory_engine_review_units
+                         WHERE account_id = $1 AND review_unit_id = $2",
+                        &[&account_id, &row.get::<_, String>(0)],
+                    )?;
+                }
             }
             for draft_id in &stale_draft_ids {
                 transaction.execute(
@@ -3603,9 +3626,10 @@ impl AccountStudyStore<'_> {
                 let attempt_updated = transaction.execute(
                     "UPDATE memory_engine_generation_job_attempts
                      SET status = 'succeeded', cost_usd_micros = COALESCE(
-                         (SELECT COALESCE((run->'usage'->>'costUsdMicros')::BIGINT, 0::BIGINT)
+                         (SELECT (run->'usage'->>'costUsdMicros')::BIGINT
                           FROM memory_engine_generation_runs
                           WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT),
+                         reservation_cost_usd_micros,
                          0::BIGINT),
                          reserved_cost_usd_micros = 0::BIGINT, error = NULL::TEXT,
                          completed_at_ms = $3::BIGINT, updated_at_ms = $3::BIGINT
@@ -3623,14 +3647,31 @@ impl AccountStudyStore<'_> {
                 )?;
                 let job_updated = transaction.execute(
                     "UPDATE memory_engine_generation_jobs
-                     SET status = 'succeeded', card_count = 0, error = NULL::TEXT,
-                         retry_at_ms = NULL::BIGINT, lease_owner = NULL::TEXT,
+                     SET status = 'succeeded', card_count = 0,
+                         cost_usd_micros = COALESCE(
+                             (SELECT (run->'usage'->>'costUsdMicros')::BIGINT
+                              FROM memory_engine_generation_runs
+                              WHERE account_id = $1::TEXT AND generation_run_id = $6::TEXT),
+                             (SELECT cost_usd_micros
+                              FROM memory_engine_generation_job_attempts
+                              WHERE account_id = $1::TEXT AND job_id = $3::TEXT
+                                AND attempt = $4::INTEGER AND lease_token = $5::TEXT),
+                             0::BIGINT),
+                         error = NULL::TEXT, retry_at_ms = NULL::BIGINT,
+                         lease_owner = NULL::TEXT,
                          lease_expires_at_ms = NULL::BIGINT, lease_token = NULL::TEXT,
                          reserved_cost_usd_micros = 0::BIGINT, updated_at_ms = $2::BIGINT
                      WHERE account_id = $1::TEXT AND job_id = $3::TEXT
                        AND attempts = $4::INTEGER AND lease_token = $5::TEXT
                        AND status = 'running'",
-                    &[&account_id, &now_ms, &job_id, &attempt, &lease_token],
+                    &[
+                        &account_id,
+                        &now_ms,
+                        &job_id,
+                        &attempt,
+                        &lease_token,
+                        &run_id,
+                    ],
                 )?;
                 if attempt_updated != 1 || job_updated != 1 {
                     return Err(PostgresStoreError::GenerationFinalizationIncomplete);
@@ -5274,6 +5315,126 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("started receipt regression");
+    }
+
+    #[test]
+    fn finish_generation_job_uses_reservation_when_usage_cost_is_null() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres null-cost finish regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_finish_null_cost_{}_{}",
+            std::process::id(),
+            NOW + 1
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect null-cost admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create null-cost schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), PostgresStoreError> {
+            let mut store = PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+            {
+                let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                account.ensure_account(NOW)?;
+            }
+            for (job_id, reservation) in [
+                ("job-null-success", 50_i64),
+                ("job-null-failure", 60_i64),
+                ("job-null-finalizer", 70_i64),
+            ] {
+                let source_id = format!("source-{job_id}");
+                store.client.borrow_mut().execute(
+                    "INSERT INTO memory_engine_generation_jobs
+                        (account_id, job_id, source_id, title, status, model_key,
+                         cost_usd_micros, created_at_ms, updated_at_ms, reserved_cost_usd_micros)
+                     VALUES ($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, 'queued',
+                             $5::TEXT, 0::BIGINT, $6::BIGINT, $6::BIGINT, $7::BIGINT)",
+                    &[
+                        &"acct_null_cost",
+                        &job_id,
+                        &source_id,
+                        &job_id,
+                        &"model-null-cost",
+                        &NOW,
+                        &reservation,
+                    ],
+                )?;
+                let claimed = store
+                    .claim_generation_job("worker-null-cost", NOW, 10, 0, 1, 3)?
+                    .expect("null-cost job claim");
+                let run_id = format!("job:{}:attempt:{}", claimed.id, claimed.attempts);
+                assert!(store.bind_generation_job_attempt_run(
+                    "acct_null_cost",
+                    job_id,
+                    claimed.attempts,
+                    claimed.lease_token.as_deref().expect("lease token"),
+                    &run_id,
+                )?);
+                let mut run = generation_run(&run_id, &[&source_id], &[]);
+                run.usage = Some(GenerationRunUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_usd_micros: None,
+                    latency_ms: 1,
+                });
+                let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                account.save_generation_run(&run)?;
+                drop(account);
+                let succeeded = job_id == "job-null-success";
+                let finalized = job_id == "job-null-finalizer";
+                if finalized {
+                    let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                    assert!(account.finalize_generation_run(
+                        &run_id,
+                        i32::try_from(claimed.attempts).expect("attempt fits"),
+                        claimed.lease_token.as_deref().expect("lease token"),
+                        NOW + 1,
+                        true,
+                    )?);
+                } else {
+                    assert!(store.finish_generation_job(
+                        "acct_null_cost",
+                        job_id,
+                        claimed.lease_token.as_deref().expect("lease token"),
+                        NOW + 1,
+                        if succeeded {
+                            Ok((1, 0))
+                        } else {
+                            Err("provider failed".to_owned())
+                        },
+                        3,
+                        1_000,
+                    )?);
+                }
+                let attempt = store
+                    .generation_job_attempt(
+                        "acct_null_cost",
+                        job_id,
+                        claimed.attempts,
+                        claimed.lease_token.as_deref().expect("lease token"),
+                    )?
+                    .expect("finished attempt");
+                assert_eq!(attempt.cost_usd_micros, reservation);
+                assert_eq!(attempt.reserved_cost_usd_micros, 0);
+                let job = store
+                    .generation_job("acct_null_cost", job_id)?
+                    .expect("finished job");
+                assert_eq!(job.cost_usd_micros, reservation);
+                if succeeded || finalized {
+                    assert_eq!(job.reserved_cost_usd_micros, 0);
+                } else {
+                    assert_eq!(job.reserved_cost_usd_micros, reservation);
+                }
+            }
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop null-cost schema");
+        result.expect("null-cost finish reservation fallback");
     }
 
     #[test]
@@ -7447,5 +7608,104 @@ mod tests {
             idempotency_key: Some(idempotency_key.to_owned()),
             grade: None,
         }
+    }
+    #[test]
+    fn live_postgres_stale_cleanup_preserves_replacement_owner() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres cleanup ownership test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_cleanup_owner_{}_{}",
+            std::process::id(),
+            NOW + 31
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect cleanup owner admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create cleanup owner schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("cleanup-owner-source");
+            let reference = reference_span("cleanup-owner-reference", &source.id);
+            let unit = ReviewUnitId::new("cleanup-owner-unit");
+            let old_draft = accepted_draft(
+                "cleanup-owner-old-draft",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("cleanup-owner-old-run"),
+            );
+            let replacement = accepted_draft(
+                "cleanup-owner-replacement-draft",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("cleanup-owner-replacement-run"),
+            );
+            let old_run = generation_run("cleanup-owner-old-run", &[&source.id], &[&old_draft.id]);
+            let replacement_run = generation_run(
+                "cleanup-owner-replacement-run",
+                &[&source.id],
+                &[&replacement.id],
+            );
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-cleanup-owner")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&old_run)?;
+                account.save_generated_prompt_draft(&old_draft)?;
+                account.save_generation_run(&replacement_run)?;
+                account.save_generated_prompt_draft(&replacement)?;
+                let kept = account.keep_generated_prompt_draft(&replacement.id, NOW)?;
+                account.set_schedule_state(
+                    &kept.review_unit_id,
+                    Some(&schedule_state(1, ScheduleStatus::Review, NOW)),
+                    NOW,
+                )?;
+                account.record_attempt(service_attempt(
+                    &kept.review_unit_id,
+                    "cleanup-owner-receipt",
+                    NOW + 1,
+                ))?;
+            }
+            let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            finalizer_store.migrate()?;
+            let mut finalizer =
+                finalizer_store.for_account(AccountScope::new("acct-cleanup-owner")?);
+            assert!(!finalizer.finalize_generation_run(
+                "cleanup-owner-old-run",
+                1,
+                "stale-owner-token",
+                NOW + 1,
+                false,
+            )?);
+            let snapshot = finalizer.snapshot()?;
+            assert!(snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|draft| draft.id == replacement.id));
+            assert!(snapshot
+                .review_units
+                .iter()
+                .any(|record| record.review_unit_id == unit));
+            assert!(snapshot
+                .schedules
+                .iter()
+                .any(|schedule| schedule.review_unit_id == unit));
+            assert!(snapshot.attempts.iter().any(|attempt| {
+                attempt.review_unit_id == unit
+                    && attempt.idempotency_key.as_deref() == Some("cleanup-owner-receipt")
+            }));
+            assert_eq!(finalizer.list_queue_candidates()?.len(), 1);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop cleanup owner schema");
+        result.expect("cleanup ownership contract");
     }
 }

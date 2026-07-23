@@ -1021,10 +1021,14 @@ impl BetaPersistenceStore {
                 .map(|draft| draft.id.clone())
                 .collect::<BTreeSet<_>>();
             let stale_review_unit_ids = snapshot
-                .generated_prompt_drafts
+                .review_units
                 .iter()
-                .filter(|draft| stale_draft_ids.contains(&draft.id))
-                .map(|draft| draft.review_unit_id.clone())
+                .filter(|unit| {
+                    unit.generated_prompt_draft_id
+                        .as_ref()
+                        .is_some_and(|draft_id| stale_draft_ids.contains(draft_id))
+                })
+                .map(|unit| unit.review_unit_id.clone())
                 .collect::<BTreeSet<_>>();
             let stale_reference_span_ids = snapshot
                 .generated_prompt_drafts
