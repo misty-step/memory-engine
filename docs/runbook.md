@@ -62,8 +62,8 @@ curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG ima
 ## Service sessions (machine consumers)
 
 Agents, QA runs, and future service consumers authenticate without email.
-`POST /v1/service-sessions` issues (or rotates) the account-scoped session
-token for an allowlisted service account, gated by the operator admin token.
+`POST /v1/service-sessions` issues an independent, expiring account-scoped
+session token for an allowlisted service account, gated by the operator admin token.
 The surface is disabled entirely unless the app sets
 `MEMORY_ENGINE_ADMIN_TOKEN`. Agents never read mail-provider archives; magic
 links stay a human-only delivery channel.
@@ -71,9 +71,9 @@ links stay a human-only delivery channel.
 Provisioning (operator, once):
 
 1. Add the dedicated dogfood email to `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` in
-   the app spec. Use a dedicated address — magic-link sign-in on the same
-   email rotates the API session token and would revoke the service
-   credential.
+   the app spec. Use a dedicated address. Magic-link and service/browser logins
+   create independent expiring sessions; logging out one browser profile does
+   not revoke another, while logout-all is explicit.
 2. Set `MEMORY_ENGINE_ADMIN_TOKEN` as an app-spec secret. Custody: Mint
    (`secret://memory-engine/admin`); never commit or paste it.
 3. Issue the credential and store it in Mint as
@@ -93,10 +93,16 @@ The response maps onto the receipt variables below:
 `MEMORY_ENGINE_ACCOUNT_ID=accountId`,
 `MEMORY_ENGINE_SESSION_TOKEN=sessionToken`.
 
-Rotation and revocation are the same call: every issue mints a fresh token
-and the prior one fails with `403` immediately. To revoke without keeping a
-usable credential, reissue and discard the response. Issuance is audited in
-the app log (`service session issued account=...`).
+Each issue mints a fresh independently auditable token; existing sessions stay
+valid until expiry or explicit revocation. API clients can revoke one bearer
+session or all bearer sessions through the account-scoped DELETE routes below;
+browser logout has the same one/all semantics for cookie sessions. Issuance is
+audited in the app log (`service session issued account=...`).
+
+`DELETE /v1/accounts/{account_id}/service-sessions/current` revokes only the
+presented bearer token. `DELETE /v1/accounts/{account_id}/service-sessions/all`
+revokes every bearer token for that account. Both routes require the raw bearer
+credential, never a persisted SHA-256 digest.
 
 ## Waitlist (invite-beta first-run)
 
@@ -108,9 +114,12 @@ job is ever created. Joining is idempotent on normalized email and returns
 the identical response whether the address is brand new, already on the
 list, or already allowlisted, so the response can never be used to probe
 registration or allowlist state. Rate limiting runs per normalized email and
-per client IP, trusting only the edge-set `do-connecting-ip` header (falling
-back to `x-real-ip`/`x-forwarded-for`) so a caller cannot forge its own quota
-identity.
+per trusted edge-overwritten client identity. DigitalOcean App Platform
+overwrites `do-connecting-ip` from the accepted client address before forwarding
+requests, and the API uses that value. Generic caller-controlled `x-real-ip` and
+`x-forwarded-for` headers never influence a quota. If the edge identity is
+missing, requests use the deterministic `unknown` bucket. The deployment contract is documented by DigitalOcean at
+https://docs.digitalocean.com/products/app-platform/how-to/troubleshoot-apps/#my-app-is-not-receiving-the-client-s-ip-address.
 
 Storage is dual-backend, dispatched the same way as every other
 `memory-engine-api` store: `MEMORY_ENGINE_POSTGRES_URL` set → Postgres
@@ -162,10 +171,13 @@ curl -fsS --max-time 20 \
 
 All four routes sit beside `/internal/scheduler/return-notifications`,
 outside the versioned `/v1/*` contract — operator tooling, not a public API
-surface. Marking invited only records that state on the waitlist row; it
-does not grant access. Invited access still requires the operator to add the
-address to `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` so the existing magic-link
-sign-in flow accepts it.
+surface. Marking invited is durable admission state: every magic-link request
+consults the persisted waitlist row, so a restart or another replica sees the
+same decision. Deleting the operational row revokes admission and outstanding
+unconsumed links; the append-only audit row remains for recovery evidence.
+The configured `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` entries remain an explicit
+operator allowlist, while invite-beta admission is persisted in the waitlist
+adapter rather than copied into process memory.
 
 ## Queued generation (machine consumers)
 
@@ -267,6 +279,55 @@ esac
 printf '%s\n' "$generate_status" \
   | tee "$receipt_dir/production-generation-$stamp.latency.txt"
 ```
+
+## Auth/session migration and rollback
+
+Postgres migration version 6 replaces the legacy account-scoped raw session
+columns with per-session rows keyed by session_token_hash/session_id_hash,
+adds expiry and revocation timestamps, and hashes legacy rows in one transaction.
+The file adapter performs the equivalent one-time migration for legacy
+session.token and browser-session rows on first read; raw values are not
+retained after the rewrite.
+
+Before applying migration 6, take a provider snapshot or Neon branch and retain
+the migration receipt. Roll forward by running the API with the versioned
+Postgres migrator, then verify row counts, non-empty 64-character hashes,
+expiry timestamps, and absence of the legacy columns/tables. Run the migrator
+twice: the second run must be a no-op and must leave the same row counts. Do
+not roll back only the binary after migration 6: the hashed-session schema is
+not compatible with a pre-migration binary.
+
+For a deterministic Postgres rollback, stop API writes and capture the exact
+commit/schema pair, then restore the provider snapshot before migration 6:
+
+```sh
+export DATABASE_URL='postgres://...'
+export SNAPSHOT_FILE="/secure/backup/memory-engine-pre-auth-v6-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump --format=custom --no-owner --file="$SNAPSHOT_FILE" "$DATABASE_URL"
+# Roll back only while writes are stopped.
+pg_restore --clean --if-exists --no-owner --dbname="$DATABASE_URL" "$SNAPSHOT_FILE"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c   "SELECT version FROM memory_engine_schema_migrations ORDER BY version DESC LIMIT 1;"
+```
+
+Deploy the matching pre-v6 commit only after the restore reports the pre-v6
+schema. For file stores, stop all API processes, archive the complete store
+root before migration, and restore it atomically on rollback:
+
+```sh
+export STORE_ROOT='/var/lib/memory-engine/store'
+export STORE_BACKUP="/secure/backup/memory-engine-store-pre-auth-v6-$(date -u +%Y%m%dT%H%M%SZ).tar"
+tar --create --file="$STORE_BACKUP" --directory="$STORE_ROOT" .
+# Roll back with writes stopped; restore into a sibling and swap atomically.
+rm -rf "${STORE_ROOT}.restore"
+mkdir "${STORE_ROOT}.restore"
+tar --extract --file="$STORE_BACKUP" --directory="${STORE_ROOT}.restore"
+mv "$STORE_ROOT" "${STORE_ROOT}.failed"
+mv "${STORE_ROOT}.restore" "$STORE_ROOT"
+```
+
+A failed migration transaction leaves the legacy tables intact; retry is safe.
+A file migration cleanup failure revokes the replacement hash and locks the
+account until the operator restores the pre-migration store snapshot.
 
 ## Deploy and rollback
 
@@ -579,8 +640,8 @@ curl -s https://api.resend.com/emails/<email-id> -H "Authorization: Bearer $RESE
 
 `POST /app/account` is abuse-limited in the API boundary before any magic link
 is sent. The fixed window is 5 attempts per 15 minutes per normalized email and
-per client IP (`do-connecting-ip`, then `x-real-ip`, then the first
-`x-forwarded-for` value). Rejected requests return `429` with the generic
+per trusted edge-overwritten `do-connecting-ip`; a missing edge identity is
+grouped as `unknown`. Forwarding headers are ignored. Rejected requests return `429` with the generic
 message "Too many sign-in attempts. Try again later."; they do not write an
 outbox row or reveal whether an email is allowlisted.
 

@@ -12,17 +12,17 @@ use memory_engine_service::{
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
-    account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, file_content_feedback_failure, file_study_failure,
+    account_store_path, app_session_max_age_ms, auth_challenge_consumed_path, auth_challenge_path,
+    browser_session_path, file_content_feedback_failure, file_study_failure, is_secret_hash,
     persisted_project_deck_exists, persisted_source_exists, persisted_sources,
     postgres_content_feedback_failure, postgres_failure, postgres_study_failure, rate_limit_path,
     require_current_review, require_current_review_postgres, run_bridge_generation,
     run_reference_generation, run_source_generation, run_source_generation_with_run_id,
-    secret_hash, study_failure, with_postgres_account, with_postgres_account_timed,
-    with_postgres_store, with_postgres_store_timed, with_postgres_study, write_atomic, ApiFailure,
-    BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
-    ReturnNotificationPreference, SourceRecord, StudyViewResponse, SubmitReviewRequest,
-    SubmitReviewTimings,
+    secret_hash, session_csrf_token, study_failure, with_postgres_account,
+    with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
+    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
+    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
+    SubmitReviewRequest, SubmitReviewTimings,
 };
 
 #[derive(Clone, Debug)]
@@ -187,6 +187,25 @@ impl StudyStorage {
             .account_session_matches_with_timings(account_id, session_token, timings)
     }
 
+    pub(crate) fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner
+            .revoke_account_session(account_id, session_token, now_ms)
+    }
+
+    pub(crate) fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .revoke_account_sessions_for_account(account_id, now_ms)
+    }
+
     pub(crate) fn save_browser_session(
         &self,
         session_id: &str,
@@ -216,6 +235,15 @@ impl StudyStorage {
         now_ms: i64,
     ) -> Result<(), ApiFailure> {
         self.inner.revoke_browser_session(session_id, now_ms)
+    }
+
+    pub(crate) fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .revoke_browser_sessions_for_account(account_id, now_ms)
     }
 
     /// Persists a magic-link auth challenge.
@@ -654,6 +682,17 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure>;
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure>;
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure>;
     fn account_session_matches_with_timings(
         &self,
         account_id: &str,
@@ -679,6 +718,11 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         self.load_browser_session(session_id)
     }
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure>;
     fn save_auth_challenge(
         &self,
         challenge_hash: &str,
@@ -973,6 +1017,92 @@ impl FileStudyStorage {
         let mut study = crate::open_study_session(store_path, self.now)?;
         operation(&mut study)
     }
+
+    fn migrate_legacy_account_session(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let legacy_path = self.store_root.join(account_id).join("session.token");
+        let Ok(raw) = fs::read_to_string(&legacy_path) else {
+            return Ok(());
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let token_hash = secret_hash(raw);
+        let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
+        write_atomic(
+            &path,
+            format!("{account_id}\n{now_ms}\n{expires_at_ms}\n\n").as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let persisted =
+            fs::read_to_string(&path).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let valid = persisted.lines().next() == Some(account_id)
+            && persisted
+                .lines()
+                .nth(1)
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(now_ms)
+            && persisted
+                .lines()
+                .nth(2)
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(expires_at_ms);
+        if !valid {
+            return Err(ApiFailure::internal(
+                "legacy session migration verification failed; account remains locked".to_owned(),
+            ));
+        }
+        if let Err(error) = fs::remove_file(&legacy_path) {
+            // Never leave a usable hashed session beside a raw legacy token.
+            // Mark the replacement revoked and fail closed; an operator can
+            // restore the account from the documented store snapshot.
+            let lock_record = format!("{account_id}\n{now_ms}\n{expires_at_ms}\n{now_ms}\n");
+            let _ = write_atomic(&path, lock_record.as_bytes());
+            return Err(ApiFailure::internal(format!(
+                "legacy session cleanup failed; account remains locked: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy_browser_session_token(
+        &self,
+        path: &FsPath,
+        raw_token: &str,
+    ) -> Result<String, ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
+        let Ok(saved) = fs::read_to_string(path) else {
+            return Ok(secret_hash(raw_token));
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        let Some(current_token) = lines.get(1).map(String::as_str) else {
+            return Ok(secret_hash(raw_token));
+        };
+        if is_secret_hash(current_token) {
+            return Ok(current_token.to_owned());
+        }
+        if current_token != raw_token {
+            return Ok(secret_hash(current_token));
+        }
+        let token_hash = secret_hash(raw_token);
+        lines[1].clone_from(&token_hash);
+        if let Some(csrf_hash) = lines.get_mut(2) {
+            *csrf_hash = secret_hash(&session_csrf_token(&token_hash));
+        }
+        write_atomic(path, format!("{}\n", lines.join("\n")).as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(token_hash)
+    }
 }
 
 impl StudyStorageAdapter for FileStudyStorage {
@@ -985,11 +1115,30 @@ impl StudyStorageAdapter for FileStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<(), ApiFailure> {
-        let path = account_session_path(&self.store_root, account_id);
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        let token_hash = secret_hash(session_token);
+        let now_ms = self.now_ms();
+        let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
-        fs::write(path, session_token).map_err(|error| ApiFailure::internal(error.to_string()))
+        write_atomic(
+            &path,
+            format!("{account_id}\n{now_ms}\n{expires_at_ms}\n\n").as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let marker = self.store_root.join(account_id).join("account.marker");
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        write_atomic(&marker, format!("{now_ms}\n").as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))
     }
 
     fn account_session_matches(
@@ -997,12 +1146,124 @@ impl StudyStorageAdapter for FileStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure> {
-        let path = account_session_path(&self.store_root, account_id);
+        let token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
+        if !path.exists() {
+            let _lock = crate::file_lock::acquire(&self.store_root.join("_api_sessions.lock"))?;
+            if !path.exists() {
+                self.migrate_legacy_account_session(account_id, self.now_ms())?;
+            }
+        }
         let Ok(saved) = fs::read_to_string(path) else {
             return Ok(false);
         };
+        let mut lines = saved.lines();
+        let Some(saved_account_id) = lines.next() else {
+            return Ok(false);
+        };
+        let _created_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok()) else {
+            return Ok(false);
+        };
+        let revoked_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        Ok(saved_account_id == account_id
+            && revoked_at_ms.is_none()
+            && expires_at_ms > self.now_ms())
+    }
 
-        Ok(saved.trim() == session_token)
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        let token_hash = secret_hash(session_token);
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(token_hash)
+            .join("session");
+        let Ok(saved) = fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        if lines.first().map(String::as_str) != Some(account_id)
+            || lines.get(3).is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        while lines.len() < 4 {
+            lines.push(String::new());
+        }
+        lines[3] = now_ms.to_string();
+        write_atomic(
+            &path,
+            format!(
+                "{}
+",
+                lines.join(
+                    "
+"
+                )
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        let root = self.store_root.join("_api_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+            if lines.first().map(String::as_str) != Some(account_id)
+                || lines.get(3).is_some_and(|value| !value.trim().is_empty())
+            {
+                continue;
+            }
+            while lines.len() < 4 {
+                lines.push(String::new());
+            }
+            lines[3] = now_ms.to_string();
+            write_atomic(
+                &path,
+                format!(
+                    "{}
+",
+                    lines.join(
+                        "
+"
+                    )
+                )
+                .as_bytes(),
+            )
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn save_browser_session(
@@ -1017,11 +1278,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         fs::write(
             path,
             format!(
-                "{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n\n",
                 session.account_id,
                 session.session_token,
                 session.csrf_token_hash,
-                session.expires_at_ms
+                session.expires_at_ms,
+                self.now_ms()
             ),
         )
         .map_err(|error| ApiFailure::internal(error.to_string()))
@@ -1032,7 +1294,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
-        let Ok(saved) = fs::read_to_string(path) else {
+        let Ok(saved) = fs::read_to_string(&path) else {
             return Ok(None);
         };
         let mut lines = saved.lines();
@@ -1042,31 +1304,90 @@ impl StudyStorageAdapter for FileStudyStorage {
         let Some(session_token) = lines.next() else {
             return Ok(None);
         };
-        let Some(csrf_token_hash) = lines.next() else {
+        let legacy_raw_token = (!is_secret_hash(session_token)).then(|| session_token.to_owned());
+        let session_token = if let Some(raw_token) = legacy_raw_token.as_deref() {
+            self.migrate_legacy_browser_session_token(&path, raw_token)?
+        } else {
+            session_token.to_owned()
+        };
+        let Some(persisted_csrf_token_hash) = lines.next() else {
             return Ok(None);
         };
         let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok()) else {
             return Ok(None);
         };
-        if expires_at_ms <= self.now_ms() {
+        let _created_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        let revoked_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        if expires_at_ms <= self.now_ms() || revoked_at_ms.is_some() {
             return Ok(None);
         }
-
+        let csrf_token_hash = if legacy_raw_token.is_some() {
+            secret_hash(&session_csrf_token(&session_token))
+        } else {
+            persisted_csrf_token_hash.to_owned()
+        };
         Ok(Some(BrowserSessionRecord {
             account_id: account_id.to_owned(),
-            session_token: session_token.to_owned(),
-            csrf_token_hash: csrf_token_hash.to_owned(),
+            session_token,
+            csrf_token_hash,
             expires_at_ms,
         }))
     }
 
-    fn revoke_browser_session(&self, session_id: &str, _now_ms: i64) -> Result<(), ApiFailure> {
+    fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(ApiFailure::internal(error.to_string())),
+        let Ok(saved) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        while lines.len() < 5 {
+            lines.push(String::new());
         }
+        if lines.len() == 5 {
+            lines.push(now_ms.to_string());
+        } else {
+            lines[5] = now_ms.to_string();
+        }
+        write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let root = self.store_root.join("_browser_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if saved.lines().next() == Some(account_id) {
+                let session_id_hash = entry.file_name().to_string_lossy().into_owned();
+                let session_path = self
+                    .store_root
+                    .join("_browser_sessions")
+                    .join(session_id_hash)
+                    .join("session");
+                let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+                while lines.len() < 5 {
+                    lines.push(String::new());
+                }
+                if lines.len() == 5 {
+                    lines.push(now_ms.to_string());
+                } else {
+                    lines[5] = now_ms.to_string();
+                }
+                write_atomic(&session_path, format!("{}\n", lines.join("\n")).as_bytes())
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn save_auth_challenge(
@@ -1426,6 +1747,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         window_ms: i64,
         max_attempts: u32,
     ) -> Result<bool, ApiFailure> {
+        let _lock = crate::file_lock::acquire(&self.store_root.join("_rate_limits.lock"))?;
         let mut attempts_by_key = Vec::with_capacity(keys.len());
         for key in keys {
             let path = rate_limit_path(&self.store_root, key);
@@ -1454,7 +1776,11 @@ impl StudyStorageAdapter for FileStudyStorage {
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
-        Ok(account_session_path(&self.store_root, account_id).exists()
+        Ok(self
+            .store_root
+            .join(account_id)
+            .join("account.marker")
+            .exists()
             || account_store_path(&self.store_root, account_id).exists())
     }
 
@@ -1942,7 +2268,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             self.now_ms(),
             |mut account| {
                 account
-                    .save_api_session(session_token, self.now_ms())
+                    .save_api_session(
+                        &secret_hash(session_token),
+                        self.now_ms(),
+                        self.now_ms().saturating_add(app_session_max_age_ms()),
+                    )
                     .map_err(postgres_failure)
             },
         )
@@ -1953,9 +2283,14 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
         with_postgres_store(&self.database_url, |store| {
             store
-                .api_session_matches(account_id, session_token)
+                .api_session_matches(account_id, &session_token_hash, self.now_ms())
                 .map_err(postgres_failure)
         })
     }
@@ -1965,9 +2300,41 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         session_token: &str,
         timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<bool, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
         with_postgres_store_timed(&self.database_url, timings, |store| {
             store
-                .api_session_matches(account_id, session_token)
+                .api_session_matches(account_id, &session_token_hash, self.now_ms())
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let token_hash = secret_hash(session_token);
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .revoke_api_session(&token_hash, now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .revoke_api_sessions(now_ms)
+                .map(|_| ())
                 .map_err(postgres_failure)
         })
     }
@@ -2033,6 +2400,18 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_store(&self.database_url, |store| {
             store
                 .revoke_browser_session(&secret_hash(session_id), now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .revoke_browser_sessions_for_account(account_id, now_ms)
                 .map_err(postgres_failure)
         })
     }
@@ -2877,6 +3256,39 @@ mod tests {
             self.release.wait();
             self.delegate.generate_drafts(source)
         }
+    }
+
+    #[test]
+    fn legacy_account_session_migration_hashes_and_removes_raw_token() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-legacy-session-migration-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_legacy_file";
+        let legacy_path = root.join(account_id).join("session.token");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, "legacy-wire-token\n").expect("legacy token");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        storage
+            .migrate_legacy_account_session(account_id, test_now())
+            .expect("migrate legacy account session");
+        assert!(
+            !legacy_path.exists(),
+            "raw token must be removed after verified rewrite"
+        );
+        let hash_path = root
+            .join("_api_sessions")
+            .join(secret_hash("legacy-wire-token"))
+            .join("session");
+        let persisted = fs::read_to_string(hash_path).expect("hashed session");
+        assert!(persisted.starts_with(account_id));
+        assert!(!persisted.contains("legacy-wire-token"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

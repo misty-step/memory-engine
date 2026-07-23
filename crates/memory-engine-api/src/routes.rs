@@ -35,10 +35,9 @@ use memory_engine_api_render::{
     AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
-    client_rate_limit_key, csrf_token, html_with_browser_session,
-    html_with_cleared_browser_session, normalize_email, read_session_token,
-    report_submit_browser_performance, report_submit_server_performance, AccountCreated,
-    ApiFailure, ApiState, AppAccount, BrowserSubmitReceipt, ContentFeedbackRequest,
+    csrf_token, html_with_browser_session, html_with_cleared_browser_session, normalize_email,
+    read_session_token, report_submit_browser_performance, report_submit_server_performance,
+    AccountCreated, ApiFailure, ApiState, AppAccount, BrowserSubmitReceipt, ContentFeedbackRequest,
     CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome,
     GenerationJob, HealthResponse, InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord,
     ReadinessResponse, ScheduledReturnNotificationReport, SourceList, SourcePermission,
@@ -68,6 +67,8 @@ enum V1Route {
     OpenApi,
     Accounts,
     ServiceSessions,
+    ApiSessionRevoke,
+    ApiSessionsRevokeAll,
     Sources,
     Source,
     ProjectDecks,
@@ -93,6 +94,8 @@ const V1_OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.v1.json");
 const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
 const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
 const V1_SERVICE_SESSIONS_PATH: &str = "/v1/service-sessions";
+const V1_API_SESSION_REVOKE_PATH: &str = "/v1/accounts/{account_id}/service-sessions/current";
+const V1_API_SESSIONS_REVOKE_ALL_PATH: &str = "/v1/accounts/{account_id}/service-sessions/all";
 const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
 const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
 const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
@@ -121,6 +124,8 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::OpenApi,
     V1Route::Accounts,
     V1Route::ServiceSessions,
+    V1Route::ApiSessionRevoke,
+    V1Route::ApiSessionsRevokeAll,
     V1Route::Sources,
     V1Route::Source,
     V1Route::ProjectDecks,
@@ -225,6 +230,13 @@ impl V1Route {
             Self::ServiceSessions => {
                 router.route(V1_SERVICE_SESSIONS_PATH, post(issue_service_session))
             }
+            Self::ApiSessionRevoke => {
+                router.route(V1_API_SESSION_REVOKE_PATH, delete(revoke_api_session))
+            }
+            Self::ApiSessionsRevokeAll => router.route(
+                V1_API_SESSIONS_REVOKE_ALL_PATH,
+                delete(revoke_all_api_sessions),
+            ),
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
             Self::Source => router.route(
                 V1_SOURCE_PATH,
@@ -258,11 +270,16 @@ impl V1Route {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
     fn operations(self) -> &'static [V1ContractOperation] {
         match self {
             Self::OpenApi => single_operation!("GET", V1_OPENAPI_PATH),
             Self::Accounts => single_operation!("POST", V1_ACCOUNTS_PATH),
             Self::ServiceSessions => single_operation!("POST", V1_SERVICE_SESSIONS_PATH),
+            Self::ApiSessionRevoke => single_operation!("DELETE", V1_API_SESSION_REVOKE_PATH),
+            Self::ApiSessionsRevokeAll => {
+                single_operation!("DELETE", V1_API_SESSIONS_REVOKE_ALL_PATH)
+            }
             Self::Sources => &[
                 V1ContractOperation {
                     method: "GET",
@@ -352,6 +369,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
+        .route("/app/logout-all", post(logout_all_app_sessions))
         .route(
             "/app/return-notifications",
             get(return_notification_page).post(update_return_notifications),
@@ -571,18 +589,24 @@ async fn app_analytics(
 
 async fn create_account(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
     let email = normalize_email(&request.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))?;
-    let account = state.create_account(&email)?;
+    let account = if state.anonymous_account_creation_allowed() {
+        state.create_account(&email)?
+    } else {
+        let admin_token = admin_token_from_headers(&headers);
+        state.issue_service_session(admin_token, &email)?
+    };
 
     Ok((StatusCode::CREATED, Json(account)))
 }
 
-/// Issue (or rotate) an account-scoped service-session credential for a
-/// machine consumer. Gated by the operator admin token; reissue revokes the
-/// prior credential immediately.
+/// Issue an independent account-scoped service-session credential for a
+/// machine consumer. Gated by the operator admin token; callers can revoke one
+/// credential or all credentials through the explicit DELETE routes.
 ///
 /// The admin token is verified before the body is deserialized, so an
 /// unauthorized caller can never exercise the JSON parser on this
@@ -602,6 +626,26 @@ async fn issue_service_session(
     let account = state.issue_service_session(admin_token, &request.email)?;
 
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+async fn revoke_api_session(
+    State(state): State<ApiState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.revoke_api_session(&account_id, session_token)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_all_api_sessions(
+    State(state): State<ApiState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.revoke_all_api_sessions(&account_id, session_token)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_source(
@@ -1066,7 +1110,7 @@ async fn create_app_account(
 
     no_store_response(match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
-        Err(error) => app_failure_response(error),
+        Err(error) => app_failure_response(&error),
     })
 }
 
@@ -1213,9 +1257,10 @@ async fn delete_waitlist(
 
 async fn verify_app_login(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<AppLoginVerifyQuery>,
 ) -> Response {
-    match state.verify_magic_link(&query.token) {
+    match state.verify_magic_link_for_client(&query.token, &client_rate_limit_key(&headers)) {
         Ok(account) => {
             let view = state.app_study_view(&account).ok();
             no_store_response(html_with_browser_session(
@@ -1233,7 +1278,7 @@ async fn verify_app_login(
             *response.status_mut() = status;
             no_store_response(response)
         }
-        Err(error) => no_store_response(app_failure_response(error)),
+        Err(error) => no_store_response(app_failure_response(&error)),
     }
 }
 
@@ -1276,8 +1321,8 @@ async fn return_notification_page(
         Ok(Err(error)) if error.is_return_notification_link_invalid() => {
             return_notification_token_recovery_response(&error)
         }
-        Ok(Err(error)) => no_store_response(app_failure_response(error)),
-        Err(error) => no_store_response(app_failure_response(ApiFailure::internal(format!(
+        Ok(Err(error)) => no_store_response(app_failure_response(&error)),
+        Err(error) => no_store_response(app_failure_response(&ApiFailure::internal(format!(
             "notification page worker join failed: {error}"
         )))),
     }
@@ -1321,13 +1366,13 @@ async fn update_return_notifications(
             Err(error) if error.is_return_notification_link_invalid() => {
                 return_notification_token_recovery_response(&error)
             }
-            Err(error) => app_failure_response(error),
+            Err(error) => app_failure_response(&error),
         });
     }
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return no_store_response(app_failure_response(error)),
+            Err(error) => return no_store_response(app_failure_response(&error)),
         };
     let enabled = form.enabled.as_deref() == Some("on");
     let reminder_email = form.reminder_email.clone();
@@ -1369,7 +1414,18 @@ async fn logout_app_session(
 ) -> Response {
     match state.revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
         Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
-        Err(error) => app_failure_response(error),
+        Err(error) => app_failure_response(&error),
+    }
+}
+
+async fn logout_all_app_sessions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppAccountActionForm>,
+) -> Response {
+    match state.revoke_all_browser_sessions(&headers, csrf_token(form.csrf_token.as_ref())) {
+        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
+        Err(error) => app_failure_response(&error),
     }
 }
 
@@ -1381,7 +1437,7 @@ async fn save_app_account(
     let source_account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let source_view = state.app_study_view(&source_account).ok();
     let result = normalize_email(&form.email)
@@ -1392,7 +1448,7 @@ async fn save_app_account(
         Ok(account) => {
             let account = match state.create_browser_session(&account) {
                 Ok(account) => account,
-                Err(error) => return app_failure_response(error),
+                Err(error) => return app_failure_response(&error),
             };
             let view = state.app_study_view(&account).ok().or(source_view);
             html_with_browser_session(
@@ -1414,6 +1470,15 @@ async fn start_app_study(
     State(state): State<ApiState>,
     Form(form): Form<AppStartForm>,
 ) -> Response {
+    if !state.anonymous_account_creation_allowed() {
+        let mut response = Html(render_auth_recovery(
+            "Sign-in required",
+            "Guest study spaces are disabled here. Request an invite link to continue.",
+        ))
+        .into_response();
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return no_store_response(response);
+    }
     let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
     let account = match state.create_account(&email) {
         Ok(account) => account,
@@ -1424,7 +1489,7 @@ async fn start_app_study(
     };
     let account = match state.create_browser_session(&account) {
         Ok(account) => account,
-        Err(error) => return app_failure_response(error),
+        Err(error) => return app_failure_response(&error),
     };
     let result = state.save_app_source(
         &account,
@@ -1445,7 +1510,7 @@ async fn create_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.save_app_source(
         &account,
@@ -1472,7 +1537,7 @@ async fn capture_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let request = capture_request(form.title, form.body, form.capture, form.permission);
     let notice = match state.save_app_source(&account, &request) {
@@ -1547,7 +1612,7 @@ async fn generate_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let title = state
         .list_app_sources(&account)
@@ -1576,7 +1641,7 @@ async fn archive_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.archive_app_source(&account, &form.source_id);
 
@@ -1614,7 +1679,7 @@ async fn update_app_source_permission(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     match state.update_app_source_permission(&account, &form.source_id, form.permission) {
         Ok(()) => Html(render_account_page(
@@ -1644,7 +1709,7 @@ async fn retry_app_job(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let notice = if state.retry_generation_job(&account, &form.job_id) {
         "Retrying. Generating again in the background."
@@ -1661,7 +1726,7 @@ async fn retry_app_job(
 async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
-        Err(error) => return app_failure_response(error),
+        Err(error) => return app_failure_response(&error),
     };
     let account_id = account.account_id().to_owned();
     // `tokio_stream::StreamExt::filter_map` is synchronous: the closure returns
@@ -1706,7 +1771,7 @@ async fn keep_app_draft(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.keep_draft(
         account.account_id(),
@@ -1734,7 +1799,7 @@ async fn edit_app_draft(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.edit_pending_draft(
         account.account_id(),
@@ -1764,7 +1829,7 @@ async fn reject_app_draft(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.reject_pending_draft(
         account.account_id(),
@@ -1792,25 +1857,51 @@ async fn next_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.next_app_review(&account);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
-fn app_failure_response(error: ApiFailure) -> Response {
-    if error.is_session_expired() {
-        let status = error.status();
-        let mut response = Html(render_auth_recovery(
+fn client_rate_limit_key(headers: &HeaderMap) -> String {
+    // DigitalOcean's edge overwrites this header from the accepted client's address before forwarding the request. Generic forwarding headers remain
+    // untrusted and are intentionally ignored. Missing edge identity is one
+    // deterministic bucket rather than an attacker-controlled bypass.
+    headers
+        .get("do-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| "unknown".to_owned(), str::to_owned)
+}
+
+fn app_failure_response(error: &ApiFailure) -> Response {
+    let status = error.status();
+    let (title, message) = if error.is_session_expired() {
+        (
             "Your session expired",
             "Your study data is safe. Sign in again to continue where you left off.",
-        ))
-        .into_response();
-        *response.status_mut() = status;
-        return no_store_response(response);
-    }
-    error.into_response()
+        )
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        (
+            "Please try again later",
+            "We’re taking a short break from sign-in attempts. Wait a little while, then request a fresh link.",
+        )
+    } else if error.is_magic_link_recovery() {
+        (
+            "Sign-in link expired",
+            "That link is no longer valid. Request a fresh link and return to your study space.",
+        )
+    } else {
+        (
+            "We couldn’t complete sign-in",
+            "We couldn’t complete that request. Request a fresh sign-in link and try again.",
+        )
+    };
+    let mut response = Html(render_auth_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
 }
 fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> Response {
     let mut response = Html(render_submit_recovery(title, message)).into_response();
@@ -1818,7 +1909,7 @@ fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> R
     no_store_response(response)
 }
 
-fn submit_failure_response(error: ApiFailure) -> Response {
+fn submit_failure_response(error: &ApiFailure) -> Response {
     if error.is_session_expired() {
         return app_failure_response(error);
     }
@@ -1847,7 +1938,7 @@ async fn reveal_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.reveal_app_review(&account, &form.review_unit_id);
 
@@ -1862,7 +1953,7 @@ async fn reference_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.learn_more_app_review(&account, &form.review_unit_id);
 
@@ -1877,7 +1968,7 @@ async fn skip_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
 
@@ -1892,7 +1983,7 @@ async fn delete_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.delete_app_review(&account, &form.review_unit_id);
 
@@ -1907,7 +1998,7 @@ async fn edit_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let view = match state.next_app_review(&account) {
         Ok(view) => view,
@@ -1931,7 +2022,7 @@ async fn save_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.edit_app_review(
         &account,
@@ -1961,7 +2052,7 @@ async fn snooze_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
 
@@ -1976,7 +2067,7 @@ async fn snooze_concept_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
@@ -2001,7 +2092,7 @@ async fn bridge_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.bridge_app_review(&account, &form.review_unit_id);
 
@@ -2103,7 +2194,7 @@ async fn submit_app_review(
         Err(error) => {
             let outcome = submit_outcome(error.status());
             let render_started = Instant::now();
-            let response = submit_failure_response(error);
+            let response = submit_failure_response(&error);
             (response, bounded_request_ms(render_started), outcome)
         }
     };
@@ -2327,7 +2418,7 @@ fn render_content_feedback_follow_up_failure(
     error: ApiFailure,
 ) -> Response {
     if error.is_session_expired() {
-        return app_failure_response(error);
+        return app_failure_response(&error);
     }
     let status = error.status();
     let message = error.message;
@@ -2385,7 +2476,7 @@ pub(crate) fn render_content_feedback_persistence_failure(
     error: ApiFailure,
 ) -> Response {
     if error.is_session_expired() {
-        return app_failure_response(error);
+        return app_failure_response(&error);
     }
     let mut status = error.status();
     let mut message = error.message;
@@ -2448,7 +2539,7 @@ async fn record_app_content_feedback(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let request = ContentFeedbackRequest {
         verdict: form.verdict,

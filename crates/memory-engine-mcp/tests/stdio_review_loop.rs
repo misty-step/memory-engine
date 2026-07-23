@@ -22,28 +22,25 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         .await
         .expect("bind local API listener");
     let address = listener.local_addr().expect("local address");
+    let email = format!("memory-engine-mcp-test-{}@example.com", unique_suffix());
+    let store_root =
+        std::env::temp_dir().join(format!("memory-engine-mcp-api-{}", unique_suffix()));
+    let state = memory_engine_api::ApiState::new(
+        memory_engine_api::AccountRegistry::with_store_root(&store_root).with_auth_config(
+            memory_engine_api::AuthConfig::allow_emails([email.clone()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
+    let created = state.create_account(&email).expect("pre-provision account");
+    let account_id = created.account_id.clone();
+    let session_token = created.session_token.clone();
     let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            memory_engine_api::router(memory_engine_api::ApiState::default()),
-        )
-        .await
-        .expect("serve local API");
+        axum::serve(listener, memory_engine_api::router(state))
+            .await
+            .expect("serve local API");
     });
 
     let base_url = format!("http://{address}");
-    let email = format!("memory-engine-mcp-test-{}@example.com", unique_suffix());
-    let created: Value = ureq::post(format!("{base_url}/v1/accounts"))
-        .send_json(json!({ "email": email }))
-        .expect("create account")
-        .body_mut()
-        .read_json()
-        .expect("account json");
-    let account_id = created["accountId"].as_str().expect("accountId").to_owned();
-    let session_token = created["sessionToken"]
-        .as_str()
-        .expect("sessionToken")
-        .to_owned();
 
     let binary = env!("CARGO_BIN_EXE_memory-engine-mcp");
     let mut child = Command::new(binary)

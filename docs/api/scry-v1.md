@@ -12,8 +12,9 @@ HTML forms are not part of this contract. Token clients authenticate with:
 Authorization: Bearer <sessionToken>
 ```
 
-The session token comes from `POST /v1/accounts` or from a pre-provisioned
-account session. The token is secret; receipts and demos must never print it.
+The session token comes from an invite magic-link or an operator-issued
+pre-provisioned account session. The token is secret; receipts and demos must
+never print it. Anonymous account creation is not part of this contract.
 
 ## Contract Files
 
@@ -30,16 +31,18 @@ account session. The token is secret; receipts and demos must never print it.
 
 ## Consumer Demo
 
-Create a disposable local or staging account where the email is allowlisted:
+Provision a disposable local or staging account through the invite magic-link
+or operator service-session flow. Then run the contract against that account
+without printing the session token:
 
 ```sh
+MEMORY_ENGINE_ACCOUNT_ID=acct_... \
+MEMORY_ENGINE_SESSION_TOKEN="$SESSION_TOKEN" \
 cargo run -p memory-engine-contract -- \
-  --base-url http://127.0.0.1:18080 \
-  --email scry-contract-local@example.com
+  --base-url http://127.0.0.1:18080
 ```
 
-Production account creation is allowlist-gated. The production demo must reuse
-a pre-provisioned account without printing the session token:
+The production demo uses the same pre-provisioned account contract:
 
 ```sh
 MEMORY_ENGINE_ACCOUNT_ID=acct_... \

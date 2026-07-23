@@ -18,48 +18,32 @@ already returns (`dueCount`, `grade`, `scheduleChange.before/after`).
 
 ## Auth model
 
-The v1 contract is Bearer-token, not cookie/browser-session: `POST
-/v1/accounts` with an allowlisted email returns `{accountId, sessionToken}`
-once, and every subsequent call sends `Authorization: Bearer <sessionToken>`.
-There is no v1 endpoint to recover a lost token — that's a deliberate gap in
-the current contract (the browser magic-link flow re-issues a *browser*
-session, not a v1 API token) — so the CLI's one-time setup is:
+The v1 contract is Bearer-token, not cookie/browser-session. Anonymous account
+creation is not a client contract: credentials must be provisioned through the
+invite magic-link flow or the operator-gated service-session flow. Every review
+call sends `Authorization: Bearer <sessionToken>`.
+
+Import a pre-provisioned credential pair once:
 
 ```sh
-# New account (first time this email registers):
-cargo run -p memory-engine-review -- login --email you@example.com
-
-# Or import an existing account's credentials directly:
-cargo run -p memory-engine-review -- login --account-id acct_... --session-token sess_...
+MEMORY_ENGINE_ACCOUNT_ID=acct_... \
+MEMORY_ENGINE_SESSION_TOKEN="$SESSION_TOKEN" \
+cargo run -p memory-engine-review -- login \
+  --base-url https://memory-engine-api-i2xcr.ondigitalocean.app \
+  --account-id $MEMORY_ENGINE_ACCOUNT_ID \
+  --session-token $MEMORY_ENGINE_SESSION_TOKEN
 ```
 
-Either form writes `~/.memory-engine/review/credentials.json` (mode `0600`,
-never committed) and every later `review`/`streak` invocation reads it. Env
-vars `MEMORY_ENGINE_ACCOUNT_ID`/`MEMORY_ENGINE_SESSION_TOKEN` (the same names
-`docs/runbook.md` already uses) override the file, so the existing
-pre-provisioned production account can be used without writing it to disk.
-
-### Recovering an existing session token
-
-`account_id_for(email)` is deterministic, so re-running `login --email` for an
-account that already exists returns `409 Conflict` (correct — it does not leak
-a fresh token for someone else's email). To recover a lost token for an
-account you already control, read it back from the same store the API itself
-uses (`memory_engine_api_sessions.session_token`, keyed by `account_id`):
-
-```sh
-neonctl connection-string --project-id twilight-brook-49749008 --pooled
-# then, inside that psql session or via `psql "$CONNSTR" -c ...`:
-SELECT session_token FROM memory_engine_api_sessions WHERE account_id = '<account_id>';
-```
-
-Treat that value like any other credential — do not print it to a shared
-terminal/log; pipe it directly into `login --session-token`.
+The command writes `~/.memory-engine/review/credentials.json` (mode `0600`,
+never committed). Environment variables with the same names override the file,
+so production credentials can stay in the shell or secret manager. The CLI never
+queries persistence for a token and never creates an account.
 
 ## Commands
 
 ```sh
-cargo run -p memory-engine-review -- login --email you@example.com
+cargo run -p memory-engine-review -- login \
+  --account-id acct_... --session-token "$SESSION_TOKEN"
 cargo run -p memory-engine-review               # runs the review loop (default subcommand)
 cargo run -p memory-engine-review -- streak      # 30-day streak + cold-recall report
 cargo test -p memory-engine-review
@@ -107,17 +91,9 @@ Two runs were exercised for this ticket:
 
 ### 1. Production auth boundary (real, deployed API, read-only)
 
-Confirms the allowlist actually rejects a non-allowlisted email — the
-contract this CLI's `login --email` path depends on:
-
-```sh
-$ curl -sS -X POST https://memory-engine-api.fly.dev/v1/accounts \
-    -H 'content-type: application/json' \
-    -d '{"email":"memory-engine-review-dispatch-check@example.com"}' \
-    -w '\nHTTP %{http_code}\n'
-{"error":"This email is not allowed to register."}
-HTTP 403
-```
+Anonymous account creation is not a client contract. The v1 account-session route is
+operator-gated; browser sign-in uses the invite magic-link flow. This receipt
+therefore does not exercise anonymous account creation or email delivery.
 
 This ticket deliberately did **not** pull the operator's real production
 session token to run the full review loop against his live account: doing so
@@ -199,25 +175,7 @@ transcript (a unit reviewed for a second time, `scheduleChange.before.reps
 >= 1`) needs a longer-running local session and is left as the natural
 follow-on once real usage accumulates repeat reviews.
 
-The conflict/recovery error path was also exercised for real:
-
-```sh
-$ ./target/debug/memory-engine-review login --base-url http://127.0.0.1:18099 \
-    --email dogfood-morning-review@example.com
-create account failed with HTTP 409
-
-If this account already exists in production, fetch its existing session token
-(see docs/dogfood/morning-review-cli.md, "Recovering an existing session token")
-and run:
-  memory-engine-review login --account-id <id> --session-token <token>
-```
-
-The same flow is also covered by an automated test —
-`review_loop_drives_a_real_local_api_end_to_end` in
-`crates/memory-engine-review/src/main.rs` — which boots the real axum router
-in-process, seeds a source/draft the same way, and asserts the CLI's own
-`run_review` reaches `dueCount == 0`, prints the expected transcript lines,
-and writes both NDJSON event types.
+Credential provisioning is intentionally outside this client. The local end-to-end test `review_loop_drives_a_real_local_api_end_to_end` explicitly seeds a fixture account before starting the real axum router, then exercises the review loop over HTTP. This keeps the client honest without reintroducing anonymous account creation.
 
 ## Stayed Outside This Client
 
@@ -225,8 +183,7 @@ and writes both NDJSON event types.
   this client assumes a populated due queue)
 - voice input (typed only; a later rung)
 - any new server-side streak/cold-recall field or endpoint
-- production account self-service beyond the existing allowlist + `POST
-  /v1/accounts` — recovering a token is a documented manual step, not code
+- production account self-service; credentials are provisioned outside this client
 
 ## Residual Risk
 

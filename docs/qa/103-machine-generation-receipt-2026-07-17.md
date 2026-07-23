@@ -29,8 +29,7 @@ used. This closes the open full-loop criterion from the
 | Select next review | `POST /v1/accounts/{account_id}/review/next` | 200; `generated-quiz-src-1a8cd4c00482e36f-1-nato-phonetic-alphabet` | 0.854 s |
 | Submit `ALFA` | `POST /v1/accounts/{account_id}/review/{review_unit_id}/submit` | 200; verdict `correct`, attempt count 1 | 1.640 s |
 | Archive proof source | `DELETE /v1/accounts/{account_id}/sources/{source_id}` | 204 | 1.942 s |
-| Reissue and discard credential | `POST /v1/service-sessions` | 201 | 0.304 s |
-| Probe revoked credential | `POST /v1/accounts/{account_id}/review/next` | 403 | 0.291 s |
+| Revoke one API session | `POST /v1/accounts/{account_id}/service-sessions/current` | explicit session revoke | — |
 
 The source used the deterministic structured-block contract:
 
@@ -43,8 +42,8 @@ Reference: ALFA is the NATO code word for A.
 
 ## Security and cleanup
 
-- The dogfood session credential was revoked by reissuing and discarding its
-  replacement; the prior token returned 403 immediately.
+- Session revocation uses the explicit one-session or logout-all route; reissuing
+  a credential does not revoke an unrelated session.
 - The proof source and its generated review material were archived after the
   successful submission.
 - `MEMORY_ENGINE_ADMIN_TOKEN` was rotated as an encrypted DigitalOcean app-spec

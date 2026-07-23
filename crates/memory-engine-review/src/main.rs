@@ -75,7 +75,7 @@ fn dispatch(
 
 fn print_usage() {
     println!(
-        "usage:\n  memory-engine-review login --email EMAIL [--base-url URL]\n  memory-engine-review login --account-id ID --session-token TOKEN [--base-url URL]\n  memory-engine-review [review] [--base-url URL] [--max-cards N]\n  memory-engine-review streak [--days N]\n\nCredentials resolve in order: MEMORY_ENGINE_ACCOUNT_ID/MEMORY_ENGINE_SESSION_TOKEN\nenv vars, then the file written by `login` (default {}).",
+        "usage:\n  memory-engine-review login --account-id ID --session-token TOKEN [--base-url URL]\n  memory-engine-review [review] [--base-url URL] [--max-cards N]\n  memory-engine-review streak [--days N]\n\nCredentials resolve in order: MEMORY_ENGINE_ACCOUNT_ID/MEMORY_ENGINE_SESSION_TOKEN\nenv vars, then the file written by `login` (default {}).",
         default_credentials_path().display()
     );
 }
@@ -86,7 +86,6 @@ fn print_usage() {
 
 fn run_login(args: &[String]) -> Result<(), CliFailure> {
     let mut base_url = DEFAULT_BASE_URL.to_owned();
-    let mut email = None;
     let mut account_id = None;
     let mut session_token = None;
     let mut credentials_path = default_credentials_path();
@@ -98,7 +97,6 @@ fn run_login(args: &[String]) -> Result<(), CliFailure> {
             .ok_or_else(|| CliFailure(format!("{flag} requires a value")))?;
         match flag.as_str() {
             "--base-url" => base_url.clone_from(value),
-            "--email" => email = Some(value.clone()),
             "--account-id" => account_id = Some(value.clone()),
             "--session-token" => session_token = Some(value.clone()),
             "--credentials-path" => credentials_path = PathBuf::from(value),
@@ -107,37 +105,20 @@ fn run_login(args: &[String]) -> Result<(), CliFailure> {
         index += 2;
     }
 
-    let credentials = match (email, account_id, session_token) {
-        (Some(email), None, None) => {
-            let agent = build_agent();
-            let created = create_account(&agent, &base_url, &email).map_err(|error| {
-                CliFailure(format!(
-                    "{error}\n\nIf this account already exists in production, fetch its \
-                     existing session token (see docs/dogfood/morning-review-cli.md, \
-                     \"Recovering an existing session token\") and run:\n  \
-                     memory-engine-review login --account-id <id> --session-token <token>"
-                ))
-            })?;
-            StoredCredentials {
-                base_url,
-                account_id: created.account_id,
-                session_token: created.session_token,
-            }
-        }
-        (None, Some(account_id), Some(session_token)) => StoredCredentials {
+    let credentials = match (account_id, session_token) {
+        (Some(account_id), Some(session_token)) => StoredCredentials {
             base_url,
             account_id,
             session_token,
         },
-        (None, None, None) => {
+        (None, None) => {
             return Err(CliFailure(
-                "login requires --email, or --account-id and --session-token together".to_owned(),
+                "login requires pre-provisioned --account-id and --session-token".to_owned(),
             ));
         }
         _ => {
             return Err(CliFailure(
-                "pass either --email alone, or --account-id and --session-token together"
-                    .to_owned(),
+                "--account-id and --session-token must be provided together".to_owned(),
             ));
         }
     };
@@ -594,7 +575,7 @@ fn resolve_session(
     let stored = read_credentials(credentials_path)?.ok_or_else(|| {
         CliFailure(format!(
             "no credentials found (checked MEMORY_ENGINE_ACCOUNT_ID/MEMORY_ENGINE_SESSION_TOKEN \
-             and {}). Run `memory-engine-review login --email you@example.com` first.",
+             and {}). Run `memory-engine-review login --account-id <id> --session-token <token>` with pre-provisioned credentials.",
             credentials_path.display()
         ))
     })?;
@@ -771,18 +752,6 @@ fn build_agent() -> ureq::Agent {
         .into()
 }
 
-fn create_account(
-    agent: &ureq::Agent,
-    base_url: &str,
-    email: &str,
-) -> Result<AccountCreated, CliFailure> {
-    let mut response = agent
-        .post(&endpoint(base_url, "/v1/accounts"))
-        .send_json(json!({ "email": email }))
-        .map_err(|error| transport_failure("create account", &error))?;
-    read_json(&mut response, "create account")
-}
-
 fn read_json<T: DeserializeOwned>(
     response: &mut ureq::http::Response<ureq::Body>,
     action: &str,
@@ -867,13 +836,6 @@ fn format_date(year: i64, month: u32, day: u32) -> String {
 // ---------------------------------------------------------------------------
 // API response shapes (thin subset of docs/api/openapi.v1.json)
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AccountCreated {
-    account_id: String,
-    session_token: String,
-}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1101,9 +1063,7 @@ mod tests {
     fn login_rejects_partial_existing_credentials() {
         let error = run_login(&["--account-id".to_owned(), "acct_demo".to_owned()])
             .expect_err("partial credentials should fail");
-        assert!(error
-            .to_string()
-            .contains("--account-id and --session-token together"));
+        assert!(error.to_string().contains("must be provided together"));
     }
 
     #[test]
@@ -1172,19 +1132,24 @@ mod tests {
             .await
             .expect("bind local API listener");
         let address = listener.local_addr().expect("local address");
+        let email = format!("memory-engine-review-test-{}@example.com", unique_suffix());
+        let store_root =
+            std::env::temp_dir().join(format!("memory-engine-review-api-{}", unique_suffix()));
+        let state = memory_engine_api::ApiState::new(
+            memory_engine_api::AccountRegistry::with_store_root(&store_root).with_auth_config(
+                memory_engine_api::AuthConfig::allow_emails([email.clone()])
+                    .with_anonymous_account_creation(true),
+            ),
+        );
+        let created = state.create_account(&email).expect("pre-provision account");
         let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                memory_engine_api::router(memory_engine_api::ApiState::default()),
-            )
-            .await
-            .expect("serve local API");
+            axum::serve(listener, memory_engine_api::router(state))
+                .await
+                .expect("serve local API");
         });
 
         let agent = build_agent();
         let base_url = format!("http://{address}");
-        let email = format!("memory-engine-review-test-{}@example.com", unique_suffix());
-        let created = create_account(&agent, &base_url, &email).expect("create account");
         let client = ReviewClient::new(
             agent,
             base_url.clone(),

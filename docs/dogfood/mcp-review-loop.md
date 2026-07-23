@@ -43,22 +43,21 @@ different backend methods for different UI intents.
 
 ## Credential model
 
-Same env vars `docs/runbook.md` and `docs/dogfood/morning-review-cli.md`
-already use: `MEMORY_ENGINE_ACCOUNT_ID` / `MEMORY_ENGINE_SESSION_TOKEN`. There
-is no interactive `login` subcommand — stdin is the JSON-RPC channel, not a
-terminal — so a brand-new local server instead bootstraps its own account
-non-interactively from `MEMORY_ENGINE_MCP_EMAIL`, persisting the result to
-`~/.memory-engine/mcp/credentials.json` (mode `0600`) for reuse across
-restarts. `MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
+Credentials are provisioned through the invite magic-link or operator service-session
+flows before this stdio server starts. Anonymous account creation is disabled.
+There is no interactive `login` subcommand — stdin is the JSON-RPC channel, not a
+terminal — so import a pre-provisioned pair through `MEMORY_ENGINE_ACCOUNT_ID` /
+`MEMORY_ENGINE_SESSION_TOKEN`, or place the same pair in
+`~/.memory-engine/mcp/credentials.json` (mode `0600`).
+`MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
 `https://memory-engine-api-i2xcr.ondigitalocean.app`, matching
 `memory-engine-review`).
 
-Resolution order: env vars -> credentials file -> `MEMORY_ENGINE_MCP_EMAIL`
-bootstrap -> fail loudly. There is no in-memory fallback
-(`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the
-server exits non-zero with no stdout before reading any stdin when none of
-the three resolve) — the same lesson `powder-mcp` encoded after an
-ephemeral in-memory mode silently evaporated claims on process exit.
+Resolution order: env vars -> credentials file -> fail loudly. There is no
+anonymous bootstrap or in-memory fallback.
+`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the real binary
+exits non-zero with no stdout before reading stdin when no pre-provisioned
+credential resolves.
 
 ## Commands
 

@@ -1443,7 +1443,10 @@ mod tests {
     #[test]
     fn rerunning_a_generation_job_is_idempotent_after_an_interrupted_schedule() {
         let store = TempStore::new("idempotent-generation");
-        let registry = AccountRegistry::with_store_root(store.0.clone());
+        let registry = AccountRegistry::with_store_root(store.0.clone()).with_auth_config(
+            crate::AuthConfig::allow_emails(["idempotent@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        );
         let account = registry
             .create_account("idempotent@example.com")
             .expect("test account");
@@ -1531,7 +1534,8 @@ mod tests {
             .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
             .expect("create schema");
         let result = (|| -> Result<(), String> {
-            let registry = AccountRegistry::with_postgres_url(scoped_url.clone());
+            let registry = AccountRegistry::with_postgres_url(scoped_url.clone())
+                .with_auth_config(crate::AuthConfig::for_local_tests());
             let account = registry
                 .create_account("fence@example.com")
                 .map_err(|error| error.message.clone())?;
@@ -1689,8 +1693,9 @@ mod tests {
             .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
             .expect("create schema");
         let result = (|| -> Result<(), String> {
-            let registry =
-                AccountRegistry::with_postgres_url(scoped_url.clone()).with_clock(test_clock_ms);
+            let registry = AccountRegistry::with_postgres_url(scoped_url.clone())
+                .with_auth_config(crate::AuthConfig::for_local_tests())
+                .with_clock(test_clock_ms);
             let account = registry
                 .create_account("expiry@example.com")
                 .map_err(|error| error.message.clone())?;

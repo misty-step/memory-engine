@@ -26,11 +26,17 @@ use memory_engine_study::{
 
 use crate::{render_app_shell, render_login_requested};
 use memory_engine_api_state::{
-    ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
+    AccountRegistry, ApiState, AppAccount, AuthConfig, GenerationJob, JobStatus, SourceRecord,
+    StudyViewResponse,
 };
 
 fn account() -> AppAccount {
-    let state = ApiState::default();
+    let state = ApiState::new(
+        AccountRegistry::default().with_auth_config(
+            AuthConfig::allow_emails(["preview@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
     let created = state
         .create_account("preview@example.com")
         .unwrap_or_else(|error| panic!("preview account must be valid: {}", error.message));

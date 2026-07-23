@@ -86,24 +86,9 @@ CREATE TABLE IF NOT EXISTS memory_engine_accounts (
     created_at_ms BIGINT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memory_engine_api_sessions (
-    account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
-    session_token TEXT NOT NULL,
-    updated_at_ms BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
-    session_id_hash TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
-    session_token TEXT NOT NULL,
-    csrf_token_hash TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    revoked_at_ms BIGINT
-);
-
-CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
-    ON memory_engine_browser_sessions(account_id, expires_at_ms);
+-- API and browser session tables are created by migration 6. Keeping their
+-- DDL out of the base migration lets version 6 inspect and rename the raw
+-- pre-migration tables before any new indexes are parsed.
 
 CREATE TABLE IF NOT EXISTS memory_engine_rate_limits (
     rate_limit_key TEXT PRIMARY KEY,
@@ -247,6 +232,109 @@ CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
     ON memory_engine_content_feedback(account_id, review_unit_id, occurred_at_ms);
 ";
 
+/// Upgrade the pre-PR73 raw session tables without a compatibility auth path.
+///
+/// The migration runs in the same transaction as its schema-version marker. It
+/// hashes legacy rows into the replacement tables, preserves their expiry
+/// metadata, and drops the raw-token copies only after the replacement insert
+/// succeeds. A failed transaction leaves the legacy schema intact for retry.
+const SESSION_SCHEMA_MIGRATION_SQL: &str = r"
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_api_sessions'
+                 AND column_name = 'session_token') THEN
+        ALTER TABLE memory_engine_api_sessions
+            RENAME CONSTRAINT memory_engine_api_sessions_pkey
+            TO memory_engine_api_sessions_legacy_v1_pkey;
+        ALTER INDEX IF EXISTS memory_engine_api_sessions_account_idx
+            RENAME TO memory_engine_api_sessions_legacy_v1_account_idx;
+        ALTER TABLE memory_engine_api_sessions
+            RENAME TO memory_engine_api_sessions_legacy_v1;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS memory_engine_api_sessions (
+    session_token_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    revoked_at_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS memory_engine_api_sessions_account_idx
+    ON memory_engine_api_sessions(account_id, expires_at_ms);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_api_sessions_legacy_v1') THEN
+        INSERT INTO memory_engine_api_sessions
+            (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+        SELECT encode(digest(session_token, 'sha256'), 'hex'), account_id,
+               updated_at_ms, updated_at_ms + 1209600000, NULL
+          FROM memory_engine_api_sessions_legacy_v1
+        ON CONFLICT (session_token_hash) DO NOTHING;
+        DROP TABLE memory_engine_api_sessions_legacy_v1;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_browser_sessions'
+                 AND column_name = 'session_token') THEN
+        ALTER TABLE memory_engine_browser_sessions
+            RENAME CONSTRAINT memory_engine_browser_sessions_pkey
+            TO memory_engine_browser_sessions_legacy_v1_pkey;
+        ALTER INDEX IF EXISTS memory_engine_browser_sessions_account_idx
+            RENAME TO memory_engine_browser_sessions_legacy_v1_account_idx;
+        ALTER TABLE memory_engine_browser_sessions
+            RENAME TO memory_engine_browser_sessions_legacy_v1;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
+    session_id_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    session_token_hash TEXT NOT NULL,
+    csrf_token_hash TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    revoked_at_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
+    ON memory_engine_browser_sessions(account_id, expires_at_ms);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_browser_sessions_legacy_v1') THEN
+        INSERT INTO memory_engine_browser_sessions
+            (session_id_hash, account_id, session_token_hash, csrf_token_hash,
+             created_at_ms, expires_at_ms, revoked_at_ms)
+        SELECT session_id_hash, account_id,
+               encode(digest(session_token, 'sha256'), 'hex'),
+               encode(digest(
+                   'csrf_' || encode(
+                       digest('csrf:' || encode(digest(session_token, 'sha256'), 'hex'), 'sha256'),
+                       'hex'
+                   ),
+                   'sha256'
+               ), 'hex'),
+               created_at_ms, expires_at_ms, revoked_at_ms
+          FROM memory_engine_browser_sessions_legacy_v1
+        ON CONFLICT (session_id_hash) DO NOTHING;
+        DROP TABLE memory_engine_browser_sessions_legacy_v1;
+    END IF;
+END $$;
+";
+
 const CLAIM_RETURN_NOTIFICATION_SQL: &str = r"
 UPDATE memory_engine_return_notification_preferences
  SET claim_id = $6,
@@ -383,6 +471,7 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL,
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
         WAITLIST_MIGRATION_SQL,
+        SESSION_SCHEMA_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -409,6 +498,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL),
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
     (5, WAITLIST_MIGRATION_SQL),
+    (6, SESSION_SCHEMA_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -681,6 +771,25 @@ impl Drop for CountingTransaction<'_> {
 
 pub struct PostgresStudyStore {
     client: RefCell<CountingClient>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthChallengeSessionOutcome {
+    Invalid,
+    NotAdmitted,
+    Created { email: String },
+}
+
+#[derive(Debug)]
+pub struct AuthChallengeSessionRequest<'a> {
+    pub challenge_hash: &'a str,
+    pub now_ms: i64,
+    pub configured_allowed: bool,
+    pub account_id: &'a str,
+    pub session_token_hash: &'a str,
+    pub browser_session_id_hash: &'a str,
+    pub csrf_token_hash: &'a str,
+    pub expires_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1079,8 +1188,7 @@ impl PostgresStudyStore {
         Ok(row.is_some())
     }
 
-    /// Check whether the supplied API session token is current without creating
-    /// the account.
+    /// Check one hashed API session without creating the account.
     ///
     /// # Errors
     ///
@@ -1088,14 +1196,15 @@ impl PostgresStudyStore {
     pub fn api_session_matches(
         &mut self,
         account_id: &str,
-        session_token: &str,
+        session_token_hash: &str,
+        now_ms: i64,
     ) -> Result<bool, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
             "SELECT 1 FROM memory_engine_api_sessions
-             WHERE account_id = $1 AND session_token = $2",
-            &[&account_id, &session_token],
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL AND expires_at_ms > $3",
+            &[&account_id, &session_token_hash, &now_ms],
         )?;
-
         Ok(row.is_some())
     }
 
@@ -1115,11 +1224,11 @@ impl PostgresStudyStore {
     ) -> Result<(), PostgresStoreError> {
         self.client.borrow_mut().execute(
             "INSERT INTO memory_engine_browser_sessions
-                (session_id_hash, account_id, session_token, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
+                (session_id_hash, account_id, session_token_hash, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
              VALUES ($1, $2, $3, $4, $5, $6, NULL)
              ON CONFLICT (session_id_hash) DO UPDATE
              SET account_id = EXCLUDED.account_id,
-                 session_token = EXCLUDED.session_token,
+                 session_token_hash = EXCLUDED.session_token_hash,
                  csrf_token_hash = EXCLUDED.csrf_token_hash,
                  created_at_ms = EXCLUDED.created_at_ms,
                  expires_at_ms = EXCLUDED.expires_at_ms,
@@ -1148,7 +1257,7 @@ impl PostgresStudyStore {
         now_ms: i64,
     ) -> Result<Option<BrowserSession>, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
-            "SELECT account_id, session_token, csrf_token_hash, expires_at_ms
+            "SELECT account_id, session_token_hash, csrf_token_hash, expires_at_ms
              FROM memory_engine_browser_sessions
              WHERE session_id_hash = $1
                AND revoked_at_ms IS NULL
@@ -1181,6 +1290,27 @@ impl PostgresStudyStore {
             &[&session_id_hash, &now_ms],
         )?;
 
+        Ok(())
+    }
+
+    /// Revoke every browser session for one account while retaining the rows
+    /// and timestamps for audit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    /// Revokes every browser credential for an account in one durable transaction.
+    pub fn revoke_browser_sessions_for_account(
+        &mut self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "UPDATE memory_engine_browser_sessions
+             SET revoked_at_ms = COALESCE(revoked_at_ms, $2)
+             WHERE account_id = $1 AND revoked_at_ms IS NULL",
+            &[&account_id, &now_ms],
+        )?;
         Ok(())
     }
 
@@ -1302,6 +1432,131 @@ impl PostgresStudyStore {
         )?;
 
         Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Read the admitted email bound to a live challenge before beginning the
+    /// session-creation transaction. The transaction revalidates the challenge
+    /// and admission under the same advisory lock, so this read is only a
+    /// credential-shaping hint and never an authorization decision.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn auth_challenge_email(
+        &mut self,
+        challenge_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT email_normalized
+             FROM memory_engine_auth_challenges
+             WHERE challenge_hash = $1
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2",
+            &[&challenge_hash, &now_ms],
+        )?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Consume a magic-link challenge and create its account/API/browser
+    /// credentials in one transaction. The email advisory lock is shared with
+    /// invite mark/delete operations, preventing another replica from changing
+    /// admission between the recheck and session inserts.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when Postgres rejects the transaction.
+    pub fn consume_auth_challenge_and_create_sessions(
+        &mut self,
+        request: &AuthChallengeSessionRequest<'_>,
+    ) -> Result<AuthChallengeSessionOutcome, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let Some(hint) = transaction.query_opt(
+            "SELECT email_normalized
+             FROM memory_engine_auth_challenges
+             WHERE challenge_hash = $1
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2",
+            &[&request.challenge_hash, &request.now_ms],
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(AuthChallengeSessionOutcome::Invalid);
+        };
+        let email: String = hint.get(0);
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email],
+        )?;
+        let Some(challenge) = transaction.query_opt(
+            "UPDATE memory_engine_auth_challenges
+             SET consumed_at_ms = $2
+             WHERE challenge_hash = $1
+               AND email_normalized = $3
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2
+             RETURNING email_normalized",
+            &[&request.challenge_hash, &request.now_ms, &email],
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(AuthChallengeSessionOutcome::Invalid);
+        };
+        let email: String = challenge.get(0);
+        if !request.configured_allowed {
+            let invited = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM memory_engine_waitlist_entries
+                     WHERE email_normalized = $1 AND invited_at_ms IS NOT NULL
+                     FOR UPDATE",
+                    &[&email],
+                )?
+                .is_some();
+            if !invited {
+                transaction.commit()?;
+                return Ok(AuthChallengeSessionOutcome::NotAdmitted);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO memory_engine_accounts (account_id, created_at_ms)
+             VALUES ($1, $2)
+             ON CONFLICT (account_id) DO NOTHING",
+            &[&request.account_id, &request.now_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_api_sessions
+                (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, NULL)
+             ON CONFLICT (session_token_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id, created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms, revoked_at_ms = NULL",
+            &[
+                &request.session_token_hash,
+                &request.account_id,
+                &request.now_ms,
+                &request.expires_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_browser_sessions
+                (session_id_hash, account_id, session_token_hash, csrf_token_hash,
+                 created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)
+             ON CONFLICT (session_id_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id, session_token_hash = EXCLUDED.session_token_hash,
+                 csrf_token_hash = EXCLUDED.csrf_token_hash, created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms, revoked_at_ms = NULL",
+            &[
+                &request.browser_session_id_hash,
+                &request.account_id,
+                &request.session_token_hash,
+                &request.csrf_token_hash,
+                &request.now_ms,
+                &request.expires_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(AuthChallengeSessionOutcome::Created { email })
     }
 
     /// Persist the learner's explicit due-count reminder choice.
@@ -2298,6 +2553,10 @@ impl PostgresStudyStore {
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
         transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
+        transaction.execute(
             "INSERT INTO memory_engine_waitlist_entries
                 (email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms)
              VALUES ($1, $2, $3, $3, NULL)
@@ -2343,6 +2602,10 @@ impl PostgresStudyStore {
     ) -> Result<Option<PostgresWaitlistEntry>, PostgresStoreError> {
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
         let Some(row) = transaction.query_opt(
             "SELECT email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms
              FROM memory_engine_waitlist_entries
@@ -2392,6 +2655,10 @@ impl PostgresStudyStore {
     ) -> Result<bool, PostgresStoreError> {
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
         let deleted = transaction.execute(
             "DELETE FROM memory_engine_waitlist_entries WHERE email_normalized = $1",
             &[&email_normalized],
@@ -2400,6 +2667,12 @@ impl PostgresStudyStore {
             transaction.execute(
                 "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
                  VALUES ($1, 'deleted', $2)",
+                &[&email_normalized, &now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE memory_engine_auth_challenges
+                 SET consumed_at_ms = $2
+                 WHERE email_normalized = $1 AND consumed_at_ms IS NULL",
                 &[&email_normalized, &now_ms],
             )?;
         }
@@ -2652,41 +2925,91 @@ impl AccountStudyStore<'_> {
         Ok(())
     }
 
-    /// Persist the latest API session token for the scoped account.
+    /// Persist one independently expiring API session. The caller supplies the
+    /// SHA-256 token hash; raw bearer credentials never cross this adapter.
     ///
     /// # Errors
     ///
-    /// Returns [`PostgresStoreError`] when the session cannot be saved.
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
     pub fn save_api_session(
         &mut self,
-        session_token: &str,
-        updated_at_ms: i64,
+        session_token_hash: &str,
+        created_at_ms: i64,
+        expires_at_ms: i64,
     ) -> Result<(), PostgresStoreError> {
         self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_api_sessions (account_id, session_token, updated_at_ms)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (account_id) DO UPDATE
-             SET session_token = EXCLUDED.session_token,
-                 updated_at_ms = EXCLUDED.updated_at_ms",
-            &[&self.scope.account_id, &session_token, &updated_at_ms],
+            "INSERT INTO memory_engine_api_sessions
+                (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, NULL)
+             ON CONFLICT (session_token_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id,
+                 created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms,
+                 revoked_at_ms = NULL",
+            &[
+                &session_token_hash,
+                &self.scope.account_id,
+                &created_at_ms,
+                &expires_at_ms,
+            ],
         )?;
-
         Ok(())
     }
 
-    /// Check whether the supplied API session token is current for this account.
+    /// Check one hashed API session while enforcing expiry and revocation.
     ///
     /// # Errors
     ///
     /// Returns [`PostgresStoreError`] when Postgres rejects the read.
-    pub fn api_session_matches(&self, session_token: &str) -> Result<bool, PostgresStoreError> {
+    pub fn api_session_matches(
+        &self,
+        session_token_hash: &str,
+        now_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
             "SELECT 1 FROM memory_engine_api_sessions
-             WHERE account_id = $1 AND session_token = $2",
-            &[&self.scope.account_id, &session_token],
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL AND expires_at_ms > $3",
+            &[&self.scope.account_id, &session_token_hash, &now_ms],
         )?;
-
         Ok(row.is_some())
+    }
+
+    /// Revoke one API session without affecting other credentials for the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn revoke_api_session(
+        &mut self,
+        session_token_hash: &str,
+        revoked_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let changed = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_api_sessions
+             SET revoked_at_ms = $3
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL",
+            &[&self.scope.account_id, &session_token_hash, &revoked_at_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Revoke every API session for the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn revoke_api_sessions(&mut self, revoked_at_ms: i64) -> Result<u64, PostgresStoreError> {
+        self.client
+            .borrow_mut()
+            .execute(
+                "UPDATE memory_engine_api_sessions
+                 SET revoked_at_ms = $2
+                 WHERE account_id = $1 AND revoked_at_ms IS NULL",
+                &[&self.scope.account_id, &revoked_at_ms],
+            )
+            .map_err(Into::into)
     }
 
     /// Check whether a client review idempotency key already applied.
@@ -4825,6 +5148,7 @@ mod tests {
     #[test]
     fn migration_uses_account_scoped_primary_keys_and_durable_receipts() {
         let sql = migration_sql();
+        let session_sql = super::SESSION_SCHEMA_MIGRATION_SQL;
         let jobs_sql = generation_jobs_migration_sql();
 
         assert!(sql.contains("memory_engine_accounts"));
@@ -4837,8 +5161,23 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (account_id, receipt_key)"));
         assert!(sql.contains("memory_engine_applied_reviews"));
         assert!(sql.contains("memory_engine_browser_sessions"));
-        assert!(sql.contains("session_id_hash TEXT PRIMARY KEY"));
-        assert!(sql.contains("csrf_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("session_id_hash TEXT PRIMARY KEY"));
+        assert!(session_sql.contains("session_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("expires_at_ms BIGINT NOT NULL"));
+        assert!(session_sql.contains("revoked_at_ms BIGINT"));
+        assert!(session_sql.contains("csrf_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("memory_engine_api_sessions_legacy_v1"));
+        assert!(session_sql.contains("RENAME CONSTRAINT memory_engine_api_sessions_pkey"));
+        assert!(session_sql.contains("memory_engine_api_sessions_legacy_v1_account_idx"));
+        assert!(session_sql.contains("RENAME CONSTRAINT memory_engine_browser_sessions_pkey"));
+        assert!(session_sql.contains("memory_engine_browser_sessions_legacy_v1_account_idx"));
+        assert!(session_sql.contains("encode(digest(session_token, 'sha256'), 'hex')"));
+        assert!(session_sql.contains(
+            "digest('csrf:' || encode(digest(session_token, 'sha256'), 'hex'), 'sha256')"
+        ));
+        assert!(!session_sql.contains("session_token TEXT NOT NULL"));
+        assert!(sql.contains("memory_engine_waitlist_entries"));
+        assert!(super::MIGRATIONS.iter().any(|(version, _)| *version == 6));
         assert!(sql.contains("memory_engine_auth_challenges"));
         assert!(sql.contains("memory_engine_content_feedback"));
         assert!(sql.contains("PRIMARY KEY (account_id, feedback_id)"));
@@ -4858,6 +5197,107 @@ mod tests {
         assert!(jobs_sql.contains("memory_engine_generation_jobs"));
         assert!(jobs_sql.contains("lease_expires_at_ms"));
         assert!(jobs_sql.contains("status IN ('queued', 'running', 'retry')"));
+    }
+
+    #[test]
+    fn live_legacy_session_migration_rehearses_pk_renames_and_is_idempotent() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live legacy session migration rehearsal; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!("memory_engine_auth_v6_{}_{}", std::process::id(), NOW);
+        let mut admin = super::connect_client(&database_url).expect("connect migration admin");
+        admin
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;")
+            .expect("install pgcrypto");
+        let extension_schema: String = admin
+            .query_one(
+                "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pgcrypto'",
+                &[],
+            )
+            .expect("find pgcrypto schema")
+            .get(0);
+        let scoped_url = format!(
+            "{}{}options=-csearch_path%3D{}%2C{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema,
+            extension_schema
+        );
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create migration schema");
+        let result = (|| -> Result<(), String> {
+            let mut setup =
+                super::connect_client(&scoped_url).map_err(|error| format!("{error:?}"))?;
+            setup
+                .batch_execute(
+                    "CREATE TABLE memory_engine_accounts (account_id TEXT PRIMARY KEY, created_at_ms BIGINT NOT NULL);
+                     CREATE TABLE memory_engine_api_sessions (
+                         account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id),
+                         session_token TEXT NOT NULL, updated_at_ms BIGINT NOT NULL
+                     );
+                     CREATE TABLE memory_engine_browser_sessions (
+                         session_id_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id),
+                         session_token TEXT NOT NULL, csrf_token_hash TEXT NOT NULL, created_at_ms BIGINT NOT NULL,
+                         expires_at_ms BIGINT NOT NULL, revoked_at_ms BIGINT
+                     );
+                     CREATE INDEX memory_engine_browser_sessions_account_idx ON memory_engine_browser_sessions(account_id);
+                     INSERT INTO memory_engine_accounts(account_id, created_at_ms) VALUES ('acct_legacy_v6', 1);
+                     INSERT INTO memory_engine_api_sessions(account_id, session_token, updated_at_ms)
+                         VALUES ('acct_legacy_v6', 'legacy-api-token', 2);
+                     INSERT INTO memory_engine_browser_sessions
+                         (session_id_hash, account_id, session_token, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
+                         VALUES ('legacy-browser-id', 'acct_legacy_v6', 'legacy-browser-token', 'legacy-csrf', 2, 9999999999999, NULL);",
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            let mut store = super::PostgresStudyStore::connect(&scoped_url)
+                .map_err(|error| format!("{error:?}"))?;
+            store.migrate().map_err(|error| format!("{error:?}"))?;
+            store.migrate().map_err(|error| format!("{error:?}"))?;
+            let mut verify =
+                super::connect_client(&scoped_url).map_err(|error| format!("{error:?}"))?;
+            let api_count: i64 = verify
+                .query_one("SELECT count(*) FROM memory_engine_api_sessions", &[])
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            let browser_count: i64 = verify
+                .query_one("SELECT count(*) FROM memory_engine_browser_sessions", &[])
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert_eq!(api_count, 1);
+            assert_eq!(browser_count, 1);
+            let api_hash: String = verify
+                .query_one(
+                    "SELECT session_token_hash FROM memory_engine_api_sessions",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert_eq!(api_hash.len(), 64);
+            assert_ne!(api_hash, "legacy-api-token");
+            let legacy_api: bool = verify
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_engine_api_sessions_legacy_v1')",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            let legacy_browser: bool = verify
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_engine_browser_sessions_legacy_v1')",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert!(!legacy_api);
+            assert!(!legacy_browser);
+            Ok(())
+        })();
+        let _ = admin.batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#));
+        result.expect("legacy session migration rehearsal");
     }
 
     #[test]
@@ -6851,7 +7291,7 @@ mod tests {
                     "app-account-ip:203.0.113.11".to_owned(),
                 ];
                 let mut store = PostgresStudyStore::connect(&database_url)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| format!("{error:?}"))?;
                 barrier.wait();
                 store
                     .record_rate_limit_attempts(

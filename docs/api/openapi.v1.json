@@ -29,8 +29,13 @@
     },
     "/v1/accounts": {
       "post": {
-        "summary": "Create an account session",
-        "security": [],
+        "summary": "Issue an account service session (operator only)",
+        "description": "Production hosts require the x-admin-token header. The issued credential is returned once and persisted only as a SHA-256 hash with an expiry; reissuing creates an independent session and does not revoke other sessions.",
+        "security": [
+          {
+            "adminToken": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -60,17 +65,11 @@
     },
     "/v1/service-sessions": {
       "post": {
-        "summary": "Issue or rotate a service-session credential",
-        "description": "Operator-gated machine bootstrap: issues a fresh account-scoped session token for an allowlisted service account, creating the account on first issue. Every issue replaces the prior token, so reissue doubles as immediate revocation. Disabled unless the host configures an admin token.",
-        "security": [],
-        "parameters": [
+        "summary": "Issue an independent service-session credential",
+        "description": "Operator-gated machine bootstrap: issues a fresh account-scoped session token for an allowlisted service account, creating the account on first issue. Each issue is independently expiring and auditable; reissue does not revoke other sessions. Disabled unless the host configures an admin token.",
+        "security": [
           {
-            "name": "x-admin-token",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
+            "adminToken": []
           }
         ],
         "requestBody": {
@@ -93,6 +92,70 @@
                 }
               }
             }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/service-sessions/current": {
+      "delete": {
+        "summary": "Revoke one service-session credential",
+        "description": "Revokes only the bearer credential presented by this request. Other independently issued account sessions remain valid.",
+        "security": [
+          {
+            "bearerSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session revocation accepted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/service-sessions/all": {
+      "delete": {
+        "summary": "Revoke every service-session credential",
+        "description": "Revokes every API bearer credential for the account, including the credential presented by this request.",
+        "security": [
+          {
+            "bearerSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session revocation accepted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
           },
           "403": {
             "$ref": "#/components/responses/Error"
@@ -913,6 +976,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "Use the sessionToken returned by /v1/accounts or a pre-provisioned account session."
+      },
+      "adminToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-admin-token",
+        "description": "Operator credential required for account/session issuance in production."
       }
     },
     "parameters": {

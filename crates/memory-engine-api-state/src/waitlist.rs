@@ -171,6 +171,40 @@ pub(crate) fn mark_invited(
     Ok(result)
 }
 
+/// Remove every unconsumed magic-link challenge for an email. The caller holds
+/// the waitlist lock, so challenge consumption and invite deletion have one
+/// deterministic file-store linearization point. Challenge filenames contain
+/// only hashes; no raw credential is read or logged.
+fn revoke_auth_challenges_for_email(store_path: &Path, email: &str) -> Result<(), ApiFailure> {
+    let Some(store_root) = store_path.parent() else {
+        return Ok(());
+    };
+    let challenges_root = store_root.join("_auth_challenges");
+    let Ok(entries) = fs::read_dir(challenges_root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| ApiFailure::internal(format!("auth challenge scan: {error}")))?;
+        let challenge_path = entry.path().join("challenge");
+        let Ok(saved) = fs::read_to_string(&challenge_path) else {
+            continue;
+        };
+        if saved.lines().next() == Some(email) {
+            match fs::remove_file(challenge_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ApiFailure::internal(format!(
+                        "auth challenge revoke: {error}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delete one entry from the operational table, appending a `deleted`
 /// audit-log entry. Returns `false` when no entry matched.
 ///
@@ -185,6 +219,7 @@ pub(crate) fn delete(store_path: &Path, email: &str, now_ms: i64) -> Result<bool
     if removed {
         save(store_path, &entries)?;
         append_audit_event(store_path, email, "deleted", now_ms)?;
+        revoke_auth_challenges_for_email(store_path, email)?;
     }
     Ok(removed)
 }

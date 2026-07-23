@@ -14,13 +14,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountCreated {
-    pub account_id: String,
-    pub session_token: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
@@ -301,24 +294,6 @@ impl MemoryEngineClient {
     fn authorization(&self) -> String {
         format!("Bearer {}", self.session_token)
     }
-}
-
-/// Create an account against `base_url`, outside any existing `MemoryEngineClient`
-/// (no account id/session token exist yet).
-///
-/// # Errors
-///
-/// Returns an error when the create-account request fails.
-pub fn create_account(base_url: &str, email: &str) -> Result<AccountCreated, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .build()
-        .into();
-    let mut response = agent
-        .post(endpoint(base_url, "/v1/accounts"))
-        .send_json(json!({ "email": email }))
-        .map_err(|error| transport_failure("create account", &error))?;
-    read_json(&mut response, "create account")
 }
 
 fn read_json<T: DeserializeOwned>(
