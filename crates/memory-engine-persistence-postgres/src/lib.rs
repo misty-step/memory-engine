@@ -1956,6 +1956,26 @@ impl PostgresStudyStore {
             "SELECT pg_advisory_xact_lock($1::BIGINT)",
             &[&9_301_093_i64],
         )?;
+        let stale_account_rows = transaction.query(
+            "SELECT DISTINCT attempt.account_id
+             FROM memory_engine_generation_job_attempts attempt
+             JOIN memory_engine_generation_jobs job
+               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
+             WHERE job.status = 'running' AND job.attempts = attempt.attempt
+               AND job.lease_token = attempt.lease_token
+               AND (job.lease_expires_at_ms IS NULL
+                    OR job.lease_expires_at_ms + $2::BIGINT < $1::BIGINT)
+               AND attempt.status = 'running'
+             ORDER BY attempt.account_id",
+            &[&now_ms, &reclaim_grace_ms],
+        )?;
+        for row in stale_account_rows {
+            let account_id: String = row.get(0);
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+                &[&account_id],
+            )?;
+        }
         let stale_run_rows = transaction.query(
             "SELECT DISTINCT attempt.account_id, attempt.generation_run_id
              FROM memory_engine_generation_job_attempts attempt
