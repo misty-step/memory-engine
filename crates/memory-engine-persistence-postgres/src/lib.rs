@@ -2838,7 +2838,8 @@ impl AccountStudyStore<'_> {
                      FROM memory_engine_generation_runs
                      WHERE account_id = $1 AND generation_run_id = $2
                        AND (run->>'status' = 'finalized'
-                            OR (run->>'status' IS NULL AND (run->>'completedAt') IS NOT NULL))",
+                            OR (run->>'status' IS NULL AND (run->>'completedAt') IS NOT NULL
+                                AND (run->>'completedAt')::BIGINT <> -9223372036854775808))",
                     &[&account_id, run_id],
                 )?
                 .is_some();

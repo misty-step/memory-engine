@@ -582,6 +582,40 @@ fn validates_generated_drafts_before_promotion() {
 }
 
 #[test]
+fn unfinished_generation_run_is_not_decision_eligible() {
+    let directory = TempDirectory::new("unfinished-run-decision");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_source_document(source_document("src-unfinished"))
+        .expect("source");
+    store
+        .save_reference_span(reference_span("ref-unfinished", "src-unfinished"))
+        .expect("reference");
+
+    let mut run = generation_run("run-unfinished", &["src-unfinished"], &["draft-unfinished"]);
+    run.completed_at = None;
+    store.save_generation_run(run).expect("unfinished run");
+    let draft = accepted_draft(
+        "draft-unfinished",
+        "unfinished-unit",
+        &["src-unfinished"],
+        &["ref-unfinished"],
+        Some("run-unfinished"),
+    );
+    store
+        .save_generated_prompt_draft(draft.clone())
+        .expect("draft");
+
+    assert_eq!(
+        store
+            .keep_generated_prompt_draft(&draft.id, NOW)
+            .expect_err("unfinished run must reject keep"),
+        BetaStoreError::MissingGenerationRunForAcceptedDraft
+    );
+}
+
+#[test]
 fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history() {
     let directory = TempDirectory::new("lifecycle");
     let path = directory.path().join("store.json");

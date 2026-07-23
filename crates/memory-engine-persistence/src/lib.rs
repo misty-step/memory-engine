@@ -1977,7 +1977,10 @@ fn record_learner_draft_decision(
         .ok_or(BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
     let run = find_by_id(&snapshot.generation_runs, run_id)
         .ok_or(BetaStoreError::MissingGenerationRunForAcceptedDraft)?;
-    if run.completed_at == Some(PENDING_GENERATION_COMPLETION) {
+    if run
+        .completed_at
+        .is_none_or(|completed| completed == PENDING_GENERATION_COMPLETION)
+    {
         return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
     }
     let decision = match *input {
