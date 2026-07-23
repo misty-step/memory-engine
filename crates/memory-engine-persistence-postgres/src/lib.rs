@@ -5318,6 +5318,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn finish_generation_job_uses_reservation_when_usage_cost_is_null() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!("skipping live Postgres null-cost finish regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
