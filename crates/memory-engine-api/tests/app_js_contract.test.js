@@ -580,3 +580,12 @@ test("SSE refreshes the workspace on failure for authoritative retry controls", 
   expect(list.meta.textContent).toBe("provider unavailable");
   expect(browser.navigations).toEqual(["/"]);
 });
+
+test("SSE terminal events never navigate away from pages without the jobs surface", () => {
+  const eventSource = {};
+  const browser = browserHarness({ eventSource, jobsList: null });
+
+  browser.emitJob({ id: "job-1", status: "succeeded" });
+  browser.emitJob({ id: "job-1", status: "failed", error: "provider unavailable" });
+  expect(browser.navigations).toEqual([]);
+});

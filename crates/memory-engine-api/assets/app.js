@@ -639,6 +639,9 @@
   // EventSource reconnects automatically; no manual retry needed.
   source.addEventListener("job", function (event) {
     try {
+      // Pages without the activity surface (review/answer/edit) keep the
+      // learner's unsent work: no row patch, no terminal navigation.
+      if (!list) return;
       var job = JSON.parse(event.data);
       apply(job);
       if (
