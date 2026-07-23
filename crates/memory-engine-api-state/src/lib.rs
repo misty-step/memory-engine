@@ -2689,24 +2689,32 @@ where
         .find(|source| source.id == source_id)
         .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
     let generated = if local_only {
-        study.generate_with_run_id(ids, run_id)
+        if mark_pending {
+            study.generate_with_run_id_pending(ids, run_id)
+        } else {
+            study.generate_with_run_id(ids, run_id)
+        }
     } else {
         match generation_provider_config {
             Some(config) => {
                 let model = OpenRouterProvider::new(config);
                 let provider = FallbackProvider::new(&model);
-                study.generate_with_provider_and_run_id(ids, &provider, run_id)
+                if mark_pending {
+                    study.generate_with_provider_and_run_id_pending(ids, &provider, run_id)
+                } else {
+                    study.generate_with_provider_and_run_id(ids, &provider, run_id)
+                }
             }
-            None => study.generate_with_run_id(ids, run_id),
+            None => {
+                if mark_pending {
+                    study.generate_with_run_id_pending(ids, run_id)
+                } else {
+                    study.generate_with_run_id(ids, run_id)
+                }
+            }
         }
     };
-    let view = generated.map_err(study_failure)?;
-    if mark_pending {
-        study
-            .mark_generation_run_pending(run_id)
-            .map_err(study_failure)?;
-    }
-    Ok(view)
+    generated.map_err(study_failure)
 }
 
 #[cfg(test)]

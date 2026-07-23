@@ -869,8 +869,35 @@ where
         run_id: impl Into<String>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request =
-            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into())?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            false,
+        )?;
+        self.invalidate_snapshot();
+        run_beta_generation(&mut self.store, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Generate drafts for a queued worker while keeping them pending until lease publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when generation or store writes fail.
+    pub fn generate_with_run_id_pending(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            true,
+        )?;
         self.invalidate_snapshot();
         run_beta_generation(&mut self.store, request)?;
         self.status = BetaStudyStatus::Drafting;
@@ -899,6 +926,30 @@ where
         self.view()
     }
 
+    /// Provider-backed queued generation that remains pending until lease publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when provider generation or store writes fail.
+    pub fn generate_with_provider_and_run_id_pending(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        provider: &dyn DraftProvider,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            true,
+        )?;
+        self.invalidate_snapshot();
+        run_beta_generation_with_provider(&mut self.store, provider, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
     /// Remove a generation run after its worker lease fence rejects the commit.
     ///
     /// # Errors
@@ -909,19 +960,6 @@ where
     ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.store
             .discard_generation_run(run_id)
-            .map_err(BetaStudyError::Store)
-    }
-
-    /// Mark a queued generation run pending until its worker lease fence commits.
-    ///
-    /// # Errors
-    /// Returns the underlying store error when the state cannot be persisted.
-    pub fn mark_generation_run_pending(
-        &mut self,
-        run_id: &str,
-    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        self.store
-            .mark_generation_run_pending(run_id)
             .map_err(BetaStudyError::Store)
     }
 
@@ -955,8 +993,12 @@ where
         run_id: impl Into<String>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request =
-            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into())?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            false,
+        )?;
         self.invalidate_snapshot();
         run_beta_generation_with_provider(&mut self.store, provider, request)?;
         self.status = BetaStudyStatus::Drafting;
@@ -972,6 +1014,7 @@ where
             snapshot,
             source_document_ids,
             format!("study-run-{}", snapshot.generation_runs.len() + 1),
+            false,
         )
     }
 
@@ -980,6 +1023,7 @@ where
         snapshot: &BetaStoreSnapshot,
         source_document_ids: Option<Vec<String>>,
         run_id: String,
+        pending: bool,
     ) -> Result<BetaGenerationRequest, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let requested_ids = source_document_ids.unwrap_or_else(|| {
             active_source_ids(snapshot)
@@ -1012,6 +1056,7 @@ where
             completed_at: Some((self.now)()),
             default_due: (self.now)() - 60_000,
             model: None,
+            pending,
         })
     }
 

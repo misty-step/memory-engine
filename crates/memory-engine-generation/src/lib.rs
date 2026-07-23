@@ -62,6 +62,8 @@ pub struct BetaGenerationRequest {
     pub completed_at: Option<i64>,
     pub default_due: i64,
     pub model: Option<GeneratedPromptModel>,
+    /// Keep queued output decision-ineligible until the worker lease fence publishes it.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -207,15 +209,6 @@ pub trait BetaGenerationStore {
         Ok(())
     }
 
-    /// Mark a queued generation run pending until its durable lease fence commits.
-    ///
-    /// # Errors
-    ///
-    /// Returns the store error when the pending marker cannot be persisted.
-    fn mark_generation_run_pending(&mut self, _run_id: &str) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     /// Atomically fence a run and remove all stale output when the lease is lost.
     ///
     /// # Errors
@@ -266,10 +259,6 @@ impl BetaGenerationStore for BetaPersistenceStore {
 
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
         BetaPersistenceStore::discard_generation_run(self, run_id)
-    }
-
-    fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), Self::Error> {
-        BetaPersistenceStore::mark_generation_run_pending(self, run_id)
     }
 
     fn finalize_generation_run(
@@ -1059,6 +1048,7 @@ fn bridge_run_request(
         completed_at: request.completed_at,
         default_due: request.default_due,
         model: request.model.clone(),
+        pending: false,
     }
 }
 
@@ -1141,19 +1131,33 @@ fn run_receipt(
     source_permissions: Vec<SourcePermissionReceipt>,
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
-        RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::Started => (
+            Vec::new(),
+            request.pending.then_some(i64::MIN),
+            Vec::new(),
+            None,
+        ),
         RunProgress::InProgress {
             draft_ids,
             validation_failures,
             usage,
-        } => (draft_ids, None, validation_failures, usage),
+        } => (
+            draft_ids,
+            request.pending.then_some(i64::MIN),
+            validation_failures,
+            usage,
+        ),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
             usage,
         } => (
             draft_ids,
-            Some(request.completed_at.unwrap_or(request.started_at)),
+            Some(if request.pending {
+                i64::MIN
+            } else {
+                request.completed_at.unwrap_or(request.started_at)
+            }),
             validation_failures,
             usage,
         ),

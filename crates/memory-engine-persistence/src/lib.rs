@@ -987,24 +987,6 @@ impl BetaPersistenceStore {
         })
     }
 
-    /// Mark a queued generation run pending until its worker lease fence commits.
-    ///
-    /// # Errors
-    /// Returns [`BetaStoreError`] when the run cannot be persisted.
-    pub fn mark_generation_run_pending(&mut self, run_id: &str) -> Result<(), BetaStoreError> {
-        self.transact(|snapshot| {
-            let Some(run) = snapshot
-                .generation_runs
-                .iter_mut()
-                .find(|run| run.id == run_id)
-            else {
-                return Err(BetaStoreError::MissingGenerationRunForAcceptedDraft);
-            };
-            run.completed_at = Some(PENDING_GENERATION_COMPLETION);
-            Ok(())
-        })
-    }
-
     /// Atomically finalize a generation run at the worker lease fence.
     ///
     /// A failed fence removes the complete run closure, including any learner

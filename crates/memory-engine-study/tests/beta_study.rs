@@ -10,7 +10,7 @@ use memory_engine_generation::{
     ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, GeneratedLearningActivityKind,
     GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
     GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument, SourceDocumentKind,
     SourcePermission,
@@ -23,6 +23,35 @@ use memory_engine_study::{
 use serde_json::json;
 
 const NOW: i64 = 1_779_984_000_000;
+
+#[test]
+fn queued_generation_is_pending_before_lease_publication() {
+    let directory = TempDirectory::new("queued-pending-publication");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+
+    let generated = study
+        .generate_with_run_id_pending(None, "queued-run")
+        .expect("queued generation");
+    let draft_id = generated.drafts.first().expect("pending draft").id.clone();
+    let snapshot = BetaPersistenceStore::open(&path)
+        .expect("reload")
+        .snapshot();
+    assert!(snapshot.review_units.is_empty());
+    assert!(snapshot.schedules.is_empty());
+    assert!(snapshot
+        .generation_runs
+        .iter()
+        .any(|run| run.id == "queued-run" && run.completed_at == Some(i64::MIN)));
+
+    let mut decisions = BetaPersistenceStore::open(&path).expect("decision store");
+    assert!(matches!(
+        decisions.keep_generated_prompt_draft(&draft_id, NOW),
+        Err(BetaStoreError::MissingGenerationRunForAcceptedDraft)
+    ));
+}
 
 #[test]
 fn creates_source_generates_keeps_reviews_reveals_and_advances_queue() {
