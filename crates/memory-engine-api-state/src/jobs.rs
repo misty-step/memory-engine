@@ -663,22 +663,43 @@ impl JobQueue {
         if !bound {
             return;
         }
+        let registry = self.inner.registry.clone();
+        let fence_database_url = database_url.to_owned();
+        let fence_account_id = job.account_id.clone();
+        let fence_job_id = job.id.clone();
+        let fence_token = job.lease_token.clone().unwrap_or_default();
+        let fence_reservation = job.reserved_cost_usd_micros;
+        let fence_run_id = run_id.clone();
+        let fence_registry = registry.clone();
         let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
         let generation_lease_token = job.lease_token.clone().unwrap_or_default();
-        let result = self
-            .inner
-            .registry
+        let result = registry
             .run_generation_job(
                 &job.account_id,
                 &job.source_id,
                 &run_id,
                 generation_attempt,
                 &generation_lease_token,
-                || true,
+                move || {
+                    with_postgres_store(&fence_database_url, |store| {
+                        let current = store.generation_job(&fence_account_id, &fence_job_id)?;
+                        let cost =
+                            store.generation_cost_for_run(&fence_account_id, &fence_run_id)?;
+                        Ok(current.is_some_and(|current| {
+                            current.status == "running"
+                                && current.lease_token.as_deref() == Some(fence_token.as_str())
+                                && current
+                                    .lease_expires_at
+                                    .is_some_and(|expires| expires > fence_registry.now())
+                                && cost <= fence_reservation
+                        }))
+                    })
+                    .ok()
+                    .unwrap_or(false)
+                },
             )
             .and_then(|card_count| {
-                self.inner
-                    .registry
+                registry
                     .generation_cost_for_run(&job.account_id, &run_id)
                     .map(|cost| (card_count, cost))
             })
