@@ -11,10 +11,10 @@ use std::{
     net::{TcpListener, TcpStream},
 };
 
-use memory_engine_generation::{FakeModelProvider, FallbackProvider};
+use memory_engine_generation::{FakeModelProvider, FallbackProvider, StructuredBlockProvider};
 use memory_engine_study::{
     infer_capture_title, BetaStudyCurrent, BetaStudyOptions, BetaStudySession,
-    BetaStudySourceInput, BetaStudyView,
+    BetaStudySourceInput, BetaStudyView, SourcePermission,
 };
 use serde::{Deserialize, Serialize};
 
@@ -195,12 +195,46 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
     }
 }
 
+/// Generate drafts for every active source, routing each by permission.
+///
+/// `LocalOnly` sources always go through the pure deterministic path
+/// (`BetaStudySession::generate`), which never references a model provider,
+/// so a `LocalOnly` capture can never reach one. `ModelEligible` sources go
+/// through the model-capable path (`generate_with_provider`), which still
+/// re-enforces the permission boundary at the provider itself. Splitting the
+/// batch by permission keeps one `LocalOnly` source from blocking generation
+/// for unrelated eligible sources — previously a single `LocalOnly` capture
+/// failed the whole all-sources run before any drafts were produced.
 fn generate_all_sources(
     session: &mut BetaStudySession,
 ) -> Result<BetaStudyView, memory_engine_study::BetaStudyError> {
+    let structured = StructuredBlockProvider;
     let model = FakeModelProvider;
-    let provider = FallbackProvider::new(&model);
-    session.generate_with_provider(None, &provider)
+    let provider = FallbackProvider::new(&structured, &model);
+
+    let view = session.view()?;
+    let mut local_only_ids = Vec::new();
+    let mut model_eligible_ids = Vec::new();
+    for source in &view.sources {
+        if source.permission == SourcePermission::LocalOnly {
+            local_only_ids.push(source.id.clone());
+        } else {
+            model_eligible_ids.push(source.id.clone());
+        }
+    }
+
+    if local_only_ids.is_empty() && model_eligible_ids.is_empty() {
+        return session.generate_with_provider(None, &provider);
+    }
+
+    let mut latest_view = None;
+    if !local_only_ids.is_empty() {
+        latest_view = Some(session.generate(Some(local_only_ids))?);
+    }
+    if !model_eligible_ids.is_empty() {
+        latest_view = Some(session.generate_with_provider(Some(model_eligible_ids), &provider)?);
+    }
+    Ok(latest_view.expect("at least one source id list was non-empty"))
 }
 
 fn response_for(
@@ -464,6 +498,7 @@ struct SourcePayload {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +528,7 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
             .unwrap_or_else(|| {
                 format!("source-{}", slug_fragment(&source_slug_text(&title, &body)))
             });
+        let permission = parse_source_permission(form_optional(&fields, "permission").as_deref())?;
 
         return Ok(BetaStudySourceInput {
             id,
@@ -500,6 +536,7 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
             body,
             project_key: None,
             ttl_expires_at: None,
+            permission,
         });
     }
 
@@ -518,6 +555,7 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
         }
         None => format!("source-{}", slug_fragment(&source_slug_text(&title, &body))),
     };
+    let permission = payload.permission.unwrap_or_default();
 
     Ok(BetaStudySourceInput {
         id,
@@ -525,6 +563,7 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
         body,
         project_key: None,
         ttl_expires_at: None,
+        permission,
     })
 }
 
@@ -834,7 +873,15 @@ fn render_summary(html: &mut String, view: &BetaStudyView) {
 }
 
 fn render_source_form(html: &mut String) {
-    html.push_str("<section class=\"panel\"><h2>Add</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-capture\">Paste anything</label><textarea id=\"source-capture\" name=\"capture\" placeholder=\"Word, phrase, notes, or article\"></textarea><button type=\"submit\">Save capture</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate review items</button></form></section>");
+    html.push_str("<section class=\"panel\"><h2>Add</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-capture\">Paste anything</label><textarea id=\"source-capture\" name=\"capture\" placeholder=\"Word, phrase, notes, or article\"></textarea><label for=\"source-permission\">Permission</label><select id=\"source-permission\" name=\"permission\" aria-describedby=\"source-permission-hint\"><option value=\"model-eligible\" selected>Allow model help</option><option value=\"local-only\">Keep local / Never send to a model</option></select><p id=\"source-permission-hint\">Allow model help is the default; keep local / never send to a model prevents model providers from receiving this capture.</p><button type=\"submit\">Save capture</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate review items</button></form></section>");
+}
+
+fn parse_source_permission(value: Option<&str>) -> Result<SourcePermission, String> {
+    match value {
+        None | Some("" | "model-eligible") => Ok(SourcePermission::ModelEligible),
+        Some("local-only") => Ok(SourcePermission::LocalOnly),
+        Some(value) => Err(format!("unknown source permission: {value}")),
+    }
 }
 
 fn render_generation_notices(html: &mut String, view: &BetaStudyView) {
@@ -1203,6 +1250,46 @@ mod tests {
     }
 
     #[test]
+    fn phone_capture_permission_is_explicit_and_invalid_values_fail_closed() {
+        let directory = TempDirectory::new("permission-form");
+        let mut session = session(directory.path().join("study.json"));
+        let html = String::from_utf8(route(&mut session, &request("GET", "/", "")).body)
+            .expect("capture html");
+        assert!(html.contains(r#"id="source-permission" name="permission""#));
+        assert!(html.contains(r#"aria-describedby="source-permission-hint""#));
+        assert!(html.contains("Keep local / Never send to a model"));
+
+        let saved = route(
+            &mut session,
+            &form_request(
+                "/source",
+                &format!(
+                    "capture={}&permission=local-only",
+                    url_escape(&source_body())
+                ),
+            ),
+        );
+        assert_eq!(saved.status, 200);
+        assert_eq!(
+            session.view().expect("view").sources[0].permission,
+            super::SourcePermission::LocalOnly
+        );
+
+        let rejected = route(
+            &mut session,
+            &form_request(
+                "/source",
+                &format!(
+                    "capture={}&permission=not-a-permission",
+                    url_escape("should not save")
+                ),
+            ),
+        );
+        assert_eq!(rejected.status, 400);
+        assert_eq!(session.view().expect("view").summary.source_count, 1);
+    }
+
+    #[test]
     fn renders_generation_notices_as_human_sentences() {
         let directory = TempDirectory::new("notice-flow");
         let session = session(directory.path().join("study.json"));
@@ -1235,6 +1322,93 @@ mod tests {
         assert!(generated_html.contains("Drafts"));
         assert!(generated_html.contains("Explain the idea"));
         assert!(!generated_html.contains("No review items could be generated"));
+    }
+
+    #[test]
+    fn local_only_source_generates_locally_without_blocking_eligible_generation() {
+        let directory = TempDirectory::new("local-only-routing");
+        let mut session = session(directory.path().join("study.json"));
+
+        let local_source = route(
+            &mut session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-local",
+                    "title": "Private notes",
+                    "body": source_body(),
+                    "permission": "local-only"
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(local_source.status, 200);
+
+        let eligible_source = route(
+            &mut session,
+            &request(
+                "POST",
+                "/source",
+                &json!({
+                    "id": "src-eligible",
+                    "title": "Shareable notes",
+                    "body": "Mitochondria are organelles because cells use ATP as chemical energy.",
+                    "permission": "model-eligible"
+                })
+                .to_string(),
+            ),
+        );
+        assert_eq!(eligible_source.status, 200);
+
+        // Before the fix, this call failed the entire batch with
+        // `LocalOnlySource` before any drafts were produced, because the
+        // local-only and eligible sources were sent through the same
+        // enforcing model-capable call together.
+        let generated = route(&mut session, &request("POST", "/generate", "{}"));
+        assert_eq!(generated.status, 200);
+        let generated: Value = serde_json::from_slice(&generated.body).expect("generated");
+        let drafts = generated["drafts"].as_array().expect("drafts array");
+
+        let local_draft_prompts: Vec<&str> = drafts
+            .iter()
+            .filter(|draft| {
+                draft["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("src-local"))
+            })
+            .filter_map(|draft| draft["prompt"].as_str())
+            .collect();
+        assert!(
+            !local_draft_prompts.is_empty(),
+            "expected the local-only source to generate locally, got: {generated}"
+        );
+        // `FakeModelProvider` is this crate's stand-in for a real model
+        // provider; its candidates are always tagged "Explain the idea...".
+        // The local-only path (`BetaStudySession::generate`) never wires a
+        // model provider at all, so a local-only draft can never carry it.
+        assert!(
+            local_draft_prompts
+                .iter()
+                .all(|prompt| !prompt.contains("Explain the idea")),
+            "local-only source must never reach the model-fallback provider: {local_draft_prompts:?}"
+        );
+
+        let eligible_draft_prompts: Vec<&str> = drafts
+            .iter()
+            .filter(|draft| {
+                draft["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("src-eligible"))
+            })
+            .filter_map(|draft| draft["prompt"].as_str())
+            .collect();
+        assert!(
+            eligible_draft_prompts
+                .iter()
+                .any(|prompt| prompt.contains("Explain the idea")),
+            "model-eligible source must still generate through the model-capable path: {eligible_draft_prompts:?}"
+        );
     }
 
     #[test]

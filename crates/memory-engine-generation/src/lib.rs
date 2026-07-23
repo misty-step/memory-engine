@@ -18,9 +18,10 @@ use std::{collections::BTreeSet, error::Error, fmt};
 pub use provider::{
     classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
     DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
-    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
-    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
-    StructuredBlockProvider,
+    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure,
+    ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    ReferenceNoteRequest, ReviewPerformanceContext, SourceAuthorizationContext,
+    SourceAuthorizationError, StructuredBlockProvider,
 };
 
 use memory_engine_core::{
@@ -31,7 +32,7 @@ use memory_engine_persistence::{
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
     GenerationRun, GenerationRunUsage, PersistedQueueCandidate, ReferenceSpan, SourceDocument,
-    SourceDocumentKind,
+    SourceDocumentKind, SourcePermission, SourcePermissionReceipt,
 };
 
 /// The text a world-knowledge card grounds in: the captured input itself. A
@@ -96,6 +97,8 @@ pub struct BridgeGenerationResult {
 pub enum BetaGenerationError<E = BetaStoreError> {
     Store(E),
     UnknownSourceDocument(String),
+    ArchivedSourceDocument(String),
+    LocalOnlySource(String),
     UnknownReviewUnit(ReviewUnitId),
     SourceDocumentHasNoTextBody(String),
     ProviderFailure(String),
@@ -109,6 +112,11 @@ where
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::ArchivedSourceDocument(id) => write!(formatter, "Archived source document: {id}"),
+            Self::LocalOnlySource(id) => write!(
+                formatter,
+                "Local-only source {id} cannot be sent to the model provider."
+            ),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::SourceDocumentHasNoTextBody(id) => {
                 write!(formatter, "Source document has no text body: {id}")
@@ -126,6 +134,8 @@ where
         match self {
             Self::Store(error) => Some(error),
             Self::UnknownSourceDocument(_)
+            | Self::ArchivedSourceDocument(_)
+            | Self::LocalOnlySource(_)
             | Self::UnknownReviewUnit(_)
             | Self::SourceDocumentHasNoTextBody(_)
             | Self::ProviderFailure(_) => None,
@@ -238,7 +248,7 @@ pub fn run_beta_generation<S>(
 where
     S: BetaGenerationStore,
 {
-    run_beta_generation_with_provider(store, &StructuredBlockProvider, request)
+    run_beta_generation_internal(store, &StructuredBlockProvider, request, false)
 }
 
 /// Generate beta drafts from the given provider's candidates.
@@ -259,15 +269,25 @@ pub fn run_beta_generation_with_provider<S>(
 where
     S: BetaGenerationStore,
 {
-    let model = request.model.clone().unwrap_or_else(|| provider.model());
+    run_beta_generation_internal(store, provider, request, true)
+}
+
+fn run_beta_generation_internal<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    request: BetaGenerationRequest,
+    enforce_source_permission: bool,
+) -> Result<BetaGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
-    let sources = request
-        .source_document_ids
-        .iter()
-        .map(|source_document_id| {
-            require_source::<S::Error>(&snapshot.source_documents, source_document_id)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let sources = load_sources::<S::Error>(&snapshot, &request.source_document_ids)?;
+    ensure_sources_not_archived(&sources)?;
+    if enforce_source_permission {
+        ensure_model_eligible(&sources)?;
+    }
+    let model = request.model.clone().unwrap_or_else(|| provider.model());
     let mut validation_failures = Vec::new();
     let mut draft_ids = Vec::new();
     let mut accepted_draft_ids = Vec::new();
@@ -279,7 +299,15 @@ where
     // rather than last-write-wins. Per-draft model stamping stays exact.
     let mut producing_models: Vec<GeneratedPromptModel> = Vec::new();
 
-    save_generation_run_progress(store, &request, &model, RunProgress::Started)?;
+    store
+        .save_generation_run(run_receipt(
+            &request,
+            &model,
+            RunProgress::Started,
+            source_permission_receipts(&sources),
+        ))
+        .map_err(BetaGenerationError::Store)?;
+
     let mut seen_signatures =
         existing_accepted_candidate_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
@@ -339,32 +367,24 @@ where
                 &mut max_candidate_index,
             )?,
         );
-        save_generation_run_progress(
-            store,
-            &request,
-            &model,
-            RunProgress::InProgress {
-                draft_ids: draft_ids.clone(),
-                validation_failures: validation_failures.clone(),
-                usage: usage.clone(),
-            },
-        )?;
     }
 
     let run_model = match producing_models.as_slice() {
         [single] => single.clone(),
         _ => model.clone(),
     };
-    save_generation_run_progress(
-        store,
-        &request,
-        &run_model,
-        RunProgress::Completed {
-            draft_ids: draft_ids.clone(),
-            validation_failures: validation_failures.clone(),
-            usage,
-        },
-    )?;
+    store
+        .save_generation_run(run_receipt(
+            &request,
+            &run_model,
+            RunProgress::Completed {
+                draft_ids: draft_ids.clone(),
+                validation_failures: validation_failures.clone(),
+                usage,
+            },
+            source_permission_receipts(&sources),
+        ))
+        .map_err(BetaGenerationError::Store)?;
 
     Ok(BetaGenerationResult {
         run_id: request.run_id,
@@ -373,6 +393,16 @@ where
         rejected_draft_ids,
         validation_failures,
     })
+}
+
+fn load_sources<E>(
+    snapshot: &BetaStoreSnapshot,
+    source_document_ids: &[String],
+) -> Result<Vec<SourceDocument>, BetaGenerationError<E>> {
+    source_document_ids
+        .iter()
+        .map(|source_document_id| require_source(&snapshot.source_documents, source_document_id))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -440,21 +470,6 @@ where
     )?;
 
     Ok(usage)
-}
-
-fn save_generation_run_progress<S>(
-    store: &mut S,
-    request: &BetaGenerationRequest,
-    model: &GeneratedPromptModel,
-    progress: RunProgress,
-) -> Result<(), BetaGenerationError<S::Error>>
-where
-    S: BetaGenerationStore,
-{
-    store
-        .save_generation_run(run_receipt(request, model, progress))
-        .map(|_| ())
-        .map_err(BetaGenerationError::Store)
 }
 
 struct PersistCandidatesContext<'a> {
@@ -568,9 +583,54 @@ pub fn run_bridge_generation_with_provider<S>(
 where
     S: BetaGenerationStore,
 {
+    run_bridge_generation_internal(store, provider, request, true)
+}
+
+/// Generate bridge material with the deterministic local provider path.
+///
+/// # Errors
+///
+/// Returns [`BetaGenerationError`] when the parent is unknown or store writes
+/// fail.
+pub fn run_bridge_generation<S>(
+    store: &mut S,
+    request: BridgeGenerationRequest,
+) -> Result<BridgeGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    run_bridge_generation_internal(store, &FakeModelProvider, request, false)
+}
+
+fn run_bridge_generation_internal<S>(
+    store: &mut S,
+    provider: &dyn BridgeMaterialProvider,
+    request: BridgeGenerationRequest,
+    enforce_source_permission: bool,
+) -> Result<BridgeGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
-    let provider_request = bridge_material_request(&snapshot, &context);
+    let source_documents =
+        parent_source_documents::<S::Error>(&snapshot, &context.parent, enforce_source_permission)?;
+    let source_document_ids = source_documents
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    let source_permissions = source_permission_receipts(&source_documents);
+    let authorization = SourceAuthorizationContext::from_sources(&source_documents).map_err(
+        |error| match error {
+            SourceAuthorizationError::ArchivedSourceDocument(id) => {
+                BetaGenerationError::ArchivedSourceDocument(id)
+            }
+        },
+    )?;
+    if enforce_source_permission {
+        ensure_model_eligible_receipts(&source_permissions)?;
+    }
+    let provider_request = bridge_material_request(&snapshot, &context, authorization);
     let material = provider
         .generate_bridge_material(&provider_request)
         .map_err(|failure| BetaGenerationError::ProviderFailure(failure.to_string()))?;
@@ -581,9 +641,14 @@ where
     let (note, note_body, reference_note_created) =
         bridge_reference_note(&context, &material, &model, request.started_at);
 
-    let run_request = bridge_run_request(&request);
+    let run_request = bridge_run_request(&request, &source_document_ids);
     store
-        .save_generation_run(run_receipt(&run_request, &model, RunProgress::Started))
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Started,
+            source_permissions.clone(),
+        ))
         .map_err(BetaGenerationError::Store)?;
     store
         .save_concept_reference_note(note)
@@ -603,6 +668,8 @@ where
             parent_review_unit_id: &context.parent.review_unit_id,
             parent_progression: context.parent.queue.progression.as_ref(),
             parent_stage_order: context.parent_stage_order,
+            source_document_ids: &source_document_ids,
+            source_key: context.parent.queue.source_key.as_ref(),
         },
     )?;
 
@@ -615,6 +682,7 @@ where
                 validation_failures: bridge_drafts.validation_failures.clone(),
                 usage: material.usage.as_ref().map(provider_usage_to_run_usage),
             },
+            source_permissions,
         ))
         .map_err(BetaGenerationError::Store)?;
 
@@ -686,17 +754,19 @@ fn bridge_generation_context<E>(
 fn bridge_material_request(
     snapshot: &BetaStoreSnapshot,
     context: &BridgeGenerationContext,
+    authorization: SourceAuthorizationContext,
 ) -> BridgeMaterialRequest {
-    BridgeMaterialRequest {
-        concept_key: context.concept_key.clone(),
-        concept_label: context.concept_label.clone(),
-        parent_review_unit_id: context.parent.review_unit_id.clone(),
-        parent_prompt: prompt_text(&context.parent.prompt),
-        parent_expected_answer: expected_answer(&context.parent.prompt),
-        parent_stage_order: context.parent_stage_order,
-        cached_reference_note: context.cached_note.as_ref().map(|note| note.body.clone()),
-        recent_performance: recent_performance_for_concept(snapshot, &context.concept_key),
-    }
+    BridgeMaterialRequest::new(
+        context.concept_key.clone(),
+        context.concept_label.clone(),
+        context.parent.review_unit_id.clone(),
+        prompt_text(&context.parent.prompt),
+        expected_answer(&context.parent.prompt),
+        context.parent_stage_order,
+        context.cached_note.as_ref().map(|note| note.body.clone()),
+        recent_performance_for_concept(snapshot, &context.concept_key),
+        authorization,
+    )
 }
 
 fn bridge_reference_note(
@@ -735,6 +805,8 @@ struct BridgeDraftBaseContext<'a> {
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
     parent_stage_order: u32,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 struct BridgeDraftPersistence {
@@ -782,6 +854,8 @@ where
                 easier,
                 parent_review_unit_id: base.parent_review_unit_id,
                 parent_progression: base.parent_progression,
+                source_document_ids: base.source_document_ids,
+                source_key: base.source_key,
             },
         );
         drafts.push(draft);
@@ -839,10 +913,13 @@ fn record_bridge_draft(result: &mut BridgeDraftPersistence, draft: &GeneratedPro
     result.draft_ids.push(draft.id.clone());
 }
 
-fn bridge_run_request(request: &BridgeGenerationRequest) -> BetaGenerationRequest {
+fn bridge_run_request(
+    request: &BridgeGenerationRequest,
+    source_document_ids: &[String],
+) -> BetaGenerationRequest {
     BetaGenerationRequest {
         run_id: request.run_id.clone(),
-        source_document_ids: Vec::new(),
+        source_document_ids: source_document_ids.to_vec(),
         parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
         started_at: request.started_at,
         completed_at: request.completed_at,
@@ -909,11 +986,6 @@ where
 
 enum RunProgress {
     Started,
-    InProgress {
-        draft_ids: Vec<String>,
-        validation_failures: Vec<String>,
-        usage: Option<GenerationRunUsage>,
-    },
     Completed {
         draft_ids: Vec<String>,
         validation_failures: Vec<String>,
@@ -925,14 +997,10 @@ fn run_receipt(
     request: &BetaGenerationRequest,
     model: &GeneratedPromptModel,
     progress: RunProgress,
+    source_permissions: Vec<SourcePermissionReceipt>,
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
         RunProgress::Started => (Vec::new(), None, Vec::new(), None),
-        RunProgress::InProgress {
-            draft_ids,
-            validation_failures,
-            usage,
-        } => (draft_ids, None, validation_failures, usage),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
@@ -956,7 +1024,86 @@ fn run_receipt(
         completed_at,
         validation_failures,
         usage,
+        source_permissions,
+        prompt_version: model.version.clone(),
     }
+}
+
+fn source_permission_receipts(sources: &[SourceDocument]) -> Vec<SourcePermissionReceipt> {
+    sources
+        .iter()
+        .map(|source| SourcePermissionReceipt {
+            source_document_id: source.id.clone(),
+            permission: source.permission.clone(),
+            consented: source.permission == SourcePermission::ModelEligible,
+        })
+        .collect()
+}
+
+fn ensure_model_eligible<E>(sources: &[SourceDocument]) -> Result<(), BetaGenerationError<E>> {
+    ensure_sources_not_archived(sources)?;
+    ensure_model_eligible_receipts(&source_permission_receipts(sources))
+}
+
+fn ensure_sources_not_archived<E>(
+    sources: &[SourceDocument],
+) -> Result<(), BetaGenerationError<E>> {
+    if let Some(source) = sources.iter().find(|source| source.archived_at.is_some()) {
+        return Err(BetaGenerationError::ArchivedSourceDocument(
+            source.id.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_model_eligible_receipts<E>(
+    receipts: &[SourcePermissionReceipt],
+) -> Result<(), BetaGenerationError<E>> {
+    if let Some(receipt) = receipts
+        .iter()
+        .find(|receipt| receipt.permission == SourcePermission::LocalOnly)
+    {
+        return Err(BetaGenerationError::LocalOnlySource(
+            receipt.source_document_id.clone(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parent_source_documents<E>(
+    snapshot: &BetaStoreSnapshot,
+    parent: &BetaReviewUnitRecord,
+    require_provenance: bool,
+) -> Result<Vec<SourceDocument>, BetaGenerationError<E>> {
+    let draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == parent.review_unit_id);
+    let mut source_ids = draft
+        .map(|draft| draft.source_document_ids.clone())
+        .unwrap_or_default();
+    if let Some(source_key) = parent.queue.source_key.as_ref() {
+        if !source_ids.iter().any(|id| id == source_key) {
+            source_ids.push(source_key.clone());
+        }
+    }
+    if require_provenance && source_ids.is_empty() {
+        return Err(BetaGenerationError::UnknownSourceDocument(
+            parent.review_unit_id.to_string(),
+        ));
+    }
+    let mut sources = Vec::with_capacity(source_ids.len());
+    for source_id in &source_ids {
+        let source = snapshot
+            .source_documents
+            .iter()
+            .find(|source| &source.id == source_id)
+            .ok_or_else(|| BetaGenerationError::UnknownSourceDocument(source_id.clone()))?;
+        sources.push(source.clone());
+    }
+    ensure_sources_not_archived(&sources)?;
+    Ok(sources)
 }
 
 struct DraftContext<'a> {
@@ -1162,6 +1309,8 @@ struct BridgeDraftContext<'a> {
     easier: bool,
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 fn bridge_draft(
@@ -1204,7 +1353,7 @@ fn bridge_draft(
             context.parent_review_unit_id,
             candidate,
         ),
-        source_document_ids: Vec::new(),
+        source_document_ids: context.source_document_ids.to_vec(),
         reference_span_ids: Vec::new(),
         concept_reference_note_key: Some(context.concept_key.to_owned()),
         generation_run_id: Some(context.run_id.to_owned()),
@@ -1222,7 +1371,10 @@ fn bridge_draft(
                 supersedes: vec![context.parent_review_unit_id.clone()],
             }),
             concept_key: Some(context.concept_key.to_owned()),
-            source_key: None,
+            source_key: context
+                .source_key
+                .cloned()
+                .or_else(|| context.source_document_ids.first().cloned()),
             domain_key: Some("bridge".to_owned()),
         },
         activity_kind: candidate.activity_kind.clone(),

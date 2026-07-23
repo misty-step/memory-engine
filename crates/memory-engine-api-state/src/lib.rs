@@ -27,8 +27,10 @@ use axum::{
     Json,
 };
 use hmac::Hmac;
-use memory_engine_generation::FallbackProvider;
-use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
+use memory_engine_generation::{DraftProvider, FallbackProvider, StructuredBlockProvider};
+pub use memory_engine_openrouter::OpenRouterConfig;
+use memory_engine_openrouter::OpenRouterProvider;
+pub use memory_engine_persistence::SourcePermission;
 use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
 use memory_engine_persistence_postgres::{
     AccountScope, AccountStudyStore, PostgresStoreError, PostgresStudyStore,
@@ -108,12 +110,11 @@ impl Default for SchedulerRuntime {
 impl ApiState {
     #[must_use]
     pub fn new(accounts: AccountRegistry) -> Self {
-        // The file-backed host mirrors job history to disk; production uses the
-        // Postgres ledger so queued/running/retry state survives process loss.
-        let jobs = match (accounts.job_history_path(), accounts.postgres_url()) {
-            (Some(path), _) => JobQueue::with_persistence(accounts.clone(), path),
-            (None, Some(database_url)) => JobQueue::with_postgres(accounts.clone(), database_url),
-            (None, None) => JobQueue::new(accounts.clone()),
+        // The file-backed host mirrors job history to disk so the activity log
+        // survives a restart; the postgres host keeps it in memory for now.
+        let jobs = match accounts.job_history_path() {
+            Some(path) => JobQueue::with_persistence(accounts.clone(), path),
+            None => JobQueue::new(accounts.clone()),
         };
         Self {
             accounts,
@@ -135,33 +136,6 @@ impl ApiState {
     /// Returns an API failure when auth or persistence rejects the account.
     pub fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
         self.accounts.create_account(email)
-    }
-
-    /// Issue (or rotate) the service-session credential for an allowlisted
-    /// account, gated by the operator admin token. Reissuing revokes the
-    /// prior credential immediately.
-    ///
-    /// # Errors
-    ///
-    /// Returns forbidden when the admin token is not configured or does not
-    /// match, or when the email is outside the allowlist.
-    pub fn issue_service_session(
-        &self,
-        admin_token: &str,
-        email: &str,
-    ) -> Result<AccountCreated, ApiFailure> {
-        self.accounts.issue_service_session(admin_token, email)
-    }
-
-    /// Check a caller-supplied token against the configured operator admin
-    /// token, without touching any request body.
-    ///
-    /// # Errors
-    ///
-    /// Returns forbidden when the admin token is unconfigured, empty, or
-    /// mismatched.
-    pub fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
-        self.accounts.verify_admin_token(admin_token)
     }
 
     /// Request an auth magic link.
@@ -212,21 +186,6 @@ impl ApiState {
         csrf_token: &str,
     ) -> Result<AppAccount, ApiFailure> {
         self.accounts.require_browser_session(headers, csrf_token)
-    }
-    /// Require a valid browser session while accounting for every Postgres
-    /// boundary traversed by the request.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when the browser session or CSRF token is invalid.
-    pub fn require_browser_session_with_timings(
-        &self,
-        headers: &HeaderMap,
-        csrf_token: &str,
-        timings: &mut SubmitReviewTimings,
-    ) -> Result<AppAccount, ApiFailure> {
-        self.accounts
-            .require_browser_session_with_timings(headers, csrf_token, timings)
     }
 
     /// Require a valid browser session for a read-only request.
@@ -327,6 +286,22 @@ impl ApiState {
         self.accounts.list_sources(account_id, session_token)
     }
 
+    /// Update an active source's model-sharing permission for an authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account, source, or persistence boundary rejects it.
+    pub fn update_source_permission(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .update_source_permission(account_id, session_token, source_id, permission)
+    }
+
     /// List saved material for a browser-authenticated account.
     ///
     /// # Errors
@@ -336,21 +311,23 @@ impl ApiState {
         self.accounts
             .list_sources(account.account_id(), account.session_token())
     }
-    /// List saved material while accounting for every Postgres boundary
-    /// traversed by a timed browser request.
+
+    /// Update an active source's model-sharing permission for a browser account.
     ///
     /// # Errors
     ///
-    /// Returns an API failure when persistence rejects the read.
-    pub fn list_app_sources_with_timings(
+    /// Returns an API failure when the source is unknown, archived, or cannot be persisted.
+    pub fn update_app_source_permission(
         &self,
         account: &AppAccount,
-        timings: &mut SubmitReviewTimings,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        self.accounts.list_sources_with_timings(
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.update_source_permission(
             account.account_id(),
             account.session_token(),
-            Some(timings),
+            source_id,
+            permission,
         )
     }
 
@@ -477,23 +454,6 @@ impl ApiState {
     pub fn app_study_view(&self, account: &AppAccount) -> Result<StudyViewResponse, ApiFailure> {
         self.accounts
             .study_view(account.account_id(), account.session_token())
-    }
-    /// Render the current study view while accounting for every Postgres
-    /// boundary traversed by a timed browser request.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when study state rejects the read.
-    pub fn app_study_view_with_timings(
-        &self,
-        account: &AppAccount,
-        timings: &mut SubmitReviewTimings,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.study_view_with_timings(
-            account.account_id(),
-            account.session_token(),
-            Some(timings),
-        )
     }
 
     /// Persist the learner's explicit due-count return-channel choice.
@@ -981,14 +941,12 @@ impl ApiState {
         account: &AppAccount,
         review_unit_id: &str,
         request: &SubmitReviewRequest,
-        timings: &mut SubmitReviewTimings,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.accounts.submit_review_with_timings(
+        self.accounts.submit_review(
             account.account_id(),
             account.session_token(),
             review_unit_id,
             request,
-            Some(timings),
         )
     }
 
@@ -1029,24 +987,6 @@ impl ApiState {
         )
     }
 
-    /// Read the latest persisted content-feedback revision for a review unit.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when the browser session or account-scoped
-    /// persistence read fails.
-    pub fn app_content_feedback_head(
-        &self,
-        account: &AppAccount,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure> {
-        self.accounts.content_feedback_head(
-            account.account_id(),
-            account.session_token(),
-            review_unit_id,
-        )
-    }
-
     /// Enqueue a background generation job, coalescing onto an existing
     /// queued/running job for the same account+source (082) instead of
     /// starting a duplicate.
@@ -1074,58 +1014,6 @@ impl ApiState {
             .enqueue_or_coalesce(account.account_id(), source_id, title)
     }
 
-    /// Enqueue durable generation for an API-authenticated account and owned source.
-    ///
-    /// Returns the account-scoped job and whether this request coalesced onto an
-    /// existing in-flight job.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when authentication, source lookup, or enqueue
-    /// fails.
-    pub fn enqueue_generation_job_for_session(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        source_id: &str,
-    ) -> Result<(GenerationJob, bool), ApiFailure> {
-        let source = self
-            .accounts
-            .list_sources(account_id, session_token)?
-            .into_iter()
-            .find(|source| source.source_id == source_id)
-            .ok_or_else(|| ApiFailure::not_found("Source not found."))?;
-        match self
-            .jobs
-            .enqueue_or_coalesce(account_id, &source.source_id, &source.title)
-        {
-            EnqueueOutcome::Started(job) => Ok((job, false)),
-            EnqueueOutcome::AlreadyInFlight(job) => Ok((job, true)),
-            EnqueueOutcome::Rejected(reason) => Err(ApiFailure::conflict_message(reason)),
-            EnqueueOutcome::Unavailable(reason) => Err(ApiFailure::service_unavailable(reason)),
-        }
-    }
-
-    /// Return one durable generation job to its API-authenticated owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when authentication fails or the account does not
-    /// own the requested job.
-    pub fn generation_job_for_session(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        job_id: &str,
-    ) -> Result<GenerationJob, ApiFailure> {
-        self.accounts
-            .authenticate_account(account_id, session_token)?;
-        self.jobs
-            .job_for_account(account_id, job_id)
-            .map_err(ApiFailure::service_unavailable)?
-            .ok_or_else(|| ApiFailure::not_found("Generation job not found."))
-    }
-
     /// Retry a background generation job.
     #[must_use]
     pub fn retry_generation_job(&self, account: &AppAccount, job_id: &str) -> bool {
@@ -1136,17 +1024,6 @@ impl ApiState {
     #[must_use]
     pub fn jobs_for_app_account(&self, account: &AppAccount) -> Vec<GenerationJob> {
         self.jobs.jobs_for(account.account_id())
-    }
-    /// Return rendered job history while accounting for every Postgres
-    /// boundary traversed by a timed browser request.
-    #[must_use]
-    pub fn jobs_for_app_account_with_timings(
-        &self,
-        account: &AppAccount,
-        timings: &mut SubmitReviewTimings,
-    ) -> Vec<GenerationJob> {
-        self.jobs
-            .jobs_for_with_timings(account.account_id(), timings)
     }
 
     /// Return rendered job history by account id. Test helper for route coverage.
@@ -1168,19 +1045,6 @@ impl ApiState {
         self.jobs.run_pending_blocking();
     }
 
-    /// Enqueue a generation job by account id, coalescing like production
-    /// enqueue. Test helper for production-shaped (queued) route coverage.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn enqueue_generation_job_for_account_id(
-        &self,
-        account_id: &str,
-        source_id: &str,
-        title: &str,
-    ) -> EnqueueOutcome {
-        self.jobs.enqueue_or_coalesce(account_id, source_id, title)
-    }
-
     /// Read durable reminder state for boundary tests and operator receipts.
     #[doc(hidden)]
     pub fn load_return_notification_preference_for_test(
@@ -1198,25 +1062,6 @@ impl ApiState {
     pub fn job(&self, job_id: &str) -> Option<GenerationJob> {
         self.jobs.job(job_id)
     }
-
-    /// Readiness is separate from `/healthz`: it requires the production
-    /// dependency and the worker loop, so a live but non-serving process is not
-    /// advertised as ready.
-    #[must_use]
-    pub fn readiness(&self) -> ReadinessResponse {
-        let worker_started = self.jobs.worker_ready();
-        let postgres = self.accounts.postgres_ready();
-        ReadinessResponse {
-            status: if worker_started && postgres {
-                "ready"
-            } else {
-                "not_ready"
-            },
-            service: "memory-engine-api",
-            worker_started,
-            postgres,
-        }
-    }
 }
 
 impl Default for ApiState {
@@ -1232,7 +1077,6 @@ pub struct AuthConfig {
     link_delivery: AuthLinkDelivery,
     unsubscribe_secret: String,
     scheduler_manual_token: Option<String>,
-    admin_token: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -1243,7 +1087,6 @@ impl Default for AuthConfig {
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
             scheduler_manual_token: None,
-            admin_token: None,
         }
     }
 }
@@ -1418,15 +1261,6 @@ impl AuthConfig {
         self
     }
 
-    /// Set the operator admin token that gates service-session issuance.
-    /// Production hosts should source this from a secret manager; leaving it
-    /// unset disables the service-session surface entirely.
-    #[must_use]
-    pub fn with_admin_token(mut self, token: impl Into<String>) -> Self {
-        self.admin_token = Some(token.into());
-        self
-    }
-
     fn email_allowed(&self, email: &str) -> bool {
         self.allowed_emails
             .as_ref()
@@ -1473,6 +1307,21 @@ impl AccountRegistry {
     pub fn with_auth_config(self, auth_config: AuthConfig) -> Self {
         let mut data = self.lock_data();
         data.auth_config = auth_config;
+        drop(data);
+        self
+    }
+
+    /// Inject the model-generation config used by the study routes.
+    ///
+    /// Production should set this from the environment; tests can pass an
+    /// explicit config to exercise the exact route-selection code path.
+    #[must_use]
+    pub fn with_generation_provider_config(
+        self,
+        generation_provider_config: Option<OpenRouterConfig>,
+    ) -> Self {
+        let mut data = self.lock_data();
+        data.generation_provider_config = generation_provider_config;
         drop(data);
         self
     }
@@ -1525,38 +1374,6 @@ impl AccountRegistry {
         }
     }
 
-    pub(crate) fn postgres_url(&self) -> Option<String> {
-        match &self.lock_data().storage {
-            StudyStorageConfig::Postgres { database_url } => Some(database_url.clone()),
-            StudyStorageConfig::File { .. } => None,
-        }
-    }
-
-    fn postgres_ready(&self) -> bool {
-        let Some(database_url) = self.postgres_url() else {
-            return true;
-        };
-        with_postgres_store(&database_url, |store| {
-            store.ping().map_err(postgres_failure)
-        })
-        .is_ok()
-    }
-
-    pub(crate) fn generation_cost_for_run(
-        &self,
-        account_id: &str,
-        run_id: &str,
-    ) -> Result<i64, ApiFailure> {
-        let Some(database_url) = self.postgres_url() else {
-            return Ok(0);
-        };
-        with_postgres_store(&database_url, |store| {
-            store
-                .generation_cost_for_run(account_id, run_id)
-                .map_err(postgres_failure)
-        })
-    }
-
     fn lock_data(&self) -> MutexGuard<'_, AccountRegistryData> {
         self.inner
             .lock()
@@ -1569,6 +1386,7 @@ struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
+    generation_provider_config: Option<OpenRouterConfig>,
     storage: StudyStorageConfig,
     now_fn: fn() -> i64,
 }
@@ -1579,6 +1397,7 @@ impl Default for AccountRegistryData {
             accounts: BTreeMap::new(),
             browser_sessions: BTreeMap::new(),
             auth_config: AuthConfig::default(),
+            generation_provider_config: None,
             storage: StudyStorageConfig::default(),
             now_fn: wall_clock_ms,
         }
@@ -1624,6 +1443,8 @@ pub struct AccountCreated {
 pub struct CreateSourceRequest {
     pub title: String,
     pub body: String,
+    #[serde(default = "default_source_permission")]
+    pub permission: SourcePermission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1632,10 +1453,15 @@ pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
     pub body: String,
+    pub permission: SourcePermission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_expires_at: Option<i64>,
+}
+
+fn default_source_permission() -> SourcePermission {
+    SourcePermission::ModelEligible
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1673,73 +1499,6 @@ pub struct SubmitReviewRequest {
     pub answer: String,
     pub response_time_ms: u32,
     pub idempotency_key: String,
-}
-
-/// Blocking Postgres phases observed for one browser review submission.
-///
-/// `None` means the phase did not run. Callers must not coerce an absent
-/// phase to zero because auth, validation, and connection failures stop at
-/// different boundaries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SubmitReviewTimings {
-    connect_ms: Option<u64>,
-    operation_ms: Option<u64>,
-    statement_count: Option<u64>,
-}
-
-impl SubmitReviewTimings {
-    #[must_use]
-    pub const fn postgres_connect_ms(self) -> Option<u64> {
-        self.connect_ms
-    }
-
-    #[must_use]
-    pub const fn postgres_operation_ms(self) -> Option<u64> {
-        self.operation_ms
-    }
-
-    #[must_use]
-    pub const fn postgres_statement_count(self) -> Option<u64> {
-        self.statement_count
-    }
-
-    pub(crate) fn record_postgres_connect(&mut self, duration_ms: u64) {
-        self.connect_ms = Some(
-            self.connect_ms
-                .unwrap_or_default()
-                .saturating_add(duration_ms),
-        );
-    }
-
-    pub(crate) fn record_postgres_operation(&mut self, duration_ms: u64) {
-        self.operation_ms = Some(
-            self.operation_ms
-                .unwrap_or_default()
-                .saturating_add(duration_ms),
-        );
-    }
-
-    pub(crate) fn record_postgres_statement_count(&mut self, count: u64) {
-        self.statement_count = Some(
-            self.statement_count
-                .unwrap_or_default()
-                .saturating_add(count),
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SubmitPerformanceOutcome {
-    Succeeded,
-    ClientRejected,
-    ServerFailed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SubmitViewport {
-    Mobile,
-    Tablet,
-    Desktop,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1782,15 +1541,6 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub service: &'static str,
     pub return_notification_scheduler: SchedulerHealth,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadinessResponse {
-    pub status: &'static str,
-    pub service: &'static str,
-    pub worker_started: bool,
-    pub postgres: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1869,14 +1619,6 @@ impl ApiFailure {
     }
 
     #[must_use]
-    pub fn conflict_message(message: String) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message,
-        }
-    }
-
-    #[must_use]
     pub fn missing_session() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -1909,27 +1651,11 @@ impl ApiFailure {
     }
 
     #[must_use]
-    pub fn service_unavailable(message: String) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message,
-        }
-    }
-
-    #[must_use]
     pub fn internal(message: String) -> Self {
         report_internal_error(&message);
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
-        }
-    }
-
-    #[must_use]
-    pub fn payload_too_large(message: &'static str) -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: message.to_owned(),
         }
     }
 
@@ -1962,16 +1688,6 @@ pub fn init_error_reporting() {
     );
 }
 
-/// Drain and stop the process-wide Canary worker during graceful shutdown.
-///
-/// Returns `false` only when an installed reporter misses the deadline.
-pub fn shutdown_error_reporting(deadline: std::time::Duration) -> bool {
-    CANARY
-        .get()
-        .and_then(Option::as_ref)
-        .is_none_or(|reporter| reporter.shutdown(deadline))
-}
-
 pub fn report_health_check_in() {
     if let Some(reporter) = CANARY.get().and_then(Option::as_ref) {
         reporter.check_in(&memory_engine_canary::CheckInEvent {
@@ -1983,73 +1699,6 @@ pub fn report_health_check_in() {
                 "source": "memory-engine-api",
             })),
         });
-    }
-}
-
-pub fn report_submit_server_performance(duration_ms: u64, outcome: SubmitPerformanceOutcome) {
-    let outcome = match outcome {
-        SubmitPerformanceOutcome::Succeeded => memory_engine_performance::Outcome::Succeeded,
-        SubmitPerformanceOutcome::ClientRejected => {
-            memory_engine_performance::Outcome::ClientRejected
-        }
-        SubmitPerformanceOutcome::ServerFailed => memory_engine_performance::Outcome::ServerFailed,
-    };
-    let marker = memory_engine_performance::CompletionMarker::server(
-        memory_engine_performance::Action::Review(memory_engine_performance::ReviewAction::Submit),
-        memory_engine_performance::CompletionPhase::ImmediateAck,
-        outcome,
-    );
-    report_performance_observation(marker, duration_ms);
-}
-
-pub fn report_submit_browser_performance(
-    tap_to_ack_ms: u64,
-    graded_visible_ms: u64,
-    viewport: SubmitViewport,
-) {
-    let viewport = match viewport {
-        SubmitViewport::Mobile => memory_engine_performance::Viewport::Mobile,
-        SubmitViewport::Tablet => memory_engine_performance::Viewport::Tablet,
-        SubmitViewport::Desktop => memory_engine_performance::Viewport::Desktop,
-    };
-    for (phase, duration_ms) in [
-        (
-            memory_engine_performance::CompletionPhase::ImmediateAck,
-            tap_to_ack_ms,
-        ),
-        (
-            memory_engine_performance::CompletionPhase::VisibleAfterTwoAnimationFrames,
-            graded_visible_ms,
-        ),
-    ] {
-        let marker = memory_engine_performance::CompletionMarker::browser(
-            memory_engine_performance::Action::Review(
-                memory_engine_performance::ReviewAction::Submit,
-            ),
-            phase,
-            memory_engine_performance::Outcome::Succeeded,
-            memory_engine_performance::Navigation::FullPage,
-            viewport,
-        );
-        report_performance_observation(marker, duration_ms);
-    }
-}
-
-fn report_performance_observation(
-    marker: Result<
-        memory_engine_performance::CompletionMarker,
-        memory_engine_performance::MarkerError,
-    >,
-    duration_ms: u64,
-) {
-    let Some(reporter) = CANARY.get().and_then(Option::as_ref) else {
-        return;
-    };
-    let Ok(marker) = marker else {
-        return;
-    };
-    if let Ok(observation) = marker.observation(duration_ms) {
-        let _ = reporter.report_performance(observation);
     }
 }
 
@@ -2120,17 +1769,6 @@ fn normalize_required_text(text: &str, label: &'static str) -> Result<String, Ap
             "Idempotency key" => "Idempotency key must not be blank.",
             _ => "Value must not be blank.",
         }));
-    }
-
-    if label.contains("body") && trimmed.len() > MAX_SOURCE_BODY_BYTES {
-        return Err(ApiFailure::payload_too_large(
-            "Source body exceeds the 256 KiB generation limit.",
-        ));
-    }
-    if label.contains("title") && trimmed.len() > MAX_SOURCE_TITLE_BYTES {
-        return Err(ApiFailure::payload_too_large(
-            "Source title exceeds the 512 byte limit.",
-        ));
     }
 
     Ok(trimmed.to_owned())
@@ -2291,8 +1929,6 @@ fn new_magic_link_token() -> String {
 pub const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
 const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
 pub const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
-pub const MAX_SOURCE_BODY_BYTES: usize = 256 * 1024;
-pub const MAX_SOURCE_TITLE_BYTES: usize = 512;
 const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // 30 minutes: links travel through email, where spam checks and device
 // switches routinely burn ten minutes. Found in dogfood: a link expired
@@ -2387,49 +2023,34 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Generate drafts for one source using the configured provider.
 ///
-/// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
-/// a [`FallbackProvider`] whose primary is the deterministic structured-block
-/// parser, so hand-written `Concept:/Question:/Answer:` blocks keep their free
-/// path. Without a key the structured parser runs alone, which is what CI and
-/// key-less deployments use.
+/// When `OPENROUTER_API_KEY` is set, `ModelEligible` arbitrary prose routes to
+/// the model via a [`FallbackProvider`] whose primary is the deterministic
+/// structured-block parser. `LocalOnly` sources always take the structured
+/// parser path, so they remain usable without model or network access.
 fn run_source_generation<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    let run_id = format!("study-run-{:032x}", rand::random::<u128>());
-    run_source_generation_with_run_id(study, source_id, &run_id)
-}
-
-pub(crate) fn run_source_generation_with_run_id<S>(
-    study: &mut BetaStudySession<S>,
-    source_id: &str,
-    run_id: &str,
-) -> Result<BetaStudyView, ApiFailure>
-where
-    S: memory_engine_study::BetaStudyStore,
-    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
-{
-    let ids = Some(vec![source_id.to_owned()]);
-    match OpenRouterConfig::from_env() {
-        Ok(config) => {
-            let model = OpenRouterProvider::new(config);
-            let provider = FallbackProvider::new(&model);
-            study.generate_with_provider_and_run_id(ids, &provider, run_id)
-        }
-        Err(_) => study.generate_with_run_id(ids, run_id),
+    if let Some(config) = generation_provider_config {
+        let structured = StructuredBlockProvider;
+        let model = OpenRouterProvider::new(config);
+        let provider = FallbackProvider::new(&structured, &model);
+        return run_source_generation_with_provider(study, source_id, Some(&provider))
+            .map_err(study_failure);
     }
-    .map_err(study_failure)
+
+    run_source_generation_with_provider(study, source_id, None).map_err(study_failure)
 }
 
-#[cfg(test)]
 pub(crate) fn run_source_generation_with_provider<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
-    provider: &dyn memory_engine_generation::DraftProvider,
+    provider: Option<&dyn DraftProvider>,
 ) -> Result<
     BetaStudyView,
     memory_engine_study::BetaStudyError<<S as memory_engine_service::MemoryServiceStore>::Error>,
@@ -2437,53 +2058,68 @@ pub(crate) fn run_source_generation_with_provider<S>(
 where
     S: memory_engine_study::BetaStudyStore,
 {
-    study.generate_with_provider(Some(vec![source_id.to_owned()]), provider)
+    let local_only = study
+        .view()?
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
+    let ids = Some(vec![source_id.to_owned()]);
+    if local_only {
+        study.generate(ids)
+    } else if let Some(provider) = provider {
+        study.generate_with_provider(ids, provider)
+    } else {
+        study.generate(ids)
+    }
 }
 
-fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_reference_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.learn_more().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.learn_more().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.learn_more_with_provider(&model)
-            }
-            Err(_) => study.learn_more(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.learn_more_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.learn_more(),
     }
+    .map_err(study_failure)
 }
 
-fn run_bridge_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_bridge_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.generate_bridge_material().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.generate_bridge_material().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.generate_bridge_material_with_provider(&model)
-            }
-            Err(_) => study.generate_bridge_material(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.generate_bridge_material_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.generate_bridge_material(),
     }
+    .map_err(study_failure)
 }
 
 fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
@@ -2532,48 +2168,6 @@ fn with_postgres_account<R>(
     }
 }
 
-fn with_postgres_account_timed<R>(
-    database_url: &str,
-    account_id: &str,
-    now_ms: i64,
-    timings: Option<&mut SubmitReviewTimings>,
-    operation: impl FnOnce(AccountStudyStore<'_>) -> Result<R, ApiFailure>,
-) -> Result<R, ApiFailure> {
-    let Some(timings) = timings else {
-        return with_postgres_account(database_url, account_id, now_ms, operation);
-    };
-    let run = || {
-        let connect_started = std::time::Instant::now();
-        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
-        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
-        let mut store = connected?;
-
-        let operation_started = std::time::Instant::now();
-        let result = (|| {
-            migrate_postgres_store(database_url, &mut store)?;
-            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
-            let mut account = store.for_account(scope);
-            account.ensure_account(now_ms).map_err(postgres_failure)?;
-            operation(account)
-        })();
-        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
-        timings.record_postgres_statement_count(store.statement_count());
-        result
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(run)
-    } else {
-        run()
-    }
-}
-
-fn bounded_elapsed_ms(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis())
-        .unwrap_or(u64::MAX)
-        .clamp(1, memory_engine_performance::REQUEST_UI_MAX_DURATION_MS)
-}
-
 fn with_postgres_store<R>(
     database_url: &str,
     operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
@@ -2582,36 +2176,6 @@ fn with_postgres_store<R>(
         let mut store = connect_postgres_migrated(database_url)?;
 
         operation(&mut store)
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(run)
-    } else {
-        run()
-    }
-}
-fn with_postgres_store_timed<R>(
-    database_url: &str,
-    timings: Option<&mut SubmitReviewTimings>,
-    operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
-) -> Result<R, ApiFailure> {
-    let Some(timings) = timings else {
-        return with_postgres_store(database_url, operation);
-    };
-    let run = || {
-        let connect_started = std::time::Instant::now();
-        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
-        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
-        let mut store = connected?;
-
-        let operation_started = std::time::Instant::now();
-        let result = (|| {
-            migrate_postgres_store(database_url, &mut store)?;
-            operation(&mut store)
-        })();
-        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
-        timings.record_postgres_statement_count(store.statement_count());
-        result
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -2639,20 +2203,13 @@ fn with_postgres_study<R>(
 /// pressure. The set is keyed by URL so tests pointing at scratch databases
 /// still migrate each one.
 fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, ApiFailure> {
-    let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
-    migrate_postgres_store(database_url, &mut store)?;
-    Ok(store)
-}
-
-fn migrate_postgres_store(
-    database_url: &str,
-    store: &mut PostgresStudyStore,
-) -> Result<(), ApiFailure> {
-    static MIGRATED_URLS: std::sync::LazyLock<
+    static MIGRATED_URLS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::BTreeSet<String>>,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    > = std::sync::OnceLock::new();
 
-    let migrated = &*MIGRATED_URLS;
+    let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
+    let migrated =
+        MIGRATED_URLS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     // A panic while migrating must not poison every later request into a
     // panic; the set is a plain string collection, safe to keep using.
     let mut migrated = migrated
@@ -2662,7 +2219,8 @@ fn migrate_postgres_store(
         store.migrate().map_err(postgres_failure)?;
         migrated.insert(database_url.to_owned());
     }
-    Ok(())
+
+    Ok(store)
 }
 
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
@@ -2727,6 +2285,7 @@ fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
             source_id: source.id,
             title: source.title,
             body: source.body.unwrap_or_default(),
+            permission: source.permission,
             project_key: source.project_key,
             ttl_expires_at: source.ttl_expires_at,
         })
@@ -2794,6 +2353,38 @@ fn require_current_review_postgres(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountingConfiguredProvider {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl memory_engine_generation::DraftProvider for CountingConfiguredProvider {
+        fn model(&self) -> memory_engine_persistence::GeneratedPromptModel {
+            memory_engine_persistence::GeneratedPromptModel {
+                provider: "counting".to_owned(),
+                name: "configured".to_owned(),
+                version: "test".to_owned(),
+            }
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &memory_engine_persistence::SourceDocument,
+        ) -> Result<
+            memory_engine_generation::ProviderDrafts,
+            memory_engine_generation::ProviderFailure,
+        > {
+            self.calls.set(self.calls.get() + 1);
+            Ok(memory_engine_generation::ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: Vec::new(),
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     #[test]
     fn client_rate_limit_key_prefers_digitalocean_client_ip() {
         let mut headers = HeaderMap::new();
@@ -2829,21 +2420,89 @@ mod tests {
     }
 
     #[test]
-    fn source_validation_rejects_oversized_generation_input() {
-        let body = "x".repeat(MAX_SOURCE_BODY_BYTES + 1);
-        let error = normalize_required_text(&body, "Source body").expect_err("body is bounded");
-        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+    fn local_only_generation_uses_structured_path_when_external_provider_is_configured() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+        let provider = CountingConfiguredProvider::default();
 
-        let title = "x".repeat(MAX_SOURCE_TITLE_BYTES + 1);
-        let error = normalize_required_text(&title, "Source title").expect_err("title is bounded");
-        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        let view = run_source_generation_with_provider(&mut study, "local-source", Some(&provider))
+            .expect("local generation");
+
+        assert!(!view.drafts.is_empty(), "local source should produce cards");
+        assert_eq!(
+            provider.calls.get(),
+            0,
+            "configured model must not be called"
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn readiness_requires_the_worker_even_when_file_dependencies_are_local() {
-        let readiness = ApiState::default().readiness();
-        assert_eq!(readiness.status, "not_ready");
-        assert!(!readiness.worker_started);
-        assert!(readiness.postgres);
+    fn local_only_reference_and_bridge_ignore_the_runtime_generation_provider_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-reference-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+
+        let config = OpenRouterConfig {
+            api_key: "test-key".to_owned(),
+            model: "test-model".to_owned(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            timeout: std::time::Duration::from_millis(1),
+            prompt: memory_engine_openrouter::PromptVariant::Principled,
+            max_drafts: 1,
+            proxy_socket: None,
+        };
+
+        let generated = study.generate(None).expect("generate");
+        let draft_id = generated.drafts.first().expect("draft").id.clone();
+        study.approve_draft(&draft_id).expect("approve");
+        study.start().expect("start reference session");
+
+        let reference = run_reference_generation(&mut study, Some(config.clone()))
+            .expect("local reference generation");
+        assert!(
+            reference.current.is_some(),
+            "local reference should still render"
+        );
+
+        study.start().expect("start bridge session");
+        let bridge =
+            run_bridge_generation(&mut study, Some(config)).expect("local bridge generation");
+        assert!(bridge.current.is_some(), "local bridge should still render");
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use memory_engine_persistence::SourcePermission;
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
 };
@@ -15,20 +16,11 @@ use crate::{
     browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
     persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
     postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation,
-    run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
-    with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
-    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings,
+    run_bridge_generation, run_reference_generation, run_source_generation, secret_hash,
+    study_failure, with_postgres_account, with_postgres_store, with_postgres_study, write_atomic,
+    ApiFailure, BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse,
 };
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GenerationCommitFence<'a> {
-    pub(crate) generation_run_id: &'a str,
-    pub(crate) generation_attempt: i32,
-    pub(crate) lease_token: &'a str,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) enum StudyStorageConfig {
@@ -61,15 +53,21 @@ impl StudyStorageConfig {
         }
     }
 
-    pub(crate) fn storage(&self, now: fn() -> i64) -> StudyStorage {
+    pub(crate) fn storage(
+        &self,
+        now: fn() -> i64,
+        generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
+    ) -> StudyStorage {
         match self {
             Self::File { store_root } => StudyStorage::new(FileStudyStorage {
                 store_root: store_root.clone(),
                 now,
+                generation_provider_config: generation_provider_config.clone(),
             }),
             Self::Postgres { database_url } => StudyStorage::new(PostgresStudyStorage {
                 database_url: database_url.clone(),
                 now,
+                generation_provider_config,
             }),
         }
     }
@@ -117,28 +115,6 @@ fn order_content_feedback_for_copy(
     Ok(ordered)
 }
 
-fn current_content_feedback_head(
-    feedback: &[ContentFeedback],
-    account_id: &str,
-    review_unit_id: &str,
-) -> Option<String> {
-    feedback
-        .iter()
-        .filter(|candidate| {
-            candidate.account_id == account_id
-                && candidate.review_unit_id.as_str() == review_unit_id
-        })
-        .filter(|candidate| {
-            !feedback.iter().any(|child| {
-                child.account_id == account_id
-                    && child.review_unit_id.as_str() == review_unit_id
-                    && child.supersedes_id.as_deref() == Some(candidate.id.as_str())
-            })
-        })
-        .max_by_key(|candidate| (candidate.occurred_at, candidate.id.as_str()))
-        .map(|candidate| candidate.id.clone())
-}
-
 impl fmt::Debug for StudyStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -160,6 +136,7 @@ impl StudyStorage {
         Self::new(FileStudyStorage {
             store_root: store_root.into(),
             now,
+            generation_provider_config: None,
         })
     }
 
@@ -175,14 +152,13 @@ impl StudyStorage {
         self.inner.save_account_session(account_id, session_token)
     }
 
-    pub(crate) fn account_session_matches_with_timings(
+    pub(crate) fn account_session_matches(
         &self,
         account_id: &str,
         session_token: &str,
-        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<bool, ApiFailure> {
         self.inner
-            .account_session_matches_with_timings(account_id, session_token, timings)
+            .account_session_matches(account_id, session_token)
     }
 
     pub(crate) fn save_browser_session(
@@ -198,14 +174,6 @@ impl StudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         self.inner.load_browser_session(session_id)
-    }
-    pub(crate) fn load_browser_session_with_timings(
-        &self,
-        session_id: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        self.inner
-            .load_browser_session_with_timings(session_id, timings)
     }
 
     pub(crate) fn revoke_browser_session(
@@ -336,13 +304,6 @@ impl StudyStorage {
     pub(crate) fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
         self.inner.account_exists(account_id)
     }
-    pub(crate) fn account_exists_with_timings(
-        &self,
-        account_id: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<bool, ApiFailure> {
-        self.inner.account_exists_with_timings(account_id, timings)
-    }
 
     pub(crate) fn copy_account(
         &self,
@@ -363,14 +324,23 @@ impl StudyStorage {
         self.inner.save_source(account_id, store_path, source)
     }
 
-    pub(crate) fn list_sources_with_timings(
+    pub(crate) fn list_sources(
         &self,
         account_id: &str,
         store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
+        self.inner.list_sources(account_id, store_path)
+    }
+
+    pub(crate) fn update_source_permission(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
         self.inner
-            .list_sources_with_timings(account_id, store_path, timings)
+            .update_source_permission(account_id, store_path, source_id, permission)
     }
 
     pub(crate) fn generate_source(
@@ -381,17 +351,6 @@ impl StudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner
             .generate_source(account_id, store_path, source_id)
-    }
-
-    pub(crate) fn generate_source_with_run_id(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        source_id: &str,
-        run_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .generate_source_with_run_id(account_id, store_path, source_id, run_id)
     }
 
     /// Archive a source and every review unit generated from it. Returns the
@@ -423,10 +382,8 @@ impl StudyStorage {
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .approve_draft(account_id, store_path, draft_id, generation_commit_fence)
+        self.inner.approve_draft(account_id, store_path, draft_id)
     }
 
     pub(crate) fn next_review(
@@ -443,15 +400,6 @@ impl StudyStorage {
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner.study_view(account_id, store_path)
-    }
-    pub(crate) fn study_view_with_timings(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .study_view_with_timings(account_id, store_path, timings)
     }
 
     pub(crate) fn reveal_review(
@@ -546,11 +494,18 @@ impl StudyStorage {
         account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        request: SubmitReviewRequest,
-        timings: Option<&mut SubmitReviewTimings>,
+        answer: String,
+        response_time_ms: u32,
+        idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .submit_review(account_id, store_path, review_unit_id, request, timings)
+        self.inner.submit_review(
+            account_id,
+            store_path,
+            review_unit_id,
+            answer,
+            response_time_ms,
+            idempotency_key,
+        )
     }
 
     pub(crate) fn record_content_feedback(
@@ -561,16 +516,6 @@ impl StudyStorage {
     ) -> Result<memory_engine_service::ContentFeedback, ApiFailure> {
         self.inner
             .record_content_feedback(account_id, store_path, command)
-    }
-
-    pub(crate) fn content_feedback_head(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure> {
-        self.inner
-            .content_feedback_head(account_id, store_path, review_unit_id)
     }
 }
 
@@ -583,14 +528,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure>;
-    fn account_session_matches_with_timings(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        _timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<bool, ApiFailure> {
-        self.account_session_matches(account_id, session_token)
-    }
     fn save_browser_session(
         &self,
         session_id: &str,
@@ -600,13 +537,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure>;
-    fn load_browser_session_with_timings(
-        &self,
-        session_id: &str,
-        _timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        self.load_browser_session(session_id)
-    }
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
     fn save_auth_challenge(
         &self,
@@ -669,13 +599,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         max_attempts: u32,
     ) -> Result<bool, ApiFailure>;
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure>;
-    fn account_exists_with_timings(
-        &self,
-        account_id: &str,
-        _timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<bool, ApiFailure> {
-        self.account_exists(account_id)
-    }
     fn copy_account(
         &self,
         source_account_id: &str,
@@ -693,31 +616,19 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure>;
-    fn list_sources_with_timings(
+    fn update_source_permission(
         &self,
         account_id: &str,
         store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        let _ = timings;
-        self.list_sources(account_id, store_path)
-    }
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure>;
     fn generate_source(
         &self,
         account_id: &str,
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
-    fn generate_source_with_run_id(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        source_id: &str,
-        run_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let _ = run_id;
-        self.generate_source(account_id, store_path, source_id)
-    }
     fn archive_source(
         &self,
         account_id: &str,
@@ -736,7 +647,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn next_review(
         &self,
@@ -748,15 +658,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure>;
-    fn study_view_with_timings(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let _ = timings;
-        self.study_view(account_id, store_path)
-    }
     fn reveal_review(
         &self,
         account_id: &str,
@@ -812,8 +713,9 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        request: SubmitReviewRequest,
-        timings: Option<&mut SubmitReviewTimings>,
+        answer: String,
+        response_time_ms: u32,
+        idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn record_content_feedback(
         &self,
@@ -821,18 +723,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         command: RecordContentFeedbackCommand,
     ) -> Result<memory_engine_service::ContentFeedback, ApiFailure>;
-    fn content_feedback_head(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure>;
 }
 
 #[derive(Debug)]
 struct FileStudyStorage {
     store_root: PathBuf,
     now: fn() -> i64,
+    generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
 }
 
 impl FileStudyStorage {
@@ -851,8 +748,9 @@ impl FileStudyStorage {
             return Err(ApiFailure::not_found("Source not found."));
         }
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = crate::run_source_generation_with_provider(&mut study, source_id, provider)
-            .map_err(study_failure)?;
+        let view =
+            crate::run_source_generation_with_provider(&mut study, source_id, Some(provider))
+                .map_err(study_failure)?;
         Ok(StudyViewResponse::from_view(view))
     }
 
@@ -1022,8 +920,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
+        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let existing = match fs::read(&path) {
             Ok(bytes) => Some(
@@ -1133,8 +1030,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
+        let _lock = crate::file_lock::acquire(&account_dir.join("return-notifications.lock"))?;
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1170,18 +1066,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         let account_dir = self.store_root.join(&request.account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
-        let now_ms = request.now_ms;
-        let granted_at_ms = (self.now)();
-        let claim_ttl_ms = request
-            .claim_expires_at_ms
-            .saturating_sub(request.now_ms)
-            .max(0);
-        let unsubscribe_ttl_ms = request
-            .unsubscribe_expires_at_ms
-            .saturating_sub(request.now_ms)
-            .max(0);
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Ok(None);
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(None);
@@ -1190,11 +1079,11 @@ impl StudyStorageAdapter for FileStudyStorage {
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         let interval_elapsed = preference
             .last_sent_at_ms
-            .is_none_or(|sent| now_ms.saturating_sub(sent) >= request.interval_ms);
+            .is_none_or(|sent| request.now_ms.saturating_sub(sent) >= request.interval_ms);
         let eligible = (preference.pending_delivery_key.is_some()
             && preference
                 .next_retry_at_ms
-                .is_none_or(|retry_at| retry_at <= now_ms))
+                .is_none_or(|retry_at| retry_at <= request.now_ms))
             || (preference.pending_delivery_key.is_none()
                 && interval_elapsed
                 && (request.force_confirmation || request.due_count > 0));
@@ -1202,7 +1091,7 @@ impl StudyStorageAdapter for FileStudyStorage {
             || !eligible
             || preference
                 .claim_expires_at_ms
-                .is_some_and(|expires| expires > now_ms)
+                .is_some_and(|expires| expires > request.now_ms)
         {
             return Ok(None);
         }
@@ -1218,9 +1107,9 @@ impl StudyStorageAdapter for FileStudyStorage {
         let due_count = preference.pending_due_count.unwrap_or(request.due_count);
         let unsubscribe_expires_at_ms = preference
             .pending_unsubscribe_expires_at_ms
-            .unwrap_or_else(|| granted_at_ms.saturating_add(unsubscribe_ttl_ms));
+            .unwrap_or(request.unsubscribe_expires_at_ms);
         preference.claim_id = Some(request.claim_id.clone());
-        preference.claim_expires_at_ms = Some(granted_at_ms.saturating_add(claim_ttl_ms));
+        preference.claim_expires_at_ms = Some(request.claim_expires_at_ms);
         preference.pending_delivery_key = Some(delivery_key.clone());
         preference.pending_due_count = Some(due_count);
         preference.pending_unsubscribe_expires_at_ms = Some(unsubscribe_expires_at_ms);
@@ -1242,14 +1131,16 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
-        _sent_at_ms: i64,
+        sent_at_ms: i64,
     ) -> Result<bool, ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
-        let sent_at_ms = (self.now)();
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Ok(false);
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
@@ -1277,14 +1168,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         &self,
         account_id: &str,
         claim_id: &str,
-        _now_ms: i64,
+        now_ms: i64,
     ) -> Result<(), ApiFailure> {
         let account_dir = self.store_root.join(account_id);
         fs::create_dir_all(&account_dir)
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
-        let _lock =
-            crate::file_lock::acquire_blocking(&account_dir.join("return-notifications.lock"))?;
-        let now_ms = (self.now)();
+        let Some(_lock) =
+            crate::file_lock::try_acquire(&account_dir.join("return-notifications.lock"))?
+        else {
+            return Err(ApiFailure::conflict(
+                "Return notification state is busy; retry the delivery.",
+            ));
+        };
         let path = account_dir.join("return-notifications.json");
         let Ok(bytes) = fs::read(&path) else {
             return Ok(());
@@ -1447,6 +1342,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                     body: source.body.clone(),
                     project_key: source.project_key.clone(),
                     ttl_expires_at: source.ttl_expires_at,
+                    permission: source.permission.clone(),
                 })
                 .map_err(study_failure)?;
             Ok(())
@@ -1459,6 +1355,20 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
         persisted_sources(store_path)
+    }
+
+    fn update_source_permission(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        let mut study = crate::open_study_session(store_path, self.now)?;
+        study
+            .update_source_permission(source_id, permission)
+            .map(drop)
+            .map_err(study_failure)
     }
 
     fn generate_source(
@@ -1475,23 +1385,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         // lock here would turn normal foreground approval or invalidation on
         // the same account into a spurious 409 for the duration of generation.
         let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = run_source_generation(&mut study, source_id)?;
+        let view = run_source_generation(
+            &mut study,
+            source_id,
+            self.generation_provider_config.clone(),
+        )?;
 
-        Ok(StudyViewResponse::from_view(view))
-    }
-
-    fn generate_source_with_run_id(
-        &self,
-        _account_id: &str,
-        store_path: &FsPath,
-        source_id: &str,
-        run_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        if !persisted_source_exists(store_path, source_id)? {
-            return Err(ApiFailure::not_found("Source not found."));
-        }
-        let mut study = crate::open_study_session(store_path, self.now)?;
-        let view = run_source_generation_with_run_id(&mut study, source_id, run_id)?;
         Ok(StudyViewResponse::from_view(view))
     }
 
@@ -1535,9 +1434,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let _ = generation_commit_fence;
         self.with_locked_study(store_path, |study| {
             let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
@@ -1586,9 +1483,10 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let provider_config = self.generation_provider_config.clone();
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
-            let view = run_reference_generation(study)?;
+            let view = run_reference_generation(study, provider_config)?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -1675,9 +1573,10 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         review_unit_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let provider_config = self.generation_provider_config.clone();
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
-            let view = run_bridge_generation(study)?;
+            let view = run_bridge_generation(study, provider_config)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -1687,17 +1586,14 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
         review_unit_id: &str,
-        request: SubmitReviewRequest,
-        _timings: Option<&mut SubmitReviewTimings>,
+        answer: String,
+        response_time_ms: u32,
+        idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
             let view = study
-                .submit_answer_with_idempotency_key(
-                    request.answer,
-                    request.response_time_ms,
-                    Some(request.idempotency_key),
-                )
+                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
                 .map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
@@ -1712,26 +1608,13 @@ impl StudyStorageAdapter for FileStudyStorage {
         let mut store = crate::open_persistence_store(store_path)?;
         record_content_feedback(&mut store, command).map_err(file_content_feedback_failure)
     }
-
-    fn content_feedback_head(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure> {
-        let store = crate::open_persistence_store(store_path)?;
-        Ok(current_content_feedback_head(
-            &store.snapshot().content_feedback,
-            account_id,
-            review_unit_id,
-        ))
-    }
 }
 
 #[derive(Debug)]
 struct PostgresStudyStorage {
     database_url: String,
     now: fn() -> i64,
+    generation_provider_config: Option<memory_engine_openrouter::OpenRouterConfig>,
 }
 
 impl PostgresStudyStorage {
@@ -1773,18 +1656,6 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 .map_err(postgres_failure)
         })
     }
-    fn account_session_matches_with_timings(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<bool, ApiFailure> {
-        with_postgres_store_timed(&self.database_url, timings, |store| {
-            store
-                .api_session_matches(account_id, session_token)
-                .map_err(postgres_failure)
-        })
-    }
 
     fn save_browser_session(
         &self,
@@ -1810,25 +1681,6 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         with_postgres_store(&self.database_url, |store| {
-            store
-                .browser_session(&secret_hash(session_id), self.now_ms())
-                .map(|session| {
-                    session.map(|session| BrowserSessionRecord {
-                        account_id: session.account_id,
-                        session_token: session.session_token,
-                        csrf_token_hash: session.csrf_token_hash,
-                        expires_at_ms: session.expires_at_ms,
-                    })
-                })
-                .map_err(postgres_failure)
-        })
-    }
-    fn load_browser_session_with_timings(
-        &self,
-        session_id: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        with_postgres_store_timed(&self.database_url, timings, |store| {
             store
                 .browser_session(&secret_hash(session_id), self.now_ms())
                 .map(|session| {
@@ -2054,15 +1906,6 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             store.account_exists(account_id).map_err(postgres_failure)
         })
     }
-    fn account_exists_with_timings(
-        &self,
-        account_id: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<bool, ApiFailure> {
-        with_postgres_store_timed(&self.database_url, timings, |store| {
-            store.account_exists(account_id).map_err(postgres_failure)
-        })
-    }
 
     fn copy_account(
         &self,
@@ -2147,6 +1990,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     body: source.body.clone(),
                     project_key: source.project_key.clone(),
                     ttl_expires_at: source.ttl_expires_at,
+                    permission: source.permission.clone(),
                 })
                 .map(drop)
                 .map_err(study_failure)
@@ -2156,39 +2000,40 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     fn list_sources(
         &self,
         account_id: &str,
-        store_path: &FsPath,
+        _store_path: &FsPath,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        self.list_sources_with_timings(account_id, store_path, None)
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            Ok(account
+                .snapshot()
+                .map_err(postgres_failure)?
+                .source_documents
+                .into_iter()
+                .filter(|source| source.archived_at.is_none())
+                .map(|source| SourceRecord {
+                    source_id: source.id,
+                    title: source.title,
+                    body: source.body.unwrap_or_default(),
+                    permission: source.permission,
+                    project_key: source.project_key,
+                    ttl_expires_at: source.ttl_expires_at,
+                })
+                .collect())
+        })
     }
 
-    fn list_sources_with_timings(
+    fn update_source_permission(
         &self,
         account_id: &str,
         _store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        with_postgres_account_timed(
-            &self.database_url,
-            account_id,
-            self.now_ms(),
-            timings,
-            |account| {
-                Ok(account
-                    .snapshot()
-                    .map_err(postgres_failure)?
-                    .source_documents
-                    .into_iter()
-                    .filter(|source| source.archived_at.is_none())
-                    .map(|source| SourceRecord {
-                        source_id: source.id,
-                        title: source.title,
-                        body: source.body.unwrap_or_default(),
-                        project_key: source.project_key,
-                        ttl_expires_at: source.ttl_expires_at,
-                    })
-                    .collect())
-            },
-        )
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            study
+                .update_source_permission(source_id, permission)
+                .map(drop)
+                .map_err(study_failure)
+        })
     }
 
     fn generate_source(
@@ -2208,31 +2053,12 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 return Err(ApiFailure::not_found("Source not found."));
             }
             let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation(&mut study, source_id)?;
+            let view = run_source_generation(
+                &mut study,
+                source_id,
+                self.generation_provider_config.clone(),
+            )?;
 
-            Ok(StudyViewResponse::from_view(view))
-        })
-    }
-
-    fn generate_source_with_run_id(
-        &self,
-        account_id: &str,
-        _store_path: &FsPath,
-        source_id: &str,
-        run_id: &str,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if !account
-                .snapshot()
-                .map_err(postgres_failure)?
-                .source_documents
-                .iter()
-                .any(|source| source.id == source_id && source.archived_at.is_none())
-            {
-                return Err(ApiFailure::not_found("Source not found."));
-            }
-            let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation_with_run_id(&mut study, source_id, run_id)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2295,51 +2121,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         _store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if let Some(fence) = generation_commit_fence {
-                let mut account_for_commit = account.clone();
-                account_for_commit
-                    .begin_transaction()
-                    .map_err(postgres_failure)?;
-                let result = (|| {
-                    let now_ms = self.now_ms();
-                    if !account_for_commit
-                        .generation_job_attempt_has_commit_fence(
-                            fence.generation_run_id,
-                            fence.generation_attempt,
-                            fence.lease_token,
-                            now_ms,
-                        )
-                        .map_err(postgres_failure)?
-                    {
-                        return Err(ApiFailure::conflict(
-                            "Generation lease lost before cards could be committed.",
-                        ));
-                    }
-                    let mut study = BetaStudySession::from_store(account, self.now);
-                    let view = study.approve_draft(draft_id).map_err(study_failure)?;
-                    Ok(StudyViewResponse::from_view(view))
-                })();
-                match result {
-                    Ok(view) => {
-                        account_for_commit
-                            .commit_transaction()
-                            .map_err(postgres_failure)?;
-                        Ok(view)
-                    }
-                    Err(error) => {
-                        let _ = account_for_commit.rollback_transaction();
-                        Err(error)
-                    }
-                }
-            } else {
-                let mut study = BetaStudySession::from_store(account, self.now);
-                let view = study.approve_draft(draft_id).map_err(study_failure)?;
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            let view = study.approve_draft(draft_id).map_err(study_failure)?;
 
-                Ok(StudyViewResponse::from_view(view))
-            }
+            Ok(StudyViewResponse::from_view(view))
         })
     }
 
@@ -2358,29 +2144,13 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     fn study_view(
         &self,
         account_id: &str,
-        store_path: &FsPath,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.study_view_with_timings(account_id, store_path, None)
-    }
-
-    fn study_view_with_timings(
-        &self,
-        account_id: &str,
         _store_path: &FsPath,
-        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account_timed(
-            &self.database_url,
-            account_id,
-            self.now_ms(),
-            timings,
-            |account| {
-                let study = BetaStudySession::from_store(account, self.now);
-                let view = study.view().map_err(study_failure)?;
+        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+            let view = study.view().map_err(study_failure)?;
 
-                Ok(StudyViewResponse::from_view(view))
-            },
-        )
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn reveal_review(
@@ -2405,7 +2175,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
-            let view = run_reference_generation(study)?;
+            let view = run_reference_generation(study, self.generation_provider_config.clone())?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -2517,7 +2287,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_study(&self.database_url, account_id, self.now, |study| {
             require_current_review_postgres(study, review_unit_id)?;
-            let view = run_bridge_generation(study)?;
+            let view = run_bridge_generation(study, self.generation_provider_config.clone())?;
 
             Ok(StudyViewResponse::from_view(view))
         })
@@ -2528,38 +2298,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         _store_path: &FsPath,
         review_unit_id: &str,
-        request: SubmitReviewRequest,
-        timings: Option<&mut SubmitReviewTimings>,
+        answer: String,
+        response_time_ms: u32,
+        idempotency_key: String,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account_timed(
-            &self.database_url,
-            account_id,
-            self.now_ms(),
-            timings,
-            |account| {
-                if account
-                    .applied_review_idempotency_key_exists(&request.idempotency_key)
-                    .map_err(postgres_failure)?
-                {
-                    let study = BetaStudySession::from_store(account, self.now);
-                    let view = study.view().map_err(study_failure)?;
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            if account
+                .applied_review_idempotency_key_exists(&idempotency_key)
+                .map_err(postgres_failure)?
+            {
+                let study = BetaStudySession::from_store(account, self.now);
+                let view = study.view().map_err(study_failure)?;
 
-                    return Ok(StudyViewResponse::from_view(view));
-                }
+                return Ok(StudyViewResponse::from_view(view));
+            }
 
-                let mut study = BetaStudySession::from_store(account, self.now);
-                require_current_review_postgres(&mut study, review_unit_id)?;
-                let view = study
-                    .submit_answer_with_idempotency_key(
-                        request.answer,
-                        request.response_time_ms,
-                        Some(request.idempotency_key),
-                    )
-                    .map_err(study_failure)?;
+            let mut study = BetaStudySession::from_store(account, self.now);
+            require_current_review_postgres(&mut study, review_unit_id)?;
+            let view = study
+                .submit_answer_with_idempotency_key(answer, response_time_ms, Some(idempotency_key))
+                .map_err(study_failure)?;
 
-                Ok(StudyViewResponse::from_view(view))
-            },
-        )
+            Ok(StudyViewResponse::from_view(view))
+        })
     }
 
     fn record_content_feedback(
@@ -2578,49 +2339,24 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             },
         )
     }
-
-    fn content_feedback_head(
-        &self,
-        account_id: &str,
-        _store_path: &FsPath,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            let snapshot = account.snapshot().map_err(postgres_failure)?;
-            Ok(current_content_feedback_head(
-                &snapshot.content_feedback,
-                account_id,
-                review_unit_id,
-            ))
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
     };
     use memory_engine_persistence::GeneratedPromptModel;
     use memory_engine_service::MemoryServiceStore;
     use std::{
-        sync::{
-            atomic::{AtomicI64, Ordering},
-            mpsc, Arc, Barrier,
-        },
+        sync::{Arc, Barrier},
         thread,
-        time::Duration,
     };
 
     fn test_now() -> i64 {
         1_700_000_000_000
-    }
-
-    static NOTIFICATION_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
-
-    fn notification_now() -> i64 {
-        NOTIFICATION_CLOCK.load(Ordering::SeqCst)
     }
 
     struct BlockingDraftProvider {
@@ -2645,187 +2381,6 @@ mod tests {
     }
 
     #[test]
-    fn file_notification_claim_waits_and_rebases_ttls_after_lock_contention() {
-        let root = std::env::temp_dir().join(format!(
-            "memory-engine-notification-lock-{}-{}",
-            std::process::id(),
-            rand::random::<u128>()
-        ));
-        NOTIFICATION_CLOCK.store(test_now(), Ordering::SeqCst);
-        let storage = FileStudyStorage {
-            store_root: root.clone(),
-            now: notification_now,
-        };
-        storage
-            .save_return_notification_preference(
-                "acct",
-                "learner@example.com",
-                true,
-                None,
-                "unsubscribe-nonce",
-            )
-            .expect("notification preference");
-        let held = crate::file_lock::acquire(&root.join("acct").join("return-notifications.lock"))
-            .expect("hold notification lock");
-        let request = ReturnNotificationClaimRequest {
-            account_id: "acct".to_owned(),
-            now_ms: test_now(),
-            due_count: 1,
-            force_confirmation: true,
-            interval_ms: 86_400_000,
-            claim_id: "claim".to_owned(),
-            delivery_key: "delivery".to_owned(),
-            claim_expires_at_ms: test_now() + 1,
-            unsubscribe_nonce: "next-unsubscribe-nonce".to_owned(),
-            unsubscribe_expires_at_ms: test_now() + 604_800_000,
-        };
-        let contender = FileStudyStorage {
-            store_root: root.clone(),
-            now: notification_now,
-        };
-        let (started_tx, started_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let claim = thread::spawn(move || {
-            started_tx.send(()).expect("signal claim start");
-            result_tx
-                .send(contender.claim_return_notification(&request))
-                .expect("send claim result");
-        });
-        started_rx.recv().expect("claim started");
-        let early = result_rx.recv_timeout(Duration::from_millis(100));
-        assert!(
-            early.is_err(),
-            "claim must wait while the notification lock is held"
-        );
-        NOTIFICATION_CLOCK.store(test_now() + 10, Ordering::SeqCst);
-        drop(held);
-        let result = early.unwrap_or_else(|_| result_rx.recv().expect("claim after lock release"));
-
-        assert!(
-            result.expect("claim result").is_some(),
-            "short lock contention must not be reported as an ineligible notification"
-        );
-        claim.join().expect("claim thread");
-        let preference = storage
-            .load_return_notification_preference("acct")
-            .expect("load notification preference")
-            .expect("saved notification preference");
-        assert_eq!(
-            preference.claim_expires_at_ms,
-            Some(test_now() + 11),
-            "claim TTL must start after the blocking lock wait"
-        );
-        assert_eq!(
-            preference.pending_unsubscribe_expires_at_ms,
-            Some(test_now() + 10 + 604_800_000),
-            "unsubscribe TTL must start after the blocking lock wait"
-        );
-        assert!(
-            storage
-                .claim_return_notification(&ReturnNotificationClaimRequest {
-                    account_id: "acct".to_owned(),
-                    now_ms: test_now() + 10,
-                    due_count: 1,
-                    force_confirmation: true,
-                    interval_ms: 86_400_000,
-                    claim_id: "premature-reclaim".to_owned(),
-                    delivery_key: "premature-delivery".to_owned(),
-                    claim_expires_at_ms: test_now() + 11,
-                    unsubscribe_nonce: "premature-nonce".to_owned(),
-                    unsubscribe_expires_at_ms: test_now() + 10 + 604_800_000,
-                })
-                .expect("premature reclaim check")
-                .is_none(),
-            "lock wait beyond the original TTL must not expose the fresh claim"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn file_notification_completion_waits_and_samples_time_after_lock_contention() {
-        static COMPLETION_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
-        fn completion_now() -> i64 {
-            COMPLETION_CLOCK.load(Ordering::SeqCst)
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "memory-engine-notification-completion-lock-{}-{}",
-            std::process::id(),
-            rand::random::<u128>()
-        ));
-        COMPLETION_CLOCK.store(test_now(), Ordering::SeqCst);
-        let storage = FileStudyStorage {
-            store_root: root.clone(),
-            now: completion_now,
-        };
-        storage
-            .save_return_notification_preference(
-                "acct",
-                "learner@example.com",
-                true,
-                None,
-                "unsubscribe-nonce",
-            )
-            .expect("notification preference");
-        storage
-            .claim_return_notification(&ReturnNotificationClaimRequest {
-                account_id: "acct".to_owned(),
-                now_ms: test_now(),
-                due_count: 1,
-                force_confirmation: true,
-                interval_ms: 86_400_000,
-                claim_id: "claim".to_owned(),
-                delivery_key: "delivery".to_owned(),
-                claim_expires_at_ms: test_now() + 300_000,
-                unsubscribe_nonce: "next-unsubscribe-nonce".to_owned(),
-                unsubscribe_expires_at_ms: test_now() + 604_800_000,
-            })
-            .expect("claim result")
-            .expect("claim");
-
-        let held = crate::file_lock::acquire(&root.join("acct").join("return-notifications.lock"))
-            .expect("hold notification lock before completion");
-        let contender = FileStudyStorage {
-            store_root: root.clone(),
-            now: completion_now,
-        };
-        let (started_tx, started_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let completion = thread::spawn(move || {
-            started_tx.send(()).expect("signal completion start");
-            result_tx
-                .send(contender.complete_return_notification("acct", "claim", test_now()))
-                .expect("send completion result");
-        });
-        started_rx.recv().expect("completion started");
-        let early = result_rx.recv_timeout(Duration::from_millis(100));
-        assert!(
-            early.is_err(),
-            "completion must wait while the notification lock is held"
-        );
-        COMPLETION_CLOCK.store(test_now() + 10, Ordering::SeqCst);
-        drop(held);
-        let result =
-            early.unwrap_or_else(|_| result_rx.recv().expect("completion after lock release"));
-
-        assert!(
-            result.expect("completion result"),
-            "short lock contention must not discard the matching completion"
-        );
-        completion.join().expect("completion thread");
-        assert_eq!(
-            storage
-                .load_return_notification_preference("acct")
-                .expect("load completed notification")
-                .expect("completed notification")
-                .last_sent_at_ms,
-            Some(test_now() + 10),
-            "completion timestamp must be sampled after the blocking lock wait"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn file_generation_releases_descriptor_before_provider_and_foreground_commit() {
         let root = std::env::temp_dir().join(format!(
             "memory-engine-generation-foreground-{}-{}",
@@ -2836,6 +2391,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         storage
             .save_source(
@@ -2847,6 +2403,7 @@ mod tests {
                     body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("save source");
@@ -2865,6 +2422,7 @@ mod tests {
         let generation_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let generation_store_path = store_path.clone();
         let generation = thread::spawn(move || {
@@ -2879,12 +2437,7 @@ mod tests {
         // This is the foreground operation that used to receive a spurious
         // 409 while generation held the descriptor across provider work.
         storage
-            .approve_draft(
-                "acct",
-                &root.join("acct").join("study.json"),
-                &draft_id,
-                None,
-            )
+            .approve_draft("acct", &root.join("acct").join("study.json"), &draft_id)
             .expect("foreground approval must commit while provider is running");
         storage
             .save_source(
@@ -2896,6 +2449,7 @@ mod tests {
                     body: "Concept: Unrelated\nActivity: quiz\nStage: recognition-1\nQuestion: What is unrelated?\nAnswer: UNRELATED".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("foreground source mutation must commit while provider is running");
@@ -2939,6 +2493,7 @@ mod tests {
         let storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         storage
             .save_source(
@@ -2950,6 +2505,7 @@ mod tests {
                     body: "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.".to_owned(),
                     project_key: None,
                     ttl_expires_at: None,
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("save source");
@@ -2968,6 +2524,7 @@ mod tests {
         let generation_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let generation_store_path = store_path.clone();
         let generation = thread::spawn(move || {
@@ -2982,10 +2539,11 @@ mod tests {
         let approval_storage = FileStudyStorage {
             store_root: root.clone(),
             now: test_now,
+            generation_provider_config: None,
         };
         let approval_store_path = store_path.clone();
         let approval = tokio::task::spawn_blocking(move || {
-            approval_storage.approve_draft("acct", &approval_store_path, &draft_id, None)
+            approval_storage.approve_draft("acct", &approval_store_path, &draft_id)
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), approval)
             .await
@@ -3140,18 +2698,12 @@ mod tests {
 
     #[test]
     fn file_retry_backoff_reaches_and_holds_at_six_hours() {
-        static BACKOFF_CLOCK: AtomicI64 = AtomicI64::new(1_700_000_000_000);
-        fn backoff_now() -> i64 {
-            BACKOFF_CLOCK.load(Ordering::SeqCst)
-        }
-
         let root = std::env::temp_dir().join(format!(
             "memory-engine-return-backoff-cap-{}-{}",
             std::process::id(),
             rand::random::<u128>()
         ));
-        BACKOFF_CLOCK.store(test_now(), Ordering::SeqCst);
-        let storage = StudyStorage::file(&root, backoff_now);
+        let storage = StudyStorage::file(&root, test_now);
         storage
             .save_return_notification_preference(
                 "account-backoff-cap",
@@ -3166,7 +2718,6 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            BACKOFF_CLOCK.store(now_ms, Ordering::SeqCst);
             let claim_id = format!("backoff-claim-{attempt}");
             storage
                 .claim_return_notification(&ReturnNotificationClaimRequest {
@@ -3244,10 +2795,21 @@ mod tests {
         });
 
         let stale_result = stale.join().expect("stale worker");
-        reenable
-            .join()
-            .expect("reenable worker")
-            .expect("reenable after contention");
+        match reenable.join().expect("reenable worker") {
+            Ok(()) => {}
+            Err(error) => {
+                assert_eq!(error.status, StatusCode::CONFLICT);
+                storage
+                    .save_return_notification_preference(
+                        "account-a",
+                        "a@example.com",
+                        true,
+                        None,
+                        "nonce-reenabled",
+                    )
+                    .expect("reenable after contention");
+            }
+        }
         let preference = storage
             .load_return_notification_preference("account-a")
             .expect("load preference")

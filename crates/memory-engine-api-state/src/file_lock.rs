@@ -16,35 +16,6 @@ pub(crate) fn acquire(path: &Path) -> Result<FileDescriptorLock, ApiFailure> {
 }
 
 #[cfg(unix)]
-pub(crate) fn acquire_blocking(path: &Path) -> Result<FileDescriptorLock, ApiFailure> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|error| ApiFailure::internal(error.to_string()))?;
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result == 0 {
-        Ok(FileDescriptorLock { _file: file })
-    } else {
-        Err(ApiFailure::internal(
-            std::io::Error::last_os_error().to_string(),
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn acquire_blocking(_path: &Path) -> Result<FileDescriptorLock, ApiFailure> {
-    Err(ApiFailure::internal(
-        "Shared file locking is unsupported on this platform.".to_owned(),
-    ))
-}
-
-#[cfg(unix)]
 pub(crate) fn try_acquire(path: &Path) -> Result<Option<FileDescriptorLock>, ApiFailure> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;

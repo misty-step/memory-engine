@@ -880,7 +880,6 @@ dependencies = [
  "memory-engine-core",
  "memory-engine-generation",
  "memory-engine-openrouter",
- "memory-engine-performance",
  "memory-engine-persistence",
  "memory-engine-persistence-postgres",
  "memory-engine-service",
@@ -919,7 +918,6 @@ dependencies = [
 name = "memory-engine-canary"
 version = "0.0.0"
 dependencies = [
- "memory-engine-performance",
  "serde_json",
  "ureq",
 ]
@@ -962,6 +960,7 @@ dependencies = [
  "memory-engine-core",
  "memory-engine-persistence",
  "memory-engine-service",
+ "serde_json",
 ]
 
 [[package]]
@@ -996,14 +995,6 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
-]
-
-[[package]]
-name = "memory-engine-performance"
-version = "0.0.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

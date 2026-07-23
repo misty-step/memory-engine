@@ -345,7 +345,6 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-job-glyphs > span { display: none; width: 8px; height: 8px; border-radius: 50%; }
 .me-job[data-status='queued'] .g-queued { display: block; background: var(--lg-line); }
 .me-job[data-status='running'] .g-running { display: block; }
-.me-job[data-status='retry'] .g-running { display: block; }
 .me-job[data-status='succeeded'] .g-succeeded { display: block; background: var(--lg-pine); }
 .me-job[data-status='failed'] .g-failed { display: block; background: var(--lg-clay); }
 

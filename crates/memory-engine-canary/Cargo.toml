@@ -3,10 +3,9 @@ name = "memory-engine-canary"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
-description = "Bounded Canary observability adapter for memory-engine."
+description = "Fire-and-forget error reporter for the Canary observability service."
 
 [dependencies]
-memory-engine-performance = { path = "../memory-engine-performance" }
 serde_json = "1.0.145"
 ureq = { version = "3.2.0", features = ["json"] }
 

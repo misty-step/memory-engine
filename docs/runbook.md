@@ -19,8 +19,6 @@ only current application runtime; rollback stays within DigitalOcean plus git.
   magic-link delivery require `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` plus either
   `MEMORY_ENGINE_AUTH_MAILER_COMMAND` or the temporary outbox path, and
   `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` for signed reminder links.
-  Machine consumers use operator-gated service sessions
-  (`MEMORY_ENGINE_ADMIN_TOKEN`, below) — never email.
 - Return scheduler: the API process owns a bounded, Postgres-backed sweep;
   disable it with `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED=false`,
   and keep the operator-only `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN`
@@ -41,12 +39,6 @@ status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w "%{http_code}"
 test "$status" = "200"
 grep -q '"status":"ok"' /tmp/memory-engine-healthz
 
-# Readiness is dependency-aware: it is only 200 when Postgres and the
-# generation worker are available. `/healthz` above remains liveness-only.
-status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-readyz -w "%{http_code}" "$base/readyz")
-test "$status" = "200"
-grep -q '"status":"ready"' /tmp/memory-engine-readyz
-
 status=$(curl -fsS --max-time 15 -o /tmp/memory-engine-home -w "%{http_code}" "$base/")
 test "$status" = "200"
 
@@ -59,99 +51,14 @@ curl -fsS --max-time 15 "$base/favicon.png" | file - | grep -q 'PNG image data, 
 curl -fsS --max-time 15 "$base/apple-touch-icon.png" | file - | grep -q 'PNG image data, 180 x 180'
 ```
 
-## Service sessions (machine consumers)
+## Production generation latency
 
-Agents, QA runs, and future service consumers authenticate without email.
-`POST /v1/service-sessions` issues (or rotates) the account-scoped session
-token for an allowlisted service account, gated by the operator admin token.
-The surface is disabled entirely unless the app sets
-`MEMORY_ENGINE_ADMIN_TOKEN`. Agents never read mail-provider archives; magic
-links stay a human-only delivery channel.
-
-Provisioning (operator, once):
-
-1. Add the dedicated dogfood email to `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` in
-   the app spec. Use a dedicated address — magic-link sign-in on the same
-   email rotates the API session token and would revoke the service
-   credential.
-2. Set `MEMORY_ENGINE_ADMIN_TOKEN` as an app-spec secret. Custody: Mint
-   (`secret://memory-engine/admin`); never commit or paste it.
-3. Issue the credential and store it in Mint as
-   `secret://memory-engine/dogfood`:
-
-```sh
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
-curl -fsS --max-time 20 \
-  -H 'content-type: application/json' \
-  -H "x-admin-token: $MEMORY_ENGINE_ADMIN_TOKEN" \
-  -d '{"email":"<dogfood-email>"}' \
-  "$base/v1/service-sessions"
-# -> {"accountId":"acct_...","sessionToken":"sess_..."}
-```
-
-The response maps onto the receipt variables below:
-`MEMORY_ENGINE_ACCOUNT_ID=accountId`,
-`MEMORY_ENGINE_SESSION_TOKEN=sessionToken`.
-
-Rotation and revocation are the same call: every issue mints a fresh token
-and the prior one fails with `403` immediately. To revoke without keeping a
-usable credential, reissue and discard the response. Issuance is audited in
-the app log (`service session issued account=...`).
-
-## Queued generation (machine consumers)
-
-Bearer-authenticated clients enqueue the same bounded, durable generation job
-used by the browser app, then poll that account-scoped job until it reaches
-`succeeded` or `failed`. No browser cookie, CSRF token, or synchronous model
-request is involved. A duplicate POST while the same source is queued or
-running returns `200` with the existing job id and `"coalesced": true`; a new
-job returns `202`.
-Admission-control rejections return `409`; a transient queue-store failure
-returns `503` so machine clients can retry it.
-
-```sh
-set -euo pipefail
-
-base="https://memory-engine-api-i2xcr.ondigitalocean.app"
-account_id="${MEMORY_ENGINE_ACCOUNT_ID:?set MEMORY_ENGINE_ACCOUNT_ID}"
-session_token="${MEMORY_ENGINE_SESSION_TOKEN:?set MEMORY_ENGINE_SESSION_TOKEN}"
-source_id="${MEMORY_ENGINE_SOURCE_ID:?set MEMORY_ENGINE_SOURCE_ID}"
-
-job_response="$(curl -fsS --max-time 20 \
-  -H "authorization: Bearer $session_token" \
-  -X POST \
-  "$base/v1/accounts/$account_id/sources/$source_id/generation-jobs")"
-job_id="$(printf '%s' "$job_response" | jq -er '.id')"
-
-while :; do
-  job_response="$(curl -fsS --max-time 20 \
-    -H "authorization: Bearer $session_token" \
-    "$base/v1/accounts/$account_id/generation-jobs/$job_id")"
-  case "$(printf '%s' "$job_response" | jq -r '.status')" in
-    succeeded) break ;;
-    failed) printf '%s\n' "$job_response" >&2; exit 1 ;;
-    queued|running|retry) sleep 1 ;;
-    *) printf 'unexpected job response: %s\n' "$job_response" >&2; exit 1 ;;
-  esac
-done
-printf 'scheduled cards: %s\n' "$(printf '%s' "$job_response" | jq -r '.cardCount')"
-```
-
-A succeeded job can report `cardCount: 0` when generation completed but no
-draft passed the shared validation gate. That is a content-quality result, not
-a queue failure; callers may inspect the source or submit revised material.
-
-## Legacy v1 compatibility latency
-
-Use this only when a ticket explicitly needs the synchronous compatibility
-path. `/v1/accounts/{account_id}/sources/{source_id}/generate` remains a
-legacy direct API surface and returns `409` on production Postgres hosts;
-production consumers use the queued generation-job workflow above.
-The command below uses an existing allowlisted v1 account/session, saves one article-sized source,
-times the end-to-end direct request, records the response, and archives the
-source. Production account creation is allowlist-protected, so do not use a
-throwaway email here; export a pre-provisioned account id and session token
-first.
+Use this when a ticket needs model-backed production latency evidence. It
+uses an existing allowlisted v1 account/session, saves one article-sized
+source, times the end-to-end `generate` request, records the response, and
+archives the source. Production account creation is allowlist-protected, so do
+not use a throwaway email here; export a pre-provisioned account id and session
+token first.
 
 ```sh
 set -euo pipefail
@@ -238,58 +145,16 @@ curl -s https://memory-engine-api-i2xcr.ondigitalocean.app/healthz   # {"status"
 doctl apps get 5ab05b73-9265-43c9-a01c-fef53f5f46a4
 ```
 
-Errors, health check-ins, and closed performance aggregates land in Canary
-through one bounded worker queue. Every API 500 (`ApiFailure::internal`) is
-reported as service `memory-engine-api`, environment `production`.
-Performance observations are merged in process and export at most one batch
-per minute for each of the trusted server, untrusted browser, and job
-namespaces. Queue saturation, Canary failure, and shutdown deadlines remain
-fail-open for request handling; delivery/drop/invalid counts ride in the
-bounded aggregate schema. The same JSON is printed as
-`authority=non_authoritative_debug` for immediate log inspection.
-
-`POST /app/submit` is the only HTTP route with per-request performance
-headers. Every response carries `X-Request-ID: req_<32 lowercase hex>` and a
-content-free `Server-Timing` value with `request`, `total`, and `render`.
-Browser-enhanced submits also carry the opaque `handoff` token. Postgres-backed
-submits add `pgconnect`, `pgop`, and the cumulative `pgstmt` call count; those
-metrics are omitted rather than reported as zero when the phase did not run.
-The response is always `Cache-Control: no-store`. Health/readiness, static
-assets, generation SSE, and the telemetry endpoint are intentionally outside
-this instrumentation.
-
-After a graded page is visible for two animation frames, the browser consumes
-its short-lived same-tab handoff and posts one strict, content-free receipt to
-`POST /app/performance/submit`. Canary receives the trusted server route total
-separately from the untrusted browser tap-to-ack and graded-visible durations;
-the browser series carries only a coarse `mobile`, `tablet`, or `desktop`
-viewport. Missing APIs, stale or mismatched handoffs, BFCache restores, and
-malformed timings fail closed without delaying or changing review submission.
-
-The production image includes a bounded live receipt. Open a DigitalOcean
-component console and run it without printing either encrypted value:
+Errors land in Canary. Query it directly:
 
 ```sh
-doctl apps console 5ab05b73-9265-43c9-a01c-fef53f5f46a4 api
-memory-engine-canary-receipt emit-openapi
+curl -s "$CANARY_ENDPOINT/api/v1/status" -H "Authorization: Bearer $CANARY_API_KEY"
+curl -s "$CANARY_ENDPOINT/api/v1/report" -H "Authorization: Bearer $CANARY_API_KEY"
 ```
 
-The receipt times a real loopback `GET /v1/openapi.json`, queues one closed
-server observation, drains the worker, and exits nonzero on HTTP or delivery
-failure. Readback uses a distinct service-bound read credential; the
-production app keeps ingest-only authority:
-
-```sh
-CANARY_READ_ENDPOINT=https://canary.mistystep.io \
-CANARY_READ_API_KEY=... \
-CANARY_READ_SERVICE=memory-engine-api \
-cargo run -p memory-engine-canary --bin memory-engine-canary-receipt -- readback
-```
-
-Never reuse or promote the app's ingest key for readback. The deterministic
-admission-overhead receipt is
-`cargo run -p memory-engine-canary --bin memory-engine-canary-receipt -- overhead`;
-it fails above a 5 ms p95.
+Every API 500 (`ApiFailure::internal`) is reported as service
+`memory-engine-api`, environment `production`. Reporting is fire-and-forget;
+losing Canary never affects requests.
 
 ## Secrets
 
@@ -300,17 +165,20 @@ an encrypted App Platform variable and never copy its value into this repo.
 | --- | --- |
 | `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
+| `MEMORY_ENGINE_AUTH_MAILER_COMMAND` | Production command path `/usr/local/bin/send-magic-link`; keep encrypted and do not replace with the local outbox. |
+| `RESEND_API_KEY` | Encrypted Resend credential consumed only by the bundled mailer; never print or place in a command line. |
+| `MEMORY_ENGINE_MAIL_FROM` | Replyable production sender on the verified `mistystep.io` domain; keep the operator-approved sender and do not switch domains without a new ruling. |
+| `MEMORY_ENGINE_PUBLIC_BASE_URL` | Public link base used to construct the sign-in URL; keep aligned with the deployed Scry host. |
 | `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` | Stable secret for HMAC-signed, seven-day, account/email-scoped reminder unsubscribe links. |
 | `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED` | Optional kill switch; set `false` to disable scheduled reminder sweeps. |
 | `MEMORY_ENGINE_RETURN_NOTIFICATION_MANUAL_TOKEN` | Operator-only token for bounded manual scheduler runs; store encrypted. |
 | `MEMORY_ENGINE_RETURN_NOTIFICATION_BATCH_SIZE` | Optional bounded sweep size, default 100 and capped at 1000. |
 | `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS` | Optional sweep interval, default 900 seconds and capped at 86400. |
-| `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Magic-link outbox file (no email provider wired yet; see Login). |
+| `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Local/dev-only magic-link outbox fallback; never use it as production delivery proof. |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
 | `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.5-flash`; see docs/evals/). |
-| `CANARY_ENDPOINT` / `CANARY_API_KEY` | Ingest-only Canary error, check-in, and bounded performance export; absent → reporting is a no-op. |
-| `MEMORY_ENGINE_ENVIRONMENT` | Environment label on Canary error events. |
-
+| `CANARY_ENDPOINT` / `CANARY_API_KEY` | Error reporting to Canary; absent → reporting is a no-op. |
+| `MEMORY_ENGINE_ENVIRONMENT` | Environment label on Canary events. |
 ## Store backend selection
 
 `main.rs` picks the backend at boot:
@@ -338,13 +206,14 @@ Use a branch to rehearse risky migrations against real data, then delete it.
 ## Login (magic links over email)
 
 Auth is allowlist + magic link, delivered by `bin/send-magic-link` (baked
-into the image at `/usr/local/bin/send-magic-link`), which sends through
-Resend from `onboarding@resend.dev` — deliverable only to the Resend account
-owner's address, which matches the solo-dogfood allowlist. Activate it by
-setting `RESEND_API_KEY` and
-`MEMORY_ENGINE_AUTH_MAILER_COMMAND=/usr/local/bin/send-magic-link` as encrypted
-variables in the DigitalOcean app spec, updating the app, and rerunning the
-deployed smoke. Do not put the key in a shell command or checked-in spec.
+into the image at `/usr/local/bin/send-magic-link`). Production sends through
+Resend using the encrypted `RESEND_API_KEY` and a replyable
+`MEMORY_ENGINE_MAIL_FROM` address on the verified `mistystep.io` domain. The
+operator ruling is to keep that verified domain and sender, without upgrading
+billing, adding `scry.study`, or deleting `mistystep.io`. Keep
+`MEMORY_ENGINE_AUTH_MAILER_COMMAND=/usr/local/bin/send-magic-link` encrypted in
+the DigitalOcean app spec and never put the key in a shell command or checked-in
+spec.
 
 The bundled sender has two environment contracts. Magic-link mode uses
 `MEMORY_ENGINE_AUTH_EMAIL` and `MEMORY_ENGINE_AUTH_LINK` and does not require
@@ -359,10 +228,11 @@ While `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` is set instead, links land in an
 instance-local outbox. That path is a temporary solo-dogfood fallback, not a
 durable delivery channel.
 
-A failed send surfaces as a 500 and therefore lands in Canary. The sender
-address is the `MEMORY_ENGINE_MAIL_FROM` secret (default
-`Memory Engine <onboarding@resend.dev>`); switching it is a secret change, not
-a code edit — see Deliverability below.
+A failed send surfaces as a 500 and therefore lands in Canary. The production
+sender is the encrypted `MEMORY_ENGINE_MAIL_FROM` value on verified
+`mistystep.io`; the script fallback `onboarding@resend.dev` is local-only and must
+not be used as production proof. Switching the sender is a secret change, not a
+code edit — see Deliverability below.
 
 ### Due-count return channel
 
@@ -448,44 +318,65 @@ sender supports both the magic-link and due-count envelopes. A file outbox line
 beginning with `due-count` is a local proof receipt; production proof still
 requires checking the provider send log and inbox placement.
 
-### Deliverability (inbox, not spam)
+### Deliverability (verified mistystep.io sender)
 
-`onboarding@resend.dev` is a shared sender with no domain reputation, so Gmail
-spam-folders it — expected, not a script bug. To reach the inbox, send from a
-verified domain. Resend verification is fully API-driven (no dashboard):
+The operator elected to keep the existing verified `mistystep.io` Resend domain
+and sender. Do not upgrade Resend billing, add `scry.study`, or delete
+`mistystep.io` as part of this card. The public product/link host remains
+`scry.study`; the resulting sender/link-domain mismatch is an explicit,
+operator-approved residual risk, not a reason to silently change the sender.
 
-1. **Choose a domain the operator controls** — a subdomain such as
-   `mail.<domain>` keeps the apex's reputation separate. *Operator decision.*
-2. **Register it** (returns the DNS records to add):
-   ```sh
-   curl -s -X POST https://api.resend.com/domains \
-     -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" \
-     -d '{"name":"mail.<domain>"}'
-   # response.records[] = the SPF (TXT), DKIM (TXT/CNAME), and DMARC (TXT) records.
-   ```
-3. **Add those DNS records** at the domain's host. *Operator / DNS-token-gated.*
-4. **Verify + confirm propagation:**
-   ```sh
-   curl -s -X POST https://api.resend.com/domains/<id>/verify -H "Authorization: Bearer $RESEND_API_KEY"
-   dig +short TXT <selector>._domainkey.mail.<domain>   # DKIM (selector from the step-2 records[])
-   dig +short TXT mail.<domain>                          # SPF (v=spf1 … include:amazonses.com)
-   dig +short TXT _dmarc.mail.<domain>                   # DMARC (v=DMARC1; p=none …)
-   ```
-5. **Switch the sender** by updating the encrypted
-   `MEMORY_ENGINE_MAIL_FROM=Memory Engine <noreply@mail.<domain>>` App Platform
-   variable; no script edit is required. Deploy the updated app spec and rerun
-   the smoke.
-6. **Confirm inbox placement** — trigger a fresh magic link to an allowlist
-   address; verify it lands in the Gmail inbox, not spam. *Operator-confirmed.*
+Verify the active provider and DNS state without exposing credentials or message
+content:
 
-Content is already tuned for deliverability: real from-name, plain-text body, the
-full sign-in URL (no shortener), a plain subject. Keep it that way.
-
-**"Didn't get the email" — first diagnostic:** check Resend's delivery status for
-the send, then Canary for a 500 on the send path:
 ```sh
-curl -s https://api.resend.com/emails/<email-id> -H "Authorization: Bearer $RESEND_API_KEY"
+# Resend: use the deployed scoped Mint alias secret://memory-engine/resend-domain
+# or an authenticated Resend operator surface. Never print the credential.
+# The route allows only GET /domains and GET /domains/<id>; expected: mistystep.io
+# remains status=verified.
+dig +short TXT send.mistystep.io
+dig +short TXT resend._domainkey.mistystep.io
+dig +short TXT _dmarc.mistystep.io
 ```
+
+The bundled mailer emits only one bounded diagnostic line to stderr/application
+logs after a successful provider call:
+`resend_status=accepted resend_id=<provider-id>`. Transport failures emit
+`resend_status=transport_error`; non-2xx provider responses emit only
+`resend_status=failed http_status=<status>`. No recipient, token, full link,
+request body, or provider response body is logged. Control characters in recipient,
+sender, subject, and reminder idempotency inputs fail closed before any provider
+request; message paragraph breaks are encoded once as JSON newlines. Keep provider
+IDs as bounded operator evidence and redact them in shared proof when not needed
+for lookup.
+
+For a delivery investigation, use the provider operator surface with the
+redacted provider ID and classify the send as `accepted`, `delivered`,
+`bounced`, `complained`, `delayed`, or `unknown`. Do not copy message
+content or recipient addresses into logs. A provider-accepted event alone does
+not prove Inbox placement.
+
+### Production magic-link proof and rollback
+
+1. Trigger one fresh sign-in request through the normal production Scry UI for
+the already-approved invited Gmail account. Use a unique nonce in the test
+request metadata only; never paste the nonce, recipient, token, or full link into
+proof.
+2. In Gmail, record only the classification (Inbox or Spam) and privacy-safe
+source-header results for SPF, DKIM, and DMARC. Do not screenshot message body,
+recipient, token, or the full link.
+3. Open the link once in the production Scry UI and record successful sign-in.
+Attempt the same link again and record rejection. Attempt the link from a second
+account/session and record rejection; do not record either account identity.
+4. If placement or authentication fails, restore the previous known-good
+`MEMORY_ENGINE_MAIL_FROM` value on the verified `mistystep.io` domain,
+deploy through DigitalOcean, and rerun the deployed smoke. Do not delete the
+verified domain. The temporary outbox remains a local-only fallback and must not
+be enabled as a production delivery claim.
+
+Residual risk: Gmail placement can vary because the approved sender domain and
+public link host differ. Re-run the bounded Inbox/Spam and source-header proof
+after any sender, DNS, or provider reputation change.
 
 `POST /app/account` is abuse-limited in the API boundary before any magic link
 is sent. The fixed window is 5 attempts per 15 minutes per normalized email and

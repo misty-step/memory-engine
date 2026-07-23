@@ -1,11 +1,8 @@
-use std::{
-    convert::Infallible,
-    fmt::Write as _,
-    time::{Duration, Instant},
-};
+use std::{convert::Infallible, time::Duration};
 
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Form, Path, Query, Request, State},
+    middleware::{self, Next},
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode,
@@ -17,7 +14,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 
 #[path = "icons.rs"]
@@ -27,21 +24,17 @@ use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
-    render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_edit_review_html, render_login_requested,
+    render_auth_recovery, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, AnalyticsConceptFilter,
-    AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
+    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     client_rate_limit_key, csrf_token, html_with_browser_session,
-    html_with_cleared_browser_session, normalize_email, read_session_token,
-    report_submit_browser_performance, report_submit_server_performance, AccountCreated,
+    html_with_cleared_browser_session, normalize_email, read_session_token, AccountCreated,
     ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
-    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
-    InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
-    ScheduledReturnNotificationReport, SourceList, SourceRecord, StudyViewResponse,
-    SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings, SubmitViewport,
+    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, HealthResponse,
+    InvalidateProjectDeckRequest, ProjectDeckRecord, ScheduledReturnNotificationReport, SourceList,
+    SourcePermission, SourceRecord, StudyViewResponse, SubmitReviewRequest,
 };
 
 #[cfg(test)]
@@ -55,15 +48,12 @@ pub(crate) struct V1ContractOperation {
 enum V1Route {
     OpenApi,
     Accounts,
-    ServiceSessions,
     Sources,
     Source,
     ProjectDecks,
     ProjectDeckInvalidate,
     ContentFeedback,
     Generate,
-    GenerationJobs,
-    GenerationJob,
     Approve,
     Next,
     Reveal,
@@ -78,16 +68,12 @@ enum V1Route {
 const V1_OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.v1.json");
 const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
 const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
-const V1_SERVICE_SESSIONS_PATH: &str = "/v1/service-sessions";
 const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
 const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
 const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
 const V1_PROJECT_DECK_INVALIDATE_PATH: &str =
     "/v1/accounts/{account_id}/project-decks/{deck_id}/invalidate";
 const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/generate";
-const V1_GENERATION_JOBS_PATH: &str =
-    "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs";
-const V1_GENERATION_JOB_PATH: &str = "/v1/accounts/{account_id}/generation-jobs/{job_id}";
 const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
 const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
@@ -104,14 +90,11 @@ const V1_CONTENT_FEEDBACK_PATH: &str =
 const V1_ROUTES: &[V1Route] = &[
     V1Route::OpenApi,
     V1Route::Accounts,
-    V1Route::ServiceSessions,
     V1Route::Sources,
     V1Route::Source,
     V1Route::ProjectDecks,
     V1Route::ProjectDeckInvalidate,
     V1Route::Generate,
-    V1Route::GenerationJobs,
-    V1Route::GenerationJob,
     V1Route::Approve,
     V1Route::Next,
     V1Route::Reveal,
@@ -123,46 +106,6 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Submit,
     V1Route::ContentFeedback,
 ];
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GenerationJobResource {
-    id: String,
-    source_id: String,
-    title: String,
-    status: JobStatus,
-    card_count: usize,
-    attempts: u32,
-    retryable: bool,
-    error: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-impl From<GenerationJob> for GenerationJobResource {
-    fn from(job: GenerationJob) -> Self {
-        Self {
-            id: job.id,
-            source_id: job.source_id,
-            title: job.title,
-            status: job.status,
-            card_count: job.card_count,
-            attempts: job.attempts,
-            retryable: job.retryable,
-            error: job.error,
-            created_at: job.created_at,
-            updated_at: job.updated_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EnqueuedGenerationJobResource {
-    #[serde(flatten)]
-    job: GenerationJobResource,
-    coalesced: bool,
-}
 
 #[derive(Debug, Default, Deserialize)]
 struct AnalyticsQuery {
@@ -197,21 +140,17 @@ impl V1Route {
         match self {
             Self::OpenApi => router.route(V1_OPENAPI_PATH, get(v1_openapi)),
             Self::Accounts => router.route(V1_ACCOUNTS_PATH, post(create_account)),
-            Self::ServiceSessions => {
-                router.route(V1_SERVICE_SESSIONS_PATH, post(issue_service_session))
-            }
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
-            Self::Source => router.route(V1_SOURCE_PATH, delete(archive_source)),
+            Self::Source => router.route(
+                V1_SOURCE_PATH,
+                delete(archive_source).patch(update_source_permission),
+            ),
             Self::ProjectDecks => router.route(V1_PROJECT_DECKS_PATH, post(create_project_deck)),
             Self::ProjectDeckInvalidate => router.route(
                 V1_PROJECT_DECK_INVALIDATE_PATH,
                 post(invalidate_project_deck),
             ),
             Self::Generate => router.route(V1_GENERATE_PATH, post(generate_source)),
-            Self::GenerationJobs => {
-                router.route(V1_GENERATION_JOBS_PATH, post(enqueue_generation_job))
-            }
-            Self::GenerationJob => router.route(V1_GENERATION_JOB_PATH, get(get_generation_job)),
             Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
             Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
@@ -238,10 +177,6 @@ impl V1Route {
                 method: "POST",
                 path: V1_ACCOUNTS_PATH,
             }],
-            Self::ServiceSessions => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SERVICE_SESSIONS_PATH,
-            }],
             Self::Sources => &[
                 V1ContractOperation {
                     method: "GET",
@@ -252,10 +187,16 @@ impl V1Route {
                     path: V1_SOURCES_PATH,
                 },
             ],
-            Self::Source => &[V1ContractOperation {
-                method: "DELETE",
-                path: V1_SOURCE_PATH,
-            }],
+            Self::Source => &[
+                V1ContractOperation {
+                    method: "DELETE",
+                    path: V1_SOURCE_PATH,
+                },
+                V1ContractOperation {
+                    method: "PATCH",
+                    path: V1_SOURCE_PATH,
+                },
+            ],
             Self::ProjectDecks => &[V1ContractOperation {
                 method: "POST",
                 path: V1_PROJECT_DECKS_PATH,
@@ -267,14 +208,6 @@ impl V1Route {
             Self::Generate => &[V1ContractOperation {
                 method: "POST",
                 path: V1_GENERATE_PATH,
-            }],
-            Self::GenerationJobs => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATION_JOBS_PATH,
-            }],
-            Self::GenerationJob => &[V1ContractOperation {
-                method: "GET",
-                path: V1_GENERATION_JOB_PATH,
             }],
             Self::Approve => &[V1ContractOperation {
                 method: "POST",
@@ -340,10 +273,11 @@ pub(crate) fn v1_contract_operations() -> Vec<V1ContractOperation> {
 pub fn router(state: ApiState) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
         .route("/", get(app_home))
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
+        .route("/sw.js", get(static_service_worker))
+        .route("/offline.html", get(static_offline_html))
         .route("/manifest.webmanifest", get(static_manifest))
         .route("/favicon.png", get(static_favicon))
         .route("/icon-192.png", get(static_icon_192))
@@ -368,6 +302,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/save-account", post(save_app_account))
         .route("/app/source", post(create_app_source))
         .route("/app/capture", post(capture_app_source))
+        .route("/app/source/permission", post(update_app_source_permission))
         .route("/app/source/archive", post(archive_app_source))
         .route("/app/generate", post(generate_app_source))
         .route("/app/jobs/events", get(app_jobs_events))
@@ -383,10 +318,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/delete", post(delete_app_review))
         .route("/app/bridge", post(bridge_app_review))
         .route("/app/submit", post(submit_app_review))
-        .route(
-            "/app/performance/submit",
-            post(record_submit_browser_performance),
-        )
         .route("/app/content-feedback", post(record_app_content_feedback))
         .route(
             "/accounts/{account_id}/sources",
@@ -437,7 +368,29 @@ pub fn router(state: ApiState) -> Router {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
+        .layer(middleware::from_fn(no_store_dynamic_responses))
         .with_state(state)
+}
+
+async fn no_store_dynamic_responses(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if matches!(
+        path.as_str(),
+        "/static/ledger.css"
+            | "/static/app.js"
+            | "/sw.js"
+            | "/offline.html"
+            | "/manifest.webmanifest"
+            | "/favicon.png"
+            | "/icon-192.png"
+            | "/icon-512.png"
+            | "/apple-touch-icon.png"
+    ) {
+        response
+    } else {
+        no_store_response(response)
+    }
 }
 
 async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -466,16 +419,6 @@ async fn run_return_notification_scheduler(
     Ok(Json(report))
 }
 
-async fn readyz(State(state): State<ApiState>) -> (StatusCode, Json<ReadinessResponse>) {
-    let readiness = state.readiness();
-    let status = if readiness.status == "ready" {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(readiness))
-}
-
 /// Serve the Ledger design system stylesheet (DESIGN.md). The render crate
 /// owns the markup and CSS; this HTTP crate only exposes the deployed path.
 async fn static_ledger_css() -> impl IntoResponse {
@@ -488,10 +431,26 @@ async fn static_ledger_css() -> impl IntoResponse {
     )
 }
 
+async fn static_service_worker() -> impl IntoResponse {
+    const WORKER: &str = include_str!("../assets/service-worker.js");
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8"), (CACHE_CONTROL, "no-cache")],
+        WORKER,
+    )
+}
+
+async fn static_offline_html() -> impl IntoResponse {
+    const OFFLINE: &str = include_str!("../assets/offline.html");
+    (
+        [(CONTENT_TYPE, "text/html; charset=utf-8"), (CACHE_CONTROL, "public, max-age=3600")],
+        OFFLINE,
+    )
+}
+
 async fn static_manifest() -> impl IntoResponse {
     const MANIFEST: &str = r##"{
-  "name": "Memory Engine",
-  "short_name": "Memory Engine",
+  "name": "Scry",
+  "short_name": "Scry",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
@@ -568,30 +527,6 @@ async fn create_account(
     Ok((StatusCode::CREATED, Json(account)))
 }
 
-/// Issue (or rotate) an account-scoped service-session credential for a
-/// machine consumer. Gated by the operator admin token; reissue revokes the
-/// prior credential immediately.
-///
-/// The admin token is verified before the body is deserialized, so an
-/// unauthorized caller can never exercise the JSON parser on this
-/// credential-minting surface.
-async fn issue_service_session(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
-    let admin_token = headers
-        .get("x-admin-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    state.verify_admin_token(admin_token)?;
-    let Json(request) = Json::<CreateAccountRequest>::from_bytes(&body)
-        .map_err(|_| ApiFailure::bad_request("Request body must be JSON with an email field."))?;
-    let account = state.issue_service_session(admin_token, &request.email)?;
-
-    Ok((StatusCode::CREATED, Json(account)))
-}
-
 async fn create_source(
     State(state): State<ApiState>,
     Path(account_id): Path<String>,
@@ -658,40 +593,6 @@ async fn generate_source(
     )?))
 }
 
-async fn enqueue_generation_job(
-    State(state): State<ApiState>,
-    Path((account_id, source_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<(StatusCode, Json<EnqueuedGenerationJobResource>), ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-    let (job, coalesced) =
-        state.enqueue_generation_job_for_session(&account_id, session_token, &source_id)?;
-    let status = if coalesced {
-        StatusCode::OK
-    } else {
-        StatusCode::ACCEPTED
-    };
-
-    Ok((
-        status,
-        Json(EnqueuedGenerationJobResource {
-            job: job.into(),
-            coalesced,
-        }),
-    ))
-}
-
-async fn get_generation_job(
-    State(state): State<ApiState>,
-    Path((account_id, job_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<GenerationJobResource>, ApiFailure> {
-    let session_token = read_session_token(&headers)?;
-    let job = state.generation_job_for_session(&account_id, session_token, &job_id)?;
-
-    Ok(Json(job.into()))
-}
-
 async fn archive_source(
     State(state): State<ApiState>,
     Path((account_id, source_id)): Path<(String, String)>,
@@ -699,6 +600,24 @@ async fn archive_source(
 ) -> Result<StatusCode, ApiFailure> {
     let session_token = read_session_token(&headers)?;
     state.archive_source(&account_id, session_token, &source_id)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSourcePermissionRequest {
+    permission: SourcePermission,
+}
+
+async fn update_source_permission(
+    State(state): State<ApiState>,
+    Path((account_id, source_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSourcePermissionRequest>,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.update_source_permission(&account_id, session_token, &source_id, request.permission)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -861,6 +780,7 @@ struct AppStartForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -870,6 +790,7 @@ struct AppSourceForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -890,6 +811,14 @@ struct AppAccountActionForm {
 struct AppSourceActionForm {
     csrf_token: Option<String>,
     source_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppSourcePermissionForm {
+    csrf_token: Option<String>,
+    source_id: String,
+    permission: SourcePermission,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -928,32 +857,6 @@ struct AppReviewSubmitForm {
     // `Easy`.
     response_time_ms: Option<String>,
     idempotency_key: String,
-    performance_trace_id: Option<String>,
-}
-
-const BROWSER_SUBMIT_PERFORMANCE_SCHEMA: &str = "memory_engine.browser_submit.v1";
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum BrowserSubmitViewport {
-    Mobile,
-    Tablet,
-    Desktop,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BrowserSubmitPerformance {
-    schema: String,
-    csrf_token: Option<String>,
-    request_id: String,
-    trace_id: String,
-    tap_to_ack_ms: u64,
-    request_to_response_ms: u64,
-    transfer_ms: u64,
-    navigation_ms: u64,
-    graded_visible_ms: u64,
-    viewport: BrowserSubmitViewport,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1175,7 +1078,7 @@ async fn start_app_study(
     };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture),
+        &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
     html_with_browser_session(
@@ -1196,7 +1099,7 @@ async fn create_app_source(
         };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture),
+        &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
     Html(render_save_result_html(
@@ -1221,7 +1124,7 @@ async fn capture_app_source(
             Ok(account) => account,
             Err(error) => return app_failure_response(error),
         };
-    let request = capture_request(form.title, form.body, form.capture);
+    let request = capture_request(form.title, form.body, form.capture, form.permission);
     let notice = match state.save_app_source(&account, &request) {
         Ok(source) => {
             match state.enqueue_generation_job_by_source(
@@ -1230,10 +1133,9 @@ async fn capture_app_source(
                 &request.title,
             ) {
                 EnqueueOutcome::Started(_) => {
-                    "Generating your cards. They'll appear below as they're ready.".to_owned()
+                    "Generating your cards. They'll appear below as they're ready."
                 }
-                EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
-                EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
+                EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
             }
         }
         Err(error) => {
@@ -1247,7 +1149,7 @@ async fn capture_app_source(
         }
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
 }
 
 fn render_save_result_html(
@@ -1270,13 +1172,18 @@ fn capture_request(
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
+    permission: Option<SourcePermission>,
 ) -> CreateSourceRequest {
     let body = capture.or(body).unwrap_or_default();
     let title = title
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| infer_capture_title(&body));
 
-    CreateSourceRequest { title, body }
+    CreateSourceRequest {
+        title,
+        body,
+        permission: permission.unwrap_or_default(),
+    }
 }
 
 /// Re-generate from an already-saved source — enqueues a background job, same
@@ -1302,12 +1209,11 @@ async fn generate_app_source(
         })
         .unwrap_or_else(|| "New material".to_owned());
     let notice = match state.enqueue_generation_job_by_source(&account, &form.source_id, &title) {
-        EnqueueOutcome::Started(_) => "Generating. Watch the activity log.".to_owned(),
-        EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.".to_owned(),
-        EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
+        EnqueueOutcome::Started(_) => "Generating. Watch the activity log.",
+        EnqueueOutcome::AlreadyInFlight(_) => "Already generating this source.",
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
 }
 
 async fn archive_app_source(
@@ -1338,6 +1244,34 @@ async fn archive_app_source(
             ))
             .into_response()
         }
+        Err(error) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some(&error.message),
+        ))
+        .into_response(),
+    }
+}
+
+async fn update_app_source_permission(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppSourcePermissionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    match state.update_app_source_permission(&account, &form.source_id, form.permission) {
+        Ok(()) => Html(render_account_page(
+            &state,
+            &account,
+            None,
+            Some("Source permission updated."),
+        ))
+        .into_response(),
         Err(error) => Html(render_account_page(
             &state,
             &account,
@@ -1439,22 +1373,6 @@ fn app_failure_response(error: ApiFailure) -> Response {
         return no_store_response(response);
     }
     error.into_response()
-}
-fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> Response {
-    let mut response = Html(render_submit_recovery(title, message)).into_response();
-    *response.status_mut() = status;
-    no_store_response(response)
-}
-
-fn submit_failure_response(error: ApiFailure) -> Response {
-    if error.is_session_expired() {
-        return app_failure_response(error);
-    }
-    submit_recovery_response(
-        error.status(),
-        "Review not submitted",
-        "Reload the app and try again. Your study data is safe.",
-    )
 }
 
 fn no_store_response(mut response: Response) -> Response {
@@ -1661,360 +1579,24 @@ pub(crate) fn sanitize_response_time_ms(raw: Option<&str>) -> u32 {
 async fn submit_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    form: Result<Form<AppReviewSubmitForm>, axum::extract::rejection::FormRejection>,
+    Form(form): Form<AppReviewSubmitForm>,
 ) -> Response {
-    let started = Instant::now();
-    let request_id = format!("req_{:032x}", rand::random::<u128>());
-    let form = match form {
-        Ok(Form(form)) => form,
-        Err(rejection) => {
-            let render_started = Instant::now();
-            let status = rejection.into_response().status();
-            let response = submit_recovery_response(
-                status,
-                "Review not submitted",
-                "Reload the app and try again. Your study data is safe.",
-            );
-            let (response, total_ms) = submit_response_headers(
-                response,
-                &request_id,
-                None,
-                bounded_request_ms(started),
-                SubmitReviewTimings::default(),
-                bounded_request_ms(render_started),
-            );
-            report_submit_server_performance(total_ms, SubmitPerformanceOutcome::ClientRejected);
-            return no_store_response(response);
-        }
-    };
-    let trace_id = form
-        .performance_trace_id
-        .as_deref()
-        .filter(|value| strict_opaque_id(value, "trace_"))
-        .map(str::to_owned);
-    let mut postgres = SubmitReviewTimings::default();
-
-    let (response, render_ms, outcome) = match state.require_browser_session_with_timings(
-        &headers,
-        csrf_token(form.csrf_token.as_ref()),
-        &mut postgres,
-    ) {
-        Ok(account) => {
-            let result = state.submit_app_review(
-                &account,
-                &form.review_unit_id,
-                &SubmitReviewRequest {
-                    answer: form.answer,
-                    response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
-                    idempotency_key: form.idempotency_key,
-                },
-                &mut postgres,
-            );
-            let outcome = match result.as_ref() {
-                Ok(_) => SubmitPerformanceOutcome::Succeeded,
-                Err(error) => submit_outcome(error.status()),
-            };
-            let render_started = Instant::now();
-            let response = Html(render_submit_action_result_html(
-                &state,
-                &account,
-                result,
-                &request_id,
-                trace_id.as_deref(),
-                &mut postgres,
-            ))
-            .into_response();
-            (response, bounded_request_ms(render_started), outcome)
-        }
-        Err(error) => {
-            let outcome = submit_outcome(error.status());
-            let render_started = Instant::now();
-            let response = submit_failure_response(error);
-            (response, bounded_request_ms(render_started), outcome)
-        }
-    };
-
-    let (response, total_ms) = submit_response_headers(
-        response,
-        &request_id,
-        trace_id.as_deref(),
-        bounded_request_ms(started),
-        postgres,
-        render_ms,
-    );
-    report_submit_server_performance(total_ms, outcome);
-    no_store_response(response)
-}
-
-fn submit_response_headers(
-    mut response: Response,
-    request_id: &str,
-    trace_id: Option<&str>,
-    total_ms: u64,
-    postgres: SubmitReviewTimings,
-    render_ms: u64,
-) -> (Response, u64) {
-    let (total_ms, pgconnect_ms, pgop_ms, render_ms) =
-        normalize_submit_durations(total_ms, postgres, render_ms);
-    let mut timing = format!(r#"request;desc="{request_id}""#);
-    if let Some(trace_id) = trace_id {
-        let _ = write!(timing, r#", handoff;desc="{trace_id}""#);
-    }
-    let _ = write!(timing, ", total;dur={total_ms}");
-    if let Some(duration_ms) = pgconnect_ms {
-        let _ = write!(timing, ", pgconnect;dur={duration_ms}");
-    }
-    if let Some(duration_ms) = pgop_ms {
-        let _ = write!(timing, ", pgop;dur={duration_ms}");
-    }
-    if let Some(statement_count) = postgres.postgres_statement_count() {
-        let _ = write!(timing, r#", pgstmt;desc="{statement_count}""#);
-    }
-    let _ = write!(timing, ", render;dur={render_ms}");
-
-    response.headers_mut().insert(
-        "x-request-id",
-        HeaderValue::from_str(request_id).unwrap_or(HeaderValue::from_static(
-            "req_00000000000000000000000000000000",
-        )),
-    );
-    response.headers_mut().insert(
-        "server-timing",
-        HeaderValue::from_str(&timing).unwrap_or(HeaderValue::from_static(
-            r#"request;desc="req_00000000000000000000000000000000", total;dur=60000, render;dur=60000"#,
-        )),
-    );
-    (response, total_ms)
-}
-
-fn normalize_submit_durations(
-    total_ms: u64,
-    postgres: SubmitReviewTimings,
-    render_ms: u64,
-) -> (u64, Option<u64>, Option<u64>, u64) {
-    let mut phases = [
-        postgres.postgres_connect_ms(),
-        postgres.postgres_operation_ms(),
-        Some(render_ms),
-    ];
-    let phase_count = u64::try_from(phases.iter().flatten().count()).unwrap_or(u64::MAX);
-    let total_ms = total_ms.max(phase_count).min(60_000);
-    let phase_sum = phases
-        .iter()
-        .flatten()
-        .copied()
-        .fold(0_u64, u64::saturating_add);
-    if phase_sum > total_ms {
-        let flexible_total = total_ms.saturating_sub(phase_count);
-        let flexible_sum = phase_sum.saturating_sub(phase_count);
-        for duration in phases.iter_mut().flatten() {
-            let scaled = if flexible_sum == 0 {
-                0
-            } else {
-                let numerator = u128::from(duration.saturating_sub(1)) * u128::from(flexible_total);
-                u64::try_from(numerator / u128::from(flexible_sum)).unwrap_or(u64::MAX)
-            };
-            *duration = 1_u64.saturating_add(scaled);
-        }
-    }
-
-    (total_ms, phases[0], phases[1], phases[2].unwrap_or(1))
-}
-
-fn strict_opaque_id(value: &str, prefix: &str) -> bool {
-    value.len() == prefix.len() + 32
-        && value.starts_with(prefix)
-        && value[prefix.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn bounded_request_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis())
-        .unwrap_or(u64::MAX)
-        .clamp(1, 60_000)
-}
-
-fn submit_outcome(status: StatusCode) -> SubmitPerformanceOutcome {
-    if status.is_server_error() {
-        SubmitPerformanceOutcome::ServerFailed
-    } else {
-        SubmitPerformanceOutcome::ClientRejected
-    }
-}
-
-async fn record_submit_browser_performance(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(raw_event): Json<serde_json::Value>,
-) -> Response {
-    let csrf = raw_event
-        .get("csrfToken")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if let Err(error) = state.require_browser_session(&headers, csrf) {
-        return error.into_response();
-    }
-    let Ok(event) = serde_json::from_value::<BrowserSubmitPerformance>(raw_event) else {
-        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
-    };
-    if !valid_browser_submit_performance(&event) {
-        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
-    }
-
-    let viewport = match event.viewport {
-        BrowserSubmitViewport::Mobile => SubmitViewport::Mobile,
-        BrowserSubmitViewport::Tablet => SubmitViewport::Tablet,
-        BrowserSubmitViewport::Desktop => SubmitViewport::Desktop,
-    };
-    report_submit_browser_performance(event.tap_to_ack_ms, event.graded_visible_ms, viewport);
-    StatusCode::NO_CONTENT.into_response()
-}
-
-fn valid_browser_submit_performance(event: &BrowserSubmitPerformance) -> bool {
-    if event.schema != BROWSER_SUBMIT_PERFORMANCE_SCHEMA
-        || !strict_opaque_id(&event.request_id, "req_")
-        || !strict_opaque_id(&event.trace_id, "trace_")
-    {
-        return false;
-    }
-    let durations = [
-        event.tap_to_ack_ms,
-        event.request_to_response_ms,
-        event.transfer_ms,
-        event.navigation_ms,
-        event.graded_visible_ms,
-    ];
-    if durations.iter().any(|duration| *duration > 60_000)
-        || event.tap_to_ack_ms > event.request_to_response_ms
-        || event.request_to_response_ms > event.graded_visible_ms
-    {
-        return false;
-    }
-    let reconstructed = event
-        .request_to_response_ms
-        .saturating_add(event.transfer_ms)
-        .saturating_add(event.navigation_ms);
-    event.graded_visible_ms.abs_diff(reconstructed) <= 4
-}
-
-fn render_content_feedback_follow_up_failure(
-    state: &ApiState,
-    account: &AppAccount,
-    error: ApiFailure,
-) -> Response {
-    if error.is_session_expired() {
-        return app_failure_response(error);
-    }
-    let status = error.status();
-    let message = error.message;
-    let html = match state.next_app_review(account) {
-        Ok(view) => render_content_feedback_result_html(state, account, &view, &message),
-        Err(_) => render_account_page(state, account, None, Some(&message)),
-    };
-    let mut response = Html(html).into_response();
-    *response.status_mut() = status;
-    response
-}
-
-pub(crate) fn resolve_content_feedback_recovery_revision(
-    conflict_retry: bool,
-    review_unit_id: &str,
-    idempotency_key: &str,
-    supersedes_id: Option<&str>,
-    head_result: Option<Result<Option<String>, ApiFailure>>,
-    status: &mut StatusCode,
-    message: &mut String,
-) -> (String, Option<String>) {
-    let refreshed_head = match head_result {
-        Some(Ok(head)) => Some(head),
-        Some(Err(error)) => {
-            *status = error.status();
-            "Feedback was not saved, and the latest revision could not be loaded. Retry when storage is available.".clone_into(message);
-            None
-        }
-        None => None,
-    };
-    if let Some(head) = refreshed_head {
-        return (
-            format!("feedback-retry-{:032x}", rand::random::<u128>()),
-            head,
-        );
-    }
-    if !conflict_retry && idempotency_key.trim().is_empty() {
-        return (
-            format!(
-                "feedback-retry-{}-{}",
-                review_unit_id,
-                supersedes_id.unwrap_or("new")
-            ),
-            supersedes_id.map(str::to_owned),
-        );
-    }
-    (idempotency_key.to_owned(), supersedes_id.map(str::to_owned))
-}
-
-pub(crate) fn render_content_feedback_persistence_failure(
-    state: &ApiState,
-    account: &AppAccount,
-    review_unit_id: &str,
-    request: &ContentFeedbackRequest,
-    error: ApiFailure,
-) -> Response {
-    if error.is_session_expired() {
-        return app_failure_response(error);
-    }
-    let mut status = error.status();
-    let mut message = error.message;
-    let verdict = match request.verdict {
-        memory_engine_service::ContentFeedbackVerdict::Kept => "kept",
-        memory_engine_service::ContentFeedbackVerdict::Dropped => "dropped",
-    };
-    let conflict_retry =
-        status == StatusCode::CONFLICT && !request.idempotency_key.trim().is_empty();
-    let head_result =
-        conflict_retry.then(|| state.app_content_feedback_head(account, review_unit_id));
-    let (idempotency_key, supersedes_id) = resolve_content_feedback_recovery_revision(
-        conflict_retry,
-        review_unit_id,
-        &request.idempotency_key,
-        request.supersedes_id.as_deref(),
-        head_result,
-        &mut status,
-        &mut message,
-    );
-    let html = render_content_feedback_recovery_html(
-        state,
-        account,
-        &ContentFeedbackRecovery {
-            review_unit_id,
-            verdict,
-            rationale: request.rationale.as_deref(),
-            idempotency_key: &idempotency_key,
-            supersedes_id: supersedes_id.as_deref(),
-            message: &message,
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.submit_app_review(
+        &account,
+        &form.review_unit_id,
+        &SubmitReviewRequest {
+            answer: form.answer,
+            response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
+            idempotency_key: form.idempotency_key,
         },
     );
-    let mut response = Html(html).into_response();
-    *response.status_mut() = status;
-    no_store_response(response)
-}
 
-pub(crate) fn render_content_feedback_follow_up(
-    state: &ApiState,
-    account: &AppAccount,
-    next_review: Result<StudyViewResponse, ApiFailure>,
-) -> Response {
-    match next_review {
-        Ok(view) => Html(render_content_feedback_result_html(
-            state,
-            account,
-            &view,
-            "Saved. This card will help improve future generation.",
-        ))
-        .into_response(),
-        Err(error) => render_content_feedback_follow_up_failure(state, account, error),
-    }
+    Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
 async fn record_app_content_feedback(
@@ -2025,25 +1607,26 @@ async fn record_app_content_feedback(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return error.into_response(),
         };
-    let request = ContentFeedbackRequest {
-        verdict: form.verdict,
-        rationale: form.rationale,
-        idempotency_key: form.idempotency_key,
-        supersedes_id: form.supersedes_id,
-    };
-    let result = state.record_app_content_feedback(&account, &form.review_unit_id, &request);
+    let result = state.record_app_content_feedback(
+        &account,
+        &form.review_unit_id,
+        &ContentFeedbackRequest {
+            verdict: form.verdict,
+            rationale: form.rationale,
+            idempotency_key: form.idempotency_key,
+            supersedes_id: form.supersedes_id,
+        },
+    );
     match result {
-        Ok(_) => {
-            render_content_feedback_follow_up(&state, &account, state.next_app_review(&account))
-        }
-        Err(error) => render_content_feedback_persistence_failure(
+        Ok(_) => Html(render_account_page(
             &state,
             &account,
-            &form.review_unit_id,
-            &request,
-            error,
-        ),
+            None,
+            Some("Saved. This card will help improve future generation."),
+        ))
+        .into_response(),
+        Err(error) => error.into_response(),
     }
 }

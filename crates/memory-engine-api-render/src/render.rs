@@ -8,27 +8,17 @@
 //! reflect) and a review (prompt, answer, grade). Every interaction is a
 //! full-page form POST; `assets/app.js` layers progressive enhancement
 //! (honest response timing, job SSE, the Create pending state) on top.
-//! Graded pages never advance on their own — the learner reviews the verdict,
-//! answer key, and dossier until they explicitly continue or submit the
-//! generated-card quality feedback (operator rulings, memory-engine-081/116).
+//! Graded pages never auto-advance on their own — the learner reviews the
+//! verdict, answer key, and dossier until they explicitly tap Continue
+//! (operator ruling, memory-engine-081).
 
 use std::fmt::Write as _;
 
-use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent};
+use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, SourcePermission};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
-    SubmitReviewTimings,
 };
-
-pub struct ContentFeedbackRecovery<'a> {
-    pub review_unit_id: &'a str,
-    pub verdict: &'a str,
-    pub rationale: Option<&'a str>,
-    pub idempotency_key: &'a str,
-    pub supersedes_id: Option<&'a str>,
-    pub message: &'a str,
-}
 
 #[must_use]
 pub fn render_action_result_html(
@@ -36,158 +26,9 @@ pub fn render_action_result_html(
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
 ) -> String {
-    render_action_result_html_with_head(state, account, result, None, "")
-}
-
-#[must_use]
-pub fn render_content_feedback_result_html(
-    state: &ApiState,
-    account: &AppAccount,
-    view: &StudyViewResponse,
-    notice: &str,
-) -> String {
-    if view.current.is_none() && view.summary.approved_review_unit_count > 0 {
-        let inner = render_signed_in(
-            account,
-            &[],
-            Some(view),
-            &[],
-            Some(notice),
-            SignedInSurface::ReviewComplete,
-        );
-        document_with_head(&inner, "")
-    } else {
-        render_account_page_with_head(state, account, Some(view), Some(notice), "")
-    }
-}
-
-#[must_use]
-pub fn render_content_feedback_recovery_html(
-    state: &ApiState,
-    account: &AppAccount,
-    recovery: &ContentFeedbackRecovery<'_>,
-) -> String {
-    let supersedes = recovery.supersedes_id.map_or_else(String::new, |id| {
-        format!(
-            r#"<input type="hidden" name="supersedesId" value="{}">"#,
-            escape_html(id)
-        )
-    });
-    let choice = if recovery.verdict == "dropped" {
-        "Drop this card"
-    } else {
-        "Keep this card"
-    };
-    let body = format!(
-        r#"<section class="ae-group me-content-feedback">
-<p class="me-kicker">Feedback not saved</p>
-<h1 class="me-display">Try that feedback again.</h1>
-<p class="ae-lede">Selected: <strong>{choice}</strong></p>
-<form action="/app/content-feedback" method="post">
-{csrf}<input type="hidden" name="reviewUnitId" value="{review_unit_id}">
-<input type="hidden" name="verdict" value="{verdict}">
-<input type="hidden" name="idempotencyKey" value="{idempotency_key}">
-{supersedes}
-<label class="ae-label" for="me-content-feedback-retry-rationale">Why? <span class="ae-dim">(optional)</span></label>
-<textarea class="ae-input me-content-feedback-rationale" id="me-content-feedback-retry-rationale" name="rationale" rows="2">{rationale}</textarea>
-<div class="me-actions"><button class="ae-button" type="submit">Retry feedback</button></div>
-</form>
-</section>"#,
-        choice = choice,
-        csrf = hidden_csrf_input(account),
-        review_unit_id = escape_html(recovery.review_unit_id),
-        verdict = escape_html(recovery.verdict),
-        idempotency_key = escape_html(recovery.idempotency_key),
-        supersedes = supersedes,
-        rationale = escape_html(recovery.rationale.unwrap_or_default()),
-    );
-    let due = state
-        .app_study_view(account)
-        .map_or(0, |view| view.due_count);
-    document(&render_signed_in_body(
-        account,
-        due,
-        Some(recovery.message),
-        &[],
-        &body,
-    ))
-}
-
-#[must_use]
-pub fn render_submit_action_result_html(
-    state: &ApiState,
-    account: &AppAccount,
-    result: Result<StudyViewResponse, ApiFailure>,
-    request_id: &str,
-    trace_id: Option<&str>,
-    timings: &mut SubmitReviewTimings,
-) -> String {
-    let trace = trace_id.map_or_else(String::new, |trace_id| {
-        format!(
-            r#"<meta name="memory-engine-submit-handoff" content="{}">"#,
-            escape_html(trace_id)
-        )
-    });
-    let head = format!(
-        r#"<meta name="memory-engine-csrf-token" content="{}">
-<meta name="memory-engine-submit-request" content="{}">
-{}"#,
-        escape_html(account.csrf_token()),
-        escape_html(request_id),
-        trace,
-    );
     match result {
-        Ok(view) => render_submit_account_page(state, account, Some(&view), None, &head, timings),
-        Err(error) => {
-            let view = state.app_study_view_with_timings(account, timings).ok();
-            render_submit_account_page(
-                state,
-                account,
-                view.as_ref(),
-                Some(&error.message),
-                &head,
-                timings,
-            )
-        }
-    }
-}
-
-fn render_submit_account_page(
-    state: &ApiState,
-    account: &AppAccount,
-    view: Option<&StudyViewResponse>,
-    notice: Option<&str>,
-    head: &str,
-    timings: &mut SubmitReviewTimings,
-) -> String {
-    let active_review = view.is_some_and(|view| view.current.is_some());
-    let sources = if active_review {
-        Vec::new()
-    } else {
-        state
-            .list_app_sources_with_timings(account, timings)
-            .unwrap_or_default()
-    };
-    let jobs = if active_review && !notice.is_some_and(is_generating_notice) {
-        Vec::new()
-    } else {
-        state.jobs_for_app_account_with_timings(account, timings)
-    };
-    render_app_shell_with_head(Some(account), &sources, view, &jobs, notice, head)
-}
-
-fn render_action_result_html_with_head(
-    state: &ApiState,
-    account: &AppAccount,
-    result: Result<StudyViewResponse, ApiFailure>,
-    notice: Option<&str>,
-    head: &str,
-) -> String {
-    match result {
-        Ok(view) => render_account_page_with_head(state, account, Some(&view), notice, head),
-        Err(error) => {
-            render_account_page_with_head(state, account, None, Some(&error.message), head)
-        }
+        Ok(view) => render_account_page(state, account, Some(&view), None),
+        Err(error) => render_account_page(state, account, None, Some(&error.message)),
     }
 }
 
@@ -198,25 +39,9 @@ pub fn render_account_page(
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
 ) -> String {
-    render_account_page_with_head(state, account, view, notice, "")
-}
-
-fn render_account_page_with_head(
-    state: &ApiState,
-    account: &AppAccount,
-    view: Option<&StudyViewResponse>,
-    notice: Option<&str>,
-    head: &str,
-) -> String {
-    render_account_page_with_loaders_and_head(
-        state,
-        account,
-        view,
-        notice,
-        head,
-        || state.list_app_sources(account).unwrap_or_default(),
-        || state.jobs_for_app_account(account),
-    )
+    render_account_page_with_source_loader(state, account, view, notice, || {
+        state.list_app_sources(account).unwrap_or_default()
+    })
 }
 
 #[must_use]
@@ -233,38 +58,16 @@ pub fn render_edit_review_html(
         Some(view),
         &jobs,
         notice,
-        SignedInSurface::Edit,
+        true,
     ))
 }
 
-#[cfg(test)]
-fn render_account_page_with_loaders(
+fn render_account_page_with_source_loader(
     state: &ApiState,
     account: &AppAccount,
     view: Option<&StudyViewResponse>,
     notice: Option<&str>,
     load_sources: impl FnOnce() -> Vec<SourceRecord>,
-    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
-) -> String {
-    render_account_page_with_loaders_and_head(
-        state,
-        account,
-        view,
-        notice,
-        "",
-        load_sources,
-        load_jobs,
-    )
-}
-
-fn render_account_page_with_loaders_and_head(
-    state: &ApiState,
-    account: &AppAccount,
-    view: Option<&StudyViewResponse>,
-    notice: Option<&str>,
-    head: &str,
-    load_sources: impl FnOnce() -> Vec<SourceRecord>,
-    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
 ) -> String {
     // When the caller doesn't supply a view (capture, generate, retry-refresh,
     // GET home), fetch the live study view so the due count and "Start review"
@@ -276,42 +79,17 @@ fn render_account_page_with_loaders_and_head(
     } else {
         None
     };
-    render_account_page_with_resolved_view_and_loaders(
-        account,
-        view.or(fetched.as_ref()),
-        notice,
-        head,
-        load_sources,
-        load_jobs,
-    )
-}
-
-fn render_account_page_with_resolved_view_and_loaders(
-    account: &AppAccount,
-    view: Option<&StudyViewResponse>,
-    notice: Option<&str>,
-    head: &str,
-    load_sources: impl FnOnce() -> Vec<SourceRecord>,
-    load_jobs: impl FnOnce() -> Vec<GenerationJob>,
-) -> String {
-    let active_review = view.is_some_and(|view| view.current.is_some());
+    let view = view.or(fetched.as_ref());
     // Active review responses render only the supplied card. Loading the full
-    // source list here repeats a complete account snapshot while
-    // `render_signed_in` never reads it in the review branch.
-    let sources = if active_review {
+    // source list here repeats a complete account snapshot on every hot-path
+    // action while `render_signed_in` never reads it in the review branch.
+    let sources = if view.is_some_and(|view| view.current.is_some()) {
         Vec::new()
     } else {
         load_sources()
     };
-    // Jobs only affect an active review when they validate a "Generating…"
-    // notice. Keep that truth check, but avoid a second Postgres connection for
-    // ordinary next/submit responses where no such notice can be rendered.
-    let jobs = if active_review && !notice.is_some_and(is_generating_notice) {
-        Vec::new()
-    } else {
-        load_jobs()
-    };
-    render_app_shell_with_head(Some(account), &sources, view, &jobs, notice, head)
+    let jobs = state.jobs_for_app_account(account);
+    render_app_shell(Some(account), &sources, view, &jobs, notice)
 }
 
 #[must_use]
@@ -322,29 +100,11 @@ pub fn render_app_shell(
     jobs: &[GenerationJob],
     notice: Option<&str>,
 ) -> String {
-    render_app_shell_with_head(account, sources, view, jobs, notice, "")
-}
-
-fn render_app_shell_with_head(
-    account: Option<&AppAccount>,
-    sources: &[SourceRecord],
-    view: Option<&StudyViewResponse>,
-    jobs: &[GenerationJob],
-    notice: Option<&str>,
-    head: &str,
-) -> String {
     let inner = match account {
-        Some(account) => render_signed_in(
-            account,
-            sources,
-            view,
-            jobs,
-            notice,
-            SignedInSurface::Workspace,
-        ),
+        Some(account) => render_signed_in(account, sources, view, jobs, notice, false),
         None => render_signed_out(notice),
     };
-    document_with_head(&inner, head)
+    document(&inner)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -437,20 +197,6 @@ pub fn render_auth_recovery(title: &str, message: &str) -> String {
     );
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
-#[must_use]
-pub fn render_submit_recovery(title: &str, message: &str) -> String {
-    let view = format!(
-        r#"<div class="me-cover">
-<p class="me-kicker">Review safely</p>
-<h1 class="me-display">{}</h1>
-<p class="ae-lede ae-dim me-support">{}</p>
-<p><a class="ae-button" href="/">Return to your review</a></p>
-</div>"#,
-        escape_html(title),
-        escape_html(message),
-    );
-    document(&screen_centered("", &view, FOOTER_TAGLINE))
-}
 
 #[must_use]
 pub fn render_return_notification_confirmation(token: &str) -> String {
@@ -478,17 +224,13 @@ pub fn render_return_notification_disabled() -> String {
 <p class="me-kicker">Return gently</p>
 <h1 class="me-display">Reminders are off.</h1>
 <p class="ae-lede ae-dim me-support">You will not receive further due-count reminders. You can opt in again from your study space.</p>
-<p><a class="ae-accent" href="/">Back to Memory Engine</a></p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
 }
 
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
 fn document(inner: &str) -> String {
-    document_with_head(inner, "")
-}
-
-fn document_with_head(inner: &str, head: &str) -> String {
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -501,7 +243,7 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<title>Memory Engine</title>
+<title>Scry</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/favicon.png" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
@@ -509,7 +251,6 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">
 <link rel="stylesheet" href="/static/ledger.css">
-{head}
 <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -534,7 +275,7 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
     format!(
         r#"<div class="ae-screen">
 <header class="ae-bar">
-<a class="ae-name" href="/">MEMORY ENGINE</a>
+<a class="ae-name" href="/">SCRY</a>
 {header_right}
 </header>
 <main class="{stage}">
@@ -573,61 +314,35 @@ fn render_signed_out(notice: Option<&str>) -> String {
     screen("", &view, FOOTER_TAGLINE)
 }
 
-#[derive(Clone, Copy)]
-enum SignedInSurface {
-    Workspace,
-    Edit,
-    ReviewComplete,
-}
-
 fn render_signed_in(
     account: &AppAccount,
     sources: &[SourceRecord],
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
     notice: Option<&str>,
-    surface: SignedInSurface,
+    editing: bool,
 ) -> String {
     let due = view.map_or(0, |view| view.due_count);
-    let body = match surface {
-        SignedInSurface::Edit => view.and_then(|view| view.current.as_ref()).map_or_else(
-            || render_workspace(account, sources, view, jobs),
-            |current| render_edit_review(account, current),
-        ),
-        SignedInSurface::ReviewComplete => render_review_complete(),
-        SignedInSurface::Workspace => view.and_then(|view| view.current.as_ref()).map_or_else(
-            || render_workspace(account, sources, view, jobs),
-            |current| render_current_review(account, current),
-        ),
-    };
-    render_signed_in_body(account, due, notice, jobs, &body)
-}
-
-fn render_signed_in_body(
-    account: &AppAccount,
-    due: usize,
-    notice: Option<&str>,
-    jobs: &[GenerationJob],
-    body: &str,
-) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
     let footer = format!(
         r#"<span class="ae-dim">Signed in</span>
 <form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
         hidden_csrf_input(account)
     );
-    let view_inner = format!("{}{}", render_notice(notice, jobs), body);
-    screen(&header_right, &view_inner, &footer)
-}
 
-fn render_review_complete() -> String {
-    r#"<section class="ae-group me-review-complete">
-<p class="me-kicker">Review complete</p>
-<h1 class="me-display">You're all caught up.</h1>
-<p class="ae-lede">Nothing else is due right now.</p>
-<div class="me-actions"><a class="ae-button" href="/">Back to workspace</a></div>
-</section>"#
-        .to_owned()
+    let body = if editing {
+        view.and_then(|view| view.current.as_ref()).map_or_else(
+            || render_workspace(account, sources, view, jobs),
+            |current| render_edit_review(account, current),
+        )
+    } else if let Some(current) = view.and_then(|view| view.current.as_ref()) {
+        render_current_review(account, current)
+    } else {
+        render_workspace(account, sources, view, jobs)
+    };
+    let view_inner = format!("{}{}", render_notice(notice, jobs), body);
+
+    screen(&header_right, &view_inner, &footer)
 }
 
 fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
@@ -716,12 +431,8 @@ fn render_notice(message: Option<&str>, jobs: &[GenerationJob]) -> String {
 /// generation-in-progress notice needs to be checked against live job state,
 /// so it never lingers once nothing is left in flight (operator dogfood
 /// finding, memory-engine-081).
-fn is_generating_notice(text: &str) -> bool {
-    text.contains("Generating")
-}
-
 fn generating_notice_is_live(text: &str, jobs: &[GenerationJob]) -> bool {
-    if !is_generating_notice(text) {
+    if !text.contains("Generating") {
         return true;
     }
     jobs.iter()
@@ -760,6 +471,9 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
+<label class="ae-label" for="me-capture-permission">Permission</label>
+<select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
+<p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
 <div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
@@ -787,10 +501,37 @@ fn render_sources(
                 id = escape_html(&source.source_id),
             )
         };
+        let permission = match &source.permission {
+            SourcePermission::LocalOnly => {
+                "<span class=\"ae-dim me-source-permission\">Local only · never sent to a model</span>"
+            }
+            SourcePermission::ModelEligible => {
+                "<span class=\"ae-dim me-source-permission\">Model eligible</span>"
+            }
+        };
+        let edit_permission = format!(
+            r#"<form class="me-source-permission" action="/app/source/permission" method="post">{csrf}<input type="hidden" name="sourceId" value="{id}"><label class="ae-label" for="permission-{id_label}">Change permission</label><select class="ae-input" id="permission-{id_label}" name="permission" aria-label="Change permission for {title_attr}"><option value="model-eligible" {model_selected}>Allow model help</option><option value="local-only" {local_selected}>Keep local / Never send to a model</option></select><button class="ae-button-quiet ae-button-compact" type="submit">Save permission</button></form>"#,
+            csrf = hidden_csrf_input(account),
+            id = escape_html(&source.source_id),
+            id_label = escape_html(&source.source_id),
+            title_attr = escape_html(&source.title),
+            model_selected = if source.permission == SourcePermission::ModelEligible {
+                "selected"
+            } else {
+                ""
+            },
+            local_selected = if source.permission == SourcePermission::LocalOnly {
+                "selected"
+            } else {
+                ""
+            },
+        );
         let _ = write!(
             rows,
             r#"<article class="me-source">
 <p class="ae-item">{title}</p>
+{permission}
+{edit_permission}
 <div class="me-row-actions">
 {generate}
 <details class="me-remove-confirm">
@@ -801,6 +542,7 @@ fn render_sources(
 </div>
 </article>"#,
             title = escape_html(&source.title),
+            permission = permission,
             csrf_archive = hidden_csrf_input(account),
             id_archive = escape_html(&source.source_id),
         );
@@ -870,7 +612,7 @@ fn render_job_row(account: &AppAccount, job: &GenerationJob) -> String {
 /// enhancement never adds one either (the list is server-authoritative, so a
 /// job that fails live gets its Retry button on the next full page load).
 fn render_job_retry(account: &AppAccount, job: &GenerationJob) -> String {
-    if job.status != JobStatus::Failed || !job.retryable {
+    if job.status != JobStatus::Failed {
         return String::new();
     }
     format!(
@@ -886,7 +628,6 @@ fn job_meta(job: &GenerationJob) -> String {
     match job.status {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
-        JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
         JobStatus::Succeeded => format!(
             "{} {} · scheduled for review",
             job.card_count,
@@ -1680,8 +1421,9 @@ mod source_loading_tests {
     use std::cell::Cell;
 
     use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_persistence::SourcePermission;
 
-    use super::render_account_page_with_loaders;
+    use super::{render_account_page_with_source_loader, render_capture};
 
     fn source_body() -> String {
         [
@@ -1697,7 +1439,7 @@ mod source_loading_tests {
     }
 
     #[test]
-    fn active_review_loads_only_data_used_by_the_rendered_branch() {
+    fn active_review_skips_source_loader_and_workspace_loads_it() {
         let state = ApiState::default();
         let created = state
             .create_account("render-loader-active@example.com")
@@ -1709,6 +1451,7 @@ mod source_loading_tests {
                 &CreateSourceRequest {
                     title: "NATO practice notes".to_owned(),
                     body: source_body(),
+                    permission: SourcePermission::default(),
                 },
             )
             .unwrap();
@@ -1719,59 +1462,12 @@ mod source_loading_tests {
         state.run_pending_jobs_blocking();
         let active_view = state.next_app_review(&account).unwrap();
 
-        let active_source_loads = Cell::new(0);
-        let active_job_loads = Cell::new(0);
-        render_account_page_with_loaders(
-            &state,
-            &account,
-            Some(&active_view),
-            None,
-            || {
-                active_source_loads.set(active_source_loads.get() + 1);
-                Vec::new()
-            },
-            || {
-                active_job_loads.set(active_job_loads.get() + 1);
-                Vec::new()
-            },
-        );
-        assert_eq!(active_source_loads.get(), 0);
-        assert_eq!(active_job_loads.get(), 0);
-
-        render_account_page_with_loaders(
-            &state,
-            &account,
-            Some(&active_view),
-            Some("Generating review material…"),
-            Vec::new,
-            || {
-                active_job_loads.set(active_job_loads.get() + 1);
-                Vec::new()
-            },
-        );
-        assert_eq!(
-            active_job_loads.get(),
-            1,
-            "a generation notice still needs live jobs to suppress stale UI"
-        );
-
-        let notice_page = render_account_page_with_loaders(
-            &state,
-            &account,
-            Some(&active_view),
-            Some("That job can't be retried."),
-            Vec::new,
-            || {
-                active_job_loads.set(active_job_loads.get() + 1);
-                Vec::new()
-            },
-        );
-        assert_eq!(
-            active_job_loads.get(),
-            1,
-            "an unconditional notice does not require job history"
-        );
-        assert!(notice_page.contains("That job can't be retried."));
+        let active_loads = Cell::new(0);
+        render_account_page_with_source_loader(&state, &account, Some(&active_view), None, || {
+            active_loads.set(active_loads.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(active_loads.get(), 0);
 
         let workspace_state = ApiState::default();
         let workspace_created = workspace_state
@@ -1780,24 +1476,34 @@ mod source_loading_tests {
         let workspace_account = workspace_state
             .create_browser_session(&workspace_created)
             .unwrap();
-        let workspace_source_loads = Cell::new(0);
-        let workspace_job_loads = Cell::new(0);
-        render_account_page_with_loaders(
+        let workspace_loads = Cell::new(0);
+        render_account_page_with_source_loader(
             &workspace_state,
             &workspace_account,
             None,
             None,
             || {
-                workspace_source_loads.set(workspace_source_loads.get() + 1);
-                Vec::new()
-            },
-            || {
-                workspace_job_loads.set(workspace_job_loads.get() + 1);
+                workspace_loads.set(workspace_loads.get() + 1);
                 Vec::new()
             },
         );
-        assert_eq!(workspace_source_loads.get(), 1);
-        assert_eq!(workspace_job_loads.get(), 1);
+        assert_eq!(workspace_loads.get(), 1);
+    }
+
+    #[test]
+    fn capture_form_exposes_an_accessible_permission_choice_and_default() {
+        let state = ApiState::default();
+        let account = state
+            .create_account("render-permission@example.com")
+            .and_then(|account| state.create_browser_session(&account))
+            .expect("account");
+        let html = render_capture(&account);
+
+        assert!(html.contains(r#"id="me-capture-permission" name="permission""#));
+        assert!(html.contains(r#"aria-describedby="me-capture-permission-hint""#));
+        assert!(html.contains(r#"value="model-eligible" selected"#));
+        assert!(html.contains("Keep local / Never send to a model"));
+        assert!(html.contains("prevent model providers from receiving this capture"));
     }
 }
 

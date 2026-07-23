@@ -13,6 +13,7 @@ use memory_engine_core::ReviewUnitId;
 use memory_engine_generation::{
     BridgeMaterialProvider, BridgeMaterialRequest, DraftProvider, DraftRejection, LearningIntent,
     ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
+    SourceAuthorizationContext, SourceAuthorizationError,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{SourceDocument, SourceDocumentKind, SourcePermission};
@@ -350,6 +351,115 @@ fn http_error_status_is_a_human_readable_failure() {
     );
 }
 
+#[test]
+fn local_only_direct_provider_calls_fail_before_http_for_generation_and_repair() {
+    let provider = OpenRouterProvider::new(test_config("http://127.0.0.1:9".to_owned()));
+    let mut source = prose_source();
+    source.permission = SourcePermission::LocalOnly;
+
+    let generation = provider
+        .generate_drafts(&source)
+        .expect_err("local-only source must not reach HTTP");
+    assert!(matches!(
+        generation.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id)
+            if id == "src-prose"
+    ));
+
+    let repair = provider
+        .repair_drafts(
+            &source,
+            &[DraftRejection {
+                index: 1,
+                concept: "private".to_owned(),
+                question: "private".to_owned(),
+                answer: "private".to_owned(),
+                reasons: vec!["rejected".to_owned()],
+            }],
+        )
+        .expect_err("local-only repair must not reach HTTP");
+    assert!(matches!(
+        repair.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id)
+            if id == "src-prose"
+    ));
+}
+
+#[test]
+fn archived_direct_provider_calls_fail_before_http_for_generation_and_repair() {
+    let mut source = prose_source();
+    source.archived_at = Some(42);
+    let provider = OpenRouterProvider::new(test_config("http://127.0.0.1:9".to_owned()));
+
+    for failure in [
+        provider
+            .generate_drafts(&source)
+            .expect_err("archived generation must fail before HTTP"),
+        provider
+            .repair_drafts(&source, &[])
+            .expect_err("archived repair must fail before HTTP"),
+    ] {
+        assert!(matches!(
+            failure.kind(),
+            memory_engine_generation::ProviderFailureKind::ArchivedSource(id) if id == &source.id
+        ));
+    }
+}
+
+#[test]
+fn archived_reference_and_bridge_requests_cannot_be_authorized() {
+    let mut source = prose_source();
+    source.archived_at = Some(42);
+
+    let error = SourceAuthorizationContext::from_sources(&[source])
+        .expect_err("archived reference/bridge context must fail closed");
+    assert!(matches!(
+        error,
+        SourceAuthorizationError::ArchivedSourceDocument(id) if id == "src-prose"
+    ));
+}
+
+#[test]
+fn local_only_reference_and_bridge_requests_fail_before_http() {
+    let mut source = prose_source();
+    source.permission = SourcePermission::LocalOnly;
+    let authorization = SourceAuthorizationContext::from_sources(&[source]).expect("authorize");
+    let provider = OpenRouterProvider::new(test_config("http://127.0.0.1:9".to_owned()));
+
+    let reference = provider
+        .explain_concept(&ReferenceNoteRequest::new(
+            "concept",
+            "Concept",
+            "Prompt",
+            "Answer",
+            Vec::new(),
+            authorization.clone(),
+        ))
+        .expect_err("local-only reference must not reach HTTP");
+    assert!(matches!(
+        reference.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id) if id == "src-prose"
+    ));
+
+    let bridge = provider
+        .generate_bridge_material(&BridgeMaterialRequest::new(
+            "concept",
+            "Concept",
+            ReviewUnitId::new("parent"),
+            "Prompt",
+            "Answer",
+            1,
+            None,
+            Vec::new(),
+            authorization,
+        ))
+        .expect_err("local-only bridge must not reach HTTP");
+    assert!(matches!(
+        bridge.kind(),
+        memory_engine_generation::ProviderFailureKind::LocalOnlySource(id) if id == "src-prose"
+    ));
+}
+
 /// A bare-bones success body: valid envelope, zero drafts. Enough to make
 /// `generate_drafts` return `Ok` so a retry test can assert success vs failure
 /// without caring about card content.
@@ -420,13 +530,14 @@ fn maps_model_json_to_reference_note() {
 
     let provider = OpenRouterProvider::new(test_config(base_url));
     let note = provider
-        .explain_concept(&ReferenceNoteRequest {
-            concept_key: "nato-letter-a".to_owned(),
-            concept_label: "NATO letter A".to_owned(),
-            prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
-            expected_answer: "ALFA".to_owned(),
-            recent_performance: Vec::new(),
-        })
+        .explain_concept(&ReferenceNoteRequest::new(
+            "nato-letter-a",
+            "NATO letter A",
+            "What is the NATO phonetic alphabet word for A?",
+            "ALFA",
+            Vec::new(),
+            SourceAuthorizationContext::none(),
+        ))
         .expect("reference note");
 
     assert_eq!(note.title, "NATO letter A");
@@ -488,20 +599,21 @@ fn maps_model_json_to_bridge_material_candidates() {
 
     let provider = OpenRouterProvider::new(test_config(base_url));
     let material = provider
-        .generate_bridge_material(&BridgeMaterialRequest {
-            concept_key: "nato-letter-a".to_owned(),
-            concept_label: "NATO letter A".to_owned(),
-            parent_review_unit_id: ReviewUnitId::new("parent-nato-a"),
-            parent_prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
-            parent_expected_answer: "ALFA".to_owned(),
-            parent_stage_order: 4,
-            cached_reference_note: None,
-            recent_performance: vec![ReviewPerformanceContext {
+        .generate_bridge_material(&BridgeMaterialRequest::new(
+            "nato-letter-a",
+            "NATO letter A",
+            ReviewUnitId::new("parent-nato-a"),
+            "What is the NATO phonetic alphabet word for A?",
+            "ALFA",
+            4,
+            None,
+            vec![ReviewPerformanceContext {
                 review_unit_id: "parent-nato-a".to_owned(),
                 submitted_answer: "BRAVO".to_owned(),
                 verdict: Some("wrong".to_owned()),
             }],
-        })
+            SourceAuthorizationContext::none(),
+        ))
         .expect("bridge material");
 
     assert_eq!(material.reference_note.title, "NATO letter A");
@@ -559,16 +671,17 @@ fn rejects_bridge_material_without_explicit_bridge_stages() {
 
     let provider = OpenRouterProvider::new(test_config(base_url));
     let failure = provider
-        .generate_bridge_material(&BridgeMaterialRequest {
-            concept_key: "nato-letter-a".to_owned(),
-            concept_label: "NATO letter A".to_owned(),
-            parent_review_unit_id: ReviewUnitId::new("parent-nato-a"),
-            parent_prompt: "What is the NATO phonetic alphabet word for A?".to_owned(),
-            parent_expected_answer: "ALFA".to_owned(),
-            parent_stage_order: 4,
-            cached_reference_note: None,
-            recent_performance: Vec::new(),
-        })
+        .generate_bridge_material(&BridgeMaterialRequest::new(
+            "nato-letter-a",
+            "NATO letter A",
+            ReviewUnitId::new("parent-nato-a"),
+            "What is the NATO phonetic alphabet word for A?",
+            "ALFA",
+            4,
+            None,
+            Vec::new(),
+            SourceAuthorizationContext::none(),
+        ))
         .expect_err("numeric bridge stages must not be normalized into easier rungs");
 
     assert!(failure

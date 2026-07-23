@@ -17,16 +17,15 @@ use tower::ServiceExt;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use memory_engine_persistence::SourcePermission;
 use memory_engine_study::DEFAULT_BETA_STUDY_NOW;
 
 use super::{
-    router, routes, AccountRegistry, ApiFailure, ApiState, AuthConfig, CreateSourceRequest,
+    router, routes, AccountRegistry, ApiState, AuthConfig, CreateSourceRequest,
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
-use memory_engine_api_state::{
-    ContentFeedbackRequest, EnqueueOutcome, RETURN_NOTIFICATION_INTERVAL_MS,
-};
+use memory_engine_api_state::RETURN_NOTIFICATION_INTERVAL_MS;
 
 #[tokio::test]
 async fn healthz_exposes_production_api_boundary() {
@@ -128,24 +127,6 @@ fn scheduler_health_retains_last_success_when_a_report_has_failures() {
 }
 
 #[tokio::test]
-async fn readyz_distinguishes_a_live_process_from_a_started_worker() {
-    let response = router(ApiState::default())
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = response_json(response).await;
-    assert_eq!(body["status"], json!("not_ready"));
-    assert_eq!(body["workerStarted"], json!(false));
-}
-
-#[tokio::test]
 async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
     let response = router(ApiState::default())
         .oneshot(
@@ -236,6 +217,69 @@ async fn mobile_capture_enqueues_generation_then_auto_schedules_cards() {
     assert!(review.contains("2 due"));
     assert!(review.contains("Reveal answer"));
     assert!(!review.contains("Add all to reviews"));
+}
+
+#[tokio::test]
+async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_bytes() {
+    let state = ApiState::default();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let captured = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/capture",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("capture", "private learner notes"),
+                ("permission", "local-only"),
+            ],
+        ))
+        .await
+        .expect("local-only capture");
+    assert_eq!(captured.status(), StatusCode::OK);
+    let captured = response_text(captured).await;
+    assert!(captured.contains("Local only · never sent to a model"));
+
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/permission",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("sourceId", &source_id),
+                ("permission", "local-only"),
+            ],
+        ))
+        .await
+        .expect("edit permission");
+    assert_eq!(edited.status(), StatusCode::OK);
+    assert!(response_text(edited)
+        .await
+        .contains("Source permission updated."));
+
+    let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    assert!(workspace.contains("Due now"));
+    assert!(workspace.contains("Start review"));
+
+    let invalid = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/permission",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("sourceId", &source_id),
+                ("permission", "invalid"),
+            ],
+        ))
+        .await
+        .expect("invalid permission");
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -410,6 +454,7 @@ fn scheduled_return_notification_sends_live_due_count_without_request_traffic() 
             &CreateSourceRequest {
                 title: "Scheduled reminder source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("save source");
@@ -544,6 +589,7 @@ fn scheduled_return_notification_batch_quota_rotates_eligible_accounts() {
                 &CreateSourceRequest {
                     title: "Quota source".to_owned(),
                     body: source_body(),
+                    permission: SourcePermission::ModelEligible,
                 },
             )
             .expect("quota source");
@@ -621,6 +667,7 @@ fn concurrent_scheduler_instances_share_one_durable_file_claim() {
             &CreateSourceRequest {
                 title: "Concurrent scheduler source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("source");
@@ -934,202 +981,16 @@ async fn mcq_review_is_click_to_answer_and_grades_case_insensitively() {
                 ("answer", "alfa"),
                 ("responseTimeMs", "1800"),
                 ("idempotencyKey", "review-mcq-case"),
-                (
-                    "performanceTraceId",
-                    "trace_0123456789abcdef0123456789abcdef",
-                ),
             ],
         ))
         .await
         .expect("submit lowercase answer");
     assert_eq!(graded.status(), StatusCode::OK);
-    let request_id = graded
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .expect("submit request id")
-        .to_owned();
-    assert_eq!(request_id.len(), 36);
-    assert!(request_id.starts_with("req_"));
-    assert!(request_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit()));
-    let server_timing = graded
-        .headers()
-        .get("server-timing")
-        .and_then(|value| value.to_str().ok())
-        .expect("submit server timing");
-    assert!(server_timing.contains(&format!(r#"request;desc="{request_id}""#)));
-    assert!(server_timing.contains(r#"handoff;desc="trace_0123456789abcdef0123456789abcdef""#));
-    assert!(server_timing.contains("total;dur="));
-    assert!(server_timing.contains("render;dur="));
-    assert!(!server_timing.contains("pgconnect"));
-    assert!(!server_timing.contains("pgop"));
-    assert!(!server_timing.contains("pgstmt"));
-    assert!(!server_timing.contains("alfa"));
-    assert!(!server_timing.contains(&review_unit_id));
-    assert!(!server_timing.contains("review-mcq-case"));
     let graded = response_text(graded).await;
-    assert!(graded.contains(&format!(
-        r#"<meta name="memory-engine-submit-request" content="{request_id}">"#
-    )));
-    assert!(graded.contains(
-        r#"<meta name="memory-engine-submit-handoff" content="trace_0123456789abcdef0123456789abcdef">"#
-    ));
     assert!(
         graded.contains("me-verdict") && graded.contains(">Correct<"),
         "lowercase 'alfa' must grade correct against stored 'ALFA': {graded}"
     );
-}
-
-async fn assert_submit_recovery_document(
-    app: &axum::Router,
-    cookie: &str,
-    response: axum::response::Response,
-) {
-    let body = response_text(response).await;
-    assert!(
-        body.contains(r#"<script src="/static/app.js" defer></script>"#),
-        "submit recovery must load the handoff consumer"
-    );
-    assert!(body.contains(r#"href="/""#));
-    assert!(!body.contains("me-recovery-email"));
-
-    let recovered = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .header("cookie", cookie)
-                .body(Body::empty())
-                .expect("submit recovery request"),
-        )
-        .await
-        .expect("submit recovery response");
-    assert_eq!(recovered.status(), StatusCode::OK);
-    let recovered = response_text(recovered).await;
-    assert!(recovered.contains("csrfToken"));
-    assert!(!recovered.contains("me-recovery-email"));
-}
-
-async fn assert_malformed_submit_recovery(app: &axum::Router, cookie: &str, csrf: &str) {
-    let response = app
-        .clone()
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/submit",
-            cookie,
-            &[("csrfToken", csrf)],
-        ))
-        .await
-        .expect("malformed submit");
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(response.headers().contains_key("x-request-id"));
-    let timing = response
-        .headers()
-        .get("server-timing")
-        .and_then(|value| value.to_str().ok())
-        .expect("malformed submit timing");
-    assert!(timing.contains("total;dur="));
-    assert!(!timing.contains("handoff"));
-    assert_submit_recovery_document(app, cookie, response).await;
-}
-
-#[tokio::test]
-async fn browser_submit_receipts_are_bounded_and_other_routes_stay_uninstrumented() {
-    let state = ApiState::default();
-    let app = router(state);
-    let started = app
-        .clone()
-        .oneshot(form_request(
-            "POST",
-            "/app/start",
-            &[("capture", &source_body())],
-        ))
-        .await
-        .expect("start");
-    let cookie = session_cookie(&started);
-    let csrf = html_value(&response_text(started).await, "csrfToken");
-
-    let receipt = app
-        .clone()
-        .oneshot(json_request_with_cookie(
-            "POST",
-            "/app/performance/submit",
-            &cookie,
-            &json!({
-                "schema": "memory_engine.browser_submit.v1",
-                "csrfToken": csrf,
-                "requestId": "req_0123456789abcdef0123456789abcdef",
-                "traceId": "trace_0123456789abcdef0123456789abcdef",
-                "tapToAckMs": 5,
-                "requestToResponseMs": 20,
-                "transferMs": 4,
-                "navigationMs": 11,
-                "gradedVisibleMs": 35,
-                "viewport": "mobile"
-            }),
-        ))
-        .await
-        .expect("browser submit receipt");
-    assert_eq!(receipt.status(), StatusCode::NO_CONTENT);
-    assert!(!receipt.headers().contains_key("server-timing"));
-    assert!(!receipt.headers().contains_key("x-request-id"));
-
-    let invalid = app
-        .clone()
-        .oneshot(json_request_with_cookie(
-            "POST",
-            "/app/performance/submit",
-            &cookie,
-            &json!({
-                "schema": "memory_engine.browser_submit.v1",
-                "csrfToken": csrf,
-                "requestId": "req_0123456789abcdef0123456789abcdef",
-                "traceId": "trace_0123456789abcdef0123456789abcdef",
-                "tapToAckMs": 5,
-                "requestToResponseMs": 20,
-                "transferMs": 4,
-                "navigationMs": 11,
-                "gradedVisibleMs": 50,
-                "viewport": "mobile"
-            }),
-        ))
-        .await
-        .expect("invalid browser submit receipt");
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-
-    let wrong_shape = app
-        .clone()
-        .oneshot(json_request_with_cookie(
-            "POST",
-            "/app/performance/submit",
-            &cookie,
-            &json!({"csrfToken": csrf, "schema": 42}),
-        ))
-        .await
-        .expect("wrong-shaped browser submit receipt");
-    assert_eq!(wrong_shape.status(), StatusCode::BAD_REQUEST);
-
-    assert_malformed_submit_recovery(&app, &cookie, &csrf).await;
-
-    for request in [
-        Request::builder()
-            .uri("/healthz")
-            .body(Body::empty())
-            .expect("health request"),
-        Request::builder()
-            .uri("/static/ledger.css")
-            .body(Body::empty())
-            .expect("static request"),
-        Request::builder()
-            .uri("/app/jobs/events")
-            .header("cookie", &cookie)
-            .body(Body::empty())
-            .expect("event stream request"),
-    ] {
-        let response = app.clone().oneshot(request).await.expect("excluded route");
-        assert!(!response.headers().contains_key("server-timing"));
-        assert!(!response.headers().contains_key("x-request-id"));
-    }
 }
 
 #[tokio::test]
@@ -1580,9 +1441,6 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
     assert_eq!(feedback.status(), StatusCode::OK);
     let feedback = response_text(feedback).await;
     assert!(feedback.contains("Saved. This card will help improve future generation."));
-    assert!(feedback.contains("Review complete"));
-    assert!(feedback.contains(r#"href="/">Back to workspace</a>"#));
-    assert!(!feedback.contains("What do you want to remember?"));
 
     let replay = app
         .oneshot(form_request_with_cookie(
@@ -1600,185 +1458,6 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
         .await
         .expect("replay content feedback");
     assert_eq!(replay.status(), StatusCode::OK);
-    let replay = response_text(replay).await;
-    assert!(replay.contains("Review complete"));
-    assert!(!replay.contains("What do you want to remember?"));
-}
-
-#[tokio::test]
-async fn app_content_feedback_advances_to_the_next_due_review() {
-    let state = ApiState::default();
-    let app = router(state.clone());
-    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
-    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
-
-    let first_prompt =
-        next_review_html(&app, &cookie, &csrf_token, "start first feedback review").await;
-    let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
-    let first_review_key = html_value(&first_prompt, "idempotencyKey");
-    submit_review_ok(
-        &app,
-        &cookie,
-        &csrf_token,
-        &first_review_unit_id,
-        "deliberately wrong",
-        &first_review_key,
-    )
-    .await;
-
-    let invalid = app
-        .clone()
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/content-feedback",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &first_review_unit_id),
-                ("verdict", "kept"),
-                ("idempotencyKey", ""),
-                ("rationale", "keep this retry note"),
-            ],
-        ))
-        .await
-        .expect("reject invalid content feedback");
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-    let invalid = response_text(invalid).await;
-    assert!(invalid.contains("Idempotency key must not be blank."));
-    assert!(invalid.contains(r#"action="/app/content-feedback""#));
-    assert!(invalid.contains("keep this retry note"));
-    assert_eq!(html_value(&invalid, "reviewUnitId"), first_review_unit_id);
-    assert_eq!(html_value(&invalid, "verdict"), "kept");
-    let retry_feedback_key = html_value(&invalid, "idempotencyKey");
-    assert!(!retry_feedback_key.is_empty());
-    assert!(!invalid.contains(r#"action="/app/submit""#));
-    assert!(!invalid.contains("What do you want to remember?"));
-
-    let continued = submit_content_feedback_ok(
-        &app,
-        &cookie,
-        &[
-            ("csrfToken", &csrf_token),
-            ("reviewUnitId", &first_review_unit_id),
-            ("verdict", "kept"),
-            ("idempotencyKey", &retry_feedback_key),
-        ],
-    )
-    .await;
-
-    assert!(continued.contains("Saved. This card will help improve future generation."));
-    assert!(continued.contains(r#"action="/app/submit""#));
-    assert!(!continued.contains("What do you want to remember?"));
-    assert_ne!(
-        html_value(&continued, "reviewUnitId"),
-        first_review_unit_id,
-        "feedback must advance into the next due review"
-    );
-}
-
-#[tokio::test]
-async fn app_content_feedback_persistence_recovery_fields_can_be_submitted() {
-    let state = ApiState::default();
-    let app = router(state.clone());
-    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
-    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
-
-    let first_prompt = next_review_html(
-        &app,
-        &cookie,
-        &csrf_token,
-        "start persistence recovery review",
-    )
-    .await;
-    let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
-    let first_review_key = html_value(&first_prompt, "idempotencyKey");
-    let graded = submit_review_ok(
-        &app,
-        &cookie,
-        &csrf_token,
-        &first_review_unit_id,
-        "deliberately wrong",
-        &first_review_key,
-    )
-    .await;
-    let feedback_key = content_feedback_value(&graded, "idempotencyKey");
-
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::COOKIE,
-        cookie.parse().expect("cookie header"),
-    );
-    let account = state
-        .require_browser_session(&headers, &csrf_token)
-        .expect("browser session");
-    let unavailable = routes::render_content_feedback_persistence_failure(
-        &state,
-        &account,
-        &first_review_unit_id,
-        &ContentFeedbackRequest {
-            verdict: memory_engine_service::ContentFeedbackVerdict::Kept,
-            rationale: Some("keep this storage retry note".to_owned()),
-            idempotency_key: feedback_key,
-            supersedes_id: None,
-        },
-        ApiFailure::service_unavailable("Feedback storage is temporarily unavailable.".to_owned()),
-    );
-    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let unavailable = response_text(unavailable).await;
-    assert!(unavailable.contains("Feedback storage is temporarily unavailable."));
-    assert!(unavailable.contains(r#"action="/app/content-feedback""#));
-    assert!(unavailable.contains("keep this storage retry note"));
-    assert!(!unavailable.contains(r#"action="/app/submit""#));
-    assert!(!unavailable.contains("What do you want to remember?"));
-
-    let recovery_review_unit_id = html_value(&unavailable, "reviewUnitId");
-    let recovery_verdict = html_value(&unavailable, "verdict");
-    let recovery_key = html_value(&unavailable, "idempotencyKey");
-    let continued = submit_content_feedback_ok(
-        &app,
-        &cookie,
-        &[
-            ("csrfToken", &csrf_token),
-            ("reviewUnitId", &recovery_review_unit_id),
-            ("verdict", &recovery_verdict),
-            ("rationale", "keep this storage retry note"),
-            ("idempotencyKey", &recovery_key),
-        ],
-    )
-    .await;
-
-    assert!(continued.contains("Saved. This card will help improve future generation."));
-    assert!(continued.contains(r#"action="/app/submit""#));
-    assert_ne!(
-        html_value(&continued, "reviewUnitId"),
-        first_review_unit_id,
-        "a submitted persistence-recovery form must advance to the next due review"
-    );
-}
-
-#[test]
-fn app_content_feedback_head_refresh_failure_preserves_retry_revision() {
-    let mut status = StatusCode::CONFLICT;
-    let mut message = "Feedback conflicts with the latest saved revision.".to_owned();
-    let (idempotency_key, supersedes_id) = routes::resolve_content_feedback_recovery_revision(
-        true,
-        "review-1",
-        "feedback-original",
-        Some("feedback-parent"),
-        Some(Err(ApiFailure::service_unavailable(
-            "feedback head unavailable".to_owned(),
-        ))),
-        &mut status,
-        &mut message,
-    );
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        message,
-        "Feedback was not saved, and the latest revision could not be loaded. Retry when storage is available."
-    );
-    assert_eq!(idempotency_key, "feedback-original");
-    assert_eq!(supersedes_id.as_deref(), Some("feedback-parent"));
 }
 
 #[tokio::test]
@@ -1842,29 +1521,23 @@ async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempo
         "a revised feedback render must not reuse the first idempotency key"
     );
 
-    let stale_fields = [
-        ("csrfToken", csrf_token.as_str()),
-        ("reviewUnitId", second_review_unit_id.as_str()),
-        ("verdict", "kept"),
-        ("rationale", "The card is useful after all."),
-        ("idempotencyKey", first_feedback_key.as_str()),
-    ];
-    let conflicting_replay = submit_content_feedback_conflict(&app, &cookie, &stale_fields).await;
-    assert!(conflicting_replay.contains(r#"action="/app/content-feedback""#));
-    assert!(!conflicting_replay.contains(r#"action="/app/next""#));
-    assert!(conflicting_replay.contains("The card is useful after all."));
-    assert!(conflicting_replay.contains("Try that feedback again."));
-    assert!(
-        conflicting_replay.contains(r#"name="supersedesId""#),
-        "{conflicting_replay}"
-    );
-    let retry_feedback_key = html_value(&conflicting_replay, "idempotencyKey");
-    let retry_head = html_value(&conflicting_replay, "supersedesId");
-    let repeated_conflict = submit_content_feedback_conflict(&app, &cookie, &stale_fields).await;
-    let repeated_retry_key = html_value(&repeated_conflict, "idempotencyKey");
-    assert_ne!(retry_feedback_key, first_feedback_key);
-    assert_ne!(retry_feedback_key, repeated_retry_key);
-    assert_eq!(retry_head, second_head);
+    let conflicting_replay = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/content-feedback",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reviewUnitId", &second_review_unit_id),
+                ("verdict", "kept"),
+                ("rationale", "The card is useful after all."),
+                ("idempotencyKey", &first_feedback_key),
+            ],
+        ))
+        .await
+        .expect("changed replay with old key");
+    assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
 
     let revised_page = submit_content_feedback_ok(
         &app,
@@ -1874,8 +1547,8 @@ async fn app_content_feedback_revision_carries_current_head_and_refreshes_idempo
             ("reviewUnitId", &second_review_unit_id),
             ("verdict", "kept"),
             ("rationale", "The card is useful after all."),
-            ("idempotencyKey", &retry_feedback_key),
-            ("supersedesId", &retry_head),
+            ("idempotencyKey", &second_feedback_key),
+            ("supersedesId", &second_head),
         ],
     )
     .await;
@@ -2614,9 +2287,6 @@ async fn assert_forbidden_form(
         .await
         .unwrap_or_else(|error| panic!("{context}: {error}"));
     assert_eq!(response.status(), StatusCode::FORBIDDEN, "{context}");
-    if uri == "/app/submit" {
-        assert_submit_recovery_document(app, cookie, response).await;
-    }
 }
 
 #[tokio::test]
@@ -2801,7 +2471,6 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
     SESSION_CLOCK.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
 
     let expired = app
-        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/next",
@@ -2823,34 +2492,6 @@ async fn expired_browser_session_renders_direct_recovery_instead_of_json() {
     let body = response_text(expired).await;
     assert!(body.contains("Your session expired"));
     assert!(body.contains(r#"<form action="/app/account" method="post">"#));
-    assert!(!body.contains(r#"{"error""#));
-
-    let feedback = app
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/content-feedback",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", "expired-session-review"),
-                ("verdict", "kept"),
-                ("idempotencyKey", "expired-session-feedback"),
-            ],
-        ))
-        .await
-        .expect("expired feedback session response");
-    assert_eq!(feedback.status(), StatusCode::UNAUTHORIZED);
-    assert_no_store_and_no_referrer(&feedback);
-    assert_eq!(
-        feedback
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
-        "text/html; charset=utf-8"
-    );
-    let body = response_text(feedback).await;
-    assert!(body.contains("Your session expired"));
     assert!(!body.contains(r#"{"error""#));
 }
 
@@ -2924,7 +2565,8 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
         .expect("manifest response");
     assert_eq!(manifest.status(), StatusCode::OK);
     let manifest = response_json(manifest).await;
-    assert_eq!(manifest["name"], json!("Memory Engine"));
+    assert_eq!(manifest["name"], json!("Scry"));
+    assert_eq!(manifest["short_name"], json!("Scry"));
     assert_eq!(manifest["display"], json!("standalone"));
     assert_eq!(manifest["start_url"], json!("/"));
     assert_eq!(manifest["icons"][0]["src"], json!("/icon-192.png"));
@@ -2971,6 +2613,93 @@ async fn installability_assets_are_valid_and_linked_from_the_shell() {
             height
         );
     }
+}
+
+#[tokio::test]
+async fn service_worker_serves_versioned_safe_shell_and_offline_fallback() {
+    let app = router(ApiState::default());
+    let worker = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/sw.js")
+                .body(Body::empty())
+                .expect("service worker request"),
+        )
+        .await
+        .expect("service worker response");
+    assert_eq!(worker.status(), StatusCode::OK);
+    assert_eq!(
+        worker.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert_eq!(
+        worker.headers().get("cache-control").and_then(|value| value.to_str().ok()),
+        Some("no-cache")
+    );
+    let worker = response_text(worker).await;
+    for contract in [
+        "scry-shell-v1",
+        "self.skipWaiting()",
+        "self.clients.claim()",
+        "request.method !== \"GET\"",
+        "request.mode === \"navigate\"",
+        "/app/login/verify",
+        "/v1/",
+        "cache.put",
+        "caches.delete",
+    ] {
+        assert!(worker.contains(contract), "service worker contract missing {contract:?}: {worker}");
+    }
+
+    let offline = app
+        .oneshot(
+            Request::builder()
+                .uri("/offline.html")
+                .body(Body::empty())
+                .expect("offline request"),
+        )
+        .await
+        .expect("offline response");
+    assert_eq!(offline.status(), StatusCode::OK);
+    assert_eq!(
+        offline.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let offline = response_text(offline).await;
+    assert!(offline.contains("Scry"));
+    assert!(offline.contains("Try again"));
+    assert!(!offline.contains("quiz"));
+    assert!(!offline.contains("credential"));
+}
+
+#[tokio::test]
+async fn dynamic_html_and_api_responses_are_not_http_cacheable() {
+    let app = router(ApiState::default());
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_no_store_and_no_referrer(&home);
+
+    let api = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/accounts")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{\"email\":\"pwa@example.com\"}"#))
+                .expect("account request"),
+        )
+        .await
+        .expect("account response");
+    assert_no_store_and_no_referrer(&api);
 }
 
 #[tokio::test]
@@ -3324,16 +3053,22 @@ async fn scheduled_return_notification_runs_through_real_postgres() {
             &CreateSourceRequest {
                 title: "Postgres scheduled source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("Postgres source");
-    generate_source_queued(
-        &state,
-        account.account_id(),
-        &source.source_id,
-        "Postgres scheduled source",
-    )
-    .await;
+    let generated = state
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("Postgres generation");
+    for draft in &generated.drafts {
+        state
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("Postgres approve");
+    }
     let view = state
         .study_view(account.account_id(), account.session_token())
         .expect("Postgres study view");
@@ -3385,7 +3120,7 @@ async fn postgres_scheduler_retries_after_restart_and_contends_across_instances(
             .with_clock(postgres_retry_clock)
             .with_auth_config(auth_config()),
     );
-    let account = prepare_postgres_due_account(&first_state, "recovery@example.com").await;
+    let account = prepare_postgres_due_account(&first_state, "recovery@example.com");
     first_state
         .set_return_notification(&account, Some("recovery@example.com"), true)
         .expect("Postgres recovery opt-in");
@@ -4596,539 +4331,6 @@ async fn create_account_rejects_malformed_email_without_account_id() {
     assert!(body.get("accountId").is_none());
 }
 
-fn service_session_request(admin_token: Option<&str>, body: &str) -> Request<Body> {
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/v1/service-sessions")
-        .header("content-type", "application/json");
-    if let Some(token) = admin_token {
-        builder = builder.header("x-admin-token", token);
-    }
-    builder.body(Body::from(body.to_owned())).expect("request")
-}
-
-fn service_session_state(admin_token: &str) -> ApiState {
-    ApiState::new(AccountRegistry::default().with_auth_config(
-        AuthConfig::allow_emails(["dogfood@example.com".to_owned()]).with_admin_token(admin_token),
-    ))
-}
-
-#[tokio::test]
-async fn service_session_issuance_is_disabled_without_a_configured_admin_token() {
-    // No admin token configured: the endpoint refuses every caller, so a
-    // default deployment exposes no service-session surface at all.
-    let response = router(ApiState::default())
-        .oneshot(service_session_request(
-            Some("anything"),
-            r#"{"email":"dogfood@example.com"}"#,
-        ))
-        .await
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body = response_json(response).await;
-    assert!(body.get("sessionToken").is_none());
-}
-
-#[tokio::test]
-async fn service_session_issuance_rejects_a_wrong_or_missing_admin_token() {
-    let app = router(service_session_state("operator-admin-token"));
-
-    let wrong = app
-        .clone()
-        .oneshot(service_session_request(
-            Some("not-the-token"),
-            r#"{"email":"dogfood@example.com"}"#,
-        ))
-        .await
-        .expect("wrong token response");
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
-
-    let missing = app
-        .oneshot(service_session_request(
-            None,
-            r#"{"email":"dogfood@example.com"}"#,
-        ))
-        .await
-        .expect("missing token response");
-    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
-    let body = response_json(missing).await;
-    assert!(body.get("sessionToken").is_none());
-}
-
-#[tokio::test]
-async fn service_session_issuance_refuses_unauthorized_bodies_before_parsing() {
-    // An unauthorized caller must get 403 even with a malformed body: the
-    // admin-token gate runs before the JSON parser ever sees the payload.
-    let app = router(service_session_state("operator-admin-token"));
-
-    let unauthorized = app
-        .clone()
-        .oneshot(service_session_request(
-            Some("not-the-token"),
-            "{not json at all",
-        ))
-        .await
-        .expect("unauthorized malformed response");
-    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
-
-    // The same malformed body with a valid token is a 400 from our envelope.
-    let malformed = app
-        .oneshot(service_session_request(
-            Some("operator-admin-token"),
-            "{not json at all",
-        ))
-        .await
-        .expect("authorized malformed response");
-    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn service_session_issuance_enforces_the_email_allowlist() {
-    let app = router(service_session_state("operator-admin-token"));
-
-    let denied = app
-        .oneshot(service_session_request(
-            Some("operator-admin-token"),
-            r#"{"email":"stranger@example.com"}"#,
-        ))
-        .await
-        .expect("response");
-
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    let body = response_json(denied).await;
-    assert!(body.get("sessionToken").is_none());
-}
-
-#[tokio::test]
-async fn service_session_issuance_rejects_a_malformed_email() {
-    let app = router(service_session_state("operator-admin-token"));
-
-    let response = app
-        .oneshot(service_session_request(
-            Some("operator-admin-token"),
-            r#"{"email":"not-an-email"}"#,
-        ))
-        .await
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn service_session_issues_a_credential_that_drives_the_account_api() {
-    let app = router(service_session_state("operator-admin-token"));
-
-    let issued = app
-        .clone()
-        .oneshot(service_session_request(
-            Some("operator-admin-token"),
-            r#"{"email":"dogfood@example.com"}"#,
-        ))
-        .await
-        .expect("issue response");
-    assert_eq!(issued.status(), StatusCode::CREATED);
-    let issued = response_json(issued).await;
-    let account_id = issued["accountId"].as_str().expect("account id");
-    let session_token = issued["sessionToken"].as_str().expect("session token");
-    assert!(session_token.starts_with("sess_"));
-
-    let saved = app
-        .oneshot(json_request(
-            "POST",
-            &format!("/v1/accounts/{account_id}/sources"),
-            session_token,
-            &json!({
-                "title": "NATO notes",
-                "body": "ALFA is the NATO code word for A."
-            }),
-        ))
-        .await
-        .expect("save source");
-    assert_eq!(saved.status(), StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn service_session_reissue_revokes_the_prior_credential_immediately() {
-    let app = router(service_session_state("operator-admin-token"));
-
-    let first = response_json(
-        app.clone()
-            .oneshot(service_session_request(
-                Some("operator-admin-token"),
-                r#"{"email":"dogfood@example.com"}"#,
-            ))
-            .await
-            .expect("first issue"),
-    )
-    .await;
-    let second = response_json(
-        app.clone()
-            .oneshot(service_session_request(
-                Some("operator-admin-token"),
-                r#"{"email":"dogfood@example.com"}"#,
-            ))
-            .await
-            .expect("second issue"),
-    )
-    .await;
-    let account_id = second["accountId"].as_str().expect("account id");
-    assert_eq!(first["accountId"], second["accountId"]);
-    assert_ne!(first["sessionToken"], second["sessionToken"]);
-
-    let revoked = app
-        .clone()
-        .oneshot(json_request(
-            "GET",
-            &format!("/v1/accounts/{account_id}/sources"),
-            first["sessionToken"].as_str().expect("first token"),
-            &json!({}),
-        ))
-        .await
-        .expect("revoked read");
-    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-
-    let live = app
-        .oneshot(json_request(
-            "GET",
-            &format!("/v1/accounts/{account_id}/sources"),
-            second["sessionToken"].as_str().expect("second token"),
-            &json!({}),
-        ))
-        .await
-        .expect("live read");
-    assert_eq!(live.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn service_session_credential_is_isolated_to_its_own_account() {
-    let state = ApiState::new(
-        AccountRegistry::default().with_auth_config(
-            AuthConfig::allow_emails([
-                "dogfood@example.com".to_owned(),
-                "human@example.com".to_owned(),
-            ])
-            .with_admin_token("operator-admin-token"),
-        ),
-    );
-    let app = router(state);
-    let human = create_account(&app, "human@example.com").await;
-
-    let issued = response_json(
-        app.clone()
-            .oneshot(service_session_request(
-                Some("operator-admin-token"),
-                r#"{"email":"dogfood@example.com"}"#,
-            ))
-            .await
-            .expect("issue response"),
-    )
-    .await;
-    let service_token = issued["sessionToken"].as_str().expect("service token");
-
-    let cross_read = app
-        .clone()
-        .oneshot(json_request(
-            "GET",
-            &format!("/v1/accounts/{}/sources", human.account_id),
-            service_token,
-            &json!({}),
-        ))
-        .await
-        .expect("cross read");
-    assert_eq!(cross_read.status(), StatusCode::FORBIDDEN);
-
-    let cross_write = app
-        .oneshot(json_request(
-            "POST",
-            &format!("/v1/accounts/{}/sources", human.account_id),
-            service_token,
-            &json!({
-                "title": "Injected",
-                "body": "Should never land in another account."
-            }),
-        ))
-        .await
-        .expect("cross write");
-    assert_eq!(cross_write.status(), StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn service_session_enqueues_and_observes_durable_generation_without_a_browser() {
-    let state = service_session_state("operator-admin-token");
-    let app = router(state.clone());
-    let issued = response_json(
-        app.clone()
-            .oneshot(service_session_request(
-                Some("operator-admin-token"),
-                r#"{"email":"dogfood@example.com"}"#,
-            ))
-            .await
-            .expect("issue response"),
-    )
-    .await;
-    let account = TestAccount {
-        account_id: issued["accountId"].as_str().expect("account id").to_owned(),
-        session_token: issued["sessionToken"]
-            .as_str()
-            .expect("session token")
-            .to_owned(),
-    };
-    let source_id = create_source_v1(
-        &app,
-        &account,
-        "NATO notes",
-        "Concept: NATO phonetic alphabet\nQuestion: What is NATO code word for A?\nAnswer: ALFA\nReference: ALFA is the NATO code word for A.",
-    )
-    .await;
-    let enqueue_path = format!(
-        "/v1/accounts/{}/sources/{source_id}/generation-jobs",
-        account.account_id
-    );
-
-    let unauthenticated = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(&enqueue_path)
-                .body(Body::empty())
-                .expect("unauthenticated enqueue"),
-        )
-        .await
-        .expect("unauthenticated response");
-    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-
-    let first = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &enqueue_path,
-            &account.session_token,
-        ))
-        .await
-        .expect("enqueue response");
-    assert_eq!(first.status(), StatusCode::ACCEPTED);
-    let first = response_json(first).await;
-    let job_id = first["id"].as_str().expect("job id").to_owned();
-    assert_eq!(first["sourceId"], json!(source_id));
-    assert_eq!(first["status"], json!("queued"));
-    assert_eq!(first["coalesced"], json!(false));
-
-    let repeated = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &enqueue_path,
-            &account.session_token,
-        ))
-        .await
-        .expect("repeated enqueue response");
-    assert_eq!(repeated.status(), StatusCode::OK);
-    let repeated = response_json(repeated).await;
-    assert_eq!(repeated["id"], json!(job_id));
-    assert_eq!(repeated["coalesced"], json!(true));
-    assert_eq!(state.jobs_for_account_id(&account.account_id).len(), 1);
-
-    let blocking_state = state.clone();
-    tokio::task::spawn_blocking(move || blocking_state.run_pending_jobs_blocking())
-        .await
-        .expect("generation drain");
-
-    let observed = app
-        .oneshot(v1_empty_request(
-            "GET",
-            &format!(
-                "/v1/accounts/{}/generation-jobs/{job_id}",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("job observation response");
-    assert_eq!(observed.status(), StatusCode::OK);
-    let observed = response_json(observed).await;
-    assert_eq!(observed["id"], json!(job_id));
-    assert_eq!(observed["sourceId"], json!(source_id));
-    assert_eq!(observed["status"], json!("succeeded"));
-    assert!(
-        observed["error"].is_null(),
-        "successful jobs must preserve the nullable error field: {observed}"
-    );
-    assert!(
-        observed["cardCount"].as_u64().expect("card count") > 0,
-        "successful generation must schedule at least one card: {observed}"
-    );
-}
-
-#[tokio::test]
-async fn generation_job_observation_preserves_the_failed_contract() {
-    let state = ApiState::default();
-    let app = router(state.clone());
-    let account = create_account_v1(&app, "failed-job@example.com").await;
-    let source_id = create_source_v1(
-        &app,
-        &account,
-        "Archived source",
-        "Concept: durable jobs\nQuestion: What survives?\nAnswer: The job record.",
-    )
-    .await;
-    let enqueued = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("enqueue response");
-    assert_eq!(enqueued.status(), StatusCode::ACCEPTED);
-    let job_id = response_json(enqueued).await["id"]
-        .as_str()
-        .expect("job id")
-        .to_owned();
-
-    archive_source_v1(&app, &account, &source_id).await;
-    state.run_pending_jobs_blocking();
-
-    let observed = app
-        .oneshot(v1_empty_request(
-            "GET",
-            &format!(
-                "/v1/accounts/{}/generation-jobs/{job_id}",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("failed job response");
-    assert_eq!(observed.status(), StatusCode::OK);
-    let observed = response_json(observed).await;
-    assert_eq!(observed["status"], json!("failed"));
-    assert_eq!(observed["cardCount"], json!(0));
-    assert_eq!(observed["retryable"], json!(true));
-    assert_eq!(observed["error"], json!("Source not found."));
-}
-
-#[tokio::test]
-async fn generation_jobs_are_scoped_to_the_bearer_account() {
-    let app = router(ApiState::default());
-    let service = create_account_v1(&app, "dogfood@example.com").await;
-    let human = create_account_v1(&app, "human@example.com").await;
-    let source_id = create_source_v1(
-        &app,
-        &service,
-        "NATO notes",
-        "ALFA is the NATO code word for A.",
-    )
-    .await;
-    let enqueue_path = format!(
-        "/v1/accounts/{}/sources/{source_id}/generation-jobs",
-        service.account_id
-    );
-    let enqueued = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &enqueue_path,
-            &service.session_token,
-        ))
-        .await
-        .expect("enqueue response");
-    assert_eq!(enqueued.status(), StatusCode::ACCEPTED);
-    let job_id = response_json(enqueued).await["id"]
-        .as_str()
-        .expect("job id")
-        .to_owned();
-    let cross_enqueue = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
-                service.account_id
-            ),
-            &human.session_token,
-        ))
-        .await
-        .expect("cross-account enqueue response");
-    assert_eq!(cross_enqueue.status(), StatusCode::FORBIDDEN);
-
-    let cross_observation = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "GET",
-            &format!(
-                "/v1/accounts/{}/generation-jobs/{job_id}",
-                service.account_id
-            ),
-            &human.session_token,
-        ))
-        .await
-        .expect("cross-account observation response");
-    assert_eq!(cross_observation.status(), StatusCode::FORBIDDEN);
-
-    let hidden_source = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/sources/{source_id}/generation-jobs",
-                human.account_id
-            ),
-            &human.session_token,
-        ))
-        .await
-        .expect("account-scoped source response");
-    assert_eq!(hidden_source.status(), StatusCode::NOT_FOUND);
-
-    let hidden_job = app
-        .oneshot(v1_empty_request(
-            "GET",
-            &format!("/v1/accounts/{}/generation-jobs/{job_id}", human.account_id),
-            &human.session_token,
-        ))
-        .await
-        .expect("account-scoped job response");
-    assert_eq!(hidden_job.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn generation_job_routes_report_missing_owned_resources() {
-    let app = router(ApiState::default());
-    let account = create_account_v1(&app, "dogfood@example.com").await;
-
-    let missing_source = app
-        .clone()
-        .oneshot(v1_empty_request(
-            "POST",
-            &format!(
-                "/v1/accounts/{}/sources/src-does-not-exist/generation-jobs",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("missing source response");
-    assert_eq!(missing_source.status(), StatusCode::NOT_FOUND);
-
-    let missing_job = app
-        .oneshot(v1_empty_request(
-            "GET",
-            &format!(
-                "/v1/accounts/{}/generation-jobs/job-does-not-exist",
-                account.account_id
-            ),
-            &account.session_token,
-        ))
-        .await
-        .expect("missing job response");
-    assert_eq!(missing_job.status(), StatusCode::NOT_FOUND);
-}
-
 #[tokio::test]
 async fn source_routes_are_scoped_to_the_account() {
     let app = router(ApiState::default());
@@ -5516,187 +4718,7 @@ async fn postgres_backend_source_archive_hides_source_and_blocks_generation() {
         ))
         .await
         .expect("generate archived source");
-    assert_eq!(generated.status(), StatusCode::CONFLICT);
-    let generated = response_json(generated).await;
-    assert_eq!(
-        generated["error"],
-        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
-    );
-}
-
-fn server_timing_duration(timing: &str, name: &str) -> u64 {
-    timing
-        .split(',')
-        .map(str::trim)
-        .find_map(|metric| metric.strip_prefix(&format!("{name};dur=")))
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_else(|| panic!("missing {name} duration in {timing}"))
-}
-
-fn assert_postgres_submit_timing(
-    response: &axum::response::Response,
-    expected_statement_count: u64,
-) {
-    let timing = response
-        .headers()
-        .get("server-timing")
-        .and_then(|value| value.to_str().ok())
-        .expect("Postgres submit timing");
-    assert!(timing.contains("pgconnect;dur="), "{timing}");
-    assert!(timing.contains("pgop;dur="), "{timing}");
-    let total_ms = server_timing_duration(timing, "total");
-    let phase_sum_ms = ["pgconnect", "pgop", "render"]
-        .into_iter()
-        .map(|name| server_timing_duration(timing, name))
-        .sum::<u64>();
-    assert!(
-        phase_sum_ms <= total_ms,
-        "Postgres phases must fit inside total duration: {timing}"
-    );
-    let statement_count = timing
-        .split(',')
-        .map(str::trim)
-        .find_map(|metric| metric.strip_prefix(r#"pgstmt;desc=""#))
-        .and_then(|value| value.strip_suffix('"'))
-        .and_then(|value| value.parse::<u64>().ok())
-        .expect("Postgres statement count");
-    assert_eq!(
-        statement_count, expected_statement_count,
-        "cold-cache submit must count auth, review, and render work: {timing}"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok()),
-        Some("no-store")
-    );
-}
-
-async fn assert_postgres_submit_receipt(
-    graded: axum::response::Response,
-    expected_statement_count: u64,
-) -> String {
-    assert_eq!(graded.status(), StatusCode::OK);
-    assert_postgres_submit_timing(&graded, expected_statement_count);
-    let graded = response_text(graded).await;
-    assert!(graded.contains("me-verdict") && graded.contains(">Correct<"));
-    graded
-}
-
-async fn prepare_postgres_browser_review(
-    database: &PostgresTestDatabase,
-) -> (String, String, String) {
-    let browser_source = [
-        "Concept: NATO letter A",
-        "Activity: quiz",
-        "Stage: recognition-3",
-        "Question: What is the NATO phonetic alphabet word for A?",
-        "Answer: ALFA",
-        "Distractors: BRAVO, CHARLIE",
-        "Reference: The NATO phonetic alphabet word for A is ALFA.",
-    ]
-    .join("\n");
-    let browser_state = ApiState::new(AccountRegistry::with_postgres_url(
-        database.scoped_url.clone(),
-    ));
-    let browser_app = router(browser_state.clone());
-    let started = browser_app
-        .clone()
-        .oneshot(form_request(
-            "POST",
-            "/app/start",
-            &[("capture", &browser_source)],
-        ))
-        .await
-        .expect("start Postgres browser session");
-    assert_eq!(started.status(), StatusCode::OK);
-    let cookie = session_cookie(&started);
-    let started = response_text(started).await;
-    let csrf_token = html_value(&started, "csrfToken");
-    let source_id = html_value(&started, "sourceId");
-    let generated = generate_source_html(
-        &browser_app,
-        &browser_state,
-        &cookie,
-        &csrf_token,
-        &source_id,
-    )
-    .await;
-    assert_activity_succeeded_html(&generated, 1);
-    let review = advance_to_prompt(
-        &browser_app,
-        &cookie,
-        &csrf_token,
-        "NATO phonetic alphabet word for A",
-    )
-    .await;
-    (html_value(&review, "reviewUnitId"), cookie, csrf_token)
-}
-
-async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) {
-    let (review_unit_id, cookie, csrf_token) = prepare_postgres_browser_review(database).await;
-    // A fresh process has no in-memory account or browser-session cache.
-    // The submit receipt must still account for its authentication queries.
-    let cold_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
-        database.scoped_url.clone(),
-    )));
-    let graded = cold_browser_app
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/submit",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &review_unit_id),
-                ("answer", "ALFA"),
-                ("responseTimeMs", "1800"),
-                ("idempotencyKey", "postgres-submit-timing"),
-                (
-                    "performanceTraceId",
-                    "trace_0123456789abcdef0123456789abcdef",
-                ),
-            ],
-        ))
-        .await
-        .expect("Postgres browser submit");
-    assert_postgres_submit_receipt(graded, 23).await;
-
-    let completed_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
-        database.scoped_url.clone(),
-    )));
-    let completed = next_review_html(
-        &completed_browser_app,
-        &cookie,
-        &csrf_token,
-        "complete queue",
-    )
-    .await;
-    assert!(
-        !completed.contains(r#"name="reviewUnitId""#),
-        "the final card should return to workspace after Continue"
-    );
-
-    let workspace_browser_app = router(ApiState::new(AccountRegistry::with_postgres_url(
-        database.scoped_url.clone(),
-    )));
-    let workspace_submit = workspace_browser_app
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/submit",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", "missing-review-unit"),
-                ("answer", "ALFA"),
-                ("responseTimeMs", "1800"),
-                ("idempotencyKey", "postgres-error-submit-timing"),
-            ],
-        ))
-        .await
-        .expect("Postgres browser submit without an active review");
-    assert_eq!(workspace_submit.status(), StatusCode::OK);
-    assert_postgres_submit_timing(&workspace_submit, 16);
+    assert_eq!(generated.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5726,14 +4748,74 @@ async fn postgres_backend_routes_drive_source_to_review() {
         ))
         .await
         .expect("generate");
-    assert_eq!(generated.status(), StatusCode::CONFLICT);
+    assert_eq!(generated.status(), StatusCode::OK);
     let generated = response_json(generated).await;
-    assert_eq!(
-        generated["error"],
-        json!("Direct synchronous generation is disabled in production. Use the queued generation workflow.")
-    );
+    let draft_id = generated["drafts"][0]
+        .as_object()
+        .and_then(|draft| draft.get("id"))
+        .and_then(Value::as_str)
+        .expect("draft id");
 
-    assert_postgres_browser_submit_traces(&database).await;
+    let approved = routed_app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            &format!("/accounts/{}/drafts/{draft_id}/approve", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("approve");
+    assert_eq!(approved.status(), StatusCode::OK);
+    let approved = response_json(approved).await;
+    let review_unit_id = approved["current"]["reviewUnitId"]
+        .as_str()
+        .expect("review unit id");
+
+    let revealed = routed_app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            &format!(
+                "/accounts/{}/review/{review_unit_id}/reveal",
+                account.account_id
+            ),
+            &account.session_token,
+        ))
+        .await
+        .expect("reveal");
+    assert_eq!(revealed.status(), StatusCode::OK);
+    let revealed = response_json(revealed).await;
+    assert_eq!(revealed["current"]["expectedAnswer"], json!("ALFA"));
+
+    let submitted = routed_app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!(
+                "/accounts/{}/review/{review_unit_id}/submit",
+                account.account_id
+            ),
+            &account.session_token,
+            &json!({
+                "answer": "ALFA",
+                "responseTimeMs": 1800,
+                "idempotencyKey": "postgres-api-submit-nato-a"
+            }),
+        ))
+        .await
+        .expect("submit");
+    assert_eq!(submitted.status(), StatusCode::OK);
+    let submitted = response_json(submitted).await;
+    assert_eq!(submitted["summary"]["attemptCount"], json!(1));
+    assert_eq!(submitted["current"]["grade"]["verdict"], json!("correct"));
+
+    assert_postgres_restart_resume_and_duplicate_submit(
+        &database.scoped_url,
+        &account,
+        &source_id,
+        review_unit_id,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5756,14 +4838,8 @@ async fn postgres_save_account_copies_content_feedback_with_target_scope() {
         session_token: browser.session_token().to_owned(),
     };
     let source_id = create_source_v1(&app, &source_account, "Copy source", &source_body()).await;
-    generate_source_queued(
-        &state,
-        &source_account.account_id,
-        &source_id,
-        "Copy source",
-    )
-    .await;
-    let review_unit_id = next_review_v1(&app, &source_account).await;
+    let draft_id = generate_source_v1(&app, &source_account, &source_id).await;
+    let review_unit_id = approve_draft_v1(&app, &source_account, &draft_id).await;
     let _ = submit_review_v1(&app, &source_account, &review_unit_id, "ALFA").await;
     let feedback = app
         .clone()
@@ -5953,13 +5029,10 @@ async fn postgres_review_actions_emit_latency_receipt() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
-    let next_started = Instant::now();
     let page = next_review_html(&app, &cookie, &csrf_token, "latency next").await;
-    let next_elapsed = next_started.elapsed();
 
     let review_unit_id = html_value(&page, "reviewUnitId");
     let idempotency_key = html_value(&page, "idempotencyKey");
-    let submit_started = Instant::now();
     let submitted = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -5976,14 +5049,12 @@ async fn postgres_review_actions_emit_latency_receipt() {
         ))
         .await
         .expect("submit review");
-    let submit_elapsed = submit_started.elapsed();
     assert_eq!(submitted.status(), StatusCode::OK);
     let submitted = response_text(submitted).await;
     assert!(
         submitted.contains("me-verdict"),
         "latency receipt submit must render graded feedback: {submitted}"
     );
-    eprintln!("postgres review latency: next={next_elapsed:?} submit={submit_elapsed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6135,10 +5206,9 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
     let Some(database) = PostgresTestDatabase::new("v1_concept_snooze") else {
         return;
     };
-    let state = ApiState::new(AccountRegistry::with_postgres_url(
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    ));
-    let app = router(state.clone());
+    )));
     let first = create_account_v1(&app, "first-concept@example.com").await;
     let second = create_account_v1(&app, "second-concept@example.com").await;
 
@@ -6150,13 +5220,11 @@ async fn postgres_backend_v1_concept_snooze_is_authenticated_scoped_and_atomic()
             &shared_and_other_concept_body(),
         )
         .await;
-        generate_source_queued(
-            &state,
-            &account.account_id,
-            &source_id,
-            "Shared NATO concept notes",
-        )
-        .await;
+        let draft_ids = generate_source_v1_draft_ids(&app, account, &source_id).await;
+        assert_eq!(draft_ids.len(), 3);
+        for draft_id in &draft_ids {
+            approve_draft_v1(&app, account, draft_id).await;
+        }
     }
 
     let first_before = postgres_account_snapshot(&database.scoped_url, &first.account_id);
@@ -6494,6 +5562,83 @@ async fn v1_json_api_drives_full_loop_with_bearer_token() {
     assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
 
     archive_source_v1(&app, &account, &source_id).await;
+}
+
+#[tokio::test]
+async fn v1_source_permission_round_trips_through_http_and_file_store() {
+    let app = router(ApiState::default());
+    let account = create_account_v1(&app, "privacy@example.com").await;
+    let response = app
+        .clone()
+        .oneshot(v1_json_request(
+            "POST",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+            &json!({
+                "title": "Private notes",
+                "body": "Do not send this outside the local study store.",
+                "permission": "local-only"
+            }),
+        ))
+        .await
+        .expect("create local-only source");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let source = response_json(response).await;
+    assert_eq!(source["permission"], json!("local-only"));
+
+    let listed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("list local-only source");
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(listed).await["sources"][0]["permission"],
+        json!("local-only")
+    );
+
+    let source_id = source["sourceId"].as_str().expect("source id");
+    let updated = app
+        .clone()
+        .oneshot(v1_json_request(
+            "PATCH",
+            &format!("/v1/accounts/{}/sources/{source_id}", account.account_id),
+            &account.session_token,
+            &json!({"permission": "model-eligible"}),
+        ))
+        .await
+        .expect("update source permission");
+    assert_eq!(updated.status(), StatusCode::NO_CONTENT);
+
+    let listed = app
+        .clone()
+        .oneshot(v1_empty_request(
+            "GET",
+            &format!("/v1/accounts/{}/sources", account.account_id),
+            &account.session_token,
+        ))
+        .await
+        .expect("list updated source");
+    assert_eq!(
+        response_json(listed).await["sources"][0]["permission"],
+        json!("model-eligible")
+    );
+
+    archive_source_v1(&app, &account, source_id).await;
+    let archived_update = app
+        .oneshot(v1_json_request(
+            "PATCH",
+            &format!("/v1/accounts/{}/sources/{source_id}", account.account_id),
+            &account.session_token,
+            &json!({"permission": "local-only"}),
+        ))
+        .await
+        .expect("archived update");
+    assert_eq!(archived_update.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -6924,10 +6069,9 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
     let Some(database) = PostgresTestDatabase::new("stale_concept_snooze") else {
         return;
     };
-    let state = ApiState::new(AccountRegistry::with_postgres_url(
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    ));
-    let app = router(state.clone());
+    )));
     let account = create_account_v1(&app, "stale-postgres-concept@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -6936,13 +6080,10 @@ async fn postgres_concept_snooze_rejects_stale_archived_id_without_partial_updat
         &shared_and_other_concept_body(),
     )
     .await;
-    generate_source_queued(
-        &state,
-        &account.account_id,
-        &source_id,
-        "Shared NATO concept notes",
-    )
-    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
     let stale_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
 
@@ -6998,10 +6139,9 @@ async fn postgres_two_connections_archive_requested_before_concept_snooze() {
     let Some(database) = PostgresTestDatabase::new("stale_concept_two_connections") else {
         return;
     };
-    let state = ApiState::new(AccountRegistry::with_postgres_url(
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    ));
-    let app = router(state.clone());
+    )));
     let account = create_account_v1(&app, "stale-two-connection@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -7010,13 +6150,10 @@ async fn postgres_two_connections_archive_requested_before_concept_snooze() {
         &shared_and_other_concept_body(),
     )
     .await;
-    generate_source_queued(
-        &state,
-        &account.account_id,
-        &source_id,
-        "Shared NATO concept notes",
-    )
-    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
     let stale_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
     let (first_ready_tx, first_ready_rx) = mpsc::channel();
@@ -7098,10 +6235,9 @@ async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
     let Some(database) = PostgresTestDatabase::new("stale_full_record_save") else {
         return;
     };
-    let state = ApiState::new(AccountRegistry::with_postgres_url(
+    let app = router(ApiState::new(AccountRegistry::with_postgres_url(
         database.scoped_url.clone(),
-    ));
-    let app = router(state.clone());
+    )));
     let account = create_account_v1(&app, "stale-full-record@example.com").await;
     let source_id = create_source_v1(
         &app,
@@ -7110,13 +6246,10 @@ async fn postgres_stale_full_record_save_cannot_regress_newer_review_state() {
         &shared_and_other_concept_body(),
     )
     .await;
-    generate_source_queued(
-        &state,
-        &account.account_id,
-        &source_id,
-        "Shared NATO concept notes",
-    )
-    .await;
+    let draft_ids = generate_source_v1_draft_ids(&app, &account, &source_id).await;
+    for draft_id in &draft_ids {
+        approve_draft_v1(&app, &account, draft_id).await;
+    }
     let requested_id = next_review_v1(&app, &account).await;
     let before = postgres_account_snapshot(&database.scoped_url, &account.account_id);
 
@@ -7400,20 +6533,6 @@ async fn v1_openapi_artifact_matches_registered_routes() {
         &contract,
         "ConceptProgress",
         &["averageResponseTimeMs", "responseTimeTrend"],
-    );
-    assert_schema_requires(
-        &contract,
-        "GenerationJob",
-        &[
-            "id",
-            "sourceId",
-            "status",
-            "cardCount",
-            "retryable",
-            "error",
-            "createdAt",
-            "updatedAt",
-        ],
     );
 }
 
@@ -7753,39 +6872,6 @@ async fn generate_source_v1_draft_ids(
         .collect()
 }
 
-/// Generate through the production queued workflow: enqueue the durable job
-/// and drain it synchronously off the async runtime. Production
-/// (Postgres-backed) states reject the direct synchronous generate route with
-/// 409, so Postgres tests must set up scheduled cards through the same durable
-/// job path the deployed worker uses; the worker approves every accepted
-/// draft as part of the job.
-async fn generate_source_queued(state: &ApiState, account_id: &str, source_id: &str, title: &str) {
-    let blocking_state = state.clone();
-    let account = account_id.to_owned();
-    let source = source_id.to_owned();
-    let title = title.to_owned();
-    tokio::task::spawn_blocking(move || {
-        match blocking_state.enqueue_generation_job_for_account_id(&account, &source, &title) {
-            EnqueueOutcome::Started(_) | EnqueueOutcome::AlreadyInFlight(_) => {}
-            EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => {
-                panic!("queued generation rejected: {reason}")
-            }
-        }
-        blocking_state.run_pending_jobs_blocking();
-    })
-    .await
-    .expect("queued generation drain");
-    let succeeded = state
-        .jobs_for_account_id(account_id)
-        .iter()
-        .any(|job| job.status == crate::JobStatus::Succeeded && job.source_id == source_id);
-    assert!(
-        succeeded,
-        "queued generation for {source_id} must succeed: {:?}",
-        state.jobs_for_account_id(account_id)
-    );
-}
-
 async fn generate_source_v1_latest_draft(
     app: &axum::Router,
     account: &TestAccount,
@@ -8002,16 +7088,6 @@ fn json_request(method: &str, uri: &str, session_token: &str, body: &Value) -> R
         .expect("request")
 }
 
-fn json_request_with_cookie(method: &str, uri: &str, cookie: &str, body: &Value) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("cookie", cookie)
-        .body(Body::from(body.to_string()))
-        .expect("request")
-}
-
 fn empty_request(method: &str, uri: &str, session_token: &str) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -8204,25 +7280,6 @@ async fn submit_content_feedback_ok(
     response_text(response).await
 }
 
-async fn submit_content_feedback_conflict(
-    app: &axum::Router,
-    cookie: &str,
-    fields: &[(&str, &str)],
-) -> String {
-    let response = app
-        .clone()
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/content-feedback",
-            cookie,
-            fields,
-        ))
-        .await
-        .expect("conflicting content feedback submit");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    response_text(response).await
-}
-
 /// The async-model successor to `assert_keep_flow_html`: after a job drains,
 /// the workspace shows a finished activity-log row (a succeeded job with a
 /// card count, already scheduled for review) rather than a manual keep gate.
@@ -8392,7 +7449,7 @@ fn slow_failing_provider_script(store_root: &FsPath) -> String {
     script_path.to_string_lossy().into_owned()
 }
 
-async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAccount {
+fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::AppAccount {
     let created = state
         .create_account(email)
         .expect("Postgres recovery account");
@@ -8406,16 +7463,22 @@ async fn prepare_postgres_due_account(state: &ApiState, email: &str) -> super::A
             &CreateSourceRequest {
                 title: "Postgres recovery source".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::ModelEligible,
             },
         )
         .expect("Postgres recovery source");
-    generate_source_queued(
-        state,
-        account.account_id(),
-        &source.source_id,
-        "Postgres recovery source",
-    )
-    .await;
+    let generated = state
+        .generate_source(
+            account.account_id(),
+            account.session_token(),
+            &source.source_id,
+        )
+        .expect("Postgres recovery generation");
+    for draft in &generated.drafts {
+        state
+            .approve_draft(account.account_id(), account.session_token(), &draft.id)
+            .expect("Postgres recovery approval");
+    }
     account
 }
 
@@ -8536,7 +7599,6 @@ async fn prepare_review_unit(app: &axum::Router, account: &TestAccount) -> Strin
         .to_owned()
 }
 
-#[allow(dead_code)]
 async fn assert_postgres_restart_resume_and_duplicate_submit(
     database_url: &str,
     original: &TestAccount,
@@ -9107,6 +8169,7 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
             &super::CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");

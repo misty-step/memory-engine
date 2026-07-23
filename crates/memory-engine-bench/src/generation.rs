@@ -20,6 +20,7 @@ use memory_engine_generation::{
     references_source_artifact, run_beta_generation_with_provider, BetaGenerationRequest,
     BetaGenerationStore, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
     DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
+    SourceAuthorizationContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
@@ -1326,20 +1327,21 @@ fn bridge_quality_fixture<P>(provider: &P) -> Result<BridgeQualityScore, String>
 where
     P: BridgeMaterialProvider + ?Sized,
 {
-    let request = BridgeMaterialRequest {
-        concept_key: "nato-cat-composition".to_owned(),
-        concept_label: "nato cat composition".to_owned(),
-        parent_review_unit_id: ReviewUnitId::new("parent-nato-cat"),
-        parent_prompt: "Spell CAT over the phone using the NATO phonetic alphabet.".to_owned(),
-        parent_expected_answer: "CHARLIE ALFA TANGO".to_owned(),
-        parent_stage_order: 4,
-        cached_reference_note: None,
-        recent_performance: vec![ReviewPerformanceContext {
+    let request = BridgeMaterialRequest::new(
+        "nato-cat-composition",
+        "nato cat composition",
+        ReviewUnitId::new("parent-nato-cat"),
+        "Spell CAT over the phone using the NATO phonetic alphabet.",
+        "CHARLIE ALFA TANGO",
+        4,
+        None,
+        vec![ReviewPerformanceContext {
             review_unit_id: "parent-nato-cat".to_owned(),
             submitted_answer: "CHARLIE TANGO".to_owned(),
             verdict: Some("wrong".to_owned()),
         }],
-    };
+        SourceAuthorizationContext::none(),
+    );
     let material = provider
         .generate_bridge_material(&request)
         .map_err(|failure| failure.to_string())?;
@@ -2100,13 +2102,14 @@ mod tests {
         ) -> Result<BridgeMaterial, ProviderFailure> {
             Ok(BridgeMaterial {
                 model: self.model(),
-                reference_note: self.explain_concept(&ReferenceNoteRequest {
-                    concept_key: request.concept_key.clone(),
-                    concept_label: request.concept_label.clone(),
-                    prompt: request.parent_prompt.clone(),
-                    expected_answer: request.parent_expected_answer.clone(),
-                    recent_performance: request.recent_performance.clone(),
-                })?,
+                reference_note: self.explain_concept(&ReferenceNoteRequest::new(
+                    request.concept_key.clone(),
+                    request.concept_label.clone(),
+                    request.parent_prompt.clone(),
+                    request.parent_expected_answer.clone(),
+                    request.recent_performance.clone(),
+                    request.authorization().clone(),
+                ))?,
                 candidates: vec![DraftCandidate {
                     index: 1,
                     concept: request.concept_label.clone(),

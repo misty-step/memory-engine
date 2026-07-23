@@ -1,10 +1,10 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
-use std::{env, net::SocketAddr, process, time::Duration};
+use std::{env, net::SocketAddr, process};
 
 use memory_engine_api::{
-    init_error_reporting, router, shutdown_error_reporting, start_health_reporting_loop,
-    AccountRegistry, ApiState, AuthConfig,
+    init_error_reporting, router, start_health_reporting_loop, AccountRegistry, ApiState,
+    AuthConfig, OpenRouterConfig,
 };
 
 #[tokio::main]
@@ -41,7 +41,9 @@ async fn main() {
     };
     let state = if let Ok(database_url) = env::var("MEMORY_ENGINE_POSTGRES_URL") {
         ApiState::new(
-            AccountRegistry::with_postgres_url(database_url).with_auth_config(auth_config),
+            AccountRegistry::with_postgres_url(database_url)
+                .with_auth_config(auth_config)
+                .with_generation_provider_config(OpenRouterConfig::from_env().ok()),
         )
     } else if env::var("MEMORY_ENGINE_ENABLE_FILE_STORE").as_deref() == Ok("true") {
         let Ok(store_dir) = env::var("MEMORY_ENGINE_API_STORE_DIR") else {
@@ -50,7 +52,11 @@ async fn main() {
             );
             process::exit(1);
         };
-        ApiState::new(AccountRegistry::with_store_root(store_dir).with_auth_config(auth_config))
+        ApiState::new(
+            AccountRegistry::with_store_root(store_dir)
+                .with_auth_config(auth_config)
+                .with_generation_provider_config(OpenRouterConfig::from_env().ok()),
+        )
     } else {
         eprintln!("MEMORY_ENGINE_POSTGRES_URL is required for memory-engine-api");
         process::exit(1);
@@ -68,9 +74,6 @@ async fn main() {
         eprintln!("{error}");
     }
     scheduler.shutdown().await;
-    if !shutdown_error_reporting(Duration::from_secs(6)) {
-        eprintln!("Canary reporter did not drain before shutdown deadline");
-    }
     if serve_result.is_err() {
         process::exit(1);
     }
@@ -108,12 +111,6 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
         let token = token.trim();
         if !token.is_empty() {
             auth_config = auth_config.with_scheduler_manual_token(token.to_owned());
-        }
-    }
-    if let Ok(token) = env::var("MEMORY_ENGINE_ADMIN_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            auth_config = auth_config.with_admin_token(token.to_owned());
         }
     }
     // Local/dev only: surface the magic link on the "check your email" page so

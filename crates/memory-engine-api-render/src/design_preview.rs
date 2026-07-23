@@ -18,7 +18,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use memory_engine_core::{Rating, ReviewUnitId, Verdict};
-use memory_engine_persistence::GeneratedLearningActivityKind;
+use memory_engine_persistence::{GeneratedLearningActivityKind, SourcePermission};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyFeedback,
     BetaStudyGrade, BetaStudyItemHistory, BetaStudySummary,
@@ -44,6 +44,7 @@ fn source(id: &str, title: &str) -> SourceRecord {
         source_id: id.to_owned(),
         title: title.to_owned(),
         body: String::new(),
+        permission: SourcePermission::default(),
         project_key: None,
         ttl_expires_at: None,
     }
@@ -119,12 +120,9 @@ fn job(
         status,
         card_count,
         attempts: 1,
-        retryable: true,
         error: error.map(str::to_owned),
         created_at,
         updated_at: created_at,
-        retry_at: None,
-        lease_expires_at: None,
     }
 }
 

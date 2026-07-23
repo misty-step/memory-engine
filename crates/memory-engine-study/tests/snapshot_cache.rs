@@ -8,7 +8,7 @@ use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord,
     BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft, GenerationRun, ReferenceSpan,
-    SourceDocument,
+    SourceDocument, SourcePermission,
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
@@ -114,6 +114,15 @@ impl memory_engine_study::BetaStudyStore for SnapshotCountingStore {
     ) -> Result<SourceDocument, StoreError> {
         self.inner
             .archive_source_document(source_document_id, archived_at)
+    }
+
+    fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: memory_engine_study::SourcePermission,
+    ) -> Result<SourceDocument, StoreError> {
+        self.inner
+            .update_source_document_permission(source_document_id, permission)
     }
 
     fn approve_generated_prompt_draft(
@@ -248,6 +257,7 @@ fn seed_review(path: &Path) {
             .join("\n"),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         })
         .expect("source");
     let generated = study.generate(None).expect("generate");

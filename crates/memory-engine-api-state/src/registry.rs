@@ -2,10 +2,9 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
-use memory_engine_persistence::GeneratedPromptValidationStatus;
+use memory_engine_persistence::{GeneratedPromptValidationStatus, SourcePermission};
 use memory_engine_service::RecordContentFeedbackCommand;
 
-use crate::storage::GenerationCommitFence;
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
     new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
@@ -15,9 +14,8 @@ use crate::{
     CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
     ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
     ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
-    APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    SubmitReviewRequest, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS, APP_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+    AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS, RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
@@ -173,68 +171,6 @@ impl AccountRegistry {
         let account = self.login_account(&email)?;
 
         self.create_browser_session(&account)
-    }
-
-    /// Check a caller-supplied token against the configured operator admin
-    /// token.
-    ///
-    /// # Errors
-    ///
-    /// Returns forbidden when the admin token is unconfigured, empty, or
-    /// mismatched.
-    pub(crate) fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
-        let configured = {
-            let data = self.lock_data();
-            data.auth_config.admin_token.clone()
-        };
-        // Compare hashes, not raw strings: SHA-256 preimage resistance makes
-        // the non-constant-time equality useless to a timing attacker probing
-        // this privileged credential.
-        if configured.as_deref().is_none_or(|configured| {
-            configured.is_empty() || secret_hash(configured) != secret_hash(admin_token)
-        }) {
-            return Err(ApiFailure::forbidden(
-                "Service session issuance is not authorized.",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Issue (or rotate) the account-scoped service-session credential.
-    ///
-    /// Gated by the operator admin token; the account is created on first
-    /// issue, and every issue mints a fresh token that immediately replaces
-    /// the prior one, so reissue doubles as revocation.
-    ///
-    /// # Errors
-    ///
-    /// Returns forbidden when the admin token is unconfigured or mismatched,
-    /// or the email is outside the allowlist; bad request on malformed email.
-    pub(crate) fn issue_service_session(
-        &self,
-        admin_token: &str,
-        email: &str,
-    ) -> Result<AccountCreated, ApiFailure> {
-        self.verify_admin_token(admin_token)?;
-        let auth_config = {
-            let data = self.lock_data();
-            data.auth_config.clone()
-        };
-        let email = normalize_email(email).ok_or_else(|| {
-            ApiFailure::bad_request("Account email must contain one @ and a domain.")
-        })?;
-        if !auth_config.email_allowed(&email) {
-            return Err(ApiFailure::forbidden(
-                "This email is not allowed to register.",
-            ));
-        }
-        let account = self.login_account(&email)?;
-        eprintln!(
-            "service session issued account={} at={}",
-            account.account_id,
-            self.now()
-        );
-        Ok(account)
     }
 
     pub(crate) fn set_return_notification(
@@ -612,6 +548,7 @@ impl AccountRegistry {
             source_id: source_id_for(account_id, &title, &body),
             title,
             body,
+            permission: request.permission.clone(),
             project_key: None,
             ttl_expires_at: None,
         };
@@ -654,6 +591,7 @@ impl AccountRegistry {
             source_id: project_deck_id_for(account_id, &project_key, &title, &body),
             title,
             body,
+            permission: SourcePermission::ModelEligible,
             project_key: Some(project_key.clone()),
             ttl_expires_at: request.ttl_expires_at,
         };
@@ -713,19 +651,29 @@ impl AccountRegistry {
         account_id: &str,
         session_token: &str,
     ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        self.list_sources_with_timings(account_id, session_token, None)
+        let account = self.require_account(account_id, session_token)?;
+        let storage = self.storage();
+
+        storage.list_sources(account_id, &account.store_path)
     }
 
-    pub(crate) fn list_sources_with_timings(
+    pub(crate) fn update_source_permission(
         &self,
         account_id: &str,
         session_token: &str,
-        mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Vec<SourceRecord>, ApiFailure> {
-        let account =
-            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?;
-        self.storage()
-            .list_sources_with_timings(account_id, &account.store_path, timings)
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let storage = self.storage();
+        if !storage
+            .list_sources(account_id, &account.store_path)?
+            .iter()
+            .any(|source| source.source_id == source_id)
+        {
+            return Err(ApiFailure::not_found("Source not found."));
+        }
+        storage.update_source_permission(account_id, &account.store_path, source_id, permission)
     }
 
     /// Runs an API registry operation.
@@ -739,11 +687,6 @@ impl AccountRegistry {
         session_token: &str,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        if self.postgres_url().is_some() {
-            return Err(ApiFailure::conflict(
-                "Direct synchronous generation is disabled in production. Use the queued generation workflow.",
-            ));
-        }
         let account = self.require_account(account_id, session_token)?;
         self.storage()
             .generate_source(account_id, &account.store_path, source_id)
@@ -765,26 +708,14 @@ impl AccountRegistry {
         &self,
         account_id: &str,
         source_id: &str,
-        run_id: &str,
-        generation_attempt: i32,
-        lease_token: &str,
-        lease_valid: impl Fn() -> bool,
     ) -> Result<usize, ApiFailure> {
-        // Serialize generation per account: two captures otherwise read-modify-
-        // write the whole study store concurrently and clobber each other's
-        // cards (059). Held across the whole run; different accounts never block.
+        let storage = self.storage();
+        let store_path = storage.account_store_path(account_id);
+        storage.generate_source(account_id, &store_path, source_id)?;
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let storage = self.storage();
-        let store_path = storage.account_store_path(account_id);
-        storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
-        if !lease_valid() {
-            return Err(ApiFailure::conflict(
-                "Generation lease lost before cards could be committed.",
-            ));
-        }
         let view = storage.study_view(account_id, &store_path)?;
         let pending = view
             .drafts
@@ -797,21 +728,7 @@ impl AccountRegistry {
             .collect::<Vec<_>>();
         let card_count = pending.len();
         for draft_id in pending {
-            if !lease_valid() {
-                return Err(ApiFailure::conflict(
-                    "Generation lease lost before cards could be committed.",
-                ));
-            }
-            storage.approve_draft(
-                account_id,
-                &store_path,
-                &draft_id,
-                Some(GenerationCommitFence {
-                    generation_run_id: run_id,
-                    generation_attempt,
-                    lease_token,
-                }),
-            )?;
+            storage.approve_draft(account_id, &store_path, &draft_id)?;
         }
         Ok(card_count)
     }
@@ -844,17 +761,6 @@ impl AccountRegistry {
                 supersedes_id: request.supersedes_id.clone(),
             },
         )
-    }
-
-    pub(crate) fn content_feedback_head(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        review_unit_id: &str,
-    ) -> Result<Option<String>, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage()
-            .content_feedback_head(account_id, &account.store_path, review_unit_id)
     }
 
     /// Runs an API registry operation.
@@ -894,7 +800,7 @@ impl AccountRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
-            .approve_draft(account_id, &account.store_path, draft_id, None)
+            .approve_draft(account_id, &account.store_path, draft_id)
     }
 
     /// Runs an API registry operation.
@@ -921,19 +827,8 @@ impl AccountRegistry {
         account_id: &str,
         session_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.study_view_with_timings(account_id, session_token, None)
-    }
-
-    pub(crate) fn study_view_with_timings(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        let account =
-            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?;
-        self.storage()
-            .study_view_with_timings(account_id, &account.store_path, timings)
+        let account = self.require_account(account_id, session_token)?;
+        self.storage().study_view(account_id, &account.store_path)
     }
 
     /// Runs an API registry operation.
@@ -1110,17 +1005,6 @@ impl AccountRegistry {
         review_unit_id: &str,
         request: &SubmitReviewRequest,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.submit_review_with_timings(account_id, session_token, review_unit_id, request, None)
-    }
-
-    pub(crate) fn submit_review_with_timings(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        review_unit_id: &str,
-        request: &SubmitReviewRequest,
-        mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
         let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
         let answer = normalize_required_text(&request.answer, "Review answer")?;
         if request.response_time_ms == 0 {
@@ -1129,8 +1013,7 @@ impl AccountRegistry {
             ));
         }
         let storage = self.storage();
-        let account =
-            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?;
+        let account = self.require_account(account_id, session_token)?;
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
@@ -1147,12 +1030,9 @@ impl AccountRegistry {
             account_id,
             &account.store_path,
             review_unit_id,
-            SubmitReviewRequest {
-                answer,
-                response_time_ms: request.response_time_ms,
-                idempotency_key: idempotency_key.clone(),
-            },
-            timings,
+            answer,
+            request.response_time_ms,
+            idempotency_key.clone(),
         )?;
         let record = data
             .accounts
@@ -1207,33 +1087,13 @@ impl AccountRegistry {
         headers: &HeaderMap,
         csrf_token: &str,
     ) -> Result<AppAccount, ApiFailure> {
-        self.require_browser_session_inner(headers, csrf_token, None)
-    }
-
-    pub(crate) fn require_browser_session_with_timings(
-        &self,
-        headers: &HeaderMap,
-        csrf_token: &str,
-        timings: &mut SubmitReviewTimings,
-    ) -> Result<AppAccount, ApiFailure> {
-        self.require_browser_session_inner(headers, csrf_token, Some(timings))
-    }
-
-    fn require_browser_session_inner(
-        &self,
-        headers: &HeaderMap,
-        csrf_token: &str,
-        mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
         let mut session = {
             let data = self.lock_data();
             data.browser_sessions.get(session_id).cloned()
         };
         if session.is_none() {
-            session = self
-                .storage()
-                .load_browser_session_with_timings(session_id, timings.as_deref_mut())?;
+            session = self.storage().load_browser_session(session_id)?;
             if let Some(session) = &session {
                 let mut data = self.lock_data();
                 data.browser_sessions
@@ -1250,7 +1110,7 @@ impl AccountRegistry {
         if session.csrf_token_hash != secret_hash(csrf_token) {
             return Err(ApiFailure::forbidden("CSRF token does not match session."));
         }
-        self.require_account_with_timings(&session.account_id, &session.session_token, timings)?;
+        self.require_account(&session.account_id, &session.session_token)?;
 
         Ok(AppAccount {
             browser_session_id: session_id.to_owned(),
@@ -1325,17 +1185,10 @@ impl AccountRegistry {
         Ok(())
     }
 
-    pub(crate) fn authenticate_account(
-        &self,
-        account_id: &str,
-        session_token: &str,
-    ) -> Result<(), ApiFailure> {
-        self.require_account(account_id, session_token).map(drop)
-    }
-
     pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
-        data.storage.storage(data.now_fn)
+        data.storage
+            .storage(data.now_fn, data.generation_provider_config.clone())
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
@@ -1355,15 +1208,6 @@ impl AccountRegistry {
         account_id: &str,
         session_token: &str,
     ) -> Result<AccountRecord, ApiFailure> {
-        self.require_account_with_timings(account_id, session_token, None)
-    }
-
-    fn require_account_with_timings(
-        &self,
-        account_id: &str,
-        session_token: &str,
-        mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<AccountRecord, ApiFailure> {
         let storage = self.storage();
         {
             let data = self.lock_data();
@@ -1374,11 +1218,7 @@ impl AccountRegistry {
             }
         }
 
-        if storage.account_session_matches_with_timings(
-            account_id,
-            session_token,
-            timings.as_deref_mut(),
-        )? {
+        if storage.account_session_matches(account_id, session_token)? {
             return Ok(AccountRecord {
                 session_token: session_token.to_owned(),
                 store_path: storage.account_store_path(account_id),
@@ -1387,7 +1227,7 @@ impl AccountRegistry {
             });
         }
 
-        if storage.account_exists_with_timings(account_id, timings)? {
+        if storage.account_exists(account_id)? {
             return Err(ApiFailure::forbidden_account());
         }
 
