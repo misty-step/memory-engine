@@ -415,16 +415,6 @@ impl StudyStorage {
             .generate_source_with_run_id(account_id, store_path, source_id, run_id)
     }
 
-    pub(crate) fn discard_generation_run(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        run_id: &str,
-    ) -> Result<(), ApiFailure> {
-        self.inner
-            .discard_generation_run(account_id, store_path, run_id)
-    }
-
     pub(crate) fn finalize_generation_run(
         &self,
         account_id: &str,
@@ -798,14 +788,6 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         self.generate_source(account_id, store_path, source_id)
     }
 
-    fn discard_generation_run(
-        &self,
-        _account_id: &str,
-        _store_path: &FsPath,
-        _run_id: &str,
-    ) -> Result<(), ApiFailure> {
-        Ok(())
-    }
     fn finalize_generation_run(
         &self,
         _account_id: &str,
@@ -1634,17 +1616,6 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(StudyViewResponse::from_view(view))
     }
 
-    fn discard_generation_run(
-        &self,
-        _account_id: &str,
-        store_path: &FsPath,
-        run_id: &str,
-    ) -> Result<(), ApiFailure> {
-        self.with_locked_study(store_path, |study| {
-            study.discard_generation_run(run_id).map_err(study_failure)
-        })
-    }
-
     fn finalize_generation_run(
         &self,
         _account_id: &str,
@@ -2462,24 +2433,6 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             )?;
             Ok(StudyViewResponse::from_view(view))
         })
-    }
-
-    fn discard_generation_run(
-        &self,
-        account_id: &str,
-        _store_path: &FsPath,
-        run_id: &str,
-    ) -> Result<(), ApiFailure> {
-        with_postgres_account(
-            &self.database_url,
-            account_id,
-            self.now_ms(),
-            |mut account| {
-                account
-                    .discard_generation_run(run_id)
-                    .map_err(postgres_failure)
-            },
-        )
     }
 
     fn finalize_generation_run(
