@@ -208,6 +208,10 @@ pub trait BetaGenerationStore {
     }
 
     /// Mark a queued generation run pending until its durable lease fence commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the pending marker cannot be persisted.
     fn mark_generation_run_pending(&mut self, _run_id: &str) -> Result<(), Self::Error> {
         Ok(())
     }
