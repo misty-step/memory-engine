@@ -7611,6 +7611,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn live_postgres_stale_cleanup_preserves_replacement_owner() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!("skipping live Postgres cleanup ownership test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
