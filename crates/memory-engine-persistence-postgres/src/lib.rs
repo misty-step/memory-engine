@@ -2146,6 +2146,10 @@ impl PostgresStudyStore {
         };
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+            &[&account_id],
+        )?;
         let attempt_row = transaction.query_opt(
             "SELECT attempt, reservation_cost_usd_micros, generation_run_id
              FROM memory_engine_generation_job_attempts
@@ -3628,7 +3632,10 @@ impl AccountStudyStore<'_> {
                        AND status = 'running'",
                     &[&account_id, &now_ms, &job_id, &attempt, &lease_token],
                 )?;
-                return Ok(attempt_updated == 1 && job_updated == 1);
+                if attempt_updated != 1 || job_updated != 1 {
+                    return Err(PostgresStoreError::GenerationFinalizationIncomplete);
+                }
+                return Ok(true);
             }
 
             cleanup_generation_run(transaction, &account_id, run_id)?;
@@ -4350,6 +4357,7 @@ pub enum PostgresStoreError {
     LearnerDraftDecisionAlreadyRecorded(String),
     MissingGenerationRunForAcceptedDraft,
     GenerationLeaseLost,
+    GenerationFinalizationIncomplete,
     ReviewUnitMismatch,
     ScheduleLastReviewMismatch,
     DuplicateAppliedReview(String),
@@ -4396,6 +4404,9 @@ impl fmt::Display for PostgresStoreError {
                 formatter.write_str("Accepted generated prompt draft requires a generation run")
             }
             Self::GenerationLeaseLost => formatter.write_str("Generation lease lost before persistence"),
+            Self::GenerationFinalizationIncomplete => {
+                formatter.write_str("Generation finalization did not update its attempt and job atomically")
+            }
             Self::ReviewUnitMismatch => formatter.write_str("Review unit ids must match"),
             Self::ScheduleLastReviewMismatch => {
                 formatter.write_str("Schedule last_review must match the attempt timestamp")
@@ -4455,6 +4466,7 @@ impl Error for PostgresStoreError {
             | Self::LearnerDraftDecisionAlreadyRecorded(_)
             | Self::MissingGenerationRunForAcceptedDraft
             | Self::GenerationLeaseLost
+            | Self::GenerationFinalizationIncomplete
             | Self::ReviewUnitMismatch
             | Self::ScheduleLastReviewMismatch
             | Self::DuplicateAppliedReview(_)
@@ -4993,6 +5005,16 @@ mod tests {
                 3,
                 1_000,
             )?);
+            assert!(
+                !after_lease.renew_generation_job(
+                    "acct_jobs",
+                    "job-1",
+                    claimed.lease_token.as_deref().expect("first lease token"),
+                    NOW + 20,
+                    10,
+                )?,
+                "a finished stale attempt cannot be renewed afterward"
+            );
             let stale_attempt = after_lease
                 .generation_job_attempt(
                     "acct_jobs",
