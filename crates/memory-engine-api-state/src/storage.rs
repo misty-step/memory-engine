@@ -415,6 +415,7 @@ impl StudyStorage {
             .generate_source_with_run_id(account_id, store_path, source_id, run_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_generation_run(
         &self,
         account_id: &str,
@@ -788,6 +789,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         self.generate_source(account_id, store_path, source_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_generation_run(
         &self,
         _account_id: &str,
@@ -1621,18 +1623,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
         run_id: &str,
-        _generation_attempt: i32,
-        _lease_token: &str,
-        _now_ms: i64,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
         lease_valid: bool,
     ) -> Result<bool, ApiFailure> {
         self.with_locked_study(store_path, |study| {
             study
                 .finalize_generation_run(
                     run_id,
-                    _generation_attempt,
-                    _lease_token,
-                    _now_ms,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
                     lease_valid,
                 )
                 .map_err(study_failure)

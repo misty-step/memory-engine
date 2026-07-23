@@ -4725,7 +4725,7 @@ mod tests {
             let reclaimed = after_lease
                 .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
                 .expect("expired lease must be reclaimed");
-            assert_eq!(reclaimed.attempts, 2);
+            assert_eq!(reclaimed_job.attempts, 2);
             assert!(!after_lease.finish_generation_job(
                 "acct_jobs",
                 "job-1",
@@ -5411,7 +5411,7 @@ mod tests {
                 let claimed = setup
                     .claim_generation_job("worker-a", NOW, 10, 0, 1, 3)?
                     .expect("first finalizer claim");
-                old_attempt = claimed.attempts as i32;
+                old_attempt = i32::try_from(claimed.attempts).expect("attempt fits i32");
                 old_token = claimed.lease_token.clone().expect("first lease token");
                 assert!(setup.bind_generation_job_attempt_run(
                     "acct-generation-finalizer",
@@ -5421,9 +5421,9 @@ mod tests {
                     &run.id,
                 )?);
             }
-            let mut reclaimer = super::PostgresStudyStore::connect(&scoped_url)?;
-            reclaimer.migrate()?;
-            let reclaimed = reclaimer
+            let mut reclaim_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            reclaim_store.migrate()?;
+            let reclaimed_job = reclaim_store
                 .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
                 .expect("expired first lease is reclaimed");
             assert_eq!(reclaimed.attempts, 2);
@@ -5482,6 +5482,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn live_postgres_generation_discard_serializes_with_second_instance_keep() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!(
