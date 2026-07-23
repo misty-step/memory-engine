@@ -425,6 +425,27 @@ impl StudyStorage {
             .discard_generation_run(account_id, store_path, run_id)
     }
 
+    pub(crate) fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.finalize_generation_run(
+            account_id,
+            store_path,
+            run_id,
+            generation_attempt,
+            lease_token,
+            now_ms,
+            lease_valid,
+        )
+    }
+
     /// Archive a source and every review unit generated from it. Returns the
     /// view plus the count of cards actually retired by this call (across
     /// every generation run for the source) — the caller reports this count
@@ -784,6 +805,18 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         _run_id: &str,
     ) -> Result<(), ApiFailure> {
         Ok(())
+    }
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        _store_path: &FsPath,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        Ok(true)
     }
     fn archive_source(
         &self,
@@ -1612,6 +1645,29 @@ impl StudyStorageAdapter for FileStudyStorage {
         })
     }
 
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            study
+                .finalize_generation_run(
+                    run_id,
+                    _generation_attempt,
+                    _lease_token,
+                    _now_ms,
+                    lease_valid,
+                )
+                .map_err(study_failure)
+        })
+    }
+
     fn archive_source(
         &self,
         _account_id: &str,
@@ -2424,6 +2480,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     .map_err(postgres_failure)
             },
         )
+    }
+
+    fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .finalize_generation_run(
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
+                    lease_valid,
+                )
+                .map_err(postgres_failure)
+        })
     }
 
     fn archive_source(

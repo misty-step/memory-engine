@@ -958,29 +958,6 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
-    fn postgres_generation_lease_is_valid(
-        &self,
-        account_id: &str,
-        run_id: &str,
-        generation_attempt: i32,
-        lease_token: &str,
-    ) -> Result<bool, ApiFailure> {
-        let Some(database_url) = self.postgres_url() else {
-            return Ok(true);
-        };
-        crate::with_postgres_store(&database_url, |store| {
-            store
-                .generation_job_attempt_has_commit_fence(
-                    account_id,
-                    run_id,
-                    generation_attempt,
-                    lease_token,
-                    self.now(),
-                )
-                .map_err(crate::postgres_failure)
-        })
-    }
-
     /// Runs a queued generation job end to end on a worker thread. Accepted
     /// drafts remain pending until the learner explicitly keeps or edits them.
     /// Returns the scheduled review-card count, which is zero until a decision
@@ -1010,37 +987,24 @@ impl AccountRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
-        let discard_stale = || {
-            if let Err(error) = storage.discard_generation_run(account_id, &store_path, run_id) {
-                eprintln!(
-                    "failed to discard stale generation run {run_id} for {account_id}: {error:?}"
-                );
-            }
-        };
         storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
-        if !lease_valid() {
-            discard_stale();
-            return Err(ApiFailure::conflict(
-                "Generation lease lost before cards could be committed.",
-            ));
-        }
-        match self.postgres_generation_lease_is_valid(
+        // Evaluate the in-memory cancellation fence first. The durable adapter
+        // then validates the exact Postgres attempt/lease under the same account
+        // advisory transaction lock, or commits the file rollback under its lock.
+        let local_lease_valid = lease_valid();
+        let finalized = storage.finalize_generation_run(
             account_id,
+            &store_path,
             run_id,
             generation_attempt,
             lease_token,
-        ) {
-            Ok(true) => {}
-            Ok(false) => {
-                discard_stale();
-                return Err(ApiFailure::conflict(
-                    "Generation lease lost before cards could be committed.",
-                ));
-            }
-            Err(error) => {
-                discard_stale();
-                return Err(error);
-            }
+            self.now(),
+            local_lease_valid,
+        )?;
+        if !finalized {
+            return Err(ApiFailure::conflict(
+                "Generation lease lost before cards could be committed.",
+            ));
         }
         let _view = storage.study_view(account_id, &store_path)?;
         // card_count is the number of scheduled cards, and generation never

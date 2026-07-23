@@ -1691,40 +1691,6 @@ impl PostgresStudyStore {
         Ok(row.get(0))
     }
 
-    /// Check whether a durable generation attempt still owns the exact lease
-    /// token and remains unexpired at the commit boundary.
-    ///
-    /// # Errors
-    /// Returns the Postgres error when the receipt cannot be read.
-    pub fn generation_job_attempt_has_commit_fence(
-        &mut self,
-        account_id: &str,
-        run_id: &str,
-        attempt: i32,
-        lease_token: &str,
-        now_ms: i64,
-    ) -> Result<bool, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT 1
-             FROM memory_engine_generation_job_attempts attempt
-             JOIN memory_engine_generation_jobs job
-               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
-             WHERE attempt.account_id = $1::TEXT
-               AND attempt.generation_run_id = $2::TEXT
-               AND attempt.attempt = $3::INTEGER
-               AND attempt.lease_token = $4::TEXT
-               AND attempt.status = 'running'
-               AND job.status = 'running'
-               AND job.attempts = attempt.attempt
-               AND job.lease_token = attempt.lease_token
-               AND job.lease_expires_at_ms > $5::BIGINT
-             FOR UPDATE OF attempt, job
-             LIMIT 1",
-            &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
-        )?;
-        Ok(row.is_some())
-    }
-
     /// Read the receipt for one exact durable provider attempt.
     ///
     /// # Errors
@@ -3124,45 +3090,6 @@ impl AccountStudyStore<'_> {
         })
     }
 
-    /// Check whether a generation run still belongs to the currently active
-    /// job attempt for the scoped account and exact lease token.
-    ///
-    /// # Errors
-    /// Returns [`PostgresStoreError`] when the receipt cannot be read.
-    pub fn generation_job_attempt_has_commit_fence(
-        &mut self,
-        run_id: &str,
-        attempt: i32,
-        lease_token: &str,
-        now_ms: i64,
-    ) -> Result<bool, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT 1
-             FROM memory_engine_generation_job_attempts attempt
-             JOIN memory_engine_generation_jobs job
-               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
-             WHERE attempt.account_id = $1::TEXT
-               AND attempt.generation_run_id = $2::TEXT
-               AND attempt.attempt = $3::INTEGER
-               AND attempt.lease_token = $4::TEXT
-               AND attempt.status = 'running'
-               AND job.status = 'running'
-               AND job.attempts = attempt.attempt
-               AND job.lease_token = attempt.lease_token
-               AND job.lease_expires_at_ms > $5::BIGINT
-             FOR UPDATE OF attempt, job
-             LIMIT 1",
-            &[
-                &self.scope.account_id,
-                &run_id,
-                &attempt,
-                &lease_token,
-                &now_ms,
-            ],
-        )?;
-        Ok(row.is_some())
-    }
-
     /// Execute a block of mutations inside one SQL transaction.
     ///
     /// # Errors
@@ -3332,6 +3259,125 @@ impl AccountStudyStore<'_> {
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Atomically fence a generation attempt and remove its complete stale
+    /// output closure when the lease is no longer owned.
+    ///
+    /// The account advisory transaction lock serializes this fence with every
+    /// learner decision on every connection. Generation-job attempt ledger rows
+    /// are intentionally retained for recovery and audit.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when the transaction cannot be committed.
+    pub fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            let owns_lease = lease_valid
+                && transaction
+                    .query_opt(
+                        "SELECT 1
+                         FROM memory_engine_generation_job_attempts attempt
+                         JOIN memory_engine_generation_jobs job
+                           ON job.account_id = attempt.account_id
+                          AND job.job_id = attempt.job_id
+                         WHERE attempt.account_id = $1::TEXT
+                           AND attempt.generation_run_id = $2::TEXT
+                           AND attempt.attempt = $3::INTEGER
+                           AND attempt.lease_token = $4::TEXT
+                           AND attempt.status = 'running'
+                           AND job.status = 'running'
+                           AND job.attempts = attempt.attempt
+                           AND job.lease_token = attempt.lease_token
+                           AND job.lease_expires_at_ms > $5::BIGINT
+                         FOR UPDATE OF attempt, job
+                         LIMIT 1",
+                        &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
+                    )?
+                    .is_some();
+            if owns_lease {
+                return Ok(true);
+            }
+
+            let stale = transaction.query(
+                "SELECT draft_id, review_unit_id, draft->'referenceSpanIds'
+                 FROM memory_engine_generated_prompt_drafts
+                 WHERE account_id = $1::TEXT
+                   AND draft->>'generationRunId' = $2::TEXT",
+                &[&account_id, &run_id],
+            )?;
+            let mut stale_draft_ids = Vec::with_capacity(stale.len());
+            let mut stale_review_unit_ids = std::collections::BTreeSet::new();
+            let mut stale_reference_span_ids = std::collections::BTreeSet::new();
+            for row in stale {
+                let draft_id: String = row.get(0);
+                let review_unit_id: String = row.get(1);
+                let references: serde_json::Value = row.get(2);
+                stale_draft_ids.push(draft_id);
+                stale_review_unit_ids.insert(review_unit_id);
+                for reference in references.as_array().into_iter().flatten() {
+                    if let Some(reference_id) = reference.as_str() {
+                        stale_reference_span_ids.insert(reference_id.to_owned());
+                    }
+                }
+            }
+            for review_unit_id in &stale_review_unit_ids {
+                transaction.execute(
+                    "DELETE FROM memory_engine_review_units
+                     WHERE account_id = $1::TEXT AND review_unit_id = $2::TEXT",
+                    &[&account_id, review_unit_id],
+                )?;
+            }
+            for draft_id in &stale_draft_ids {
+                transaction.execute(
+                    "DELETE FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1::TEXT AND draft_id = $2::TEXT",
+                    &[&account_id, draft_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM memory_engine_generation_runs
+                 WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
+                &[&account_id, &run_id],
+            )?;
+            for reference_id in stale_reference_span_ids {
+                let referenced_by_draft = transaction
+                    .query_opt(
+                        "SELECT 1
+                         FROM memory_engine_generated_prompt_drafts
+                         WHERE account_id = $1::TEXT
+                           AND draft->'referenceSpanIds' ? $2::TEXT
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                let referenced_by_review = transaction
+                    .query_opt(
+                        "SELECT 1
+                         FROM memory_engine_review_units
+                         WHERE account_id = $1::TEXT
+                           AND record->'referenceSpanIds' ? $2::TEXT
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                if !referenced_by_draft && !referenced_by_review {
+                    transaction.execute(
+                        "DELETE FROM memory_engine_reference_spans
+                         WHERE account_id = $1::TEXT AND reference_span_id = $2::TEXT",
+                        &[&account_id, &reference_id],
+                    )?;
+                }
+            }
+            Ok(false)
         })
     }
 
@@ -3563,6 +3609,24 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
 
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
         AccountStudyStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        AccountStudyStore::finalize_generation_run(
+            self,
+            run_id,
+            generation_attempt,
+            lease_token,
+            now_ms,
+            lease_valid,
+        )
     }
 }
 
@@ -5272,6 +5336,145 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres store contract");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_postgres_stale_finalizer_wins_against_second_connection_decisions() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres stale finalizer race; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_finalizer_{}_{}",
+            std::process::id(),
+            NOW + 3
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect finalizer race admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create finalizer race schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-finalizer");
+            let reference_keep = reference_span("reference-generation-finalizer-keep", &source.id);
+            let reference_edit = reference_span("reference-generation-finalizer-edit", &source.id);
+            let keep_unit = ReviewUnitId::new("unit-generation-finalizer-keep");
+            let edit_unit = ReviewUnitId::new("unit-generation-finalizer-edit");
+            let keep_draft = accepted_draft(
+                "draft-generation-finalizer-keep",
+                &keep_unit,
+                &[&source.id],
+                &[&reference_keep.id],
+                Some("run-generation-finalizer"),
+            );
+            let edit_draft = accepted_draft(
+                "draft-generation-finalizer-edit",
+                &edit_unit,
+                &[&source.id],
+                &[&reference_edit.id],
+                Some("run-generation-finalizer"),
+            );
+            let run = generation_run(
+                "run-generation-finalizer",
+                &[&source.id],
+                &[&keep_draft.id, &edit_draft.id],
+            );
+            let old_attempt;
+            let old_token;
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-generation-finalizer")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference_keep)?;
+                account.save_reference_span(&reference_edit)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&keep_draft)?;
+                account.save_generated_prompt_draft(&edit_draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-finalizer",
+                    "job-generation-finalizer",
+                    &source.id,
+                    "Finalizer race",
+                    "model-finalizer",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-a", NOW, 10, 0, 1, 3)?
+                    .expect("first finalizer claim");
+                old_attempt = claimed.attempts as i32;
+                old_token = claimed.lease_token.clone().expect("first lease token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-finalizer",
+                    "job-generation-finalizer",
+                    claimed.attempts,
+                    &old_token,
+                    &run.id,
+                )?);
+            }
+            let mut reclaimer = super::PostgresStudyStore::connect(&scoped_url)?;
+            reclaimer.migrate()?;
+            let reclaimed = reclaimer
+                .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
+                .expect("expired first lease is reclaimed");
+            assert_eq!(reclaimed.attempts, 2);
+
+            // Commit both learner decisions from independent connections before
+            // the stale worker finalizer. The advisory transaction lock must let
+            // finalization win over these already-committed decisions.
+            let mut keep_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut keep_account = keep_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            keep_account.keep_generated_prompt_draft(&keep_draft.id, NOW + 17)?;
+            drop(keep_account);
+            let mut edit_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut edit_account = edit_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            edit_account.edit_and_keep_generated_prompt_draft(
+                &edit_draft.id,
+                "Edited stale prompt",
+                "Edited stale answer",
+                NOW + 18,
+            )?;
+            drop(edit_account);
+
+            let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut finalizer = finalizer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            assert!(!finalizer.finalize_generation_run(
+                &run.id,
+                old_attempt,
+                &old_token,
+                NOW + 19,
+                true,
+            )?);
+            assert!(!finalizer.finalize_generation_run(
+                &run.id,
+                old_attempt,
+                &old_token,
+                NOW + 20,
+                true,
+            )?);
+            let snapshot = finalizer.snapshot()?;
+            assert!(snapshot.generated_prompt_drafts.is_empty());
+            assert!(snapshot.review_units.is_empty());
+            assert!(snapshot.schedules.is_empty());
+            assert!(snapshot.attempts.is_empty());
+            assert!(snapshot.content_feedback.is_empty());
+            assert!(snapshot.applied_reviews.is_empty());
+            assert!(snapshot.generation_runs.is_empty());
+            assert!(snapshot.reference_spans.is_empty());
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop finalizer race schema");
+        result.expect("generation stale finalizer race contract");
     }
 
     #[test]

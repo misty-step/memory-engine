@@ -912,6 +912,29 @@ where
             .map_err(BetaStudyError::Store)
     }
 
+    /// Atomically fence a generation run and remove stale output when needed.
+    ///
+    /// # Errors
+    /// Returns the underlying store error when finalization cannot commit.
+    pub fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .finalize_generation_run(
+                run_id,
+                generation_attempt,
+                lease_token,
+                now_ms,
+                lease_valid,
+            )
+            .map_err(BetaStudyError::Store)
+    }
+
     /// Provider-backed counterpart to [`Self::generate_with_run_id`].
     ///
     /// # Errors

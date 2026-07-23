@@ -206,6 +206,18 @@ pub trait BetaGenerationStore {
     fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Atomically fence a run and remove all stale output when the lease is lost.
+    fn finalize_generation_run(
+        &mut self,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 impl BetaGenerationStore for BetaPersistenceStore {
@@ -242,6 +254,17 @@ impl BetaGenerationStore for BetaPersistenceStore {
 
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
         BetaPersistenceStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        BetaPersistenceStore::finalize_generation_run(self, run_id, lease_valid)
     }
 }
 

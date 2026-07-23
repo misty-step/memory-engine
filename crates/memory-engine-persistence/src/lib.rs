@@ -985,6 +985,79 @@ impl BetaPersistenceStore {
         })
     }
 
+    /// Atomically finalize a generation run at the worker lease fence.
+    ///
+    /// A failed fence removes the complete run closure, including any learner
+    /// decision that raced with the stale worker. The account file lock held by
+    /// `transact` serializes this operation with every learner mutation.
+    ///
+    /// # Errors
+    /// Returns [`BetaStoreError`] when the rollback cannot be committed.
+    pub fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        lease_valid: bool,
+    ) -> Result<bool, BetaStoreError> {
+        self.transact(|snapshot| {
+            if lease_valid {
+                return Ok(true);
+            }
+            let stale_draft_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| draft.generation_run_id.as_deref() == Some(run_id))
+                .map(|draft| draft.id.clone())
+                .collect::<BTreeSet<_>>();
+            let stale_review_unit_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| stale_draft_ids.contains(&draft.id))
+                .map(|draft| draft.review_unit_id.clone())
+                .collect::<BTreeSet<_>>();
+            let stale_reference_span_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| stale_draft_ids.contains(&draft.id))
+                .flat_map(|draft| draft.reference_span_ids.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            snapshot.schedules.retain(|schedule| {
+                !stale_review_unit_ids.contains(&schedule.review_unit_id)
+            });
+            snapshot.attempts.retain(|attempt| {
+                !stale_review_unit_ids.contains(&attempt.review_unit_id)
+            });
+            snapshot.content_feedback.retain(|feedback| {
+                !stale_review_unit_ids.contains(&feedback.review_unit_id)
+            });
+            snapshot.applied_reviews.retain(|receipt| {
+                !stale_review_unit_ids.contains(&receipt.attempt.review_unit_id)
+            });
+            snapshot.review_units.retain(|unit| {
+                !stale_review_unit_ids.contains(&unit.review_unit_id)
+            });
+            snapshot
+                .generated_prompt_drafts
+                .retain(|draft| !stale_draft_ids.contains(&draft.id));
+            snapshot.generation_runs.retain(|run| run.id.as_str() != run_id);
+            let referenced_span_ids = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .flat_map(|draft| draft.reference_span_ids.iter().cloned())
+                .chain(
+                    snapshot
+                        .review_units
+                        .iter()
+                        .flat_map(|unit| unit.reference_span_ids.iter().cloned()),
+                )
+                .collect::<BTreeSet<_>>();
+            snapshot.reference_spans.retain(|span| {
+                !stale_reference_span_ids.contains(&span.id)
+                    || referenced_span_ids.contains(&span.id)
+            });
+            Ok(false)
+        })
+    }
+
     /// Promote an accepted generated draft into a review unit.
     ///
     /// # Errors
