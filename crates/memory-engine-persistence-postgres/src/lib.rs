@@ -5385,7 +5385,8 @@ mod tests {
             let old_attempt;
             let old_token;
             {
-                let mut account = setup.for_account(AccountScope::new("acct-generation-finalizer")?);
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-finalizer")?);
                 account.ensure_account(NOW)?;
                 account.save_source_document(&source)?;
                 account.save_reference_span(&reference_keep)?;
@@ -5431,11 +5432,13 @@ mod tests {
             // the stale worker finalizer. The advisory transaction lock must let
             // finalization win over these already-committed decisions.
             let mut keep_store = super::PostgresStudyStore::connect(&scoped_url)?;
-            let mut keep_account = keep_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            let mut keep_account =
+                keep_store.for_account(AccountScope::new("acct-generation-finalizer")?);
             keep_account.keep_generated_prompt_draft(&keep_draft.id, NOW + 17)?;
             drop(keep_account);
             let mut edit_store = super::PostgresStudyStore::connect(&scoped_url)?;
-            let mut edit_account = edit_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            let mut edit_account =
+                edit_store.for_account(AccountScope::new("acct-generation-finalizer")?);
             edit_account.edit_and_keep_generated_prompt_draft(
                 &edit_draft.id,
                 "Edited stale prompt",
@@ -5445,7 +5448,8 @@ mod tests {
             drop(edit_account);
 
             let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
-            let mut finalizer = finalizer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            let mut finalizer =
+                finalizer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
             assert!(!finalizer.finalize_generation_run(
                 &run.id,
                 old_attempt,

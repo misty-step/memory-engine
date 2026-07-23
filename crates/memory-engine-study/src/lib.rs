@@ -925,13 +925,7 @@ where
         lease_valid: bool,
     ) -> Result<bool, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.store
-            .finalize_generation_run(
-                run_id,
-                generation_attempt,
-                lease_token,
-                now_ms,
-                lease_valid,
-            )
+            .finalize_generation_run(run_id, generation_attempt, lease_token, now_ms, lease_valid)
             .map_err(BetaStudyError::Store)
     }
 

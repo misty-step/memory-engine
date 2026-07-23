@@ -1020,25 +1020,27 @@ impl BetaPersistenceStore {
                 .filter(|draft| stale_draft_ids.contains(&draft.id))
                 .flat_map(|draft| draft.reference_span_ids.iter().cloned())
                 .collect::<BTreeSet<_>>();
-            snapshot.schedules.retain(|schedule| {
-                !stale_review_unit_ids.contains(&schedule.review_unit_id)
-            });
-            snapshot.attempts.retain(|attempt| {
-                !stale_review_unit_ids.contains(&attempt.review_unit_id)
-            });
-            snapshot.content_feedback.retain(|feedback| {
-                !stale_review_unit_ids.contains(&feedback.review_unit_id)
-            });
-            snapshot.applied_reviews.retain(|receipt| {
-                !stale_review_unit_ids.contains(&receipt.attempt.review_unit_id)
-            });
-            snapshot.review_units.retain(|unit| {
-                !stale_review_unit_ids.contains(&unit.review_unit_id)
-            });
+            snapshot
+                .schedules
+                .retain(|schedule| !stale_review_unit_ids.contains(&schedule.review_unit_id));
+            snapshot
+                .attempts
+                .retain(|attempt| !stale_review_unit_ids.contains(&attempt.review_unit_id));
+            snapshot
+                .content_feedback
+                .retain(|feedback| !stale_review_unit_ids.contains(&feedback.review_unit_id));
+            snapshot
+                .applied_reviews
+                .retain(|receipt| !stale_review_unit_ids.contains(&receipt.attempt.review_unit_id));
+            snapshot
+                .review_units
+                .retain(|unit| !stale_review_unit_ids.contains(&unit.review_unit_id));
             snapshot
                 .generated_prompt_drafts
                 .retain(|draft| !stale_draft_ids.contains(&draft.id));
-            snapshot.generation_runs.retain(|run| run.id.as_str() != run_id);
+            snapshot
+                .generation_runs
+                .retain(|run| run.id.as_str() != run_id);
             let referenced_span_ids = snapshot
                 .generated_prompt_drafts
                 .iter()
