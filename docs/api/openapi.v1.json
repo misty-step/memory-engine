@@ -304,8 +304,8 @@
           }
         ],
         "responses": {
-          "202": {
-            "description": "Generation job accepted",
+          "200": {
+            "description": "Existing in-flight generation job",
             "content": {
               "application/json": {
                 "schema": {
@@ -314,8 +314,8 @@
               }
             }
           },
-          "200": {
-            "description": "Existing in-flight generation job",
+          "202": {
+            "description": "Generation job accepted",
             "content": {
               "application/json": {
                 "schema": {
@@ -345,7 +345,7 @@
     "/v1/accounts/{account_id}/generation-jobs/{job_id}": {
       "get": {
         "summary": "Observe one account-scoped generation job",
-        "description": "Poll until status is succeeded or failed. cardCount reports how many accepted cards were scheduled and may be zero when no draft passed validation.",
+        "description": "Poll until status is succeeded or failed. cardCount reports scheduled cards created by the job (zero until a learner keeps or edits a draft); generation itself creates no review units or schedules.",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -376,31 +376,6 @@
           },
           "503": {
             "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/accounts/{account_id}/drafts/{draft_id}/approve": {
-      "post": {
-        "summary": "Keep one generated draft as a review unit",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/AccountId"
-          },
-          {
-            "$ref": "#/components/parameters/DraftId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Study view with current review when due",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StudyViewResponse"
-                }
-              }
-            }
           }
         }
       }
@@ -695,6 +670,241 @@
           }
         }
       }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/keep": {
+      "post": {
+        "summary": "Keep one generated draft as a review unit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/edit": {
+      "post": {
+        "summary": "Edit and keep one generated draft as a review unit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditDraftRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/accounts/{account_id}/drafts/{draft_id}/reject": {
+      "post": {
+        "summary": "Reject one generated draft without scheduling it",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/DraftId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Study view with current review when due",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyViewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid decision payload or rejected draft",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or expired session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account scope or CSRF check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Draft or account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A different learner decision is already recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -943,7 +1153,13 @@
           },
           "status": {
             "type": "string",
-            "enum": ["queued", "running", "retry", "succeeded", "failed"]
+            "enum": [
+              "queued",
+              "running",
+              "retry",
+              "succeeded",
+              "failed"
+            ]
           },
           "cardCount": {
             "type": "integer",
@@ -957,7 +1173,10 @@
             "type": "boolean"
           },
           "error": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "createdAt": {
             "type": "integer"
@@ -1033,16 +1252,25 @@
         "properties": {
           "verdict": {
             "type": "string",
-            "enum": ["kept", "dropped"]
+            "enum": [
+              "kept",
+              "dropped"
+            ]
           },
           "rationale": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "idempotencyKey": {
             "type": "string"
           },
           "supersedesId": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -1057,14 +1285,43 @@
           "occurredAt"
         ],
         "properties": {
-          "id": {"type": "string"},
-          "reviewUnitId": {"type": "string"},
-          "verdict": {"type": "string", "enum": ["kept", "dropped"]},
-          "rationale": {"type": ["string", "null"]},
-          "source": {"type": "string", "enum": ["human"]},
-          "accountId": {"type": "string"},
-          "occurredAt": {"type": "integer"},
-          "supersedesId": {"type": ["string", "null"]}
+          "id": {
+            "type": "string"
+          },
+          "reviewUnitId": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string",
+            "enum": [
+              "kept",
+              "dropped"
+            ]
+          },
+          "rationale": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "human"
+            ]
+          },
+          "accountId": {
+            "type": "string"
+          },
+          "occurredAt": {
+            "type": "integer"
+          },
+          "supersedesId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       },
       "StudyViewResponse": {
@@ -1123,10 +1380,15 @@
           "activityKind",
           "activityStage",
           "prompt",
+          "answer",
+          "conceptLabel",
           "validationStatus",
           "validationReasons",
           "workedSolution",
-          "approved"
+          "approved",
+          "learnerDecision",
+          "sourceSpans",
+          "provenance"
         ],
         "properties": {
           "id": {
@@ -1165,6 +1427,38 @@
           },
           "approved": {
             "type": "boolean"
+          },
+          "answer": {
+            "type": "string"
+          },
+          "conceptLabel": {
+            "type": "string"
+          },
+          "learnerDecision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LearnerDraftDecision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sourceSpans": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StudyReferenceSpan"
+            }
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StudyGenerationProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -1622,6 +1916,125 @@
         "properties": {
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "EditDraftRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prompt",
+          "expectedAnswer"
+        ],
+        "properties": {
+          "prompt": {
+            "type": "string"
+          },
+          "expectedAnswer": {
+            "type": "string"
+          }
+        }
+      },
+      "LearnerDraftDecision": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/KeptLearnerDraftDecision"
+          },
+          {
+            "$ref": "#/components/schemas/RejectedLearnerDraftDecision"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind"
+        }
+      },
+      "KeptLearnerDraftDecision": {
+        "type": "object",
+        "required": [
+          "kind",
+          "edited",
+          "decidedAt"
+        ],
+        "properties": {
+          "kind": {
+            "const": "kept"
+          },
+          "edited": {
+            "type": "boolean"
+          },
+          "decidedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "RejectedLearnerDraftDecision": {
+        "type": "object",
+        "required": [
+          "kind",
+          "decidedAt"
+        ],
+        "properties": {
+          "kind": {
+            "const": "rejected"
+          },
+          "decidedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "StudyReferenceSpan": {
+        "type": "object",
+        "required": [
+          "id",
+          "sourceDocumentId",
+          "label",
+          "text",
+          "locator"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "sourceDocumentId": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "locator": {
+            "type": "string"
+          }
+        }
+      },
+      "StudyGenerationProvenance": {
+        "type": "object",
+        "required": [
+          "generationRunId",
+          "provider",
+          "model",
+          "promptVersion"
+        ],
+        "properties": {
+          "generationRunId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "promptVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }

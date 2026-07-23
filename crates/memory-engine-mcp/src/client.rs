@@ -50,7 +50,12 @@ pub struct ProjectDeckRecord {
 pub struct DraftRow {
     pub id: String,
     pub validation_status: String,
-    pub approved: bool,
+    #[serde(default)]
+    pub learner_decision: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source_spans: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -109,12 +114,9 @@ impl MemoryEngineClient {
         &self.account_id
     }
 
-    /// Create a project-scoped deck, generate its review cards, and approve
-    /// every accepted draft, so the deck is immediately due for study. This
-    /// composes three v1 calls (`project-decks`, `sources/{id}/generate`,
-    /// `drafts/{id}/approve`) behind one agent-intent verb: an agent asking
-    /// to "capture this as a deck" wants reviewable cards, not a bare saved
-    /// source record.
+    /// Create a project-scoped deck and generate accepted drafts that remain pending
+    /// until an explicit keep, edit, or reject operation. Returns the generated draft
+    /// IDs so an agent can inspect provenance before choosing a learner decision.
     ///
     /// # Errors
     ///
@@ -125,7 +127,7 @@ impl MemoryEngineClient {
         title: &str,
         body: &str,
         ttl_expires_at: Option<i64>,
-    ) -> Result<(ProjectDeckRecord, usize), String> {
+    ) -> Result<(ProjectDeckRecord, Vec<DraftRow>), String> {
         let mut request = json!({
             "projectKey": project_key,
             "title": title,
@@ -143,21 +145,15 @@ impl MemoryEngineClient {
             "/v1/accounts/{}/sources/{}/generate",
             self.account_id, deck.source.source_id
         ))?;
-        let pending = view
+        let pending_drafts = view
             .drafts
-            .iter()
-            .filter(|draft| draft.validation_status == "accepted" && !draft.approved)
-            .map(|draft| draft.id.clone())
+            .into_iter()
+            .filter(|draft| {
+                draft.validation_status == "accepted" && draft.learner_decision.is_none()
+            })
             .collect::<Vec<_>>();
-        let approved_count = pending.len();
-        for draft_id in pending {
-            let _: StudyView = self.post_empty(&format!(
-                "/v1/accounts/{}/drafts/{draft_id}/approve",
-                self.account_id
-            ))?;
-        }
 
-        Ok((deck, approved_count))
+        Ok((deck, pending_drafts))
     }
 
     /// List saved sources that belong to a project deck (`project_key` set),
@@ -191,6 +187,47 @@ impl MemoryEngineClient {
             ),
             &json!({ "event": event }),
         )
+    }
+
+    /// Keep one generated draft after inspecting its provenance.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn keep_draft(&self, draft_id: &str) -> Result<StudyView, String> {
+        self.post_empty(&format!(
+            "/v1/accounts/{}/drafts/{draft_id}/keep",
+            self.account_id
+        ))
+    }
+
+    /// Edit one generated draft and keep the edited wording.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn edit_draft(
+        &self,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyView, String> {
+        self.post_json(
+            &format!("/v1/accounts/{}/drafts/{draft_id}/edit", self.account_id),
+            &json!({
+                "prompt": prompt,
+                "expectedAnswer": expected_answer,
+            }),
+        )
+    }
+
+    /// Reject one generated draft without scheduling it.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn reject_draft(&self, draft_id: &str) -> Result<StudyView, String> {
+        self.post_empty(&format!(
+            "/v1/accounts/{}/drafts/{draft_id}/reject",
+            self.account_id
+        ))
     }
 
     /// Fetch the next due review card.

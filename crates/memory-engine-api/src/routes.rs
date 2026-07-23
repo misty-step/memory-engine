@@ -53,6 +53,16 @@ pub(crate) struct V1ContractOperation {
     pub(crate) path: &'static str,
 }
 
+#[cfg(test)]
+macro_rules! single_operation {
+    ($method:literal, $path:expr) => {
+        &[V1ContractOperation {
+            method: $method,
+            path: $path,
+        }]
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum V1Route {
     OpenApi,
@@ -66,7 +76,9 @@ enum V1Route {
     Generate,
     GenerationJobs,
     GenerationJob,
-    Approve,
+    Keep,
+    EditDraft,
+    RejectDraft,
     Next,
     Reveal,
     Reference,
@@ -90,7 +102,9 @@ const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/ge
 const V1_GENERATION_JOBS_PATH: &str =
     "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs";
 const V1_GENERATION_JOB_PATH: &str = "/v1/accounts/{account_id}/generation-jobs/{job_id}";
-const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
+const V1_KEEP_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/keep";
+const V1_EDIT_DRAFT_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/edit";
+const V1_REJECT_DRAFT_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/reject";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
 const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
 const V1_REFERENCE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reference";
@@ -114,7 +128,9 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Generate,
     V1Route::GenerationJobs,
     V1Route::GenerationJob,
-    V1Route::Approve,
+    V1Route::Keep,
+    V1Route::EditDraft,
+    V1Route::RejectDraft,
     V1Route::Next,
     V1Route::Reveal,
     V1Route::Reference,
@@ -164,6 +180,13 @@ struct EnqueuedGenerationJobResource {
     #[serde(flatten)]
     job: GenerationJobResource,
     coalesced: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditDraftRequest {
+    prompt: String,
+    expected_answer: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,7 +240,9 @@ impl V1Route {
                 router.route(V1_GENERATION_JOBS_PATH, post(enqueue_generation_job))
             }
             Self::GenerationJob => router.route(V1_GENERATION_JOB_PATH, get(get_generation_job)),
-            Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
+            Self::Keep => router.route(V1_KEEP_PATH, post(keep_draft)),
+            Self::EditDraft => router.route(V1_EDIT_DRAFT_PATH, post(edit_draft)),
+            Self::RejectDraft => router.route(V1_REJECT_DRAFT_PATH, post(reject_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
             Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
             Self::Reference => router.route(V1_REFERENCE_PATH, post(reference_review)),
@@ -235,18 +260,9 @@ impl V1Route {
     #[cfg(test)]
     fn operations(self) -> &'static [V1ContractOperation] {
         match self {
-            Self::OpenApi => &[V1ContractOperation {
-                method: "GET",
-                path: V1_OPENAPI_PATH,
-            }],
-            Self::Accounts => &[V1ContractOperation {
-                method: "POST",
-                path: V1_ACCOUNTS_PATH,
-            }],
-            Self::ServiceSessions => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SERVICE_SESSIONS_PATH,
-            }],
+            Self::OpenApi => single_operation!("GET", V1_OPENAPI_PATH),
+            Self::Accounts => single_operation!("POST", V1_ACCOUNTS_PATH),
+            Self::ServiceSessions => single_operation!("POST", V1_SERVICE_SESSIONS_PATH),
             Self::Sources => &[
                 V1ContractOperation {
                     method: "GET",
@@ -267,66 +283,25 @@ impl V1Route {
                     path: V1_SOURCE_PATH,
                 },
             ],
-            Self::ProjectDecks => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECKS_PATH,
-            }],
-            Self::ProjectDeckInvalidate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECK_INVALIDATE_PATH,
-            }],
-            Self::Generate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATE_PATH,
-            }],
-            Self::GenerationJobs => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATION_JOBS_PATH,
-            }],
-            Self::GenerationJob => &[V1ContractOperation {
-                method: "GET",
-                path: V1_GENERATION_JOB_PATH,
-            }],
-            Self::Approve => &[V1ContractOperation {
-                method: "POST",
-                path: V1_APPROVE_PATH,
-            }],
-            Self::Next => &[V1ContractOperation {
-                method: "POST",
-                path: V1_NEXT_PATH,
-            }],
-            Self::Reveal => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REVEAL_PATH,
-            }],
-            Self::Reference => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REFERENCE_PATH,
-            }],
-            Self::Skip => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SKIP_PATH,
-            }],
-            Self::Snooze => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_PATH,
-            }],
-            Self::SnoozeConcept => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_CONCEPT_PATH,
-            }],
-            Self::Bridge => &[V1ContractOperation {
-                method: "POST",
-                path: V1_BRIDGE_PATH,
-            }],
-            Self::Submit => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SUBMIT_PATH,
-            }],
-            Self::ContentFeedback => &[V1ContractOperation {
-                method: "POST",
-                path: V1_CONTENT_FEEDBACK_PATH,
-            }],
+            Self::ProjectDecks => single_operation!("POST", V1_PROJECT_DECKS_PATH),
+            Self::ProjectDeckInvalidate => {
+                single_operation!("POST", V1_PROJECT_DECK_INVALIDATE_PATH)
+            }
+            Self::Generate => single_operation!("POST", V1_GENERATE_PATH),
+            Self::GenerationJobs => single_operation!("POST", V1_GENERATION_JOBS_PATH),
+            Self::GenerationJob => single_operation!("GET", V1_GENERATION_JOB_PATH),
+            Self::Keep => single_operation!("POST", V1_KEEP_PATH),
+            Self::EditDraft => single_operation!("POST", V1_EDIT_DRAFT_PATH),
+            Self::RejectDraft => single_operation!("POST", V1_REJECT_DRAFT_PATH),
+            Self::Next => single_operation!("POST", V1_NEXT_PATH),
+            Self::Reveal => single_operation!("POST", V1_REVEAL_PATH),
+            Self::Reference => single_operation!("POST", V1_REFERENCE_PATH),
+            Self::Skip => single_operation!("POST", V1_SKIP_PATH),
+            Self::Snooze => single_operation!("POST", V1_SNOOZE_PATH),
+            Self::SnoozeConcept => single_operation!("POST", V1_SNOOZE_CONCEPT_PATH),
+            Self::Bridge => single_operation!("POST", V1_BRIDGE_PATH),
+            Self::Submit => single_operation!("POST", V1_SUBMIT_PATH),
+            Self::ContentFeedback => single_operation!("POST", V1_CONTENT_FEEDBACK_PATH),
         }
     }
 }
@@ -390,6 +365,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/jobs/events", get(app_jobs_events))
         .route("/app/jobs/retry", post(retry_app_job))
         .route("/app/next", post(next_app_review))
+        .route("/app/draft/keep", post(keep_app_draft))
+        .route("/app/draft/edit", post(edit_app_draft))
+        .route("/app/draft/reject", post(reject_app_draft))
         .route("/app/reveal", post(reveal_app_review))
         .route("/app/reference", post(reference_app_review))
         .route("/app/skip", post(skip_app_review))
@@ -418,8 +396,16 @@ pub fn router(state: ApiState) -> Router {
             post(generate_source),
         )
         .route(
-            "/accounts/{account_id}/drafts/{draft_id}/approve",
-            post(approve_draft),
+            "/accounts/{account_id}/drafts/{draft_id}/keep",
+            post(keep_draft),
+        )
+        .route(
+            "/accounts/{account_id}/drafts/{draft_id}/edit",
+            post(edit_draft),
+        )
+        .route(
+            "/accounts/{account_id}/drafts/{draft_id}/reject",
+            post(reject_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
     mount_review_routes(router).with_state(state)
@@ -747,14 +733,42 @@ async fn update_source_permission(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn approve_draft(
+async fn keep_draft(
     State(state): State<ApiState>,
     Path((account_id, draft_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
+    Ok(Json(state.keep_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+    )?))
+}
 
-    Ok(Json(state.approve_draft(
+async fn edit_draft(
+    State(state): State<ApiState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<EditDraftRequest>,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    Ok(Json(state.edit_pending_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+        &request.prompt,
+        &request.expected_answer,
+    )?))
+}
+
+async fn reject_draft(
+    State(state): State<ApiState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    Ok(Json(state.reject_pending_draft(
         &account_id,
         session_token,
         &draft_id,
@@ -957,6 +971,22 @@ struct AppSourcePermissionForm {
 struct AppJobActionForm {
     csrf_token: Option<String>,
     job_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppDraftActionForm {
+    csrf_token: Option<String>,
+    draft_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppDraftEditForm {
+    csrf_token: Option<String>,
+    draft_id: String,
+    prompt: String,
+    expected_answer: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1666,6 +1696,92 @@ async fn static_app_js() -> impl IntoResponse {
         ],
         JS,
     )
+}
+
+async fn keep_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.keep_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn edit_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftEditForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.edit_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+        &form.prompt,
+        &form.expected_answer,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn reject_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(error),
+        };
+    let result = state.reject_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn next_app_review(

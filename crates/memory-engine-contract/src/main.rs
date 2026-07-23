@@ -18,7 +18,7 @@ const REQUIRED_CONTRACT_PATHS: &[&str] = &[
     "/v1/accounts/{account_id}/sources",
     "/v1/accounts/{account_id}/sources/{source_id}",
     "/v1/accounts/{account_id}/sources/{source_id}/generate",
-    "/v1/accounts/{account_id}/drafts/{draft_id}/approve",
+    "/v1/accounts/{account_id}/drafts/{draft_id}/keep",
     "/v1/accounts/{account_id}/review/next",
     "/v1/accounts/{account_id}/review/{review_unit_id}/reveal",
     "/v1/accounts/{account_id}/review/{review_unit_id}/submit",
@@ -164,7 +164,7 @@ fn drive_review_loop(
         .clone();
 
     client.post_empty::<StudyView>(&format!(
-        "/v1/accounts/{}/drafts/{draft_id}/approve",
+        "/v1/accounts/{}/drafts/{draft_id}/keep",
         client.account_id
     ))?;
 

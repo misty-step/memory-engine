@@ -519,19 +519,59 @@ impl ApiState {
             .archive_source(account.account_id(), account.session_token(), source_id)
     }
 
-    /// Approve a generated draft.
+    /// Keep an accepted generated draft and schedule it for review.
     ///
     /// # Errors
     ///
-    /// Returns an API failure when auth, draft lookup, or persistence fails.
-    pub fn approve_draft(
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
+    pub fn keep_draft(
         &self,
         account_id: &str,
         session_token: &str,
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.accounts
-            .approve_draft(account_id, session_token, draft_id)
+            .keep_draft(account_id, session_token, draft_id)
+    }
+
+    /// Edit and keep an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, validation, draft decision, or
+    /// persistence rejects the request.
+    pub fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.edit_pending_draft(
+            account_id,
+            session_token,
+            draft_id,
+            prompt,
+            expected_answer,
+        )
+    }
+
+    /// Reject an accepted generated draft without scheduling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
+    pub fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .reject_pending_draft(account_id, session_token, draft_id)
     }
 
     /// Fetch the next due review.
@@ -2613,7 +2653,7 @@ where
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let run_id = format!("study-run-{:032x}", rand::random::<u128>());
-    run_source_generation_with_run_id(study, source_id, &run_id, generation_provider_config)
+    run_source_generation_inner(study, source_id, &run_id, generation_provider_config, false)
 }
 
 pub(crate) fn run_source_generation_with_run_id<S>(
@@ -2621,6 +2661,20 @@ pub(crate) fn run_source_generation_with_run_id<S>(
     source_id: &str,
     run_id: &str,
     generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    run_source_generation_inner(study, source_id, run_id, generation_provider_config, true)
+}
+
+fn run_source_generation_inner<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    run_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
+    mark_pending: bool,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
@@ -2634,20 +2688,33 @@ where
         .iter()
         .find(|source| source.id == source_id)
         .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
-    if local_only {
-        return study
-            .generate_with_run_id(ids, run_id)
-            .map_err(study_failure);
-    }
-    match generation_provider_config {
-        Some(config) => {
-            let model = OpenRouterProvider::new(config);
-            let provider = FallbackProvider::new(&model);
-            study.generate_with_provider_and_run_id(ids, &provider, run_id)
+    let generated = if local_only {
+        if mark_pending {
+            study.generate_with_run_id_pending(ids, run_id)
+        } else {
+            study.generate_with_run_id(ids, run_id)
         }
-        None => study.generate_with_run_id(ids, run_id),
-    }
-    .map_err(study_failure)
+    } else {
+        match generation_provider_config {
+            Some(config) => {
+                let model = OpenRouterProvider::new(config);
+                let provider = FallbackProvider::new(&model);
+                if mark_pending {
+                    study.generate_with_provider_and_run_id_pending(ids, &provider, run_id)
+                } else {
+                    study.generate_with_provider_and_run_id(ids, &provider, run_id)
+                }
+            }
+            None => {
+                if mark_pending {
+                    study.generate_with_run_id_pending(ids, run_id)
+                } else {
+                    study.generate_with_run_id(ids, run_id)
+                }
+            }
+        }
+    };
+    generated.map_err(study_failure)
 }
 
 #[cfg(test)]
@@ -2905,7 +2972,64 @@ fn migrate_postgres_store(
     Ok(())
 }
 
+trait LearnerDecisionApiError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure>;
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence::BetaStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer | Self::AttemptAnswerBlank => Some(
+                ApiFailure::bad_request("The learner decision request is invalid."),
+            ),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence_postgres::PostgresStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer => Some(ApiFailure::bad_request(
+                "The learner decision request is invalid.",
+            )),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
+    if let Some(failure) = error.learner_decision_api_failure() {
+        return failure;
+    }
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
@@ -2999,6 +3123,30 @@ fn study_failure<E: std::fmt::Display>(
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
+}
+
+fn file_study_failure(
+    error: memory_engine_study::BetaStudyError<memory_engine_persistence::BetaStoreError>,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
+}
+
+fn postgres_study_failure(
+    error: memory_engine_study::BetaStudyError<
+        memory_engine_persistence_postgres::PostgresStoreError,
+    >,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
 }
 
 fn require_current_review(
@@ -3221,7 +3369,7 @@ mod tests {
 
         let generated = study.generate(None).expect("generate");
         let draft_id = generated.drafts.first().expect("draft").id.clone();
-        study.approve_draft(&draft_id).expect("approve");
+        study.keep_draft(&draft_id).expect("keep");
         study.start().expect("start reference session");
 
         let reference = run_reference_generation(&mut study, Some(config.clone()))
@@ -3234,7 +3382,17 @@ mod tests {
         study.start().expect("start bridge session");
         let bridge =
             run_bridge_generation(&mut study, Some(config)).expect("local bridge generation");
-        assert!(bridge.current.is_some(), "local bridge should still render");
+        assert!(
+            bridge.current.is_none(),
+            "local bridge generation must remain pending"
+        );
+        assert!(
+            bridge
+                .drafts
+                .iter()
+                .any(|draft| draft.review_unit_id.as_str().starts_with("bridge-")),
+            "local bridge drafts should remain inspectable"
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

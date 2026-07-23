@@ -18,7 +18,7 @@ Belongs to the beta store:
 - generated learning drafts, including prompt or exercise drafts, critique
   notes, validation status, and model metadata;
 - generation run receipts;
-- approved review units and their queue metadata;
+- learner-kept review units and their queue metadata;
 - learner attempts and schedule records;
 - applied-review receipts used for duplicate and stale-write protection.
 
@@ -51,7 +51,7 @@ Snapshot collections:
   exercise drafts with worked solutions, activity kind, ladder stage, scoring
   rubric, and validation status before anything enters review.
 - `generationRuns`: provider/model run receipts and validation failures.
-- `reviewUnits`: approved prompt, prompt id, reference links, queue metadata,
+- `reviewUnits`: kept prompt, prompt id, reference links, queue metadata,
   and generated-draft linkage.
 - `schedules`: JSON-safe `ScheduleState` records keyed by `ReviewUnitId`.
 - `attempts`: `ServiceAttemptRecord` history.

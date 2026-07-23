@@ -593,8 +593,7 @@
       case "retry":
         return "Retrying after a temporary failure…";
       case "succeeded":
-        var n = job.cardCount || 0;
-        return n + " " + (n === 1 ? "card" : "cards") + " · scheduled for review";
+        return "Generation succeeded; accepted drafts are pending your review.";
       case "failed":
         return job.error || "Generation failed. Try again.";
       default:
@@ -636,12 +635,27 @@
   }
 
   var source = new EventSource("/app/jobs/events");
+  var terminalNavigationStarted = false;
   // EventSource reconnects automatically; no manual retry needed.
   source.addEventListener("job", function (event) {
     try {
-      apply(JSON.parse(event.data));
+      // Pages without the activity surface (review/answer/edit) keep the
+      // learner's unsent work: no row patch, no terminal navigation.
+      if (!list) return;
+      var job = JSON.parse(event.data);
+      apply(job);
+      if (
+        !terminalNavigationStarted &&
+        (job.status === "succeeded" || job.status === "failed")
+      ) {
+        terminalNavigationStarted = true;
+        // The POST response may be this document. Navigate with GET rather
+        // than reload so capture is never submitted twice. SSR refreshes the
+        // authoritative pending-draft/review surface and retry controls.
+        window.location.assign("/");
+      }
     } catch (err) {
-      /* ignore a malformed frame; the next event or reload corrects it */
+      /* ignore a malformed frame; the next event or navigation corrects it */
     }
   });
 })();

@@ -13,23 +13,17 @@ use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
     account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
-    persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
-    postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation,
-    run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
-    with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
-    with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
-    ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings,
+    browser_session_path, file_content_feedback_failure, file_study_failure,
+    persisted_project_deck_exists, persisted_source_exists, persisted_sources,
+    postgres_content_feedback_failure, postgres_failure, postgres_study_failure, rate_limit_path,
+    require_current_review, require_current_review_postgres, run_bridge_generation,
+    run_reference_generation, run_source_generation, run_source_generation_with_run_id,
+    secret_hash, study_failure, with_postgres_account, with_postgres_account_timed,
+    with_postgres_store, with_postgres_store_timed, with_postgres_study, write_atomic, ApiFailure,
+    BrowserSessionRecord, ReturnNotificationClaim, ReturnNotificationClaimRequest,
+    ReturnNotificationPreference, SourceRecord, StudyViewResponse, SubmitReviewRequest,
+    SubmitReviewTimings,
 };
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GenerationCommitFence<'a> {
-    pub(crate) generation_run_id: &'a str,
-    pub(crate) generation_attempt: i32,
-    pub(crate) lease_token: &'a str,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) enum StudyStorageConfig {
@@ -416,9 +410,39 @@ impl StudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .generate_source_with_run_id(account_id, store_path, source_id, run_id)
+        self.inner.generate_source_with_run_id(
+            account_id,
+            store_path,
+            source_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.finalize_generation_run(
+            account_id,
+            store_path,
+            run_id,
+            generation_attempt,
+            lease_token,
+            now_ms,
+            lease_valid,
+        )
     }
 
     /// Archive a source and every review unit generated from it. Returns the
@@ -445,15 +469,35 @@ impl StudyStorage {
             .invalidate_project_deck(account_id, store_path, deck_id, invalidated_at)
     }
 
-    pub(crate) fn approve_draft(
+    pub(crate) fn keep_draft(
         &self,
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner.keep_draft(account_id, store_path, draft_id)
+    }
+
+    pub(crate) fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner
-            .approve_draft(account_id, store_path, draft_id, generation_commit_fence)
+            .edit_pending_draft(account_id, store_path, draft_id, prompt, expected_answer)
+    }
+
+    pub(crate) fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .reject_pending_draft(account_id, store_path, draft_id)
     }
 
     pub(crate) fn next_review(
@@ -748,9 +792,25 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let _ = run_id;
         self.generate_source(account_id, store_path, source_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        _store_path: &FsPath,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        Ok(true)
     }
     fn archive_source(
         &self,
@@ -765,12 +825,25 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         deck_id: &str,
         invalidated_at: i64,
     ) -> Result<StudyViewResponse, ApiFailure>;
-    fn approve_draft(
+    fn keep_draft(
         &self,
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn next_review(
         &self,
@@ -1523,7 +1596,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         }
         // Provider/model work must stay outside the descriptor lock. The
         // persistence store owns the atomic commit path; holding the account
-        // lock here would turn normal foreground approval or invalidation on
+        // lock here would turn normal foreground keep or invalidation on
         // the same account into a spurious 409 for the duration of generation.
         let mut study = crate::open_study_session(store_path, self.now)?;
         let view = run_source_generation(
@@ -1541,6 +1614,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         if !persisted_source_exists(store_path, source_id)? {
             return Err(ApiFailure::not_found("Source not found."));
@@ -1553,6 +1628,29 @@ impl StudyStorageAdapter for FileStudyStorage {
             self.generation_provider_config.clone(),
         )?;
         Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            study
+                .finalize_generation_run(
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
+                    lease_valid,
+                )
+                .map_err(study_failure)
+        })
     }
 
     fn archive_source(
@@ -1590,17 +1688,42 @@ impl StudyStorageAdapter for FileStudyStorage {
         })
     }
 
-    fn approve_draft(
+    fn keep_draft(
         &self,
         _account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let _ = generation_commit_fence;
         self.with_locked_study(store_path, |study| {
-            let view = study.approve_draft(draft_id).map_err(study_failure)?;
+            let view = study.keep_draft(draft_id).map_err(file_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
 
+    fn edit_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(file_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn reject_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            let view = study.reject_draft(draft_id).map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -2304,25 +2427,56 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         _store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if !account
-                .snapshot()
-                .map_err(postgres_failure)?
-                .source_documents
-                .iter()
-                .any(|source| source.id == source_id && source.archived_at.is_none())
-            {
-                return Err(ApiFailure::not_found("Source not found."));
-            }
-            let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation_with_run_id(
-                &mut study,
-                source_id,
-                run_id,
-                self.generation_provider_config.clone(),
-            )?;
-            Ok(StudyViewResponse::from_view(view))
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account.set_generation_lease_fence(run_id, generation_attempt, lease_token);
+                if !account
+                    .snapshot()
+                    .map_err(postgres_failure)?
+                    .source_documents
+                    .iter()
+                    .any(|source| source.id == source_id && source.archived_at.is_none())
+                {
+                    return Err(ApiFailure::not_found("Source not found."));
+                }
+                let mut study = BetaStudySession::from_store(account, self.now);
+                let view = run_source_generation_with_run_id(
+                    &mut study,
+                    source_id,
+                    run_id,
+                    self.generation_provider_config.clone(),
+                )?;
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
+    }
+
+    fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .finalize_generation_run(
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
+                    lease_valid,
+                )
+                .map_err(postgres_failure)
         })
     }
 
@@ -2379,56 +2533,48 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         })
     }
 
-    fn approve_draft(
+    fn keep_draft(
         &self,
         account_id: &str,
         _store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if let Some(fence) = generation_commit_fence {
-                let mut account_for_commit = account.clone();
-                account_for_commit
-                    .begin_transaction()
-                    .map_err(postgres_failure)?;
-                let result = (|| {
-                    let now_ms = self.now_ms();
-                    if !account_for_commit
-                        .generation_job_attempt_has_commit_fence(
-                            fence.generation_run_id,
-                            fence.generation_attempt,
-                            fence.lease_token,
-                            now_ms,
-                        )
-                        .map_err(postgres_failure)?
-                    {
-                        return Err(ApiFailure::conflict(
-                            "Generation lease lost before cards could be committed.",
-                        ));
-                    }
-                    let mut study = BetaStudySession::from_store(account, self.now);
-                    let view = study.approve_draft(draft_id).map_err(study_failure)?;
-                    Ok(StudyViewResponse::from_view(view))
-                })();
-                match result {
-                    Ok(view) => {
-                        account_for_commit
-                            .commit_transaction()
-                            .map_err(postgres_failure)?;
-                        Ok(view)
-                    }
-                    Err(error) => {
-                        let _ = account_for_commit.rollback_transaction();
-                        Err(error)
-                    }
-                }
-            } else {
-                let mut study = BetaStudySession::from_store(account, self.now);
-                let view = study.approve_draft(draft_id).map_err(study_failure)?;
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study.keep_draft(draft_id).map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
 
-                Ok(StudyViewResponse::from_view(view))
-            }
+    fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study
+                .reject_draft(draft_id)
+                .map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
         })
     }
 
@@ -2975,13 +3121,8 @@ mod tests {
         // This is the foreground operation that used to receive a spurious
         // 409 while generation held the descriptor across provider work.
         storage
-            .approve_draft(
-                "acct",
-                &root.join("acct").join("study.json"),
-                &draft_id,
-                None,
-            )
-            .expect("foreground approval must commit while provider is running");
+            .keep_draft("acct", &root.join("acct").join("study.json"), &draft_id)
+            .expect("foreground keep must commit while provider is running");
         storage
             .save_source(
                 "acct",
@@ -3018,7 +3159,7 @@ mod tests {
             snapshot.review_units.iter().any(|unit| {
                 unit.generated_prompt_draft_id.as_deref() == Some(draft_id.as_str())
             }),
-            "foreground approval must survive the later generation commit"
+            "foreground keep must survive the later generation commit"
         );
         assert!(!reloaded.list_queue_candidates().expect("queue").is_empty());
 
@@ -3086,13 +3227,13 @@ mod tests {
         };
         let approval_store_path = store_path.clone();
         let approval = tokio::task::spawn_blocking(move || {
-            approval_storage.approve_draft("acct", &approval_store_path, &draft_id, None)
+            approval_storage.keep_draft("acct", &approval_store_path, &draft_id)
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), approval)
             .await
-            .expect("foreground approval must not wait for provider to release")
-            .expect("foreground approval task")
-            .expect("foreground approval");
+            .expect("foreground keep must not wait for provider to release")
+            .expect("foreground keep task")
+            .expect("foreground keep");
         release.wait();
         generation
             .join()

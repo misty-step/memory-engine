@@ -203,12 +203,14 @@ while :; do
     *) printf 'unexpected job response: %s\n' "$job_response" >&2; exit 1 ;;
   esac
 done
-printf 'scheduled cards: %s\n' "$(printf '%s' "$job_response" | jq -r '.cardCount')"
+printf 'scheduled cards created by generation: %s\n' "$(printf '%s' "$job_response" | jq -r '.cardCount')"
 ```
 
-A succeeded job can report `cardCount: 0` when generation completed but no
-draft passed the shared validation gate. That is a content-quality result, not
-a queue failure; callers may inspect the source or submit revised material.
+A succeeded job reports the scheduled cards created by generation in
+`cardCount`; this remains 0 while generated drafts await learner decisions.
+Generation itself creates no review units or due schedules; a learner keep or
+edit decision is the explicit scheduling gate. Inspect the study view for pending
+drafts.
 
 ## Legacy v1 compatibility latency
 

@@ -51,7 +51,14 @@ fn active_review_render_skips_workspace_material() {
     ));
     state.run_pending_jobs_blocking();
 
-    let view = state.next_app_review(&account).expect("next review");
+    let pending = state.next_app_review(&account).expect("pending review");
+    let view = state
+        .keep_draft(
+            account.account_id(),
+            account.session_token(),
+            &pending.drafts[0].id,
+        )
+        .expect("keep review");
     assert!(
         view.current.is_some(),
         "fixture must reach an active review"

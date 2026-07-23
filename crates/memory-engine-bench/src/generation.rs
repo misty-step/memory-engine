@@ -338,6 +338,7 @@ fn score_source(
         completed_at: Some(NOW),
         default_due: NOW,
         model: None,
+        pending: false,
     };
     let fallback_learning_intent = Some(classify_learning_intent(&document).intent);
     let mut bench_store = BenchGenerationStore::new(document);

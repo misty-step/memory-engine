@@ -1222,17 +1222,17 @@ mod tests {
                 .as_array()
                 .expect("drafts array")
                 .iter()
-                .find(|draft| !draft["approved"].as_bool().unwrap_or(true))
-                .expect("one unapproved draft for this source")["id"]
+                .find(|draft| draft["learnerDecision"].is_null())
+                .expect("one undecided draft for this source")["id"]
                 .as_str()
                 .expect("draft id")
                 .to_owned();
             client
                 .post_empty::<serde_json::Value>(&format!(
-                    "/v1/accounts/{}/drafts/{draft_id}/approve",
+                    "/v1/accounts/{}/drafts/{draft_id}/keep",
                     created.account_id
                 ))
-                .expect("approve draft");
+                .expect("keep draft");
         }
 
         // SAFETY: no other test in this process depends on these two names.

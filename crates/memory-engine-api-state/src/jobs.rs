@@ -3,7 +3,7 @@
 //! Creating material no longer blocks the request. A capture enqueues a
 //! `GenerationJob`, the handler returns immediately, and an in-process worker
 //! runs the (synchronous, ~20s) model call on a blocking thread, then
-//! optimistically approves and schedules the resulting cards. Job status
+//! persists generated candidates for explicit learner decisions. Job status
 //! (`queued → running → succeeded | failed`) is held in memory and pushed to
 //! the browser over SSE; failed jobs can be retried.
 //!
@@ -111,6 +111,8 @@ pub struct GenerationJob {
     pub source_id: String,
     pub title: String,
     pub status: JobStatus,
+    /// Number of scheduled review cards created by this job. Trust-gated
+    /// generation leaves this at zero until a learner keeps or edits a draft.
     pub card_count: usize,
     pub attempts: u32,
     /// False once the bounded attempt budget is exhausted. This is sent over
@@ -661,18 +663,17 @@ impl JobQueue {
         if !bound {
             return;
         }
+        let registry = self.inner.registry.clone();
         let fence_database_url = database_url.to_owned();
         let fence_account_id = job.account_id.clone();
         let fence_job_id = job.id.clone();
         let fence_token = job.lease_token.clone().unwrap_or_default();
         let fence_reservation = job.reserved_cost_usd_micros;
         let fence_run_id = run_id.clone();
-        let fence_registry = self.inner.registry.clone();
+        let fence_registry = registry.clone();
         let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
         let generation_lease_token = job.lease_token.clone().unwrap_or_default();
-        let result = self
-            .inner
-            .registry
+        let result = registry
             .run_generation_job(
                 &job.account_id,
                 &job.source_id,
@@ -698,8 +699,7 @@ impl JobQueue {
                 },
             )
             .and_then(|card_count| {
-                self.inner
-                    .registry
+                registry
                     .generation_cost_for_run(&job.account_id, &run_id)
                     .map(|cost| (card_count, cost))
             })
@@ -1205,7 +1205,6 @@ mod tests {
     // A ghost source fails fast in the worker (no model call), so every job
     // becomes terminal (failed) without touching the network.
     const GHOST: &str = "ghost-source";
-    static TEST_CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
     fn enqueue_id(outcome: EnqueueOutcome) -> String {
         match outcome {
@@ -1214,10 +1213,6 @@ mod tests {
                 panic!("test enqueue rejected: {reason}")
             }
         }
-    }
-
-    fn test_clock_ms() -> i64 {
-        TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[test]
@@ -1485,8 +1480,32 @@ mod tests {
                 || true,
             )
             .expect("replayed generation");
-        assert!(first > 0, "fixture must produce scheduled material");
+        assert_eq!(
+            first, 0,
+            "successful generation must leave accepted drafts pending"
+        );
         assert_eq!(second, 0, "a replay must not schedule duplicate material");
+        let study = memory_engine_persistence::BetaPersistenceStore::open(
+            registry.storage().account_store_path(&account.account_id),
+        )
+        .expect("study store");
+        let snapshot = study.snapshot();
+        assert!(
+            snapshot.review_units.is_empty(),
+            "generation must not create review units"
+        );
+        assert!(
+            snapshot.schedules.is_empty(),
+            "generation must not create due schedules"
+        );
+        assert!(
+            snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|draft| draft.validation.status
+                    == memory_engine_persistence::GeneratedPromptValidationStatus::Accepted),
+            "accepted generated drafts must remain inspectable"
+        );
     }
 
     #[test]
@@ -1615,6 +1634,10 @@ mod tests {
                 snapshot.review_units.is_empty(),
                 "stale worker must not commit any review units after reclaim"
             );
+            assert!(
+                snapshot.generated_prompt_drafts.is_empty(),
+                "stale worker must not leave pending drafts after reclaim"
+            );
             match outcome {
                 Ok(_) => Err("stale worker was able to commit review units".to_owned()),
                 Err(error) => {
@@ -1637,6 +1660,10 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn postgres_generation_cannot_commit_after_live_lease_expiry_without_reclaim() {
+        static TEST_CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn test_clock_ms() -> i64 {
+            TEST_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+        }
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
             eprintln!(
                 "skipping live Postgres expiry regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
@@ -1735,14 +1762,32 @@ mod tests {
                 "unexpected fence error: {}",
                 err.message
             );
-            let scope =
-                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
-                    .map_err(|error| error.to_string())?;
+            let account_id = account.account_id.clone();
+            let session_token = account.session_token.clone();
+            let scope = memory_engine_persistence_postgres::AccountScope::new(account_id.clone())
+                .map_err(|error| error.to_string())?;
             let account = ledger.for_account(scope);
             let snapshot = account.snapshot().map_err(|error| error.to_string())?;
             assert!(
                 snapshot.review_units.is_empty(),
                 "expired lease must not commit review units"
+            );
+            assert!(
+                snapshot.generated_prompt_drafts.is_empty(),
+                "expired lease must not leave pending drafts"
+            );
+            let workspace = registry
+                .study_view(&account_id, &session_token)
+                .map_err(|error| error.message.clone())?;
+            assert!(
+                workspace.drafts.is_empty(),
+                "expired output must stay off the learner workspace"
+            );
+            assert!(
+                registry
+                    .keep_draft(&account_id, &session_token, "expired-draft")
+                    .is_err(),
+                "expired output must be undecidable"
             );
             Ok(())
         })();

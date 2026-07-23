@@ -101,7 +101,8 @@ probe:
 
 `crates/memory-engine-study` now ports the beta-study session/API boundary:
 
-- source intake, generation invocation, draft approval, reveal state,
+- source intake, generation invocation, pending draft inspection, explicit
+  keep/edit/reject decisions, and reveal state,
   grade/apply-review, and queue advancement as one session object;
 - API DTOs for sources, drafts, queue rows, current review state, schedule
   changes, summary, and API-pressure notes with TypeScript-compatible serde
@@ -116,7 +117,8 @@ probe:
 `crates/memory-engine-beta-app` now ports the local beta-study HTTP host:
 
 - serves a phone-friendly HTML/form interface rendered by the Rust binary;
-- exposes the existing `/state`, `/source`, `/generate`, `/approve`, `/reveal`,
+- exposes the existing `/state`, `/source`, `/generate`, `/draft/keep`,
+  `/draft/edit`, `/draft/reject`, `/reveal`,
   `/answer`, and `/next` routes over the Rust `memory-engine-study` session;
 - validates malformed JSON payloads before touching session state;
 - accepts URL-encoded form submissions for browser flows while preserving the

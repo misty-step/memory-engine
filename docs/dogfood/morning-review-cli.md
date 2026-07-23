@@ -143,7 +143,7 @@ Memory Engine API listening on http://127.0.0.1:18099
 
 An account, one source, and one approved review unit were seeded through the
 same v1 endpoints the CLI itself uses (`POST /v1/accounts`, `.../sources`,
-`.../sources/{id}/generate`, `.../drafts/{id}/approve`) — the seeding is
+`.../sources/{id}/generate`, `.../drafts/{id}/keep`) — the seeding is
 outside this ticket's scope (source ingestion is a different dogfood
 surface); this only proves the review-loop half.
 
