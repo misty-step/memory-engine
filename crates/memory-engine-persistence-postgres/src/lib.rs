@@ -4725,7 +4725,7 @@ mod tests {
             let reclaimed = after_lease
                 .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
                 .expect("expired lease must be reclaimed");
-            assert_eq!(reclaimed_job.attempts, 2);
+            assert_eq!(reclaimed.attempts, 2);
             assert!(!after_lease.finish_generation_job(
                 "acct_jobs",
                 "job-1",
@@ -5426,7 +5426,7 @@ mod tests {
             let reclaimed_job = reclaim_store
                 .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
                 .expect("expired first lease is reclaimed");
-            assert_eq!(reclaimed.attempts, 2);
+            assert_eq!(reclaimed_job.attempts, 2);
 
             // Commit both learner decisions from independent connections before
             // the stale worker finalizer. The advisory transaction lock must let
