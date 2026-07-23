@@ -1246,12 +1246,18 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
             &[stale_draft.id.as_str()],
         ))
         .expect("stale run");
-    store
-        .discard_generation_run("stale-run")
-        .expect("discard stale run");
-    store
-        .discard_generation_run("stale-run")
-        .expect("repeat stale discard");
+    assert!(
+        !store
+            .finalize_generation_run("stale-run", false)
+            .expect("finalize stale run"),
+        "stale file finalizer must reject the lost lease"
+    );
+    assert!(
+        !store
+            .finalize_generation_run("stale-run", false)
+            .expect("repeat stale finalizer"),
+        "repeated stale finalization remains idempotent"
+    );
     let after_discard = store.snapshot();
     assert!(!after_discard
         .generated_prompt_drafts
