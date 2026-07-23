@@ -3287,6 +3287,7 @@ impl AccountStudyStore<'_> {
 
     /// Atomically fence a generation attempt and remove its complete stale
     /// output closure when the lease is no longer owned.
+    #[allow(clippy::too_many_lines)]
     ///
     /// The account advisory transaction lock serializes this fence with every
     /// learner decision on every connection. Generation-job attempt ledger rows
