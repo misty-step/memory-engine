@@ -208,6 +208,9 @@ pub trait BetaGenerationStore {
     }
 
     /// Atomically fence a run and remove all stale output when the lease is lost.
+    ///
+    /// # Errors
+    /// Returns the store error when finalization cannot be persisted.
     fn finalize_generation_run(
         &mut self,
         _run_id: &str,

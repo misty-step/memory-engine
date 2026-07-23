@@ -1196,6 +1196,7 @@ fn mastered_after_three_reviews(schedule: &ScheduleState) -> bool {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
     let directory = TempDirectory::new("learner-trust-driver");
     let path = directory.path().join("store.json");
