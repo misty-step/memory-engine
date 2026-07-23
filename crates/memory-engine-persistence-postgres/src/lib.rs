@@ -7646,7 +7646,9 @@ mod tests {
                 &[&reference.id],
                 Some("cleanup-owner-replacement-run"),
             );
-            let old_run = generation_run("cleanup-owner-old-run", &[&source.id], &[&old_draft.id]);
+            let mut old_run =
+                generation_run("cleanup-owner-old-run", &[&source.id], &[&old_draft.id]);
+            old_run.completed_at = Some(i64::MIN);
             let replacement_run = generation_run(
                 "cleanup-owner-replacement-run",
                 &[&source.id],
@@ -7673,6 +7675,14 @@ mod tests {
                     NOW + 1,
                 ))?;
             }
+            let mut pending_reader = super::PostgresStudyStore::connect(&scoped_url)?;
+            pending_reader.migrate()?;
+            let pending_account =
+                pending_reader.for_account(AccountScope::new("acct-cleanup-owner")?);
+            let pending_view = BetaStudySession::from_store(pending_account, || NOW).view()?;
+            assert_eq!(pending_view.drafts.len(), 1);
+            assert_eq!(pending_view.drafts[0].id, replacement.id);
+
             let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
             finalizer_store.migrate()?;
             let mut finalizer =

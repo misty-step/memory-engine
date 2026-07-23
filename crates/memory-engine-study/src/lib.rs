@@ -1581,7 +1581,10 @@ where
         let active_drafts = snapshot
             .generated_prompt_drafts
             .iter()
-            .filter(|draft| draft_has_active_source(draft, &active_source_ids))
+            .filter(|draft| {
+                draft_has_active_source(draft, &active_source_ids)
+                    && draft_run_is_finalized(draft, &snapshot)
+            })
             .collect::<Vec<_>>();
         let now = (self.now)();
         let active_queue = queue
@@ -1952,6 +1955,15 @@ fn ensure_active_source_model_eligible<E>(
     }
 
     Ok(authorization)
+}
+
+fn draft_run_is_finalized(draft: &GeneratedPromptDraft, snapshot: &BetaStoreSnapshot) -> bool {
+    snapshot
+        .generation_runs
+        .iter()
+        .find(|run| run.id == draft.generation_run_id.as_deref().unwrap_or_default())
+        .and_then(|run| run.completed_at)
+        .is_some_and(|completed_at| completed_at != i64::MIN)
 }
 
 fn draft_has_active_source(

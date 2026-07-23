@@ -35,10 +35,19 @@ fn queued_generation_is_pending_before_lease_publication() {
     let generated = study
         .generate_with_run_id_pending(None, "queued-run")
         .expect("queued generation");
-    let draft_id = generated.drafts.first().expect("pending draft").id.clone();
+    assert!(
+        generated.drafts.is_empty(),
+        "unfinalized drafts must stay off the learner workspace"
+    );
     let snapshot = BetaPersistenceStore::open(&path)
         .expect("reload")
         .snapshot();
+    let draft_id = snapshot
+        .generated_prompt_drafts
+        .first()
+        .expect("durable pending draft")
+        .id
+        .clone();
     assert!(snapshot.review_units.is_empty());
     assert!(snapshot.schedules.is_empty());
     assert!(snapshot
@@ -50,6 +59,33 @@ fn queued_generation_is_pending_before_lease_publication() {
     assert!(matches!(
         decisions.keep_generated_prompt_draft(&draft_id, NOW),
         Err(BetaStoreError::MissingGenerationRunForAcceptedDraft)
+    ));
+}
+
+#[test]
+fn unfinalized_generation_drafts_are_hidden_and_undecidable() {
+    let directory = TempDirectory::new("unfinalized-draft-visibility");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    let generated = study
+        .generate_with_run_id_pending(None, "visibility-run")
+        .expect("queued generation");
+    assert!(generated.drafts.is_empty());
+    let draft_id = BetaPersistenceStore::open(&path)
+        .expect("reload")
+        .snapshot()
+        .generated_prompt_drafts
+        .first()
+        .expect("durable draft")
+        .id
+        .clone();
+    assert!(matches!(
+        study.keep_draft(&draft_id),
+        Err(memory_engine_study::BetaStudyError::Store(
+            BetaStoreError::MissingGenerationRunForAcceptedDraft
+        ))
     ));
 }
 

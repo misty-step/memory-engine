@@ -1762,9 +1762,10 @@ mod tests {
                 "unexpected fence error: {}",
                 err.message
             );
-            let scope =
-                memory_engine_persistence_postgres::AccountScope::new(account.account_id.clone())
-                    .map_err(|error| error.to_string())?;
+            let account_id = account.account_id.clone();
+            let session_token = account.session_token.clone();
+            let scope = memory_engine_persistence_postgres::AccountScope::new(account_id.clone())
+                .map_err(|error| error.to_string())?;
             let account = ledger.for_account(scope);
             let snapshot = account.snapshot().map_err(|error| error.to_string())?;
             assert!(
@@ -1774,6 +1775,19 @@ mod tests {
             assert!(
                 snapshot.generated_prompt_drafts.is_empty(),
                 "expired lease must not leave pending drafts"
+            );
+            let workspace = registry
+                .study_view(&account_id, &session_token)
+                .map_err(|error| error.message.clone())?;
+            assert!(
+                workspace.drafts.is_empty(),
+                "expired output must stay off the learner workspace"
+            );
+            assert!(
+                registry
+                    .keep_draft(&account_id, &session_token, "expired-draft")
+                    .is_err(),
+                "expired output must be undecidable"
             );
             Ok(())
         })();
