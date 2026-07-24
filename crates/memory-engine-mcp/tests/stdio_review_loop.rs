@@ -191,7 +191,10 @@ async fn cold_agent_completes_a_full_review_loop_over_stdio() {
         "list_drafts",
         &json!({}),
     );
-    let drafts_payload = tool_payload(&drafts).as_array().cloned().unwrap_or_default();
+    let drafts_payload = tool_payload(&drafts)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
         drafts_payload.len(),
         1,

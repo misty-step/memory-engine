@@ -791,9 +791,7 @@ mod tests {
         )
     }
 
-    async fn spawn_local_api(
-        email: &str,
-    ) -> (String, tokio::task::JoinHandle<()>, String, String) {
+    async fn spawn_local_api(email: &str) -> (String, tokio::task::JoinHandle<()>, String, String) {
         let state = provisioned_state(email);
         let created = state
             .create_account(email)
@@ -870,11 +868,8 @@ mod tests {
     async fn a_pending_draft_from_the_local_generate_route_can_be_kept() {
         let (base_url, server, account_id, session_token) =
             spawn_local_api("mcp-client-recovery-test@example.com").await;
-        let client = MemoryEngineClient::new(
-            base_url.clone(),
-            account_id.clone(),
-            session_token.clone(),
-        );
+        let client =
+            MemoryEngineClient::new(base_url.clone(), account_id.clone(), session_token.clone());
 
         // Seed an accepted draft directly against the local (non-production)
         // synchronous route: this `ApiState` has no
@@ -938,7 +933,7 @@ mod tests {
             .keep_draft("draft-does-not-exist")
             .expect_err("an unknown draft id must fail");
         assert!(
-            error.contains("Unknown generated prompt draft: draft-does-not-exist"),
+            error.contains("Generated draft or review unit not found"),
             "error must carry the server's safe message, not a bare status code: {error}"
         );
 
