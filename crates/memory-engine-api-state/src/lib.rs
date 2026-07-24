@@ -143,6 +143,23 @@ impl ApiState {
         self.accounts.create_account(email)
     }
 
+    /// Create a guest account with a server-generated local address,
+    /// bypassing the static email allowlist. Local/dev only: gated by
+    /// [`Self::anonymous_account_creation_allowed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when anonymous account creation is disabled
+    /// or persistence rejects the account.
+    pub fn create_guest_account(&self) -> Result<AccountCreated, ApiFailure> {
+        self.accounts.create_guest_account()
+    }
+
+    #[must_use]
+    pub fn anonymous_account_creation_allowed(&self) -> bool {
+        self.accounts.anonymous_account_creation_allowed()
+    }
+
     /// Join the invite-beta waitlist. Idempotent on normalized email and
     /// silent about allowlist/account state: a repeat join or a join by an
     /// address that already has access looks identical to a brand-new one.
@@ -203,9 +220,10 @@ impl ApiState {
         self.accounts.delete_waitlist_entry(admin_token, email)
     }
 
-    /// Issue (or rotate) the service-session credential for an allowlisted
-    /// account, gated by the operator admin token. Reissuing revokes the
-    /// prior credential immediately.
+    /// Issue an independent, expiring service-session credential for an
+    /// allowlisted account, gated by the operator admin token. Reissuing
+    /// creates another credential; prior sessions remain valid until expiry
+    /// or explicit revocation.
     ///
     /// # Errors
     ///
@@ -228,6 +246,18 @@ impl ApiState {
     /// mismatched.
     pub fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
         self.accounts.verify_admin_token(admin_token)
+    }
+
+    /// Revoke one active invite before magic-link consumption.
+    ///
+    /// The operation is synchronized with challenge consumption so no link can
+    /// create an account after the revocation becomes visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the address is malformed, invite policy is deny-by-default, or persistence rejects the revocation.
+    pub fn revoke_invite(&self, email: &str) -> Result<(), ApiFailure> {
+        self.accounts.revoke_invite(email)
     }
 
     /// Request an auth magic link.
@@ -253,6 +283,20 @@ impl ApiState {
     /// invalid.
     pub fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
         self.accounts.verify_magic_link(token)
+    }
+
+    /// Verify a magic link with the trusted edge identity for abuse controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when verification, rate limiting, or persistence rejects the link.
+    pub fn verify_magic_link_for_client(
+        &self,
+        token: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<AppAccount, ApiFailure> {
+        self.accounts
+            .verify_magic_link_for_client(token, client_rate_limit_key)
     }
 
     /// Create a browser session for an already-created account.
@@ -318,6 +362,50 @@ impl ApiState {
         csrf_token: &str,
     ) -> Result<(), ApiFailure> {
         self.accounts.revoke_browser_session(headers, csrf_token)
+    }
+
+    /// Revoke every browser session for the authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the browser session or CSRF token is invalid.
+    pub fn revoke_all_browser_sessions(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .revoke_all_browser_sessions(headers, csrf_token)
+    }
+
+    /// Revoke one API bearer session for its account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the token is invalid or persistence rejects revocation.
+    pub fn revoke_api_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.revoke_api_session(account_id, session_token)
+    }
+
+    /// Revoke every API bearer session for its account. Browser sessions
+    /// are an independent scope and are not affected: a signed-in browser
+    /// stays signed in. Use [`Self::revoke_all_browser_sessions`] to sign
+    /// out browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the token is invalid or persistence rejects revocation.
+    pub fn revoke_all_api_sessions(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .revoke_all_api_sessions(account_id, session_token)
     }
 
     /// Save material through the API state boundary.
@@ -1379,17 +1467,23 @@ pub struct AuthConfig {
     unsubscribe_secret: String,
     scheduler_manual_token: Option<String>,
     admin_token: Option<String>,
+    allow_anonymous_account_creation: bool,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            allowed_emails: None,
+            // An empty allowlist keeps the invite beta deny-by-default.
+            // Operators must explicitly provision addresses before issuing links.
+            allowed_emails: Some(BTreeSet::new()),
             expose_debug_links: false,
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
             scheduler_manual_token: None,
             admin_token: None,
+            // Public credential minting is opt-in for local fixtures only.
+            // Production hosts must use invite magic-link or operator service-session flows.
+            allow_anonymous_account_creation: false,
         }
     }
 }
@@ -1531,6 +1625,22 @@ impl AuthConfig {
         }
     }
 
+    /// Build the permissive in-memory configuration used by non-production unit fixtures.
+    ///
+    /// The production binary never calls this constructor; its environment bootstrap
+    /// requires a non-empty invite allowlist and disables anonymous account creation
+    /// when `MEMORY_ENGINE_ENVIRONMENT` is production or missing.
+    ///
+    /// This explicit seam keeps local fixture setup separate from production policy.
+    #[must_use]
+    pub fn for_local_tests() -> Self {
+        Self {
+            allowed_emails: None,
+            allow_anonymous_account_creation: true,
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn with_debug_links(mut self, expose_debug_links: bool) -> Self {
         self.expose_debug_links = expose_debug_links;
@@ -1573,6 +1683,17 @@ impl AuthConfig {
         self
     }
 
+    /// Configure whether public account creation may mint credentials.
+    #[must_use]
+    pub fn with_anonymous_account_creation(mut self, allowed: bool) -> Self {
+        self.allow_anonymous_account_creation = allowed;
+        self
+    }
+
+    pub(crate) fn anonymous_account_creation_allowed(&self) -> bool {
+        self.allow_anonymous_account_creation
+    }
+
     fn email_allowed(&self, email: &str) -> bool {
         self.allowed_emails
             .as_ref()
@@ -1583,6 +1704,9 @@ impl AuthConfig {
 #[derive(Clone, Debug, Default)]
 pub struct AccountRegistry {
     inner: Arc<Mutex<AccountRegistryData>>,
+    /// Serializes invite mutation with magic-link consume and the final
+    /// allowlist check, so removal cannot race account/session creation.
+    auth_lock: Arc<Mutex<()>>,
     /// Per-account locks that serialize study-store read-modify-write, so
     /// concurrent generation jobs for one account can't clobber each other's
     /// cards (059). Shared across clones — the worker runs on clones — and keyed
@@ -1598,6 +1722,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::file(store_root),
                 ..AccountRegistryData::default()
             })),
+            auth_lock: Arc::default(),
             store_locks: Arc::default(),
         }
     }
@@ -1609,6 +1734,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::postgres(database_url),
                 ..AccountRegistryData::default()
             })),
+            auth_lock: Arc::default(),
             store_locks: Arc::default(),
         }
     }
@@ -1736,7 +1862,7 @@ impl AccountRegistry {
 }
 
 #[derive(Debug)]
-struct AccountRegistryData {
+pub(crate) struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
@@ -1760,7 +1886,6 @@ impl Default for AccountRegistryData {
 
 #[derive(Clone, Debug)]
 struct AccountRecord {
-    session_token: String,
     store_path: PathBuf,
     sources: BTreeMap<String, SourceRecord>,
     submitted_reviews: BTreeMap<String, StudyViewResponse>,
@@ -1769,6 +1894,7 @@ struct AccountRecord {
 #[derive(Clone, Debug)]
 struct BrowserSessionRecord {
     account_id: String,
+    /// SHA-256 of the API bearer credential; the raw value never persists.
     session_token: String,
     csrf_token_hash: String,
     expires_at_ms: i64,
@@ -2397,6 +2523,10 @@ pub fn read_session_token(headers: &HeaderMap) -> Result<&str, ApiFailure> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| read_bearer_session_token(headers))
+        // A persisted SHA-256 digest is an internal lookup key, never a wire
+        // credential. Reject hash-shaped presentations before they reach the
+        // registry so a store reader cannot replay an at-rest session digest.
+        .filter(|value| !is_secret_hash(value))
         .ok_or_else(ApiFailure::missing_session)
 }
 
@@ -2424,22 +2554,6 @@ fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
             })
         })
         .ok_or_else(ApiFailure::missing_session)
-}
-
-#[must_use]
-pub fn client_rate_limit_key(headers: &HeaderMap) -> String {
-    ["do-connecting-ip", "x-real-ip", "x-forwarded-for"]
-        .into_iter()
-        .find_map(|header| {
-            headers
-                .get(header)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub fn csrf_token(value: Option<&String>) -> &str {
@@ -2493,12 +2607,9 @@ fn secret_hash(value: &str) -> String {
     encoded
 }
 
-fn require_account_session(account: &AccountRecord, session_token: &str) -> Result<(), ApiFailure> {
-    if account.session_token == session_token {
-        return Ok(());
-    }
-
-    Err(ApiFailure::forbidden_account())
+#[must_use]
+pub(crate) fn is_secret_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn account_id_for(email: &str) -> String {
@@ -2517,17 +2628,13 @@ fn new_browser_session_id() -> String {
     format!("browser_{:032x}", rand::random::<u128>())
 }
 
-/// Derive a session's CSRF token from its server-side session secret.
+/// Derive a browser session's CSRF token from its durable API-session hash.
 ///
-/// The token is a pure function of `session_token`, which never leaves the
-/// server — the browser cookie carries only the opaque session id. So any
-/// cookie-authenticated render, including a plain `GET /` of the home, can emit
-/// valid CSRF-protected forms without the token being stored or threaded
-/// through. An attacker mounting a cross-site request knows neither the session
-/// secret nor this one-way derivation of it, so they cannot forge the token; and
-/// because the digest is one-way, exposing a form's CSRF token never reveals the
-/// session secret. Validation stays hash-based: the session record holds
-/// `secret_hash(session_csrf_token(session_token))`, unchanged.
+/// API credentials are issued once to the caller, but only their SHA-256 hash
+/// crosses the browser-session persistence boundary. The browser cookie carries
+/// only an opaque session id; a signed-in render can derive the form token from
+/// that stored hash without persisting another raw credential. Validation stays
+/// hash-based: the session record holds `secret_hash(session_csrf_token(session_token))`.
 fn session_csrf_token(session_token: &str) -> String {
     format!("csrf_{}", secret_hash(&format!("csrf:{session_token}")))
 }
@@ -2579,10 +2686,6 @@ fn project_deck_id_for(account_id: &str, project_key: &str, title: &str, body: &
 
 fn account_store_path(store_root: &FsPath, account_id: &str) -> PathBuf {
     store_root.join(account_id).join("study.json")
-}
-
-fn account_session_path(store_root: &FsPath, account_id: &str) -> PathBuf {
-    store_root.join(account_id).join("session.token")
 }
 
 fn browser_session_path(store_root: &FsPath, session_id: &str) -> PathBuf {
@@ -3216,19 +3319,6 @@ mod tests {
     }
 
     #[test]
-    fn client_rate_limit_key_prefers_digitalocean_client_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("do-connecting-ip", HeaderValue::from_static("203.0.113.10"));
-        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.1"));
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("10.0.0.2, 10.0.0.3"),
-        );
-
-        assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
-    }
-
-    #[test]
     fn manual_scheduler_trigger_rejects_absent_and_wrong_token_but_accepts_configured_token() {
         let state =
             ApiState::new(AccountRegistry::default().with_auth_config(
@@ -3428,5 +3518,261 @@ mod tests {
                 "graded_visible_ms": 99,
             })
         );
+    }
+    #[test]
+    fn file_sessions_are_independent_hashed_expiring_and_invite_revocation_is_final() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-auth-hardening-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["invite@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_anonymous_account_creation(true),
+                ),
+        );
+        let first = state
+            .create_account("invite@example.com")
+            .expect("first session");
+        let request = state
+            .request_magic_link("invite@example.com", "edge-a")
+            .expect("request second session");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let second = state
+            .verify_magic_link_for_client(token, "edge-a")
+            .expect("second browser session");
+        assert_ne!(first.session_token, second.session_token());
+        assert!(state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&first.account_id, &first.session_token, None)
+            .expect("first remains valid"));
+        assert!(root
+            .join("_api_sessions")
+            .read_dir()
+            .expect("api session rows")
+            .flatten()
+            .all(
+                |entry| std::fs::read_to_string(entry.path().join("session"))
+                    .map(|body| !body.contains(&first.session_token))
+                    .unwrap_or(true)
+            ));
+        NOW.store(
+            now() + app_session_max_age_ms() + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(!state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&first.account_id, &first.session_token, None)
+            .expect("expired first session"));
+        let root2 = std::env::temp_dir().join(format!(
+            "memory-engine-auth-revoke-{}",
+            rand::random::<u128>()
+        ));
+        let state2 = ApiState::new(
+            AccountRegistry::with_store_root(&root2)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["revoke@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_anonymous_account_creation(true),
+                ),
+        );
+        let pending = state2
+            .request_magic_link("revoke@example.com", "edge-b")
+            .expect("pending invite");
+        let pending_token = pending
+            .debug_link
+            .expect("pending debug link")
+            .split("token=")
+            .nth(1)
+            .expect("pending token")
+            .to_owned();
+        state2
+            .revoke_invite("revoke@example.com")
+            .expect("revoke invite");
+        assert_eq!(
+            state2
+                .verify_magic_link_for_client(&pending_token, "edge-b")
+                .expect_err("revoked invite must fail")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root2);
+    }
+
+    #[test]
+    fn revoking_all_api_sessions_preserves_the_signed_in_browser_session() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-auth-revoke-all-api-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["revoke-all@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        // Sign in through the browser: this mints both the browser-session
+        // wrapper and its backing account/API session row.
+        let request = state
+            .request_magic_link("revoke-all@example.com", "edge-a")
+            .expect("request browser session");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let browser = state
+            .verify_magic_link_for_client(token, "edge-a")
+            .expect("browser session");
+
+        // A machine client independently mints its own service session for
+        // the same account.
+        let machine = state
+            .issue_service_session("test-admin-token", "revoke-all@example.com")
+            .expect("service session");
+        assert_eq!(browser.account_id(), machine.account_id);
+
+        // The machine calls "revoke all API sessions" using its own credential.
+        state
+            .revoke_all_api_sessions(&machine.account_id, &machine.session_token)
+            .expect("revoke all api sessions");
+
+        // The browser stays signed in: its underlying account/API session
+        // survives because it backs a live browser session.
+        assert!(state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(
+                browser.account_id(),
+                browser.session_token(),
+                None
+            )
+            .expect("browser session survives revoke-all"));
+
+        // The machine credential that performed the revoke is itself gone.
+        assert!(!state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&machine.account_id, &machine.session_token, None)
+            .expect("machine session is revoked"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_return_notification_admits_a_durably_invited_email() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-durable-invite-reminder-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    // Deliberately excludes the durably invited email below:
+                    // it must be admitted through the persisted waitlist,
+                    // not the static allowlist.
+                    AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        state
+            .join_waitlist("durable@example.com", "landing", "edge-a")
+            .expect("join waitlist");
+        state
+            .mark_waitlist_invited("test-admin-token", "durable@example.com")
+            .expect("mark invited");
+
+        // Sign in through the durable invite, not the static allowlist.
+        let request = state
+            .request_magic_link("durable@example.com", "edge-b")
+            .expect("request magic link for durably invited email");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let account = state
+            .verify_magic_link_for_client(token, "edge-b")
+            .expect("durable invite signs in");
+
+        // Enabling reminders for that same durably invited email must
+        // succeed even though it is absent from the static allowlist.
+        state
+            .set_return_notification(&account, Some("durable@example.com"), true)
+            .expect("durably invited email may enable reminders");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_bypasses_the_static_allowlist() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                // The allowlist deliberately contains no guest address:
+                // guest emails are server-generated and unpredictable, so
+                // there is nothing for an allowlist to vet.
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(true),
+            ),
+        );
+
+        let guest = state
+            .create_guest_account()
+            .expect("guest account creation bypasses the static allowlist");
+        assert!(guest.account_id.starts_with("acct_"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_stays_disabled_outside_local_dev() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-disabled-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(false),
+            ),
+        );
+
+        assert_eq!(
+            state
+                .create_guest_account()
+                .expect_err("guest creation stays deny-by-default")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

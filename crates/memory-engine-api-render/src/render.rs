@@ -22,6 +22,14 @@ use memory_engine_api_state::{
     SubmitReviewTimings,
 };
 
+#[cfg(test)]
+fn render_test_state(email: &str) -> ApiState {
+    use memory_engine_api_state::{AccountRegistry, AuthConfig};
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails([email.to_owned()]).with_anonymous_account_creation(true),
+    ))
+}
+
 pub struct ContentFeedbackRecovery<'a> {
     pub review_unit_id: &'a str,
     pub verdict: &'a str,
@@ -384,11 +392,7 @@ pub fn render_analytics_page(
     options: AnalyticsViewOptions,
 ) -> String {
     let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -675,11 +679,7 @@ fn render_signed_in_body(
     body: &str,
 ) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
 }
@@ -1810,6 +1810,20 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     )
 }
 
+/// Shared "Signed in" footer for the account and workspace screens: sign
+/// out this browser session, or sign out every browser session for the
+/// account via `/app/logout-all`. Machine/service-session credentials are
+/// an independent scope and are unaffected; there is no PWA control for
+/// those today.
+fn signed_in_footer(account: &AppAccount) -> String {
+    let csrf = hidden_csrf_input(account);
+    format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
+    )
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1845,7 +1859,7 @@ const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden=
 mod source_loading_tests {
     use std::cell::Cell;
 
-    use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_api_state::{CreateSourceRequest, EnqueueOutcome};
     use memory_engine_persistence::SourcePermission;
 
     use super::{render_account_page_with_loaders, render_capture};
@@ -1865,7 +1879,7 @@ mod source_loading_tests {
 
     #[test]
     fn active_review_loads_only_data_used_by_the_rendered_branch() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-loader-active@example.com");
         let created = state
             .create_account("render-loader-active@example.com")
             .unwrap();
@@ -1948,7 +1962,7 @@ mod source_loading_tests {
     }
 
     fn assert_workspace_render_loads_all() {
-        let workspace_state = ApiState::default();
+        let workspace_state = super::render_test_state("render-loader-workspace@example.com");
         let workspace_created = workspace_state
             .create_account("render-loader-workspace@example.com")
             .unwrap();
@@ -1977,7 +1991,7 @@ mod source_loading_tests {
 
     #[test]
     fn capture_form_exposes_an_accessible_permission_choice_and_default() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-permission@example.com");
         let account = state
             .create_account("render-permission@example.com")
             .and_then(|account| state.create_browser_session(&account))
@@ -2134,7 +2148,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_is_a_complete_document_with_one_asset_contract() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-document@example.com");
         let created = state
             .create_account("analytics-document@example.com")
             .expect("account");
@@ -2203,7 +2217,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_applies_untried_filter_to_a_study_view_response() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-untried@example.com");
         let created = state
             .create_account("analytics-untried@example.com")
             .expect("account");
