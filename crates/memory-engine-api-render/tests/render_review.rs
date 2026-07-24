@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use memory_engine_api_render::{render_account_page, render_content_feedback_result_html};
+use memory_engine_api_render::{
+    render_account_page, render_content_feedback_result_html, render_library_page,
+};
 use memory_engine_api_state::{
     AccountRegistry, ApiState, AuthConfig, CreateSourceRequest, EnqueueOutcome, SourcePermission,
     StudyViewResponse,
@@ -78,8 +80,8 @@ fn active_review_render_skips_workspace_material() {
 }
 
 #[test]
-fn workspace_render_keeps_saved_material_without_active_review() {
-    let email = unique_email("workspace");
+fn library_render_keeps_saved_material_without_active_review() {
+    let email = unique_email("library");
     let state = render_test_state(&email);
     let created = state.create_account(&email).expect("account");
     let account = state
@@ -96,7 +98,7 @@ fn workspace_render_keeps_saved_material_without_active_review() {
         )
         .expect("source");
 
-    let html = render_account_page(&state, &account, None, None);
+    let html = render_library_page(&state, &account, None, None);
     assert!(html.contains("Saved material"));
     assert!(html.contains("NATO practice notes"));
 }
@@ -123,6 +125,7 @@ fn completed_feedback_action_requires_an_explicit_workspace_exit() {
         },
         due_count: 0,
         generation_notices: Vec::new(),
+        library: Vec::new(),
     };
 
     let html = render_content_feedback_result_html(&state, &account, &view, "Saved.");
@@ -134,7 +137,7 @@ fn completed_feedback_action_requires_an_explicit_workspace_exit() {
 }
 
 #[test]
-fn workspace_discloses_local_only_source_permission() {
+fn library_discloses_local_only_source_permission() {
     let email = unique_email("local-only");
     let state = render_test_state(&email);
     let created = state.create_account(&email).expect("account");
@@ -152,6 +155,6 @@ fn workspace_discloses_local_only_source_permission() {
         )
         .expect("source");
 
-    let html = render_account_page(&state, &account, None, None);
+    let html = render_library_page(&state, &account, None, None);
     assert!(html.contains("Local only · never sent to a model"));
 }

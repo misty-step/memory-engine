@@ -118,6 +118,30 @@ pub struct BetaStudyView {
     /// provider failures, rejected drafts, and an empty-result message when a
     /// run produced no drafts. Empty when the last run yielded drafts cleanly.
     pub generation_notices: Vec<String>,
+    /// Per-source active-card inventory grouped by concept (memory-engine-087).
+    /// The Library view renders this so the learner can see duplicates and
+    /// gaps without scrolling through unrelated capture or analytics.
+    pub library: Vec<LibrarySourceRow>,
+}
+
+/// One source's active-card inventory for the Library view
+/// (memory-engine-087). Cards are non-archived review units whose
+/// approved draft references this source.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySourceRow {
+    pub source_id: String,
+    pub title: String,
+    pub active_card_count: usize,
+    pub concepts: Vec<LibraryConceptRow>,
+}
+
+/// Concept-level card count within one source (memory-engine-087).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryConceptRow {
+    pub concept_label: String,
+    pub card_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1606,6 +1630,7 @@ where
             .filter(|candidate| candidate.due <= now)
             .count();
         let concept_progress = concept_progress(&snapshot, &active_source_ids);
+        let library = library_projection(&snapshot, &active_source_ids);
         let current =
             self.current_projection(&snapshot, &active_source_ids, &concept_progress, now)?;
 
@@ -1654,6 +1679,7 @@ where
             },
             api_pressure: api_pressure(),
             generation_notices: generation_notices(&snapshot),
+            library,
         })
     }
 
@@ -2201,6 +2227,62 @@ fn item_history(
             |schedule| next_review_phrase(schedule.due, now),
         ),
     }
+}
+
+/// Per-source active-card inventory for the Library view (memory-engine-087).
+/// For each active source, counts non-archived review units whose approved
+/// draft references that source, grouped by concept label. A draft that
+/// spans multiple sources contributes to each one.
+fn library_projection(
+    snapshot: &BetaStoreSnapshot,
+    active_source_ids: &BTreeSet<String>,
+) -> Vec<LibrarySourceRow> {
+    // Collect active (non-archived) review units with their approved drafts.
+    let active_units: Vec<(&BetaReviewUnitRecord, &GeneratedPromptDraft)> = snapshot
+        .review_units
+        .iter()
+        .filter(|unit| unit.archived_at.is_none())
+        .filter_map(|unit| {
+            snapshot
+                .generated_prompt_drafts
+                .iter()
+                .find(|draft| draft.id == unit.generated_prompt_draft_id.as_deref().unwrap_or(""))
+                .filter(|draft| draft_has_active_source(draft, active_source_ids))
+                .map(|draft| (unit, draft))
+        })
+        .collect();
+
+    active_source_ids
+        .iter()
+        .map(|source_id| {
+            let title = snapshot
+                .source_documents
+                .iter()
+                .find(|source| &source.id == source_id)
+                .map(|source| source.title.clone())
+                .unwrap_or_default();
+            let mut concept_map: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, draft) in &active_units {
+                if draft.source_document_ids.iter().any(|id| id == source_id) {
+                    let (_, concept_label) = concept_identity_for_draft(draft);
+                    *concept_map.entry(concept_label).or_insert(0) += 1;
+                }
+            }
+            let active_card_count: usize = concept_map.values().sum();
+            LibrarySourceRow {
+                source_id: source_id.clone(),
+                title,
+                active_card_count,
+                concepts: concept_map
+                    .into_iter()
+                    .map(|(concept_label, card_count)| LibraryConceptRow {
+                        concept_label,
+                        card_count,
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 fn concept_progress(

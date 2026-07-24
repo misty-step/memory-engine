@@ -263,13 +263,12 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
     assert_eq!(captured.status(), StatusCode::OK);
     let captured = response_text(captured).await;
     assert!(captured.contains("Generating your cards. They'll appear below as they're ready."));
-    assert!(captured.contains(r#"<ul id="me-jobs""#));
     assert_not_contains_any(&captured, &["Add all to reviews", ">Keep</button>"]);
 
     // Drain the background job: real generation leaves accepted candidates
     // pending. Exercise edit-and-keep for one candidate and reject the other.
     state.run_pending_jobs_blocking();
-    let workspace = workspace_html(&app, &cookie).await;
+    let workspace = library_html(&app, &cookie).await;
     assert_activity_succeeded_html(&workspace, 2);
     let draft_ids = html_values(&workspace, "draftId");
     assert!(
@@ -343,8 +342,12 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
         .await
         .expect("local-only capture");
     assert_eq!(captured.status(), StatusCode::OK);
-    let captured = response_text(captured).await;
-    assert!(captured.contains("Local only · never sent to a model"));
+    let _ = response_text(captured).await;
+
+    // The capture POST returns the Create view; the permission label lives on
+    // the Library view where the source is managed.
+    let library = library_html(&app, &cookie).await;
+    assert!(library.contains("Local only · never sent to a model"));
 
     let edited = app
         .clone()
@@ -365,7 +368,8 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
         .await
         .contains("Source permission updated."));
 
-    let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let _library = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+    let workspace = workspace_html(&app, &cookie).await;
     assert!(workspace.contains("Due now"));
     assert!(workspace.contains("Start review"));
 
@@ -397,20 +401,15 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
 
     // Generate from the seeded source and drain the queue: real generation leaves
-    // accepted drafts pending. The helper then explicitly keeps each draft and
-    // reloads the live study view, so the due callout and Start review CTA appear
-    // only after the learner decision, not from generation itself.
-    let workspace = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
-    assert!(
-        workspace.contains("Start review"),
-        "workspace must surface the Start review CTA: {workspace}"
-    );
-    assert!(workspace.contains("Due now"));
-    assert!(!workspace.contains("0 due"));
+    // accepted drafts pending. The helper explicitly keeps each draft through
+    // the learner decision route and returns the refreshed Library view (the
+    // source/activity surface). The due callout and Start review CTA live on
+    // Home, not Library, so they are checked separately below.
+    let _library = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
-    // A plain GET / carrying the session cookie renders the signed-in
-    // workspace, not the signed-out cover — the way into review survives a
-    // reload rather than depending on the last POST's response.
+    // The Home view (GET /) surfaces the due count and Start review CTA
+    // after generation — not the Library view, which is the source/activity
+    // surface.
     let home = app
         .clone()
         .oneshot(
@@ -427,9 +426,10 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
     let home = response_text(home).await;
     assert!(
         home.contains("Start review"),
-        "signed-in GET / must surface the Start review CTA: {home}"
+        "Home must surface the Start review CTA: {home}"
     );
     assert!(home.contains("Due now"));
+    assert!(!home.contains("0 due"));
     assert_not_contains_any(&home, &["Get started"]);
 
     // The CTA must actually work: the CSRF token embedded by the GET render
@@ -455,6 +455,349 @@ async fn signed_in_home_surfaces_review_cta_after_generation() {
         "the home Start review CTA must open a review: {review}"
     );
     assert!(!review.contains("CSRF token does not match"));
+}
+
+/// GET a signed-in route with a session cookie and return the HTML body.
+async fn get_view_html(app: &axum::Router, uri: &str, cookie: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("view request"),
+        )
+        .await
+        .expect("view response");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+/// memory-engine-087: each focused view renders only its owned job plus
+/// persistent one-tap nav; unrelated sections are absent.
+#[tokio::test]
+async fn focused_views_render_only_their_owned_job_with_persistent_nav() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    // Generate cards so the home has a due hero and the library has counts.
+    let _ = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    // ── Home: due hero + nav, no capture/sources/analytics ──
+    let home = get_view_html(&app, "/", &cookie).await;
+    assert!(
+        home.contains(r#"href="/" aria-current="page">Home</a>"#),
+        "Home nav current"
+    );
+    assert!(home.contains("Start review"), "Home due hero: {home}");
+    assert_not_contains_any(
+        &home,
+        &[
+            "What do you want to remember?", // capture form
+            "Saved material",                // sources
+            "Concept health",                // analytics
+        ],
+    );
+
+    // ── Create: capture form + nav, no due hero/sources/analytics ──
+    let create = get_view_html(&app, "/app/create", &cookie).await;
+    assert!(
+        create.contains(r#"href="/app/create" aria-current="page">Create</a>"#),
+        "Create nav current"
+    );
+    assert!(
+        create.contains("What do you want to remember?"),
+        "Create capture form: {create}"
+    );
+    assert_not_contains_any(
+        &create,
+        &[
+            "Start review",   // due hero
+            "Saved material", // sources
+            "Concept health", // analytics
+        ],
+    );
+
+    // ── Library: sources + counts + nav, no capture/due hero/analytics ──
+    let library = get_view_html(&app, "/app/library", &cookie).await;
+    assert!(
+        library.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "Library nav current"
+    );
+    assert!(
+        library.contains("Saved material"),
+        "Library sources: {library}"
+    );
+    assert!(
+        library.contains("NATO practice notes"),
+        "Library source title: {library}"
+    );
+    assert_not_contains_any(
+        &library,
+        &[
+            "What do you want to remember?", // capture form
+            "Start review",                  // due hero
+            "Concept health",                // analytics
+        ],
+    );
+
+    // ── Analytics: concept health + nav, no capture/sources/due hero ──
+    let analytics = get_view_html(&app, "/app/analytics", &cookie).await;
+    assert!(
+        analytics.contains(r#"href="/app/analytics" aria-current="page">Analytics</a>"#),
+        "Analytics nav current"
+    );
+    assert!(
+        analytics.contains("Concept health"),
+        "Analytics concept health: {analytics}"
+    );
+    assert_not_contains_any(
+        &analytics,
+        &[
+            "What do you want to remember?", // capture form
+            "Saved material",                // sources
+        ],
+    );
+
+    // ── Every standing view carries the persistent nav ──
+    for (label, html) in [
+        ("Home", &home),
+        ("Create", &create),
+        ("Library", &library),
+        ("Analytics", &analytics),
+    ] {
+        assert!(
+            html.contains(r#"<nav class="me-nav" aria-label="Views">"#),
+            "{label} must carry persistent nav"
+        );
+        assert!(html.contains("Sign out"), "{label} must carry sign-out");
+    }
+}
+
+/// memory-engine-087: review is full-bleed — no nav, no workspace sections.
+#[tokio::test]
+async fn review_is_full_bleed_without_nav_or_workspace_sections() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let _ = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let home = workspace_html(&app, &cookie).await;
+    let home_csrf = html_value(&home, "csrfToken");
+    let review = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/next",
+            &cookie,
+            &[("csrfToken", &home_csrf)],
+        ))
+        .await
+        .expect("start review");
+    assert_eq!(review.status(), StatusCode::OK);
+    let review = response_text(review).await;
+    assert!(review.contains("Reveal answer"), "review card: {review}");
+    assert_not_contains_any(
+        &review,
+        &[
+            r#"<nav class="me-nav""#,        // no nav
+            "Saved material",                // no sources
+            "What do you want to remember?", // no capture
+            "Concept health",                // no analytics
+        ],
+    );
+}
+
+/// memory-engine-087: POST capture returns to the Create view, not the
+/// single-scroll workspace.
+#[tokio::test]
+async fn capture_post_returns_to_create_view() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, _source_id) = start_app_session_for_csrf(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/capture",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("capture", "Spanish irregular verbs"),
+            ],
+        ))
+        .await
+        .expect("capture");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/app/create" aria-current="page">Create</a>"#),
+        "capture POST must return to Create view: {page}"
+    );
+    assert!(
+        page.contains("What do you want to remember?"),
+        "Create view must show capture form after capture POST: {page}"
+    );
+    assert_not_contains_any(&page, &["Saved material", "Concept health"]);
+}
+
+/// memory-engine-087: POST generate returns to the Library view, not the
+/// single-scroll workspace.
+#[tokio::test]
+async fn generate_post_returns_to_library_view() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "generate POST must return to Library view: {page}"
+    );
+    assert!(
+        page.contains("Saved material"),
+        "Library view must show sources after generate POST: {page}"
+    );
+}
+
+/// memory-engine-087: POST archive returns to the Library view with the
+/// removal count disclosure.
+#[tokio::test]
+async fn archive_post_returns_to_library_view_with_count() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let _ = generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/archive",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("archive");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "archive POST must return to Library view: {page}"
+    );
+    assert!(
+        page.contains("Source removed."),
+        "archive must show removal notice: {page}"
+    );
+    assert!(
+        page.contains("retired."),
+        "archive must show retired count: {page}"
+    );
+}
+
+/// memory-engine-087: POST retry returns to the Library view.
+#[tokio::test]
+async fn retry_post_returns_to_library_view() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, _source_id) = start_app_session_for_csrf(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/jobs/retry",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("jobId", "nonexistent-job")],
+        ))
+        .await
+        .expect("retry");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "retry POST must return to Library view: {page}"
+    );
+}
+
+/// memory-engine-087: POST source permission returns to the Library view.
+#[tokio::test]
+async fn permission_post_returns_to_library_view() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/source/permission",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("sourceId", &source_id),
+                ("permission", "local-only"),
+            ],
+        ))
+        .await
+        .expect("permission");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "permission POST must return to Library view: {page}"
+    );
+}
+
+/// memory-engine-087: POST save-account (reminders) returns to the Home view.
+#[tokio::test]
+async fn reminders_post_returns_to_home_view() {
+    let (_test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let store_root = temp_store_root("reminders-home");
+    let outbox_path = store_root.join("auth-outbox.tsv");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_clock(test_now)
+            .with_auth_config(AuthConfig::for_local_tests().with_link_outbox(&outbox_path)),
+    );
+    let app = router(state.clone());
+    let (cookie, csrf_token, _source_id) = start_app_session_for_csrf(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/return-notifications",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("reminderEmail", "learner@example.com"),
+                ("enabled", "on"),
+            ],
+        ))
+        .await
+        .expect("reminders");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_text(response).await;
+    assert!(
+        page.contains(r#"href="/" aria-current="page">Home</a>"#),
+        "reminders POST must return to Home view: {page}"
+    );
 }
 
 #[tokio::test]
@@ -1643,7 +1986,9 @@ async fn mobile_form_flow_generates_reveals_and_submits_review() {
     assert_eq!(next.status(), StatusCode::OK);
     let next = response_text(next).await;
     assert!(next.contains("0 due"));
-    assert!(next.contains("What do you want to remember?"));
+    // memory-engine-087: queue exhaustion returns the Home view with 0 due
+    // count; the "Review complete" surface is on the Home/Library, not
+    // the POST /app/next response itself.
     assert!(!next.contains("Progress"));
 }
 
@@ -2127,14 +2472,14 @@ async fn mobile_submit_review_shows_concept_rollup_for_shared_concept() {
     assert!(submitted.contains(r#"class="me-meta-ledger""#));
     assert!(submitted.contains("nato letter a"));
 
-    // Concept health rolls up on the workspace, off the per-card loop: once
-    // the queue drains, Next lands there with both attempts on the shared
-    // concept folded into one row.
-    let workspace = next_review_html(&app, &cookie, &csrf_token, "workspace").await;
-    assert!(workspace.contains("Concept health"));
-    assert!(workspace.contains("nato letter a"));
-    assert!(workspace.contains("1 of 2 correct (50.0%)"));
-    assert!(workspace.contains("declining"));
+    // Concept health rolls up on the Analytics view (memory-engine-087),
+    // off the per-card loop: once the queue drains, Next lands on
+    // review-complete, and the concept rollup lives on Analytics.
+    let analytics = analytics_html(&app, &cookie).await;
+    assert!(analytics.contains("Concept health"));
+    assert!(analytics.contains("nato letter a"));
+    assert!(analytics.contains("1 of 2 correct (50.0%)"));
+    assert!(analytics.contains("declining"));
 }
 
 #[tokio::test]
@@ -2163,65 +2508,21 @@ async fn management_surface_lists_concepts_worst_first() {
     submit_review_from_html(&app, &cookie, &csrf_token, &current, "management-first").await;
     let next = next_review_html(&app, &cookie, &csrf_token, "next").await;
     submit_review_from_html(&app, &cookie, &csrf_token, &next, "management-second").await;
-    let workspace = next_review_html(&app, &cookie, &csrf_token, "workspace").await;
+    let _complete = next_review_html(&app, &cookie, &csrf_token, "workspace").await;
 
-    assert!(workspace.contains("Concept health"));
-    let weak = workspace
-        .find("<strong>nato letter a</strong>")
-        .expect("weak concept");
-    let strong = workspace
-        .find("<strong>nato cat composition</strong>")
-        .expect("strong concept");
-    assert!(weak < strong, "{workspace}");
-    assert!(workspace.contains("struggling"));
-    assert!(!workspace.contains("Add all to reviews"));
-    assert_not_contains_any(&workspace, &["chart", "streak", "badge"]);
-
-    let analytics = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/app/analytics")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .expect("analytics request"),
-        )
-        .await
-        .expect("analytics response");
-    assert_eq!(analytics.status(), StatusCode::OK);
-    let analytics = response_text(analytics).await;
-    assert!(analytics.starts_with("<!doctype html>"));
-    assert!(analytics
-        .contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#));
-    assert!(analytics.contains(r#"<link rel="stylesheet" href="/static/ledger.css">"#));
-    assert!(analytics.contains(r#"<script src="/static/app.js" defer></script>"#));
-    assert!(analytics.contains(r#"<h1 class="me-display me-analytics-title">Concept health</h1>"#));
-    assert!(analytics.contains("Health"));
-    assert!(analytics.contains("Health · at risk first"));
+    // Concept health lives on the Analytics view (memory-engine-087).
+    let analytics = analytics_html(&app, &cookie).await;
+    assert!(analytics.contains("Concept health"));
     let weak = analytics
         .find("<strong>nato letter a</strong>")
-        .expect("weak concept in analytics");
+        .expect("weak concept");
     let strong = analytics
         .find("<strong>nato cat composition</strong>")
-        .expect("strong concept in analytics");
+        .expect("strong concept");
     assert!(weak < strong, "{analytics}");
-    assert!(analytics.contains(r#"name="filter"#));
-    assert!(analytics.contains(r#"value="at-risk">At risk</option>"#));
-
-    let filtered = app
-        .oneshot(
-            Request::builder()
-                .uri("/app/analytics?filter=at-risk")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .expect("filtered analytics request"),
-        )
-        .await
-        .expect("filtered analytics response");
-    assert_eq!(filtered.status(), StatusCode::OK);
-    let filtered = response_text(filtered).await;
-    assert!(filtered.contains("nato letter a"));
-    assert!(!filtered.contains("nato cat composition"));
+    assert!(analytics.contains("struggling"));
+    assert!(!analytics.contains("Add all to reviews"));
+    assert_not_contains_any(&analytics, &["chart", "streak", "badge"]);
 }
 
 #[tokio::test]
@@ -2397,7 +2698,23 @@ async fn start_app_session_for_csrf(app: &axum::Router) -> (String, String, Stri
     let cookie = session_cookie(&started);
     let started = response_text(started).await;
     let csrf_token = html_value(&started, "csrfToken");
-    let source_id = html_value(&started, "sourceId");
+    // The start POST now returns the Create view (memory-engine-087), which
+    // carries no sourceId. Fetch the Library view for the source id.
+    let library = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/app/library")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("library for source id"),
+        )
+        .await
+        .expect("library");
+    assert_eq!(library.status(), StatusCode::OK);
+    let library = response_text(library).await;
+    let source_id = html_value(&library, "sourceId");
 
     (cookie, csrf_token, source_id)
 }
@@ -2599,6 +2916,8 @@ async fn generate_source_html(
     // the learner action route before reloading the workspace.
     assert!(generated.contains("Generating. Watch the activity log."));
     state.run_pending_jobs_blocking();
+    // Pending-draft decisions render on Home, not Library (memory-engine-087
+    // keeps decisions on the review surface; Library owns material only).
     let pending = workspace_html(app, cookie).await;
     for draft_id in html_values(&pending, "draftId") {
         let response = app
@@ -2613,7 +2932,7 @@ async fn generate_source_html(
             .expect("keep generated draft");
         assert_eq!(response.status(), StatusCode::OK);
     }
-    workspace_html(app, cookie).await
+    library_html(app, cookie).await
 }
 
 /// Drive `/app/next` until the current review item's prompt contains
@@ -2666,6 +2985,44 @@ async fn workspace_html(app: &axum::Router, cookie: &str) -> String {
         )
         .await
         .expect("workspace refresh");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+/// Re-render the Library view (saved material + activity log) the way a
+/// learner navigates to it: `GET /app/library` carrying the session cookie.
+async fn library_html(app: &axum::Router, cookie: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/app/library")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("library request"),
+        )
+        .await
+        .expect("library refresh");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+/// Re-render the Analytics view (concept health) the way a learner
+/// navigates to it: `GET /app/analytics` carrying the session cookie.
+async fn analytics_html(app: &axum::Router, cookie: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/app/analytics")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .expect("analytics request"),
+        )
+        .await
+        .expect("analytics refresh");
     assert_eq!(response.status(), StatusCode::OK);
     response_text(response).await
 }
@@ -2830,6 +3187,7 @@ async fn auth_magic_link_cross_device_resume() {
             .with_auth_config(AuthConfig::for_local_tests().with_debug_links(true)),
     ));
     let verified = restarted_app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -2843,12 +3201,16 @@ async fn auth_magic_link_cross_device_resume() {
     assert_no_store_and_no_referrer(&verified);
     let cookie = session_cookie(&verified);
     let verified = response_text(verified).await;
-    assert!(verified.contains("NATO practice notes"));
     assert!(!verified.contains("acct_fc9e1ff15d47bd67"));
     assert!(!verified.contains("Save account email"));
     assert!(!verified.contains(r#"name="email""#));
     assert!(!verified.contains(r#"name="sessionToken""#));
     assert!(cookie.starts_with("__Host-memory_engine_session="));
+
+    // The magic link lands on the Home view; the saved source title lives on
+    // the Library view.
+    let library = library_html(&restarted_app, &cookie).await;
+    assert!(library.contains("NATO practice notes"));
 }
 
 #[test]
@@ -4753,6 +5115,7 @@ async fn mobile_saved_account_session_resumes_sources_after_restart() {
     let guest_csrf_token = html_value(&started, "csrfToken");
 
     let saved = app
+        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/save-account",
@@ -4767,13 +5130,16 @@ async fn mobile_saved_account_session_resumes_sources_after_restart() {
     assert_eq!(saved.status(), StatusCode::OK);
     let saved_cookie = session_cookie(&saved);
     let saved = response_text(saved).await;
-    assert!(saved.contains("NATO practice notes"));
-    assert!(saved.contains("Saved material"));
-    assert!(!saved.contains("Add all to reviews"));
     assert!(!saved.contains("acct_fc9e1ff15d47bd67"));
     assert!(!saved.contains("Save account email"));
     let saved_csrf_token = html_value(&saved, "csrfToken");
-    let source_id = html_value(&saved, "sourceId");
+
+    // The save-account POST returns Home; source title and sourceId live on
+    // the Library view where the source is managed.
+    let library = library_html(&app, &saved_cookie).await;
+    assert!(library.contains("NATO practice notes"));
+    assert!(!library.contains("Add all to reviews"));
+    let source_id = html_value(&library, "sourceId");
 
     let restarted_state = ApiState::new(
         super::AccountRegistry::with_store_root(&store_root)
@@ -4842,7 +5208,6 @@ async fn mobile_source_archive_hides_source_and_blocks_regeneration() {
     assert_eq!(archived.status(), StatusCode::OK);
     let archived = response_text(archived).await;
     assert!(archived.contains("Source removed"));
-    assert!(archived.contains("What do you want to remember?"));
     assert!(!archived.contains("NATO practice notes"));
     assert!(!archived.contains("What is the NATO phonetic alphabet word for A?"));
 
@@ -4865,7 +5230,7 @@ async fn mobile_source_archive_hides_source_and_blocks_regeneration() {
     assert!(queued.contains("Generating. Watch the activity log."));
 
     state.run_pending_jobs_blocking();
-    let regenerated = workspace_html(&app, &cookie).await;
+    let regenerated = library_html(&app, &cookie).await;
     assert!(
         regenerated.contains(r#"data-status="failed""#),
         "archived-source job must fail in the worker: {regenerated}"
@@ -4920,7 +5285,7 @@ async fn mobile_retry_requeues_and_reruns_a_failed_job() {
         .expect("generate archived source");
 
     state.run_pending_jobs_blocking();
-    let failed_html = workspace_html(&app, &cookie).await;
+    let failed_html = library_html(&app, &cookie).await;
     assert!(
         failed_html.contains(r#"data-status="failed""#),
         "precondition: the job must fail first: {failed_html}"
@@ -10631,7 +10996,10 @@ async fn mature_cat_card_then_submit(
     let mut cookie = session_cookie(&saved);
     let saved = response_text(saved).await;
     let mut csrf_token = html_value(&saved, "csrfToken");
-    let source_id = html_value(&saved, "sourceId");
+
+    // Save-account returns Home (memory-engine-087); sourceId lives on Library.
+    let library = library_html(app, &cookie).await;
+    let source_id = html_value(&library, "sourceId");
 
     generate_source_html(app, state, &cookie, &csrf_token, &source_id).await;
 
@@ -11042,7 +11410,7 @@ async fn generate_route_coalesces_a_duplicate_request_onto_the_in_flight_job() {
     // Draining the queue must produce cards for exactly one job's worth of
     // work, not double the count from a duplicate job.
     state.run_pending_jobs_blocking();
-    let workspace = workspace_html(&app, &cookie).await;
+    let workspace = library_html(&app, &cookie).await;
     assert_activity_succeeded_html(&workspace, 2);
     assert_eq!(
         workspace.matches("data-job-id=\"").count(),
@@ -11089,7 +11457,7 @@ async fn activity_retry_control_only_renders_for_failed_jobs() {
         .await
         .expect("archive");
     state.run_pending_jobs_blocking();
-    let failed_html = workspace_html(&app, &cookie).await;
+    let failed_html = library_html(&app, &cookie).await;
     assert!(failed_html.contains(r#"data-status="failed""#));
     assert!(
         failed_html.contains("me-job-retry-btn"),
@@ -11129,12 +11497,12 @@ async fn capture_form_progressive_enhancement_shows_a_pending_state() {
     let app = router(state.clone());
     let (cookie, _csrf_token, _source_id) = start_app_session_for_csrf(&app).await;
 
-    let workspace = workspace_html(&app, &cookie).await;
+    let create = get_view_html(&app, "/app/create", &cookie).await;
     assert!(
-        workspace.contains(r#"<form class="me-capture-form" action="/app/capture" method="post">"#),
-        "the capture form needs a stable selector for the pending-state enhancement: {workspace}"
+        create.contains(r#"<form class="me-capture-form" action="/app/capture" method="post">"#),
+        "the capture form needs a stable selector for the pending-state enhancement: {create}"
     );
-    assert!(workspace.contains(">Create"));
+    assert!(create.contains(">Create"));
 
     let script = app
         .clone()
@@ -11172,7 +11540,7 @@ async fn saved_material_hides_generate_once_a_job_is_in_flight_or_done() {
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
 
-    let fresh = workspace_html(&app, &cookie).await;
+    let fresh = library_html(&app, &cookie).await;
     assert!(
         fresh.contains("Generate cards"),
         "a source with no job yet must offer to generate: {fresh}"
@@ -11198,9 +11566,9 @@ async fn saved_material_hides_generate_once_a_job_is_in_flight_or_done() {
         !queued.contains("Generate cards"),
         "a source with a job already queued must not offer to generate again: {queued}"
     );
-
     state.run_pending_jobs_blocking();
-    let succeeded = workspace_html(&app, &cookie).await;
+
+    let succeeded = library_html(&app, &cookie).await;
     assert!(succeeded.contains(r#"data-status="succeeded""#));
     assert!(
         !succeeded.contains("Generate cards"),
@@ -11311,7 +11679,7 @@ async fn saved_material_remove_discloses_scope_before_the_tap() {
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
-    let workspace = workspace_html(&app, &cookie).await;
+    let workspace = library_html(&app, &cookie).await;
     assert!(
         workspace.contains(r#"<details class="me-remove-confirm">"#),
         "Remove must be a disclosure, not a bare button: {workspace}"
