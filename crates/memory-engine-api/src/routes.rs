@@ -1479,8 +1479,7 @@ async fn start_app_study(
         *response.status_mut() = StatusCode::FORBIDDEN;
         return no_store_response(response);
     }
-    let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
-    let account = match state.create_account(&email) {
+    let account = match state.create_guest_account() {
         Ok(account) => account,
         Err(error) => {
             return Html(render_app_shell(None, &[], None, &[], Some(&error.message)))

@@ -2995,7 +2995,12 @@ impl AccountStudyStore<'_> {
         Ok(changed == 1)
     }
 
-    /// Revoke every API session for the account.
+    /// Revoke every standalone API session for the account. Browser
+    /// sessions are an independent scope: any API session currently backing
+    /// a live (non-revoked) row in `memory_engine_browser_sessions` is
+    /// preserved, not revoked. Use
+    /// [`PostgresStudyStore::revoke_browser_sessions_for_account`] to sign
+    /// out browsers.
     ///
     /// # Errors
     ///
@@ -3006,7 +3011,11 @@ impl AccountStudyStore<'_> {
             .execute(
                 "UPDATE memory_engine_api_sessions
                  SET revoked_at_ms = $2
-                 WHERE account_id = $1 AND revoked_at_ms IS NULL",
+                 WHERE account_id = $1 AND revoked_at_ms IS NULL
+                   AND session_token_hash NOT IN (
+                       SELECT session_token_hash FROM memory_engine_browser_sessions
+                       WHERE account_id = $1 AND revoked_at_ms IS NULL
+                   )",
                 &[&self.scope.account_id, &revoked_at_ms],
             )
             .map_err(Into::into)
@@ -6219,6 +6228,65 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres store contract");
+    }
+
+    #[test]
+    fn live_postgres_revoke_api_sessions_preserves_browser_backed_session() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres revoke-api-sessions test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_revoke_api_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), PostgresStoreError> {
+            let mut store = PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+
+            let account_id = "acct-revoke-api-sessions";
+            {
+                let mut account = store.for_account(AccountScope::new(account_id)?);
+                account.ensure_account(NOW)?;
+                account.save_api_session("browser-backing-hash", NOW, NOW + 1_000_000)?;
+                account.save_api_session("machine-only-hash", NOW, NOW + 1_000_000)?;
+            }
+            // A browser session wraps one of the two API sessions; revoking
+            // "all API sessions" is the machine-facing logout-all and must
+            // not sign out this browser.
+            store.save_browser_session(
+                "browser-session-id-hash",
+                account_id,
+                "browser-backing-hash",
+                "csrf-hash",
+                NOW,
+                NOW + 1_000_000,
+            )?;
+
+            let mut account = store.for_account(AccountScope::new(account_id)?);
+            account.revoke_api_sessions(NOW + 1)?;
+            assert!(
+                account.api_session_matches("browser-backing-hash", NOW + 1)?,
+                "browser-backed API session must survive revoke-all"
+            );
+            assert!(
+                !account.api_session_matches("machine-only-hash", NOW + 1)?,
+                "standalone machine API session must be revoked"
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live postgres revoke-api-sessions contract");
     }
 
     #[test]

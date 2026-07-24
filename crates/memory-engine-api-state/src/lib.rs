@@ -143,6 +143,18 @@ impl ApiState {
         self.accounts.create_account(email)
     }
 
+    /// Create a guest account with a server-generated local address,
+    /// bypassing the static email allowlist. Local/dev only: gated by
+    /// [`Self::anonymous_account_creation_allowed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when anonymous account creation is disabled
+    /// or persistence rejects the account.
+    pub fn create_guest_account(&self) -> Result<AccountCreated, ApiFailure> {
+        self.accounts.create_guest_account()
+    }
+
     #[must_use]
     pub fn anonymous_account_creation_allowed(&self) -> bool {
         self.accounts.anonymous_account_creation_allowed()
@@ -379,7 +391,10 @@ impl ApiState {
         self.accounts.revoke_api_session(account_id, session_token)
     }
 
-    /// Revoke every API bearer session for its account.
+    /// Revoke every API bearer session for its account. Browser sessions
+    /// are an independent scope and are not affected: a signed-in browser
+    /// stays signed in. Use [`Self::revoke_all_browser_sessions`] to sign
+    /// out browsers.
     ///
     /// # Errors
     ///
@@ -3595,5 +3610,169 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(root2);
+    }
+
+    #[test]
+    fn revoking_all_api_sessions_preserves_the_signed_in_browser_session() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-auth-revoke-all-api-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["revoke-all@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        // Sign in through the browser: this mints both the browser-session
+        // wrapper and its backing account/API session row.
+        let request = state
+            .request_magic_link("revoke-all@example.com", "edge-a")
+            .expect("request browser session");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let browser = state
+            .verify_magic_link_for_client(token, "edge-a")
+            .expect("browser session");
+
+        // A machine client independently mints its own service session for
+        // the same account.
+        let machine = state
+            .issue_service_session("test-admin-token", "revoke-all@example.com")
+            .expect("service session");
+        assert_eq!(browser.account_id(), machine.account_id);
+
+        // The machine calls "revoke all API sessions" using its own credential.
+        state
+            .revoke_all_api_sessions(&machine.account_id, &machine.session_token)
+            .expect("revoke all api sessions");
+
+        // The browser stays signed in: its underlying account/API session
+        // survives because it backs a live browser session.
+        assert!(state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(
+                browser.account_id(),
+                browser.session_token(),
+                None
+            )
+            .expect("browser session survives revoke-all"));
+
+        // The machine credential that performed the revoke is itself gone.
+        assert!(!state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&machine.account_id, &machine.session_token, None)
+            .expect("machine session is revoked"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_return_notification_admits_a_durably_invited_email() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-durable-invite-reminder-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    // Deliberately excludes the durably invited email below:
+                    // it must be admitted through the persisted waitlist,
+                    // not the static allowlist.
+                    AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        state
+            .join_waitlist("durable@example.com", "landing", "edge-a")
+            .expect("join waitlist");
+        state
+            .mark_waitlist_invited("test-admin-token", "durable@example.com")
+            .expect("mark invited");
+
+        // Sign in through the durable invite, not the static allowlist.
+        let request = state
+            .request_magic_link("durable@example.com", "edge-b")
+            .expect("request magic link for durably invited email");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let account = state
+            .verify_magic_link_for_client(token, "edge-b")
+            .expect("durable invite signs in");
+
+        // Enabling reminders for that same durably invited email must
+        // succeed even though it is absent from the static allowlist.
+        state
+            .set_return_notification(&account, Some("durable@example.com"), true)
+            .expect("durably invited email may enable reminders");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_bypasses_the_static_allowlist() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                // The allowlist deliberately contains no guest address:
+                // guest emails are server-generated and unpredictable, so
+                // there is nothing for an allowlist to vet.
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(true),
+            ),
+        );
+
+        let guest = state
+            .create_guest_account()
+            .expect("guest account creation bypasses the static allowlist");
+        assert!(guest.account_id.starts_with("acct_"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_stays_disabled_outside_local_dev() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-disabled-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(false),
+            ),
+        );
+
+        assert_eq!(
+            state
+                .create_guest_account()
+                .expect_err("guest creation stays deny-by-default")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

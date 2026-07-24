@@ -4571,6 +4571,63 @@ async fn app_logout_requires_csrf_without_revoking_session() {
 }
 
 #[tokio::test]
+async fn app_logout_all_is_reachable_from_the_rendered_page_and_revokes_the_session() {
+    let store_root = temp_store_root("logout-all-reachable");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    ));
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("title", "NATO practice notes"), ("body", &source_body())],
+        ))
+        .await
+        .expect("start");
+    assert_eq!(started.status(), StatusCode::OK);
+    let cookie = session_cookie(&started);
+    let started = response_text(started).await;
+    let csrf_token = html_value(&started, "csrfToken");
+    // The rendered page must expose a reachable control for signing out of
+    // every session, not just this one (memory-engine-invite-auth-hardening
+    // PR83 review).
+    assert!(started.contains(r#"action="/app/logout-all""#));
+
+    let logged_out = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/logout-all",
+            &cookie,
+            &[("csrfToken", &csrf_token)],
+        ))
+        .await
+        .expect("logout-all");
+    assert_eq!(logged_out.status(), StatusCode::OK);
+    let set_cookie = logged_out
+        .headers()
+        .get(SET_COOKIE)
+        .expect("clear cookie")
+        .to_str()
+        .expect("set-cookie");
+    assert!(set_cookie.contains("__Host-memory_engine_session="));
+    assert!(set_cookie.contains("Max-Age=0"));
+
+    let rejected = app
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/next",
+            &cookie,
+            &[("csrfToken", &csrf_token)],
+        ))
+        .await
+        .expect("next after logout-all");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn mobile_saved_account_session_resumes_sources_after_restart() {
     let store_root = temp_store_root("mobile-save-resume");
     let app = router(ApiState::new(

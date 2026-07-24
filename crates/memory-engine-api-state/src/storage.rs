@@ -197,6 +197,10 @@ impl StudyStorage {
             .revoke_account_session(account_id, session_token, now_ms)
     }
 
+    /// Revokes every standalone account/API session for `account_id`.
+    /// Browser sessions are an independent scope: any session currently
+    /// backing a signed-in browser is preserved, not revoked. Use
+    /// [`Self::revoke_browser_sessions_for_account`] to sign out browsers.
     pub(crate) fn revoke_account_sessions_for_account(
         &self,
         account_id: &str,
@@ -688,6 +692,8 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         session_token: &str,
         now_ms: i64,
     ) -> Result<bool, ApiFailure>;
+    /// Browser sessions are an independent scope and must be preserved; see
+    /// the [`StudyStorage::revoke_account_sessions_for_account`] facade doc.
     fn revoke_account_sessions_for_account(
         &self,
         account_id: &str,
@@ -1103,6 +1109,41 @@ impl FileStudyStorage {
             .map_err(|error| ApiFailure::internal(error.to_string()))?;
         Ok(token_hash)
     }
+
+    /// Hashes of the account/API session credentials that currently back a
+    /// live (non-revoked) browser session for `account_id`. Browser and
+    /// machine session scopes are independent, so revoking every standalone
+    /// API/service session must preserve whichever of these are backing a
+    /// signed-in browser.
+    fn browser_backed_session_hashes_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<HashSet<String>, ApiFailure> {
+        let root = self.store_root.join("_browser_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(HashSet::new());
+        };
+        let mut hashes = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = saved.lines();
+            if lines.next() != Some(account_id) {
+                continue;
+            }
+            let Some(session_token_hash) = lines.next() else {
+                continue;
+            };
+            let revoked_at_ms = lines.nth(3).and_then(|value| value.parse::<i64>().ok());
+            if revoked_at_ms.is_none() {
+                hashes.insert(session_token_hash.to_owned());
+            }
+        }
+        Ok(hashes)
+    }
 }
 
 impl StudyStorageAdapter for FileStudyStorage {
@@ -1222,11 +1263,18 @@ impl StudyStorageAdapter for FileStudyStorage {
         Ok(true)
     }
 
+    /// Revokes every standalone account/API session for `account_id`,
+    /// preserving whichever ones currently back a live browser session (see
+    /// [`Self::browser_backed_session_hashes_for_account`]). Browser and
+    /// machine session scopes are independent: this is the "revoke all
+    /// API/service sessions" operation and must not silently sign out the
+    /// account's signed-in browsers.
     fn revoke_account_sessions_for_account(
         &self,
         account_id: &str,
         now_ms: i64,
     ) -> Result<(), ApiFailure> {
+        let preserved = self.browser_backed_session_hashes_for_account(account_id)?;
         let _lock =
             crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
         let root = self.store_root.join("_api_sessions");
@@ -1235,6 +1283,9 @@ impl StudyStorageAdapter for FileStudyStorage {
         };
         for entry in entries {
             let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            if preserved.contains(&entry.file_name().to_string_lossy().into_owned()) {
+                continue;
+            }
             let path = entry.path().join("session");
             let Ok(saved) = fs::read_to_string(&path) else {
                 continue;
@@ -1249,19 +1300,8 @@ impl StudyStorageAdapter for FileStudyStorage {
                 lines.push(String::new());
             }
             lines[3] = now_ms.to_string();
-            write_atomic(
-                &path,
-                format!(
-                    "{}
-",
-                    lines.join(
-                        "
-"
-                    )
-                )
-                .as_bytes(),
-            )
-            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
         Ok(())
     }

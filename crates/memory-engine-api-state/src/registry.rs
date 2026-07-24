@@ -55,8 +55,7 @@ impl AccountRegistry {
     }
 
     pub(crate) fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
-        let anonymous_allowed = self.anonymous_account_creation_allowed();
-        if !anonymous_allowed {
+        if !self.anonymous_account_creation_allowed() {
             return Err(ApiFailure::forbidden(
                 "Anonymous account creation is disabled.",
             ));
@@ -72,6 +71,27 @@ impl AccountRegistry {
                 "This email is not allowed to register.",
             ));
         }
+        self.create_account_unchecked(email)
+    }
+
+    /// Mint a guest account with a server-generated local address.
+    ///
+    /// Skips the static allowlist entirely: the ticket-42 check in
+    /// [`Self::create_account`] guards a caller-supplied email, but a guest
+    /// address is generated right here and never caller-controlled, so
+    /// there is nothing for an allowlist to vet. Still gated by
+    /// [`Self::anonymous_account_creation_allowed`] (local/dev only).
+    pub(crate) fn create_guest_account(&self) -> Result<AccountCreated, ApiFailure> {
+        if !self.anonymous_account_creation_allowed() {
+            return Err(ApiFailure::forbidden(
+                "Anonymous account creation is disabled.",
+            ));
+        }
+        let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
+        self.create_account_unchecked(&email)
+    }
+
+    fn create_account_unchecked(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
         let account_id = account_id_for(email);
         if self.account_exists(&account_id)? {
             return Err(ApiFailure::conflict("Account already exists."));
@@ -597,10 +617,15 @@ impl AccountRegistry {
             (false, _, None) => return Ok(()),
         };
         if enabled {
+            // Mirror `request_magic_link`: a durably invited account (per
+            // the persisted waitlist) is authenticated the same as one
+            // admitted through the static allowlist. Without this, a
+            // learner invited only through the durable flow can sign in
+            // and study but can never enable reminders.
             let allowed = {
                 let data = self.lock_data();
                 data.auth_config.email_allowed(&email)
-            };
+            } || self.persisted_invite_allows(&email);
             if !allowed {
                 return Err(ApiFailure::forbidden(
                     "That reminder email is not allowed for this account.",
@@ -1784,6 +1809,8 @@ impl AccountRegistry {
             .ok_or_else(ApiFailure::forbidden_account)
     }
 
+    /// Browser sessions are an independent scope and are preserved; see
+    /// [`StudyStorage::revoke_account_sessions_for_account`].
     pub(crate) fn revoke_all_api_sessions(
         &self,
         account_id: &str,

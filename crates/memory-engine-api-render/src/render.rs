@@ -392,11 +392,7 @@ pub fn render_analytics_page(
     options: AnalyticsViewOptions,
 ) -> String {
     let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -683,11 +679,7 @@ fn render_signed_in_body(
     body: &str,
 ) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
 }
@@ -1815,6 +1807,20 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     format!(
         r#"<input type="hidden" name="csrfToken" value="{}">"#,
         escape_html(account.csrf_token())
+    )
+}
+
+/// Shared "Signed in" footer for the account and workspace screens: sign
+/// out this browser session, or sign out every browser session for the
+/// account via `/app/logout-all`. Machine/service-session credentials are
+/// an independent scope and are unaffected; there is no PWA control for
+/// those today.
+fn signed_in_footer(account: &AppAccount) -> String {
+    let csrf = hidden_csrf_input(account);
+    format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
     )
 }
 
