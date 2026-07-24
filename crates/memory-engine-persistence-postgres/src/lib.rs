@@ -484,9 +484,9 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOBS_MIGRATION_SQL,
         GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL,
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
-        REMEDIATION_PACKS_MIGRATION_SQL,
         WAITLIST_MIGRATION_SQL,
         SESSION_SCHEMA_MIGRATION_SQL,
+        REMEDIATION_PACKS_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -512,9 +512,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, GENERATION_JOBS_MIGRATION_SQL),
     (3, GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL),
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
-    (5, REMEDIATION_PACKS_MIGRATION_SQL),
-    (6, WAITLIST_MIGRATION_SQL),
-    (7, SESSION_SCHEMA_MIGRATION_SQL),
+    (5, WAITLIST_MIGRATION_SQL),
+    (6, SESSION_SCHEMA_MIGRATION_SQL),
+    (7, REMEDIATION_PACKS_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -5258,6 +5258,56 @@ mod tests {
         assert!(jobs_sql.contains("memory_engine_generation_jobs"));
         assert!(jobs_sql.contains("lease_expires_at_ms"));
         assert!(jobs_sql.contains("status IN ('queued', 'running', 'retry')"));
+    }
+
+    /// A shipped migration version must never be rebound to different SQL.
+    ///
+    /// [`PostgresStudyStore::migrate`] records applied migrations by number in
+    /// `memory_engine_schema_migrations` and skips any version already present.
+    /// Renumbering therefore produces a silent production no-op: the new SQL is
+    /// bound to a number the database already recorded, so it never executes.
+    /// It cannot be caught by the suite or by hosted CI either, because both
+    /// start from an empty database where every version applies in order and
+    /// the schema looks correct.
+    ///
+    /// Each entry below pins a substring that appears in exactly one migration.
+    /// A new migration must append the next unused version; it must never take
+    /// a number that has already shipped.
+    #[test]
+    fn shipped_migration_versions_are_never_rebound() {
+        const PINNED: &[(i32, &str)] = &[
+            (1, "memory_engine_rate_limits"),
+            (
+                2,
+                "CREATE TABLE IF NOT EXISTS memory_engine_generation_jobs",
+            ),
+            (3, "ADD COLUMN IF NOT EXISTS lease_token"),
+            (4, "memory_engine_generation_job_attempts"),
+            (5, "memory_engine_waitlist_entries"),
+            (6, "memory_engine_api_sessions"),
+            (7, "memory_engine_remediation_packs"),
+        ];
+
+        for (version, marker) in PINNED {
+            let (_, sql) = super::MIGRATIONS
+                .iter()
+                .find(|(candidate, _)| candidate == version)
+                .unwrap_or_else(|| {
+                    panic!("migration {version} disappeared; shipped versions are permanent")
+                });
+            assert!(
+                sql.contains(marker),
+                "migration {version} no longer contains {marker:?}. A shipped version was \
+                 rebound to different SQL, which will never run on any database that already \
+                 recorded version {version}. Append the next unused version instead."
+            );
+        }
+
+        assert_eq!(
+            super::MIGRATIONS.len(),
+            PINNED.len(),
+            "a migration was added or removed without pinning its version above"
+        );
     }
 
     #[test]
