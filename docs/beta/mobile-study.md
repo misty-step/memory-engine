@@ -53,7 +53,7 @@ Browser smoke receipt on May 22, 2026:
 - loaded `http://127.0.0.1:4174`;
 - saved the bundled NATO source fixture;
 - generated one quiz draft and one exercise draft;
-- approved both drafts;
+- kept or edited both drafts explicitly;
 - revealed and submitted the exercise answer `CHARLIE ALFA TANGO`;
 - repeated reveal and submit after grading to verify the UI still showed one
   attempt;

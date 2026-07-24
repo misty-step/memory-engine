@@ -56,7 +56,7 @@ harmless belt-and-suspenders on Postgres.
 ## Residual
 
 The lock guards `run_generation_job` only. A concurrent user mutation
-(review/approve) on the file host can still race a background generation — a
+(review/keep) on the file host can still race a background generation — a
 narrower window (one user, rare overlap) than the worker's 4-way concurrency,
 noted in the ticket as a follow-up.
 

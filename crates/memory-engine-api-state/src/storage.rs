@@ -12,24 +12,18 @@ use memory_engine_service::{
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
 
 use crate::{
-    account_session_path, account_store_path, auth_challenge_consumed_path, auth_challenge_path,
-    browser_session_path, file_content_feedback_failure, persisted_project_deck_exists,
-    persisted_source_exists, persisted_sources, postgres_content_feedback_failure,
-    postgres_failure, rate_limit_path, require_current_review, require_current_review_postgres,
-    run_bridge_generation, run_reference_generation, run_source_generation,
-    run_source_generation_with_run_id, secret_hash, study_failure, with_postgres_account,
+    account_store_path, app_session_max_age_ms, auth_challenge_consumed_path, auth_challenge_path,
+    browser_session_path, file_content_feedback_failure, file_study_failure, is_secret_hash,
+    persisted_project_deck_exists, persisted_source_exists, persisted_sources,
+    postgres_content_feedback_failure, postgres_failure, postgres_study_failure, rate_limit_path,
+    require_current_review, require_current_review_postgres, run_bridge_generation,
+    run_reference_generation, run_source_generation, run_source_generation_with_run_id,
+    secret_hash, session_csrf_token, study_failure, with_postgres_account,
     with_postgres_account_timed, with_postgres_store, with_postgres_store_timed,
     with_postgres_study, write_atomic, ApiFailure, BrowserSessionRecord, ReturnNotificationClaim,
     ReturnNotificationClaimRequest, ReturnNotificationPreference, SourceRecord, StudyViewResponse,
     SubmitReviewRequest, SubmitReviewTimings,
 };
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GenerationCommitFence<'a> {
-    pub(crate) generation_run_id: &'a str,
-    pub(crate) generation_attempt: i32,
-    pub(crate) lease_token: &'a str,
-}
 
 #[derive(Clone, Debug)]
 pub(crate) enum StudyStorageConfig {
@@ -193,6 +187,29 @@ impl StudyStorage {
             .account_session_matches_with_timings(account_id, session_token, timings)
     }
 
+    pub(crate) fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner
+            .revoke_account_session(account_id, session_token, now_ms)
+    }
+
+    /// Revokes every standalone account/API session for `account_id`.
+    /// Browser sessions are an independent scope: any session currently
+    /// backing a signed-in browser is preserved, not revoked. Use
+    /// [`Self::revoke_browser_sessions_for_account`] to sign out browsers.
+    pub(crate) fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .revoke_account_sessions_for_account(account_id, now_ms)
+    }
+
     pub(crate) fn save_browser_session(
         &self,
         session_id: &str,
@@ -222,6 +239,15 @@ impl StudyStorage {
         now_ms: i64,
     ) -> Result<(), ApiFailure> {
         self.inner.revoke_browser_session(session_id, now_ms)
+    }
+
+    pub(crate) fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        self.inner
+            .revoke_browser_sessions_for_account(account_id, now_ms)
     }
 
     /// Persists a magic-link auth challenge.
@@ -416,9 +442,39 @@ impl StudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .generate_source_with_run_id(account_id, store_path, source_id, run_id)
+        self.inner.generate_source_with_run_id(
+            account_id,
+            store_path,
+            source_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.inner.finalize_generation_run(
+            account_id,
+            store_path,
+            run_id,
+            generation_attempt,
+            lease_token,
+            now_ms,
+            lease_valid,
+        )
     }
 
     /// Archive a source and every review unit generated from it. Returns the
@@ -445,15 +501,35 @@ impl StudyStorage {
             .invalidate_project_deck(account_id, store_path, deck_id, invalidated_at)
     }
 
-    pub(crate) fn approve_draft(
+    pub(crate) fn keep_draft(
         &self,
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner.keep_draft(account_id, store_path, draft_id)
+    }
+
+    pub(crate) fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner
-            .approve_draft(account_id, store_path, draft_id, generation_commit_fence)
+            .edit_pending_draft(account_id, store_path, draft_id, prompt, expected_answer)
+    }
+
+    pub(crate) fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner
+            .reject_pending_draft(account_id, store_path, draft_id)
     }
 
     pub(crate) fn next_review(
@@ -610,6 +686,19 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure>;
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure>;
+    /// Browser sessions are an independent scope and must be preserved; see
+    /// the [`StudyStorage::revoke_account_sessions_for_account`] facade doc.
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure>;
     fn account_session_matches_with_timings(
         &self,
         account_id: &str,
@@ -635,6 +724,11 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         self.load_browser_session(session_id)
     }
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure>;
     fn save_auth_challenge(
         &self,
         challenge_hash: &str,
@@ -748,9 +842,25 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let _ = run_id;
         self.generate_source(account_id, store_path, source_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        _store_path: &FsPath,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        Ok(true)
     }
     fn archive_source(
         &self,
@@ -765,12 +875,25 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         deck_id: &str,
         invalidated_at: i64,
     ) -> Result<StudyViewResponse, ApiFailure>;
-    fn approve_draft(
+    fn keep_draft(
         &self,
         account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure>;
+    fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn next_review(
         &self,
@@ -900,6 +1023,127 @@ impl FileStudyStorage {
         let mut study = crate::open_study_session(store_path, self.now)?;
         operation(&mut study)
     }
+
+    fn migrate_legacy_account_session(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let legacy_path = self.store_root.join(account_id).join("session.token");
+        let Ok(raw) = fs::read_to_string(&legacy_path) else {
+            return Ok(());
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let token_hash = secret_hash(raw);
+        let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
+        write_atomic(
+            &path,
+            format!("{account_id}\n{now_ms}\n{expires_at_ms}\n\n").as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let persisted =
+            fs::read_to_string(&path).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let valid = persisted.lines().next() == Some(account_id)
+            && persisted
+                .lines()
+                .nth(1)
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(now_ms)
+            && persisted
+                .lines()
+                .nth(2)
+                .and_then(|value| value.parse::<i64>().ok())
+                == Some(expires_at_ms);
+        if !valid {
+            return Err(ApiFailure::internal(
+                "legacy session migration verification failed; account remains locked".to_owned(),
+            ));
+        }
+        if let Err(error) = fs::remove_file(&legacy_path) {
+            // Never leave a usable hashed session beside a raw legacy token.
+            // Mark the replacement revoked and fail closed; an operator can
+            // restore the account from the documented store snapshot.
+            let lock_record = format!("{account_id}\n{now_ms}\n{expires_at_ms}\n{now_ms}\n");
+            let _ = write_atomic(&path, lock_record.as_bytes());
+            return Err(ApiFailure::internal(format!(
+                "legacy session cleanup failed; account remains locked: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy_browser_session_token(
+        &self,
+        path: &FsPath,
+        raw_token: &str,
+    ) -> Result<String, ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
+        let Ok(saved) = fs::read_to_string(path) else {
+            return Ok(secret_hash(raw_token));
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        let Some(current_token) = lines.get(1).map(String::as_str) else {
+            return Ok(secret_hash(raw_token));
+        };
+        if is_secret_hash(current_token) {
+            return Ok(current_token.to_owned());
+        }
+        if current_token != raw_token {
+            return Ok(secret_hash(current_token));
+        }
+        let token_hash = secret_hash(raw_token);
+        lines[1].clone_from(&token_hash);
+        if let Some(csrf_hash) = lines.get_mut(2) {
+            *csrf_hash = secret_hash(&session_csrf_token(&token_hash));
+        }
+        write_atomic(path, format!("{}\n", lines.join("\n")).as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(token_hash)
+    }
+
+    /// Hashes of the account/API session credentials that currently back a
+    /// live (non-revoked) browser session for `account_id`. Browser and
+    /// machine session scopes are independent, so revoking every standalone
+    /// API/service session must preserve whichever of these are backing a
+    /// signed-in browser.
+    fn browser_backed_session_hashes_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<HashSet<String>, ApiFailure> {
+        let root = self.store_root.join("_browser_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(HashSet::new());
+        };
+        let mut hashes = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = saved.lines();
+            if lines.next() != Some(account_id) {
+                continue;
+            }
+            let Some(session_token_hash) = lines.next() else {
+                continue;
+            };
+            let revoked_at_ms = lines.nth(3).and_then(|value| value.parse::<i64>().ok());
+            if revoked_at_ms.is_none() {
+                hashes.insert(session_token_hash.to_owned());
+            }
+        }
+        Ok(hashes)
+    }
 }
 
 impl StudyStorageAdapter for FileStudyStorage {
@@ -912,11 +1156,30 @@ impl StudyStorageAdapter for FileStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<(), ApiFailure> {
-        let path = account_session_path(&self.store_root, account_id);
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        let token_hash = secret_hash(session_token);
+        let now_ms = self.now_ms();
+        let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
         }
-        fs::write(path, session_token).map_err(|error| ApiFailure::internal(error.to_string()))
+        write_atomic(
+            &path,
+            format!("{account_id}\n{now_ms}\n{expires_at_ms}\n\n").as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        let marker = self.store_root.join(account_id).join("account.marker");
+        if let Some(parent) = marker.parent() {
+            fs::create_dir_all(parent).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        write_atomic(&marker, format!("{now_ms}\n").as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))
     }
 
     fn account_session_matches(
@@ -924,12 +1187,129 @@ impl StudyStorageAdapter for FileStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure> {
-        let path = account_session_path(&self.store_root, account_id);
+        let token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&token_hash)
+            .join("session");
+        if !path.exists() {
+            let _lock = crate::file_lock::acquire(&self.store_root.join("_api_sessions.lock"))?;
+            if !path.exists() {
+                self.migrate_legacy_account_session(account_id, self.now_ms())?;
+            }
+        }
         let Ok(saved) = fs::read_to_string(path) else {
             return Ok(false);
         };
+        let mut lines = saved.lines();
+        let Some(saved_account_id) = lines.next() else {
+            return Ok(false);
+        };
+        let _created_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok()) else {
+            return Ok(false);
+        };
+        let revoked_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        Ok(saved_account_id == account_id
+            && revoked_at_ms.is_none()
+            && expires_at_ms > self.now_ms())
+    }
 
-        Ok(saved.trim() == session_token)
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        let token_hash = secret_hash(session_token);
+        let path = self
+            .store_root
+            .join("_api_sessions")
+            .join(token_hash)
+            .join("session");
+        let Ok(saved) = fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        if lines.first().map(String::as_str) != Some(account_id)
+            || lines.get(3).is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        while lines.len() < 4 {
+            lines.push(String::new());
+        }
+        lines[3] = now_ms.to_string();
+        write_atomic(
+            &path,
+            format!(
+                "{}
+",
+                lines.join(
+                    "
+"
+                )
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
+
+    /// Revokes every standalone account/API session for `account_id`,
+    /// preserving whichever ones currently back a live browser session (see
+    /// [`Self::browser_backed_session_hashes_for_account`]). Browser and
+    /// machine session scopes are independent: this is the "revoke all
+    /// API/service sessions" operation and must not silently sign out the
+    /// account's signed-in browsers.
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let preserved = self.browser_backed_session_hashes_for_account(account_id)?;
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        // A pre-hash-migration account may still carry a raw legacy token
+        // (see `migrate_legacy_account_session`). Left alone, presenting it
+        // later would lazily migrate a "revoked" session back to life, so
+        // clear it here too, under the same `_api_sessions.lock` used by
+        // that lazy migration.
+        let _ = fs::remove_file(self.store_root.join(account_id).join("session.token"));
+        let root = self.store_root.join("_api_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            if preserved.contains(&entry.file_name().to_string_lossy().into_owned()) {
+                continue;
+            }
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+            if lines.first().map(String::as_str) != Some(account_id)
+                || lines.get(3).is_some_and(|value| !value.trim().is_empty())
+            {
+                continue;
+            }
+            while lines.len() < 4 {
+                lines.push(String::new());
+            }
+            lines[3] = now_ms.to_string();
+            write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn save_browser_session(
@@ -944,11 +1324,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         fs::write(
             path,
             format!(
-                "{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n\n",
                 session.account_id,
                 session.session_token,
                 session.csrf_token_hash,
-                session.expires_at_ms
+                session.expires_at_ms,
+                self.now_ms()
             ),
         )
         .map_err(|error| ApiFailure::internal(error.to_string()))
@@ -959,7 +1340,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         session_id: &str,
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
-        let Ok(saved) = fs::read_to_string(path) else {
+        let Ok(saved) = fs::read_to_string(&path) else {
             return Ok(None);
         };
         let mut lines = saved.lines();
@@ -969,31 +1350,93 @@ impl StudyStorageAdapter for FileStudyStorage {
         let Some(session_token) = lines.next() else {
             return Ok(None);
         };
-        let Some(csrf_token_hash) = lines.next() else {
+        let legacy_raw_token = (!is_secret_hash(session_token)).then(|| session_token.to_owned());
+        let session_token = if let Some(raw_token) = legacy_raw_token.as_deref() {
+            self.migrate_legacy_browser_session_token(&path, raw_token)?
+        } else {
+            session_token.to_owned()
+        };
+        let Some(persisted_csrf_token_hash) = lines.next() else {
             return Ok(None);
         };
         let Some(expires_at_ms) = lines.next().and_then(|value| value.parse::<i64>().ok()) else {
             return Ok(None);
         };
-        if expires_at_ms <= self.now_ms() {
+        let _created_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        let revoked_at_ms = lines.next().and_then(|value| value.parse::<i64>().ok());
+        if expires_at_ms <= self.now_ms() || revoked_at_ms.is_some() {
             return Ok(None);
         }
-
+        let csrf_token_hash = if legacy_raw_token.is_some() {
+            secret_hash(&session_csrf_token(&session_token))
+        } else {
+            persisted_csrf_token_hash.to_owned()
+        };
         Ok(Some(BrowserSessionRecord {
             account_id: account_id.to_owned(),
-            session_token: session_token.to_owned(),
-            csrf_token_hash: csrf_token_hash.to_owned(),
+            session_token,
+            csrf_token_hash,
             expires_at_ms,
         }))
     }
 
-    fn revoke_browser_session(&self, session_id: &str, _now_ms: i64) -> Result<(), ApiFailure> {
+    fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(ApiFailure::internal(error.to_string())),
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
+        let Ok(saved) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        while lines.len() < 5 {
+            lines.push(String::new());
         }
+        if lines.len() == 5 {
+            lines.push(now_ms.to_string());
+        } else {
+            lines[5] = now_ms.to_string();
+        }
+        write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    /// Guards against the same race [`Self::migrate_legacy_browser_session_token`]
+    /// guards against: an unlocked read-modify-write here could silently
+    /// drop a concurrent revocation or lazy-migration update to the same
+    /// session file. Reuses the entry's own `path` for the write instead of
+    /// rebuilding it from the entry name.
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
+        let root = self.store_root.join("_browser_sessions");
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| ApiFailure::internal(error.to_string()))?;
+            let path = entry.path().join("session");
+            let Ok(saved) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if saved.lines().next() == Some(account_id) {
+                let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
+                while lines.len() < 5 {
+                    lines.push(String::new());
+                }
+                if lines.len() == 5 {
+                    lines.push(now_ms.to_string());
+                } else {
+                    lines[5] = now_ms.to_string();
+                }
+                write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
+                    .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     fn save_auth_challenge(
@@ -1353,6 +1796,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         window_ms: i64,
         max_attempts: u32,
     ) -> Result<bool, ApiFailure> {
+        let _lock = crate::file_lock::acquire(&self.store_root.join("_rate_limits.lock"))?;
         let mut attempts_by_key = Vec::with_capacity(keys.len());
         for key in keys {
             let path = rate_limit_path(&self.store_root, key);
@@ -1381,7 +1825,11 @@ impl StudyStorageAdapter for FileStudyStorage {
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
-        Ok(account_session_path(&self.store_root, account_id).exists()
+        Ok(self
+            .store_root
+            .join(account_id)
+            .join("account.marker")
+            .exists()
             || account_store_path(&self.store_root, account_id).exists())
     }
 
@@ -1523,7 +1971,7 @@ impl StudyStorageAdapter for FileStudyStorage {
         }
         // Provider/model work must stay outside the descriptor lock. The
         // persistence store owns the atomic commit path; holding the account
-        // lock here would turn normal foreground approval or invalidation on
+        // lock here would turn normal foreground keep or invalidation on
         // the same account into a spurious 409 for the duration of generation.
         let mut study = crate::open_study_session(store_path, self.now)?;
         let view = run_source_generation(
@@ -1541,6 +1989,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         if !persisted_source_exists(store_path, source_id)? {
             return Err(ApiFailure::not_found("Source not found."));
@@ -1553,6 +2003,29 @@ impl StudyStorageAdapter for FileStudyStorage {
             self.generation_provider_config.clone(),
         )?;
         Ok(StudyViewResponse::from_view(view))
+    }
+
+    fn finalize_generation_run(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            study
+                .finalize_generation_run(
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
+                    lease_valid,
+                )
+                .map_err(study_failure)
+        })
     }
 
     fn archive_source(
@@ -1590,17 +2063,42 @@ impl StudyStorageAdapter for FileStudyStorage {
         })
     }
 
-    fn approve_draft(
+    fn keep_draft(
         &self,
         _account_id: &str,
         store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let _ = generation_commit_fence;
         self.with_locked_study(store_path, |study| {
-            let view = study.approve_draft(draft_id).map_err(study_failure)?;
+            let view = study.keep_draft(draft_id).map_err(file_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
 
+    fn edit_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(file_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn reject_pending_draft(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.with_locked_study(store_path, |study| {
+            let view = study.reject_draft(draft_id).map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
     }
@@ -1819,7 +2317,11 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             self.now_ms(),
             |mut account| {
                 account
-                    .save_api_session(session_token, self.now_ms())
+                    .save_api_session(
+                        &secret_hash(session_token),
+                        self.now_ms(),
+                        self.now_ms().saturating_add(app_session_max_age_ms()),
+                    )
                     .map_err(postgres_failure)
             },
         )
@@ -1830,9 +2332,14 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         session_token: &str,
     ) -> Result<bool, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
         with_postgres_store(&self.database_url, |store| {
             store
-                .api_session_matches(account_id, session_token)
+                .api_session_matches(account_id, &session_token_hash, self.now_ms())
                 .map_err(postgres_failure)
         })
     }
@@ -1842,9 +2349,41 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         session_token: &str,
         timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<bool, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
         with_postgres_store_timed(&self.database_url, timings, |store| {
             store
-                .api_session_matches(account_id, session_token)
+                .api_session_matches(account_id, &session_token_hash, self.now_ms())
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_account_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        now_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let token_hash = secret_hash(session_token);
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .revoke_api_session(&token_hash, now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_account_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .revoke_api_sessions(now_ms)
+                .map(|_| ())
                 .map_err(postgres_failure)
         })
     }
@@ -1910,6 +2449,18 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         with_postgres_store(&self.database_url, |store| {
             store
                 .revoke_browser_session(&secret_hash(session_id), now_ms)
+                .map_err(postgres_failure)
+        })
+    }
+
+    fn revoke_browser_sessions_for_account(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .revoke_browser_sessions_for_account(account_id, now_ms)
                 .map_err(postgres_failure)
         })
     }
@@ -2304,25 +2855,56 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         _store_path: &FsPath,
         source_id: &str,
         run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if !account
-                .snapshot()
-                .map_err(postgres_failure)?
-                .source_documents
-                .iter()
-                .any(|source| source.id == source_id && source.archived_at.is_none())
-            {
-                return Err(ApiFailure::not_found("Source not found."));
-            }
-            let mut study = BetaStudySession::from_store(account, self.now);
-            let view = run_source_generation_with_run_id(
-                &mut study,
-                source_id,
-                run_id,
-                self.generation_provider_config.clone(),
-            )?;
-            Ok(StudyViewResponse::from_view(view))
+        with_postgres_account(
+            &self.database_url,
+            account_id,
+            self.now_ms(),
+            |mut account| {
+                account.set_generation_lease_fence(run_id, generation_attempt, lease_token);
+                if !account
+                    .snapshot()
+                    .map_err(postgres_failure)?
+                    .source_documents
+                    .iter()
+                    .any(|source| source.id == source_id && source.archived_at.is_none())
+                {
+                    return Err(ApiFailure::not_found("Source not found."));
+                }
+                let mut study = BetaStudySession::from_store(account, self.now);
+                let view = run_source_generation_with_run_id(
+                    &mut study,
+                    source_id,
+                    run_id,
+                    self.generation_provider_config.clone(),
+                )?;
+                Ok(StudyViewResponse::from_view(view))
+            },
+        )
+    }
+
+    fn finalize_generation_run(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, now_ms, |mut account| {
+            account
+                .finalize_generation_run(
+                    run_id,
+                    generation_attempt,
+                    lease_token,
+                    now_ms,
+                    lease_valid,
+                )
+                .map_err(postgres_failure)
         })
     }
 
@@ -2379,56 +2961,48 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         })
     }
 
-    fn approve_draft(
+    fn keep_draft(
         &self,
         account_id: &str,
         _store_path: &FsPath,
         draft_id: &str,
-        generation_commit_fence: Option<GenerationCommitFence<'_>>,
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
-            if let Some(fence) = generation_commit_fence {
-                let mut account_for_commit = account.clone();
-                account_for_commit
-                    .begin_transaction()
-                    .map_err(postgres_failure)?;
-                let result = (|| {
-                    let now_ms = self.now_ms();
-                    if !account_for_commit
-                        .generation_job_attempt_has_commit_fence(
-                            fence.generation_run_id,
-                            fence.generation_attempt,
-                            fence.lease_token,
-                            now_ms,
-                        )
-                        .map_err(postgres_failure)?
-                    {
-                        return Err(ApiFailure::conflict(
-                            "Generation lease lost before cards could be committed.",
-                        ));
-                    }
-                    let mut study = BetaStudySession::from_store(account, self.now);
-                    let view = study.approve_draft(draft_id).map_err(study_failure)?;
-                    Ok(StudyViewResponse::from_view(view))
-                })();
-                match result {
-                    Ok(view) => {
-                        account_for_commit
-                            .commit_transaction()
-                            .map_err(postgres_failure)?;
-                        Ok(view)
-                    }
-                    Err(error) => {
-                        let _ = account_for_commit.rollback_transaction();
-                        Err(error)
-                    }
-                }
-            } else {
-                let mut study = BetaStudySession::from_store(account, self.now);
-                let view = study.approve_draft(draft_id).map_err(study_failure)?;
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study.keep_draft(draft_id).map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
 
-                Ok(StudyViewResponse::from_view(view))
-            }
+    fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study
+                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let mut study = BetaStudySession::from_store(account, self.now);
+            let view = study
+                .reject_draft(draft_id)
+                .map_err(postgres_study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
         })
     }
 
@@ -2734,6 +3308,193 @@ mod tests {
     }
 
     #[test]
+    fn legacy_account_session_migration_hashes_and_removes_raw_token() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-legacy-session-migration-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_legacy_file";
+        let legacy_path = root.join(account_id).join("session.token");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, "legacy-wire-token\n").expect("legacy token");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        storage
+            .migrate_legacy_account_session(account_id, test_now())
+            .expect("migrate legacy account session");
+        assert!(
+            !legacy_path.exists(),
+            "raw token must be removed after verified rewrite"
+        );
+        let hash_path = root
+            .join("_api_sessions")
+            .join(secret_hash("legacy-wire-token"))
+            .join("session");
+        let persisted = fs::read_to_string(hash_path).expect("hashed session");
+        assert!(persisted.starts_with(account_id));
+        assert!(!persisted.contains("legacy-wire-token"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_account_sessions_for_account_also_clears_the_legacy_raw_token() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-revoke-legacy-session-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_legacy_revoke";
+        let legacy_path = root.join(account_id).join("session.token");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, "legacy-revoke-token\n").expect("legacy token");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+
+        storage
+            .revoke_account_sessions_for_account(account_id, test_now())
+            .expect("revoke all sessions");
+
+        assert!(
+            !legacy_path.exists(),
+            "legacy raw token must not survive a bulk revocation"
+        );
+        // Without the fix, presenting the raw legacy token here would
+        // lazily migrate it back into a fresh, valid session.
+        assert!(!storage
+            .account_session_matches(account_id, "legacy-revoke-token")
+            .expect("session check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_browser_session_waits_for_the_browser_sessions_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-browser-revoke-one-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let session_id = "session-under-lock-one";
+        let session_path = browser_session_path(&root, session_id);
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &session_path,
+            format!(
+                "acct_browser_revoke_one\nsession-token-hash\ncsrf-hash\n{}\n{}\n\n",
+                test_now() + 1_000_000,
+                test_now()
+            ),
+        )
+        .expect("browser session fixture");
+
+        let held = crate::file_lock::acquire(&root.join("_browser_sessions.lock"))
+            .expect("hold browser sessions lock");
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        let session_id_owned = session_id.to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let revoke = thread::spawn(move || {
+            started_tx.send(()).expect("signal revoke start");
+            result_tx
+                .send(contender.revoke_browser_session(&session_id_owned, test_now()))
+                .expect("send revoke result");
+        });
+        started_rx.recv().expect("revoke started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "revoke_browser_session must wait while _browser_sessions.lock is held"
+        );
+        drop(held);
+        let result = early.unwrap_or_else(|_| result_rx.recv().expect("revoke after lock release"));
+        result.expect("revoke browser session");
+        revoke.join().expect("revoke thread");
+
+        let saved = fs::read_to_string(&session_path).expect("session file after revoke");
+        assert!(
+            saved
+                .lines()
+                .nth(5)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some(),
+            "session must be marked revoked with a timestamp once the lock is released"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_browser_sessions_for_account_waits_for_the_browser_sessions_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-browser-revoke-all-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_browser_revoke_lock";
+        let session_path = browser_session_path(&root, "session-under-lock-all");
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &session_path,
+            format!(
+                "{account_id}\nsession-token-hash\ncsrf-hash\n{}\n{}\n\n",
+                test_now() + 1_000_000,
+                test_now()
+            ),
+        )
+        .expect("browser session fixture");
+
+        let held = crate::file_lock::acquire(&root.join("_browser_sessions.lock"))
+            .expect("hold browser sessions lock");
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        let account_id_owned = account_id.to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let revoke = thread::spawn(move || {
+            started_tx.send(()).expect("signal revoke start");
+            result_tx
+                .send(contender.revoke_browser_sessions_for_account(&account_id_owned, test_now()))
+                .expect("send revoke result");
+        });
+        started_rx.recv().expect("revoke started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "revoke_browser_sessions_for_account must wait while _browser_sessions.lock is held"
+        );
+        drop(held);
+        let result = early.unwrap_or_else(|_| result_rx.recv().expect("revoke after lock release"));
+        result.expect("revoke browser sessions for account");
+        revoke.join().expect("revoke thread");
+
+        let saved = fs::read_to_string(&session_path).expect("session file after revoke");
+        assert!(
+            saved
+                .lines()
+                .nth(5)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some(),
+            "session must be marked revoked with a timestamp once the lock is released"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_notification_claim_waits_and_rebases_ttls_after_lock_contention() {
         let root = std::env::temp_dir().join(format!(
             "memory-engine-notification-lock-{}-{}",
@@ -2975,13 +3736,8 @@ mod tests {
         // This is the foreground operation that used to receive a spurious
         // 409 while generation held the descriptor across provider work.
         storage
-            .approve_draft(
-                "acct",
-                &root.join("acct").join("study.json"),
-                &draft_id,
-                None,
-            )
-            .expect("foreground approval must commit while provider is running");
+            .keep_draft("acct", &root.join("acct").join("study.json"), &draft_id)
+            .expect("foreground keep must commit while provider is running");
         storage
             .save_source(
                 "acct",
@@ -3018,7 +3774,7 @@ mod tests {
             snapshot.review_units.iter().any(|unit| {
                 unit.generated_prompt_draft_id.as_deref() == Some(draft_id.as_str())
             }),
-            "foreground approval must survive the later generation commit"
+            "foreground keep must survive the later generation commit"
         );
         assert!(!reloaded.list_queue_candidates().expect("queue").is_empty());
 
@@ -3086,13 +3842,13 @@ mod tests {
         };
         let approval_store_path = store_path.clone();
         let approval = tokio::task::spawn_blocking(move || {
-            approval_storage.approve_draft("acct", &approval_store_path, &draft_id, None)
+            approval_storage.keep_draft("acct", &approval_store_path, &draft_id)
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), approval)
             .await
-            .expect("foreground approval must not wait for provider to release")
-            .expect("foreground approval task")
-            .expect("foreground approval");
+            .expect("foreground keep must not wait for provider to release")
+            .expect("foreground keep task")
+            .expect("foreground keep");
         release.wait();
         generation
             .join()

@@ -14,11 +14,10 @@ const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SOURCE_BODY: &str = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA.\n\nConcept: NATO CAT composition\nActivity: exercise\nStage: composition\nQuestion: Spell CAT over the phone using the NATO phonetic alphabet.\nAnswer: CHARLIE ALFA TANGO\nWorked Solution: C is CHARLIE, A is ALFA, and T is TANGO.\nReference: C is CHARLIE. A is ALFA. T is TANGO.";
 const REQUIRED_CONTRACT_PATHS: &[&str] = &[
-    "/v1/accounts",
     "/v1/accounts/{account_id}/sources",
     "/v1/accounts/{account_id}/sources/{source_id}",
     "/v1/accounts/{account_id}/sources/{source_id}/generate",
-    "/v1/accounts/{account_id}/drafts/{draft_id}/approve",
+    "/v1/accounts/{account_id}/drafts/{draft_id}/keep",
     "/v1/accounts/{account_id}/review/next",
     "/v1/accounts/{account_id}/review/{review_unit_id}/reveal",
     "/v1/accounts/{account_id}/review/{review_unit_id}/submit",
@@ -51,7 +50,7 @@ fn main() {
 
 fn print_usage() {
     println!(
-        "usage: cargo run -p memory-engine-contract -- [--base-url URL] [--email EMAIL]\n       cargo run -p memory-engine-contract -- --account-id ID --session-token TOKEN [--base-url URL]\n\nEnvironment fallbacks: MEMORY_ENGINE_ACCOUNT_ID and MEMORY_ENGINE_SESSION_TOKEN."
+        "usage: cargo run -p memory-engine-contract -- --account-id ID --session-token TOKEN [--base-url URL]\n\nCredentials must be pre-provisioned by the invite or operator service-session flow. Environment fallbacks: MEMORY_ENGINE_ACCOUNT_ID and MEMORY_ENGINE_SESSION_TOKEN."
     );
 }
 
@@ -61,23 +60,13 @@ fn run_contract(config: &ContractConfig) -> Result<ContractReceipt, ContractFail
         .build()
         .into();
     let contract = fetch_openapi(&agent, &config.base_url)?;
-    let session = match &config.credentials {
-        Credentials::CreateAccount { email } => {
-            let created = create_account(&agent, &config.base_url, email)?;
-            Session {
-                account_id: created.account_id,
-                token: created.session_token,
-                created_account: true,
-            }
-        }
-        Credentials::Existing {
-            account_id,
-            session_token,
-        } => Session {
-            account_id: account_id.clone(),
-            token: session_token.clone(),
-            created_account: false,
-        },
+    let Credentials::Existing {
+        account_id,
+        session_token,
+    } = &config.credentials;
+    let session = Session {
+        account_id: account_id.clone(),
+        token: session_token.clone(),
     };
     let client = ContractClient::new(agent, &config.base_url, session);
     let source = client.create_source(&config.source_title, &config.source_body)?;
@@ -112,7 +101,6 @@ fn run_contract(config: &ContractConfig) -> Result<ContractReceipt, ContractFail
         openapi_version: contract.openapi,
         contract_path_count: contract.paths.len(),
         account_id: client.account_id.clone(),
-        created_account: client.created_account,
         source_id,
         draft_id: proof.draft_id,
         review_unit_id: proof.review_unit_id,
@@ -164,7 +152,7 @@ fn drive_review_loop(
         .clone();
 
     client.post_empty::<StudyView>(&format!(
-        "/v1/accounts/{}/drafts/{draft_id}/approve",
+        "/v1/accounts/{}/drafts/{draft_id}/keep",
         client.account_id
     ))?;
 
@@ -210,18 +198,6 @@ fn drive_review_loop(
         verdict,
         attempt_count: submitted.summary.attempt_count,
     })
-}
-
-fn create_account(
-    agent: &ureq::Agent,
-    base_url: &str,
-    email: &str,
-) -> Result<AccountCreated, ContractFailure> {
-    let mut response = agent
-        .post(&endpoint(base_url, "/v1/accounts"))
-        .send_json(json!({ "email": email }))
-        .map_err(|error| transport_failure("create account", &error))?;
-    read_json(&mut response, "create account")
 }
 
 fn read_json<T: DeserializeOwned>(
@@ -287,7 +263,6 @@ fn cli_action(
     }
 
     let mut base_url = DEFAULT_BASE_URL.to_owned();
-    let mut email = None;
     let mut account_id = process_env.account_id;
     let mut session_token = process_env.session_token;
     let mut source_title = unique_source_title();
@@ -301,7 +276,6 @@ fn cli_action(
             .ok_or_else(|| ContractFailure(format!("{flag} requires a value")))?;
         match flag.as_str() {
             "--base-url" => base_url.clone_from(value),
-            "--email" => email = Some(value.clone()),
             "--account-id" => account_id = Some(value.clone()),
             "--session-token" => session_token = Some(value.clone()),
             "--source-title" => source_title.clone_from(value),
@@ -316,9 +290,12 @@ fn cli_action(
             account_id,
             session_token,
         },
-        (None, None) => Credentials::CreateAccount {
-            email: email.unwrap_or_else(unique_email),
-        },
+        (None, None) => {
+            return Err(ContractFailure(
+                "--account-id and --session-token are required; credentials must be pre-provisioned"
+                    .to_owned(),
+            ));
+        }
         _ => {
             return Err(ContractFailure(
                 "--account-id and --session-token must be provided together".to_owned(),
@@ -338,10 +315,6 @@ fn unique_source_title() -> String {
     format!("Scry v1 contract fixture {}", unique_suffix())
 }
 
-fn unique_email() -> String {
-    format!("scry-contract+{}@example.com", unique_suffix())
-}
-
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -359,9 +332,6 @@ struct ContractConfig {
 
 #[derive(Clone, Eq, PartialEq)]
 enum Credentials {
-    CreateAccount {
-        email: String,
-    },
     Existing {
         account_id: String,
         session_token: String,
@@ -371,10 +341,6 @@ enum Credentials {
 impl fmt::Debug for Credentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CreateAccount { email } => formatter
-                .debug_struct("CreateAccount")
-                .field("email", email)
-                .finish(),
             Self::Existing { account_id, .. } => formatter
                 .debug_struct("Existing")
                 .field("account_id", account_id)
@@ -388,7 +354,6 @@ impl fmt::Debug for Credentials {
 struct Session {
     account_id: String,
     token: String,
-    created_account: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -397,7 +362,6 @@ struct ContractClient {
     base_url: String,
     account_id: String,
     session_token: String,
-    created_account: bool,
 }
 
 impl ContractClient {
@@ -407,7 +371,6 @@ impl ContractClient {
             base_url: base_url.to_owned(),
             account_id: session.account_id,
             session_token: session.token,
-            created_account: session.created_account,
         }
     }
 
@@ -485,13 +448,6 @@ impl ContractClient {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-struct AccountCreated {
-    account_id: String,
-    session_token: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 struct OpenApiContract {
     openapi: String,
     paths: BTreeMap<String, serde_json::Value>,
@@ -556,7 +512,6 @@ struct ContractReceipt {
     openapi_version: String,
     contract_path_count: usize,
     account_id: String,
-    created_account: bool,
     source_id: String,
     draft_id: String,
     review_unit_id: String,
@@ -616,6 +571,23 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_missing_credentials_instead_of_minting_an_account() {
+        let error = cli_action(
+            std::iter::empty::<String>(),
+            CliEnv {
+                account_id: None,
+                session_token: None,
+            },
+        )
+        .expect_err("missing credentials should fail closed");
+
+        assert_eq!(
+            error.to_string(),
+            "--account-id and --session-token are required; credentials must be pre-provisioned"
+        );
+    }
+
+    #[test]
     fn parser_rejects_partial_existing_credentials() {
         let error = cli_action(
             ["--account-id", "acct_demo"].into_iter().map(str::to_owned),
@@ -646,7 +618,6 @@ mod tests {
             openapi_version: "3.1.0".to_owned(),
             contract_path_count: 9,
             account_id: "acct_demo".to_owned(),
-            created_account: false,
             source_id: "src_demo".to_owned(),
             draft_id: "draft_demo".to_owned(),
             review_unit_id: "ru_demo".to_owned(),
@@ -679,19 +650,30 @@ mod tests {
             .await
             .expect("bind local API listener");
         let address = listener.local_addr().expect("local address");
+        let store_root =
+            std::env::temp_dir().join(format!("memory-engine-contract-{}", unique_suffix()));
+        let state = memory_engine_api::ApiState::new(
+            memory_engine_api::AccountRegistry::with_store_root(&store_root).with_auth_config(
+                memory_engine_api::AuthConfig::allow_emails([
+                    "scry-contract-local@example.com".to_owned()
+                ])
+                .with_anonymous_account_creation(true),
+            ),
+        );
+        let created = state
+            .create_account("scry-contract-local@example.com")
+            .expect("pre-provision local account");
         let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                memory_engine_api::router(memory_engine_api::ApiState::default()),
-            )
-            .await
-            .expect("serve local API");
+            axum::serve(listener, memory_engine_api::router(state))
+                .await
+                .expect("serve local API");
         });
 
         let receipt = run_contract(&ContractConfig {
             base_url: format!("http://{address}"),
-            credentials: Credentials::CreateAccount {
-                email: "scry-contract-local@example.com".to_owned(),
+            credentials: Credentials::Existing {
+                account_id: created.account_id,
+                session_token: created.session_token,
             },
             source_title: "Scry v1 contract test".to_owned(),
             source_body: DEFAULT_SOURCE_BODY.to_owned(),

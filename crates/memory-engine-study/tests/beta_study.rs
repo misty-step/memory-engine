@@ -10,7 +10,7 @@ use memory_engine_generation::{
     ReferenceNoteProvider, ReferenceNoteRequest,
 };
 use memory_engine_persistence::{
-    BetaPersistenceStore, BetaReviewUnitRecord, GeneratedLearningActivityKind,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, GeneratedLearningActivityKind,
     GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
     GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument, SourceDocumentKind,
     SourcePermission,
@@ -25,7 +25,72 @@ use serde_json::json;
 const NOW: i64 = 1_779_984_000_000;
 
 #[test]
-fn creates_source_generates_approves_reviews_reveals_and_advances_queue() {
+fn queued_generation_is_pending_before_lease_publication() {
+    let directory = TempDirectory::new("queued-pending-publication");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+
+    let generated = study
+        .generate_with_run_id_pending(None, "queued-run")
+        .expect("queued generation");
+    assert!(
+        generated.drafts.is_empty(),
+        "unfinalized drafts must stay off the learner workspace"
+    );
+    let snapshot = BetaPersistenceStore::open(&path)
+        .expect("reload")
+        .snapshot();
+    let draft_id = snapshot
+        .generated_prompt_drafts
+        .first()
+        .expect("durable pending draft")
+        .id
+        .clone();
+    assert!(snapshot.review_units.is_empty());
+    assert!(snapshot.schedules.is_empty());
+    assert!(snapshot
+        .generation_runs
+        .iter()
+        .any(|run| run.id == "queued-run" && run.completed_at == Some(i64::MIN)));
+
+    let mut decisions = BetaPersistenceStore::open(&path).expect("decision store");
+    assert!(matches!(
+        decisions.keep_generated_prompt_draft(&draft_id, NOW),
+        Err(BetaStoreError::MissingGenerationRunForAcceptedDraft)
+    ));
+}
+
+#[test]
+fn unfinalized_generation_drafts_are_hidden_and_undecidable() {
+    let directory = TempDirectory::new("unfinalized-draft-visibility");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    let generated = study
+        .generate_with_run_id_pending(None, "visibility-run")
+        .expect("queued generation");
+    assert!(generated.drafts.is_empty());
+    let draft_id = BetaPersistenceStore::open(&path)
+        .expect("reload")
+        .snapshot()
+        .generated_prompt_drafts
+        .first()
+        .expect("durable draft")
+        .id
+        .clone();
+    assert!(matches!(
+        study.keep_draft(&draft_id),
+        Err(memory_engine_study::BetaStudyError::Store(
+            BetaStoreError::MissingGenerationRunForAcceptedDraft
+        ))
+    ));
+}
+
+#[test]
+fn creates_source_generates_keeps_reviews_reveals_and_advances_queue() {
     let directory = TempDirectory::new("happy-path");
     let path = directory.path().join("study.json");
     let mut study =
@@ -57,11 +122,11 @@ fn creates_source_generates_approves_reviews_reveals_and_advances_queue() {
     );
 
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
     assert_eq!(approved.status, BetaStudyStatus::Answering);
     assert_eq!(approved.summary.approved_review_unit_count, 2);
     let current = approved.current.expect("current");
@@ -136,11 +201,11 @@ fn resumes_from_persisted_state_without_regenerating_content() {
         study.add_source(source_input()).expect("source");
         study.generate(None).expect("generate");
         study
-            .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-            .expect("approve exercise");
+            .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+            .expect("keep exercise");
         study
-            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-            .expect("approve quiz");
+            .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("keep quiz");
         study
             .submit_answer("CHARLIE ALFA TANGO", 4_200)
             .expect("submit");
@@ -183,8 +248,8 @@ fn duplicate_submit_after_grading_is_view_only() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
 
     let first = study.submit_answer("ALFA", 1_800).expect("first");
     let duplicate = study.submit_answer("ALFA", 1_800).expect("duplicate");
@@ -229,8 +294,8 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
     assert_eq!(approved.concept_progress.len(), 1);
     assert_eq!(approved.concept_progress[0].health, "untried");
 
@@ -286,8 +351,8 @@ fn multiple_choice_choices_rotate_between_reviews_without_changing_answer() {
         study.add_source(source_input()).expect("source");
         study.generate(None).expect("generate");
         study
-            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-            .expect("approve");
+            .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("keep");
     }
 
     let mut first_session =
@@ -361,7 +426,7 @@ fn queue_rotates_due_variants_with_the_same_concept_and_stage() {
         .map(|draft| draft.id.clone())
         .collect::<Vec<_>>()
     {
-        study.approve_draft(&draft_id).expect("approve variant");
+        study.keep_draft(&draft_id).expect("keep variant");
     }
 
     let first = study
@@ -407,8 +472,8 @@ fn post_answer_feedback_exposes_item_response_time_and_success_trends() {
         study.add_source(source_input()).expect("source");
         study.generate(None).expect("generate");
         study
-            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-            .expect("approve");
+            .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("keep");
     }
     record_graded_attempt_with_response_time(
         &path,
@@ -461,11 +526,11 @@ fn concept_progress_lists_weakest_concepts_first() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
 
     study
         .submit_answer("CHARLIE ALFA TANGO", 4_200)
@@ -498,11 +563,11 @@ fn concept_progress_includes_active_approved_untried_concepts_and_excludes_archi
     study.add_source(shared_concept_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-shared-1-nato-letter-a")
-        .expect("approve first");
+        .keep_draft("study-run-1-draft-src-shared-1-nato-letter-a")
+        .expect("keep first");
     let reviewed = study
-        .approve_draft("study-run-1-draft-src-shared-2-nato-letter-a")
-        .expect("approve second");
+        .keep_draft("study-run-1-draft-src-shared-2-nato-letter-a")
+        .expect("keep second");
 
     assert_eq!(reviewed.concept_progress.len(), 1);
     assert_eq!(reviewed.concept_progress[0].concept_key, "nato-letter-a");
@@ -524,11 +589,11 @@ fn concept_progress_rolls_up_items_with_the_same_concept_key() {
     study.add_source(shared_concept_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-shared-1-nato-letter-a")
-        .expect("approve first");
+        .keep_draft("study-run-1-draft-src-shared-1-nato-letter-a")
+        .expect("keep first");
     study
-        .approve_draft("study-run-1-draft-src-shared-2-nato-letter-a")
-        .expect("approve second");
+        .keep_draft("study-run-1-draft-src-shared-2-nato-letter-a")
+        .expect("keep second");
 
     study.submit_answer("ALFA", 1_800).expect("first submit");
     study.advance().expect("next");
@@ -558,11 +623,11 @@ fn concept_progress_tiebreaks_equal_rates_by_more_evidence() {
         study.add_source(source_input()).expect("source");
         study.generate(None).expect("generate");
         study
-            .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-            .expect("approve quiz");
+            .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+            .expect("keep quiz");
         study
-            .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-            .expect("approve exercise");
+            .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+            .expect("keep exercise");
     }
     record_graded_attempt(
         &path,
@@ -608,8 +673,8 @@ fn inspects_and_edits_active_review_item_without_revealing_answer() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     let started = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
     assert_eq!(started.status, BetaStudyStatus::Answering);
     assert_eq!(
         started.current.as_ref().expect("current").expected_answer,
@@ -659,11 +724,11 @@ fn snoozes_and_deletes_active_review_items_without_touching_schedule_history() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
     study
         .submit_answer("CHARLIE ALFA TANGO", 4_200)
         .expect("submit");
@@ -756,11 +821,11 @@ fn skip_defers_current_item_without_recording_a_review_attempt() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     let started = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
     let skipped_id = started.current.expect("current").review_unit_id;
 
     let skipped = study.skip_current().expect("skip");
@@ -789,7 +854,7 @@ fn snoozes_every_card_in_the_current_concept_without_creating_review_history() {
     study.add_source(concept_snooze_input()).expect("source");
     let generated = study.generate(None).expect("generate");
     for draft in &generated.drafts {
-        study.approve_draft(&draft.id).expect("approve");
+        study.keep_draft(&draft.id).expect("keep");
     }
 
     let started = study.start().expect("start");
@@ -1009,20 +1074,38 @@ fn bridge_material_creates_easier_due_items_before_the_parent() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz sibling");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz sibling");
     let parent_id = approved.current.expect("parent").review_unit_id;
 
     let bridged = study.generate_bridge_material().expect("bridge");
-    let current = bridged.current.expect("bridge current");
+    if bridged.current.is_some() {
+        study
+            .snooze_current_until(NOW + DEFAULT_BRIDGE_PARENT_DEFER_MS)
+            .expect("defer existing queued sibling");
+    }
+    let bridge_draft_ids = bridged
+        .drafts
+        .iter()
+        .filter(|draft| draft.review_unit_id.as_str().starts_with("bridge-"))
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(bridge_draft_ids.len(), 2);
+    assert_eq!(bridged.summary.attempt_count, 0);
+    assert_eq!(bridged.summary.approved_review_unit_count, 2);
 
+    study
+        .keep_draft(&bridge_draft_ids[0])
+        .expect("keep first bridge");
+    let bridged = study
+        .keep_draft(&bridge_draft_ids[1])
+        .expect("keep second bridge");
+    let current = bridged.current.expect("kept bridge current");
     assert!(current.review_unit_id.as_str().starts_with("bridge-"));
     assert_eq!(current.activity_stage, "recognition-bridge");
-    assert_eq!(bridged.summary.attempt_count, 0);
-    assert_eq!(bridged.summary.approved_review_unit_count, 4);
     let bridge_rows = bridged
         .queue
         .iter()
@@ -1078,11 +1161,11 @@ fn bridge_descendants_keep_local_only_provenance_and_block_provider_calls() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve quiz sibling");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz sibling");
     let _parent_id = approved.current.expect("parent").review_unit_id;
 
     let mut store = BetaPersistenceStore::open(&path).expect("store");
@@ -1132,8 +1215,8 @@ fn local_only_source_blocks_model_bridge_generation() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
     let parent_id = approved.current.expect("parent").review_unit_id;
 
     let mut store = BetaPersistenceStore::open(&path).expect("store");
@@ -1172,8 +1255,8 @@ fn bridge_material_failure_keeps_the_parent_current() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     let approved = study
-        .approve_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
-        .expect("approve exercise");
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
     let parent = approved.current.expect("parent");
 
     let failure = study
@@ -1204,8 +1287,8 @@ fn view_serializes_like_the_mobile_beta_api_contract() {
     study.add_source(source_input()).expect("source");
     study.generate(None).expect("generate");
     study
-        .approve_draft("study-run-1-draft-src-nato-1-nato-letter-a")
-        .expect("approve");
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
     study.reveal().expect("reveal");
 
     let encoded = serde_json::to_value(study.view().expect("view")).expect("json");
@@ -1605,6 +1688,7 @@ fn seed_spanless_review(path: &std::path::Path) {
     });
     store
         .save_generated_prompt_draft(GeneratedPromptDraft {
+            learner_decision: None,
             id: "spanless-draft".to_owned(),
             source_document_ids: vec!["src-spanless".to_owned()],
             reference_span_ids: Vec::new(),

@@ -1,12 +1,8 @@
 //! Credential resolution for the stdio server.
 //!
-//! Mirrors `memory-engine-review`'s credential model exactly (same env var
-//! names `docs/runbook.md` already documents), but with no interactive
-//! `login` subcommand: stdin is the JSON-RPC channel, not a terminal. A
-//! brand-new local server bootstraps its own account non-interactively from
-//! `MEMORY_ENGINE_MCP_EMAIL` instead. There is no silent in-memory fallback —
-//! if none of the three paths below resolve, the server fails loudly at
-//! startup rather than guessing.
+//! Credentials must be provisioned through invite or operator service-session
+//! flows. There is no anonymous bootstrap or silent in-memory fallback: if no
+//! credential path resolves, the server fails loudly at startup.
 
 use std::{
     env, fs,
@@ -14,8 +10,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-
-use crate::client;
 
 pub const DEFAULT_BASE_URL: &str = "https://memory-engine-api-i2xcr.ondigitalocean.app";
 
@@ -35,14 +29,13 @@ pub struct Session {
 }
 
 /// Resolve credentials in order: `MEMORY_ENGINE_ACCOUNT_ID` /
-/// `MEMORY_ENGINE_SESSION_TOKEN` env vars, then `credentials_path`, then a
-/// fresh account created from `MEMORY_ENGINE_MCP_EMAIL` (persisted to
-/// `credentials_path` for reuse across restarts).
+/// `MEMORY_ENGINE_SESSION_TOKEN` env vars, then `credentials_path`.
+///
+/// Every failed path remains visible in the startup error for operator repair.
 ///
 /// # Errors
 ///
-/// Returns an error describing every path that was tried when none resolves,
-/// or when account creation fails.
+/// Returns an error when no pre-provisioned credential path resolves.
 pub fn resolve(credentials_path: &Path) -> Result<Session, String> {
     let base_url =
         non_empty_env("MEMORY_ENGINE_MCP_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
@@ -66,30 +59,11 @@ pub fn resolve(credentials_path: &Path) -> Result<Session, String> {
         });
     }
 
-    if let Some(email) = non_empty_env("MEMORY_ENGINE_MCP_EMAIL") {
-        let created = client::create_account(&base_url, &email)?;
-        write_credentials(
-            credentials_path,
-            &StoredCredentials {
-                base_url: base_url.clone(),
-                account_id: created.account_id.clone(),
-                session_token: created.session_token.clone(),
-            },
-        )?;
-        return Ok(Session {
-            base_url,
-            account_id: created.account_id,
-            session_token: created.session_token,
-        });
-    }
-
     Err(format!(
-        "no memory-engine credentials found. Set MEMORY_ENGINE_ACCOUNT_ID and \
-         MEMORY_ENGINE_SESSION_TOKEN (see docs/runbook.md), or a credentials file at {} \
-         (written by this server or `memory-engine-review login`), or MEMORY_ENGINE_MCP_EMAIL \
-         to bootstrap a fresh account. There is no in-memory fallback: a stdio MCP server \
-         that silently created and discarded an account would leave an agent believing its \
-         study state persisted when it did not.",
+        "no pre-provisioned memory-engine credentials found. Set MEMORY_ENGINE_ACCOUNT_ID and \
+         MEMORY_ENGINE_SESSION_TOKEN (see docs/runbook.md), or provide a credentials file at {} \
+         (written by an operator-managed provisioning step). Anonymous account creation is \
+         disabled; there is no in-memory fallback.",
         credentials_path.display()
     ))
 }
@@ -119,6 +93,7 @@ fn read_credentials(path: &Path) -> Result<Option<StoredCredentials>, String> {
     }
 }
 
+#[cfg(test)]
 fn write_credentials(path: &Path, credentials: &StoredCredentials) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -135,7 +110,7 @@ fn write_credentials(path: &Path, credentials: &StoredCredentials) -> Result<(),
 // matching `memory-engine-review`'s credential file: no window where the
 // session token is readable under the ambient umask before a follow-up
 // chmod narrows it.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn open_restricted(path: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
@@ -147,7 +122,7 @@ fn open_restricted(path: &Path) -> Result<fs::File, String> {
         .map_err(|error| format!("could not open {}: {error}", path.display()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn open_restricted(path: &Path) -> Result<fs::File, String> {
     fs::OpenOptions::new()
         .write(true)
@@ -205,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fails_loudly_with_no_credentials_and_no_bootstrap_email() {
+    fn resolve_fails_loudly_with_no_preprovisioned_credentials() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -214,10 +189,9 @@ mod tests {
 
         env::remove_var("MEMORY_ENGINE_ACCOUNT_ID");
         env::remove_var("MEMORY_ENGINE_SESSION_TOKEN");
-        env::remove_var("MEMORY_ENGINE_MCP_EMAIL");
 
         let error = resolve(&credentials_path).expect_err("must fail without any credential path");
-        assert!(error.contains("no memory-engine credentials found"));
+        assert!(error.contains("no pre-provisioned memory-engine credentials found"));
     }
 
     fn tempdir(label: &str) -> PathBuf {

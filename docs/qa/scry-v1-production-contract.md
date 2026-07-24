@@ -26,7 +26,6 @@ Sanitized receipt:
   "openapiVersion": "3.1.0",
   "contractPathCount": 9,
   "accountId": "acct_48e443e2719d6f90",
-  "createdAccount": false,
   "sourceId": "src_ee706c82993d0700",
   "draftId": "study-run-2-draft-src-ee706c82993d0700-1-nato-letter-a",
   "reviewUnitId": "generated-quiz-src-ee706c82993d0700-1-nato-letter-a",

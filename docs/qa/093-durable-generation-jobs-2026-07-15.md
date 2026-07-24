@@ -31,9 +31,9 @@ MEMORY_ENGINE_POSTGRES_TEST_URL=postgres://test:test@127.0.0.1:5432/sploot_test?
 ```
 
 The API-state idempotency oracle runs the same generation job twice through the
-real file-backed study adapter. The first pass schedules material; the replay
-returns zero new scheduled cards, proving a worker restart cannot duplicate
-material after an interrupted approval loop:
+real file-backed study adapter. Both passes leave accepted drafts pending with
+zero review units and zero due schedules; the replay creates no duplicate
+material after an interrupted learner-decision loop:
 
 ```sh
 cargo test -p memory-engine-api-state \
