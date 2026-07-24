@@ -6,12 +6,12 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex,
     },
 };
 
@@ -35,6 +35,15 @@ use postgres::types::ToSql;
 use postgres::{Client, ToStatement};
 
 static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide cache of database URLs [`PostgresStudyStore::migrate_once`]
+/// has already migrated. Deliberately the ONE such cache in the process:
+/// every call site (HTTP request handlers, the background generation
+/// worker, ...) shares it through [`PostgresStudyStore::migrate_once`]
+/// rather than keeping a private copy, so two call sites can never
+/// independently believe they are the first to see a URL.
+static MIGRATED_URLS: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
@@ -1135,14 +1144,26 @@ impl PostgresStudyStore {
 
     /// Run the production schema migration.
     ///
+    /// Acquires `pg_advisory_xact_lock` before touching a single table —
+    /// including `memory_engine_schema_migrations` itself. `CREATE TABLE IF
+    /// NOT EXISTS` is not safe against two connections racing the very
+    /// first, from-nothing bootstrap: both can pass the "does it exist"
+    /// catalog check, then collide creating it, and Postgres bounces the
+    /// loser off the `pg_type` catalog's `pg_type_typname_nsp_index`
+    /// constraint (every table also creates a backing row type). The
+    /// advisory lock does not require its target table to exist, so
+    /// acquiring it first — before any DDL, not just before applying the
+    /// versioned migration list — serializes every caller, in-process or
+    /// cross-process, through the entire bootstrap.
+    ///
     /// # Errors
     ///
     /// Returns [`PostgresStoreError`] when Postgres rejects the migration.
     pub fn migrate(&mut self) -> Result<(), PostgresStoreError> {
         let mut client = self.client.borrow_mut();
-        client.batch_execute(MIGRATION_TABLE_SQL)?;
         let mut transaction = client.transaction()?;
         transaction.query_one("SELECT pg_advisory_xact_lock($1)", &[&9_301_094_i64])?;
+        transaction.batch_execute(MIGRATION_TABLE_SQL)?;
         let applied =
             transaction.query("SELECT version FROM memory_engine_schema_migrations", &[])?;
         let applied = applied
@@ -1162,6 +1183,33 @@ impl PostgresStudyStore {
         }
         transaction.commit()?;
 
+        Ok(())
+    }
+
+    /// Runs [`migrate`](Self::migrate) only the first time this *process*
+    /// sees `database_url`, so a hot path (an HTTP request handler, a
+    /// background worker loop, ...) does not re-run the DDL migration batch
+    /// on every call. The cache is process-wide and shared by every
+    /// caller — deliberately not duplicated per call site — so two
+    /// independent "first time I've seen this URL" code paths (an HTTP
+    /// handler and a background worker, for instance) can never each
+    /// independently decide it is their job to run
+    /// [`migrate`](Self::migrate) at the same moment. [`migrate`](Self::migrate)
+    /// itself is also safe without this cache (see its own doc comment);
+    /// this only avoids redundant round trips once a process has already
+    /// confirmed a URL is migrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when [`migrate`](Self::migrate) fails.
+    pub fn migrate_once(&mut self, database_url: &str) -> Result<(), PostgresStoreError> {
+        let mut migrated = MIGRATED_URLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !migrated.contains(database_url) {
+            self.migrate()?;
+            migrated.insert(database_url.to_owned());
+        }
         Ok(())
     }
 
@@ -5098,6 +5146,67 @@ mod tests {
         assert_eq!(statement_count.load(Ordering::Relaxed), 12);
         drop(transaction);
         assert_eq!(statement_count.load(Ordering::Relaxed), 13);
+    }
+
+    #[test]
+    fn concurrent_cold_start_never_races_the_bootstrap_migrations_table() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping concurrent cold-start migration test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        // A fresh, never-migrated schema: reproduces the true first-launch
+        // bootstrap. The bootstrap-table race `migrate` guards against only
+        // exists the very first time `memory_engine_schema_migrations`
+        // itself does not exist yet — a schema that already has it can
+        // never exhibit the race, so re-migrating an already-set-up
+        // database (every other Postgres test's schema, reused within one
+        // test process) would not catch a regression here.
+        let schema = format!(
+            "memory_engine_test_cold_start_{}_{}",
+            std::process::id(),
+            super::migration_now_ms()
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+
+        // Each racer opens its OWN connection and calls `migrate()`
+        // directly (bypassing `migrate_once`'s in-process cache entirely)
+        // so this proves the database-level protection — the invariant
+        // that also has to hold across separate OS processes, which no
+        // in-process cache could ever provide.
+        let thread_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let scoped_url = scoped_url.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<(), String> {
+                    let mut store = PostgresStudyStore::connect(&scoped_url)
+                        .map_err(|error| error.to_string())?;
+                    barrier.wait();
+                    store.migrate().map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread must not panic"))
+            .collect();
+
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+
+        assert!(
+            results.iter().all(std::result::Result::is_ok),
+            "every racer migrating a genuinely empty schema concurrently must succeed, never \
+             collide on the bootstrap migrations table: {results:?}"
+        );
     }
 
     #[test]

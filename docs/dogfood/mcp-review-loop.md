@@ -1,6 +1,6 @@
 # MCP Review Loop Dogfood
 
-Refs-Powder: memory-engine-071
+Refs-Powder: memory-engine-071, memory-engine-mcp-production-parity
 
 ## Purpose
 
@@ -14,7 +14,16 @@ matrix (skill / CLI / API / MCP / UI) alongside `memory-engine-review` (CLI,
 
 It adds **no new server surface**. Every tool composes one or more existing
 v1 routes; `crates/memory-engine-mcp/src/client.rs` is the only place that
-speaks HTTP.
+speaks HTTP. Generation is queue-based end to end: `create_deck` enqueues a
+durable generation job (`POST .../generation-jobs`) and polls it
+(`GET .../generation-jobs/{id}`) to a bounded terminal state, never the
+legacy synchronous `POST .../generate` route — that route is refused
+outright with HTTP 409 in every production deployment once
+`MEMORY_ENGINE_POSTGRES_URL` is set (`registry.rs::generate_source`). A
+`succeeded` job's accepted drafts remain pending until an explicit
+`keep_draft`, `edit_draft`, or `reject_draft` decision — generation never
+schedules a card by itself, a policy shared with every other caller
+(including the browser UI) that this MCP face leaves unchanged.
 
 ## Tool contract
 
@@ -25,13 +34,21 @@ error-handling shape).
 
 | Tool | Composes | Intent |
 |---|---|---|
-| `create_deck` | `POST project-decks` -> `POST sources/{id}/generate` | Capture material as a project-scoped deck while leaving accepted drafts pending for provenance review. |
+| `create_deck` | `POST project-decks` -> `POST sources/{id}/generation-jobs` -> bounded poll `GET generation-jobs/{id}` | Capture material as a study deck and drive it through the durable production generation queue to a bounded terminal state; accepted drafts remain pending for an explicit decision. |
 | `keep_draft` / `edit_draft` / `reject_draft` | `POST drafts/{id}/keep`, `/edit`, or `/reject` | Make an explicit learner decision; only keep or edit-and-keep creates a due card, while reject remains terminal and exportable. |
 | `list_decks` | `GET sources`, filtered to `projectKey.is_some()` | Check what decks exist, or find a `deck_id` to invalidate. |
 | `invalidate_deck` | `POST project-decks/{id}/invalidate` | Retire every card from one deck after an external event (029's project-deck lifecycle). |
+| `list_drafts` | `POST review/next`, filtered to accepted-and-undecided | Inspect every pending draft across the account, independent of which `create_deck` call produced it — the normal state right after generation, before a keep/edit/reject decision. |
 | `list_due` | `POST review/next` | Lightweight status check: how many are due, one-line teaser of the next prompt. |
 | `review_next` | `POST review/next` | Full detail (prompt, choices, `review_unit_id`) to actually answer. |
 | `submit_answer` | `POST review/{id}/submit` | Grade an answer and advance the schedule. |
+| `reveal_answer` | `POST review/{id}/reveal` | Declared remediation: show the expected answer without grading. |
+| `learn_more` | `POST review/{id}/reference` | Declared remediation: request extra reference material instead of grading now. |
+| `skip_review` | `POST review/{id}/skip` | Declared remediation: skip this card for this pass, schedule untouched. |
+| `snooze_review` | `POST review/{id}/snooze` | Declared remediation: push just this card later in the due queue. |
+| `snooze_concept` | `POST review/{id}/snooze-concept` | Declared remediation: push every card for this card's concept later in the due queue. |
+| `bridge_review` | `POST review/{id}/bridge` | Declared remediation: request bridge (scaffold) material for a card the learner keeps missing. |
+| `record_content_feedback` | `POST review/{id}/content-feedback` | Record a kept/dropped verdict on the generated content itself, distinct from grading an answer. |
 
 `list_due` and `review_next` both call the same v1 route (`review/next` is
 the only v1 route that returns due state — there is no separate read-only
@@ -43,21 +60,35 @@ different backend methods for different UI intents.
 
 ## Credential model
 
-Credentials are provisioned through the invite magic-link or operator service-session
-flows before this stdio server starts. Anonymous account creation is disabled.
-There is no interactive `login` subcommand — stdin is the JSON-RPC channel, not a
-terminal — so import a pre-provisioned pair through `MEMORY_ENGINE_ACCOUNT_ID` /
-`MEMORY_ENGINE_SESSION_TOKEN`, or place the same pair in
-`~/.memory-engine/mcp/credentials.json` (mode `0600`).
-`MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
-`https://memory-engine-api-i2xcr.ondigitalocean.app`, matching
-`memory-engine-review`).
+`memory-engine-review` and `memory-engine-mcp` resolve credentials through
+the shared `memory-engine-credentials` crate, so `memory-engine-review
+login` and a freshly started `memory-engine-mcp` agree on the same account
+without an operator manually copying a credentials file between the two
+clients' state directories (each previously wrote its own subdirectory, so
+logging in with one did not make the other work). Resolution order: env vars
+(`MEMORY_ENGINE_ACCOUNT_ID` / `MEMORY_ENGINE_SESSION_TOKEN`) -> the one
+shared credentials file (`$MEMORY_ENGINE_HOME/credentials.json`,
+`~/.memory-engine/credentials.json` when unset, migrating a legacy
+per-client file into it first) -> fail loudly. Credentials must be
+provisioned through the invite magic-link or operator service-session flow
+before this stdio server starts; anonymous account creation is disabled and
+there is no email-bootstrap fallback. There is no interactive `login`
+subcommand for the MCP server either — stdin is the JSON-RPC channel, not a
+terminal.
 
-Resolution order: env vars -> credentials file -> fail loudly. There is no
-anonymous bootstrap or in-memory fallback.
-`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the real binary
-exits non-zero with no stdout before reading stdin when no pre-provisioned
-credential resolves.
+There is no in-memory fallback
+(`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the
+server exits non-zero with no stdout before reading any stdin when no
+credential path resolves) — the same lesson `powder-mcp` encoded after an
+ephemeral in-memory mode silently evaporated claims on process exit.
+
+`MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL. The default is the
+branded production origin `https://scry.study`. The DigitalOcean App
+Platform origin `https://memory-engine-api-i2xcr.ondigitalocean.app` that
+`scry.study` fronts is still live and still the identity `docs/runbook.md`'s
+deploy smoke checks against, but it is only an operator-origin fallback now
+— pass it explicitly via `--base-url` / `MEMORY_ENGINE_MCP_BASE_URL` while
+DNS for the branded domain is degraded, never as a silent default.
 
 ## Commands
 
@@ -65,44 +96,69 @@ credential resolves.
 cargo build -p memory-engine-mcp
 cargo test -p memory-engine-mcp
 MEMORY_ENGINE_ACCOUNT_ID=... MEMORY_ENGINE_SESSION_TOKEN=... \
-  MEMORY_ENGINE_MCP_BASE_URL=https://memory-engine-api-i2xcr.ondigitalocean.app \
+  MEMORY_ENGINE_MCP_BASE_URL=https://scry.study \
   ./target/debug/memory-engine-mcp
 ```
 
 ## Falsifier
 
 **Claim:** a cold agent (no prior context, no memory-engine-specific code)
-can drive a full deck-create -> review -> invalidate loop purely over MCP
-stdio JSON-RPC, using only the tool descriptions returned by `tools/list`.
+can drive a full deck-create -> inspect -> review -> remediation -> feedback
+-> invalidate loop purely over MCP stdio JSON-RPC, using only the tool
+descriptions returned by `tools/list`, and generation always reaches the
+production job queue rather than the retired synchronous route.
 
 **Would falsify it:** the loop cannot complete without reaching into
 `memory-engine-api` internals, a tool silently drops server state between
-calls, or a tool is a bare REST-route echo instead of an agent intent.
+calls, a tool is a bare REST-route echo instead of an agent intent, or
+`create_deck` ever calls the legacy synchronous `/generate` route.
 
 ## Automated coverage
 
-- `crates/memory-engine-mcp/src/lib.rs` unit tests: tool contract shape (six
-  agent-intent tools, no REST-route names), schema validity, argument
-  validation.
+- `crates/memory-engine-mcp/src/lib.rs` unit tests: tool contract shape
+  (seventeen agent-intent tools, no REST-route names), schema validity, and
+  argument validation.
 - `crates/memory-engine-mcp/src/session.rs` unit tests: credential
-  resolution precedence and the no-fallback failure path.
+  resolution precedence (shared with `memory-engine-review`, including a
+  one-time legacy-file migration to the shared default) and the
+  no-fallback failure path.
+- `crates/memory-engine-mcp/src/client.rs` unit tests: the queued
+  generation-jobs composition, a behavioral HTTP-request-capture proof
+  (`create_deck_enqueues_and_polls_without_ever_requesting_generate`) that
+  `create_deck` never requests the legacy `/generate` route and does
+  enqueue+poll (leaving exactly one draft pending, never auto-scheduled),
+  and a draft generated through the local (non-production) synchronous
+  route can still be inspected (`list_drafts`) and kept
+  (`keep_draft`) explicitly.
 - `crates/memory-engine-mcp/tests/no_credentials_fallback.rs`: spawns the
   real compiled binary with no credential path configured; asserts non-zero
   exit and no stdout.
 - `crates/memory-engine-mcp/tests/stdio_review_loop.rs`: spawns the real
   compiled binary against a real local `memory-engine-api` (in-process axum
-  server, not a mock) and drives the exact nine-call sequence below over its
-  actual stdin/stdout pipes, asserting `dueCount` transitions 1 -> 0 and the
-  deck stays retired after invalidation.
+  server with its background generation worker started, not a mock) and
+  drives a twelve-call sequence over its actual stdin/stdout pipes,
+  asserting the queued job reaches `succeeded` with a pending draft,
+  `keep_draft` schedules it, `dueCount` transitions 1 -> 0, and the deck
+  stays retired after invalidation.
+- `crates/memory-engine-mcp/tests/postgres_production_parity.rs`: the same
+  queued composition against a Postgres-backed `ApiState` (the same backend
+  selection every real production deployment makes), reproducing the
+  reported HTTP 409 on the legacy route and proving the queued fix reaches
+  `succeeded` on Postgres. Skipped unless `MEMORY_ENGINE_POSTGRES_TEST_URL`
+  points at a scratch database.
 
 ## Self-run transcript
 
 A local `memory-engine-api` was started exactly per `docs/runbook.md`'s
 local file-store pattern (the same Rust binary that runs in production,
-pointed at a scratch store dir):
+pointed at a scratch store dir; the binary always starts its background
+generation worker before serving). `MEMORY_ENGINE_ENVIRONMENT=development`
+marks the run as local so the production `MEMORY_ENGINE_ADMIN_TOKEN`
+requirement does not apply:
 
 ```sh
-$ MEMORY_ENGINE_ENABLE_FILE_STORE=true \
+$ MEMORY_ENGINE_ENVIRONMENT=development \
+  MEMORY_ENGINE_ENABLE_FILE_STORE=true \
   MEMORY_ENGINE_API_STORE_DIR=/tmp/me-mcp-dogfood/store \
   MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=dogfood-mcp@example.com \
   MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=/tmp/me-mcp-dogfood/outbox.tsv \
@@ -134,75 +190,98 @@ memory-engine-mcp: ready (account acct_55c1c8328e564d09, base url http://127.0.0
 <<< {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{"listChanged":false}},"protocolVersion":"2024-11-05","serverInfo":{"name":"memory-engine","version":"0.0.0"}}}
 ```
 
-**2. `tools/list`** — six agent-intent tools (truncated here; full output is
-identical to the table above rendered as JSON Schema):
+**2. `tools/list`** — seventeen agent-intent tools (truncated here; full
+output is identical to the table above rendered as JSON Schema):
 
 ```json
 >>> {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-<<< {"id":2,"jsonrpc":"2.0","result":{"tools":[{"name":"create_deck",...},{"name":"keep_draft",...},{"name":"edit_draft",...},{"name":"reject_draft",...},{"name":"list_decks",...},{"name":"invalidate_deck",...},{"name":"list_due",...},{"name":"review_next",...},{"name":"submit_answer",...}]}}
+<<< {"id":2,"jsonrpc":"2.0","result":{"tools":[{"name":"create_deck",...},{"name":"keep_draft",...},{"name":"edit_draft",...},{"name":"reject_draft",...},{"name":"list_decks",...},{"name":"invalidate_deck",...},{"name":"list_drafts",...},{"name":"list_due",...},{"name":"review_next",...},{"name":"submit_answer",...},{"name":"reveal_answer",...},{"name":"learn_more",...},{"name":"skip_review",...},{"name":"snooze_review",...},{"name":"snooze_concept",...},{"name":"bridge_review",...},{"name":"record_content_feedback",...}]}}
 ```
 
-**3. `create_deck`** — one call saves the source and generates a quiz draft, but
-leaves it pending. `pendingDrafts` returns the generated prompt and provenance for explicit review:
+**3. `create_deck`** — saves the source and drives it through the durable
+generation-jobs queue (enqueue + bounded poll), never the legacy synchronous
+`/generate` route. `generation.job.cardCount: 0` proves generation never
+auto-schedules; the one accepted draft comes back in `generation.pendingDrafts`
+for an explicit decision:
 
 ```json
 >>> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_deck","arguments":{"project_key":"nato-onboarding","title":"NATO letter A fixture","body":"Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA."}}}
-<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"pendingDrafts\": [{\n    \"id\": \"draft_...\",\n    \"sourceSpans\": [...],\n    \"provenance\": {...}\n  }],\n  \"deck\": {\n    \"deckId\": \"deck_0d32f2a69298d5d8\",\n    \"projectKey\": \"nato-onboarding\",\n    \"source\": {\"sourceId\": \"deck_0d32f2a69298d5d8\", \"title\": \"NATO letter A fixture\", ...}\n  }\n}"}]}}
+<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"deck\": {\"deckId\": \"deck_80cb605a305a472e\", \"projectKey\": \"nato-onboarding\", \"source\": {\"sourceId\": \"deck_80cb605a305a472e\", \"title\": \"NATO letter A fixture\", ...}},\n  \"generation\": {\"coalesced\": false, \"job\": {\"id\": \"job-0bf061821d32534891018729e22c710f\", \"status\": \"succeeded\", \"cardCount\": 0, \"error\": null, ...}, \"pendingDrafts\": [{\"id\": \"file-job-job-0bf061821d32534891018729e22c710f-draft-deck-80cb605a305a472e-1-nato-letter-a\", \"reviewUnitId\": \"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a\", \"validationStatus\": \"accepted\", \"approved\": false, \"learnerDecision\": null, \"sourceSpans\": [...], \"provenance\": {...}, ...}], \"status\": \"succeeded\"}\n}"}]}}
 ```
 
-**4. `keep_draft`** — inspect the returned `pendingDrafts` row, then make the learner decision explicitly:
+**4. `list_drafts`** — the same pending draft is visible account-wide,
+independent of the `create_deck` response above:
 
 ```json
->>> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"keep_draft","arguments":{"draft_id":"draft_..."}}}
-<<< {"id":4,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{... study view ...}"}]}}
+>>> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_drafts","arguments":{}}}
+<<< {"id":4,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"[{\"id\": \"file-job-job-0bf061821d32534891018729e22c710f-draft-deck-80cb605a305a472e-1-nato-letter-a\", \"validationStatus\": \"accepted\", \"approved\": false, \"learnerDecision\": null, ...}]"}]}}
 ```
 
-**5. `list_decks`** — the new deck is visible, scoped to its `project_key`:
+**5. `keep_draft`** — the explicit learner decision; only this schedules a
+review card, and `dueCount` becomes 1:
 
 ```json
->>> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_decks","arguments":{"project_key":"nato-onboarding"}}}
-<<< {"id":4,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"[{\"sourceId\": \"deck_0d32f2a69298d5d8\", \"projectKey\": \"nato-onboarding\", \"title\": \"NATO letter A fixture\", ...}]"}]}}
+>>> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"keep_draft","arguments":{"draft_id":"file-job-job-0bf061821d32534891018729e22c710f-draft-deck-80cb605a305a472e-1-nato-letter-a"}}}
+<<< {"id":5,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\"reviewUnitId\": \"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a\", \"prompt\": \"What is the NATO phonetic alphabet word for A?\", \"choices\": [\"BRAVO\", \"CHARLIE\", \"ALFA\"], ...},\n  \"drafts\": [{\"approved\": true, \"learnerDecision\": {\"kind\": \"kept\", \"edited\": false, ...}, ...}],\n  \"dueCount\": 1, ...\n}"}]}}
 ```
 
-**6. `list_due`** — a lightweight peek, one due card:
+**6. `list_decks`** — the new deck is visible, scoped to its `project_key`:
 
 ```json
->>> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_due","arguments":{}}}
-<<< {"id":5,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"dueCount\": 1,\n  \"nextPrompt\": \"In the NATO phonetic alphabet, which code word represents the letter A?\"\n}"}]}}
+>>> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_decks","arguments":{"project_key":"nato-onboarding"}}}
+<<< {"id":6,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"[{\"sourceId\": \"deck_80cb605a305a472e\", \"projectKey\": \"nato-onboarding\", \"title\": \"NATO letter A fixture\", ...}]"}]}}
 ```
 
-**7. `review_next`** — full detail, including `reviewUnitId` needed to
+**7. `list_due`** — a lightweight peek, one due card:
+
+```json
+>>> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_due","arguments":{}}}
+<<< {"id":7,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"dueCount\": 1,\n  \"nextPrompt\": \"What is the NATO phonetic alphabet word for A?\"\n}"}]}}
+```
+
+**8. `review_next`** — full detail, including `reviewUnitId` needed to
 answer:
 
 ```json
->>> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"review_next","arguments":{}}}
-<<< {"id":6,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"choices\": [\"ARCHER\", \"APEX\", \"ALFA\", \"AMBER\"],\n    \"prompt\": \"In the NATO phonetic alphabet, which code word represents the letter A?\",\n    \"reviewUnitId\": \"generated-quiz-deck-0d32f2a69298d5d8-1-nato-alphabet-a\"\n  },\n  \"dueCount\": 1\n}"}]}}
+>>> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"review_next","arguments":{}}}
+<<< {"id":8,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"choices\": [\"BRAVO\", \"CHARLIE\", \"ALFA\"],\n    \"prompt\": \"What is the NATO phonetic alphabet word for A?\",\n    \"reviewUnitId\": \"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a\", ...\n  },\n  \"dueCount\": 1, ...\n}"}]}}
 ```
 
-**8. `submit_answer`** — correct answer, `dueCount` drops to 0:
+**9. `reveal_answer`** — declared remediation: show the expected answer
+without grading, and the queue stays on the same card:
 
 ```json
->>> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"submit_answer","arguments":{"review_unit_id":"generated-quiz-deck-0d32f2a69298d5d8-1-nato-alphabet-a","answer":"ALFA"}}}
-<<< {"id":7,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"grade\": {\"isCorrect\": true, \"rating\": 3, \"verdict\": \"correct\"},\n    \"expectedAnswer\": \"ALFA\"\n  },\n  \"dueCount\": 0\n}"}]}}
+>>> {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"reveal_answer","arguments":{"review_unit_id":"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a"}}}
+<<< {"id":9,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"expectedAnswer\": \"ALFA\", \"reviewUnitId\": \"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a\", ...\n  },\n  \"dueCount\": 1, ...\n}"}]}}
 ```
 
-**9. `invalidate_deck`** — retires the deck:
+**10. `submit_answer`** — correct answer, grades the card, advances the
+schedule, `dueCount` drops to 0:
 
 ```json
->>> {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"invalidate_deck","arguments":{"deck_id":"deck_0d32f2a69298d5d8","event":"onboarding project closed"}}}
-<<< {"id":8,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": null,\n  \"drafts\": [],\n  \"dueCount\": 0\n}"}]}}
+>>> {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"submit_answer","arguments":{"review_unit_id":"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a","answer":"ALFA"}}}
+<<< {"id":10,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"grade\": {\"isCorrect\": true, \"rating\": 3, \"verdict\": \"correct\"},\n    \"scheduleChange\": {\"before\": null, \"after\": {\"reps\": 1, \"lapses\": 0, ...}}, ...\n  },\n  \"dueCount\": 0, ...\n}"}]}}
 ```
 
-**9. `list_due`** — stays retired:
+**11. `record_content_feedback`** — a kept/dropped verdict on the content
+itself, distinct from grading the answer:
 
 ```json
->>> {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_due","arguments":{}}}
-<<< {"id":9,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"dueCount\": 0,\n  \"nextPrompt\": null\n}"}]}}
+>>> {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"record_content_feedback","arguments":{"review_unit_id":"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a","verdict":"kept","rationale":"clear and correct"}}}
+<<< {"id":11,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"verdict\": \"kept\",\n  \"reviewUnitId\": \"generated-quiz-deck-80cb605a305a472e-1-nato-letter-a\", ...\n}"}]}}
 ```
 
-This is the same nine-call sequence `stdio_review_loop.rs` asserts
-automatically; the run above is the hand-driven capture from a real
-terminal, not test output.
+**12. `invalidate_deck`** — retires the deck; due count stays at 0:
+
+```json
+>>> {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"invalidate_deck","arguments":{"deck_id":"deck_80cb605a305a472e","event":"onboarding project closed"}}}
+<<< {"id":12,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": null,\n  \"drafts\": [],\n  \"dueCount\": 0, ...\n}"}]}}
+```
+
+This is the same twelve-call sequence `stdio_review_loop.rs` asserts
+automatically; the run above is a hand-driven capture from a real terminal
+against the queued generation-jobs and explicit-keep-decision path, not test
+output.
 
 ## Factory MCP registry entry
 

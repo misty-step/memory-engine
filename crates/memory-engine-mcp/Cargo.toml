@@ -13,6 +13,7 @@ name = "memory-engine-mcp"
 path = "src/main.rs"
 
 [dependencies]
+memory-engine-credentials = { path = "../memory-engine-credentials" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 ureq = { version = "3.2.0", features = ["json"] }

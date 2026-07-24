@@ -1,0 +1,13 @@
+[package]
+name = "memory-engine-credentials"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Shared credential resolution and storage for memory-engine's Bearer-token clients (CLI, MCP)."
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+
+[lints]
+workspace = true
