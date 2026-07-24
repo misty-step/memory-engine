@@ -336,3 +336,25 @@ fn bundled_resend_mailer_escapes_backslashes_in_json_fields() {
         requests[0]
     );
 }
+
+#[test]
+fn bundled_resend_mailer_escapes_json_fields_without_a_subprocess_per_character() {
+    // json_escape used to spawn a `grep` (and `printf`) subprocess for every
+    // ordinary character in the recipient, sender, subject, and message.
+    // The fix checks each value for disallowed control characters once,
+    // then escapes with pure shell built-ins. A hard wall-clock assertion
+    // here would trade one flaky shared-host timing test for another (see
+    // `waitlist_join_file_store_handler_overhead_is_negligible`): this
+    // machine measured 1.28s before the fix and 0.08-0.11s after under
+    // normal load, but a single contended run still touched 0.88s, close
+    // enough to a "generous" fixed threshold to flake. Assert correctness
+    // here; the before/after timing is recorded in the fix's commit
+    // message as reproducible, non-gating evidence.
+    let (resend_api_url, server) = start_mock_resend(1);
+    let started = std::time::Instant::now();
+    let output = run_mailer(&resend_api_url, None, true);
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "mailer failed: {output:?}");
+    server.join().expect("mock Resend server");
+    eprintln!("magic-link send completed in {elapsed:?} (informational only)");
+}

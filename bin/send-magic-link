@@ -33,6 +33,10 @@ reject_controls() {
 
 json_escape() {
     value=$1
+    if printf '%s' "$value" | tr -d "${json_lf}${json_cr}${json_tab}" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        echo 'mailer input contains unsupported control characters' >&2
+        return 1
+    fi
     escaped=
     while [ -n "$value" ]; do
         char=${value%"${value#?}"}
@@ -43,13 +47,7 @@ json_escape() {
             "$json_lf") escaped="${escaped}\n" ;;
             "$json_cr") escaped="${escaped}\r" ;;
             "$json_tab") escaped="${escaped}\t" ;;
-            *)
-                if printf '%s' "$char" | LC_ALL=C grep -q '[[:cntrl:]]'; then
-                    echo 'mailer input contains unsupported control characters' >&2
-                    return 1
-                fi
-                escaped="${escaped}${char}"
-                ;;
+            *) escaped="${escaped}${char}" ;;
         esac
     done
     printf '%s' "$escaped"
