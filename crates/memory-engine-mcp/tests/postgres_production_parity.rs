@@ -13,7 +13,8 @@
 //!    bug this ticket exists to route around, not paper over.
 //! 2. **Proves the fix against that same backend**: `MemoryEngineClient`'s
 //!    queued composition (`create_deck` → enqueue → poll `generation-jobs`)
-//!    reaches `succeeded` and schedules a due card on the Postgres store,
+//!    reaches `succeeded` leaving its draft pending a learner decision, and a
+//!    keep then schedules a due card on the Postgres store,
 //!    the exact path `docs/qa/103-machine-generation-receipt-2026-07-17.md`
 //!    proved live against `scry.study`.
 //!
@@ -34,8 +35,12 @@ async fn queued_generation_succeeds_on_postgres_where_the_legacy_route_is_refuse
         return;
     };
 
+    let email = format!("memory-engine-mcp-pg-test-{}@example.com", unique_suffix());
     let state = memory_engine_api::ApiState::new(
-        memory_engine_api::AccountRegistry::with_postgres_url(database_url),
+        memory_engine_api::AccountRegistry::with_postgres_url(database_url).with_auth_config(
+            memory_engine_api::AuthConfig::allow_emails([email.clone()])
+                .with_anonymous_account_creation(true),
+        ),
     );
     state.start_worker();
 
@@ -50,7 +55,6 @@ async fn queued_generation_succeeds_on_postgres_where_the_legacy_route_is_refuse
     });
 
     let base_url = format!("http://{address}");
-    let email = format!("memory-engine-mcp-pg-test-{}@example.com", unique_suffix());
     let created: serde_json::Value = ureq::post(format!("{base_url}/v1/accounts"))
         .send_json(json!({ "email": email }))
         .expect("create account")
@@ -118,10 +122,27 @@ async fn queued_generation_succeeds_on_postgres_where_the_legacy_route_is_refuse
     assert_eq!(enqueued.job.status, "queued");
     assert!(!enqueued.coalesced);
 
-    // Poll to a bounded terminal state ourselves here (rather than through
-    // `create_deck`, which would also create a second source) to keep this
-    // reproduction scoped to exactly the enqueue/poll/approve path.
-    let mut job = enqueued.job;
+    let job = poll_to_terminal(&client, enqueued.job).await;
+    assert_eq!(job.status, "succeeded", "job must succeed: {job:?}");
+    assert_eq!(
+        job.card_count, 0,
+        "a succeeded job schedules nothing on its own: its draft is pending a \
+         learner decision, so card_count stays 0 until the draft is kept: {job:?}"
+    );
+
+    assert_pending_until_kept(&client);
+
+    server.abort();
+}
+
+/// Poll to a bounded terminal state directly, rather than through `create_deck`,
+/// which would also create a second source: this keeps the reproduction scoped
+/// to exactly the enqueue/poll/decide path.
+async fn poll_to_terminal(
+    client: &MemoryEngineClient,
+    job: memory_engine_mcp::client::GenerationJob,
+) -> memory_engine_mcp::client::GenerationJob {
+    let mut job = job;
     let mut polls = 0;
     while !job.is_terminal() {
         polls += 1;
@@ -134,18 +155,42 @@ async fn queued_generation_succeeds_on_postgres_where_the_legacy_route_is_refuse
             .generation_job(&job.id)
             .expect("poll generation job on postgres backend");
     }
-    assert_eq!(job.status, "succeeded", "job must succeed: {job:?}");
-    assert_eq!(job.card_count, 1);
+    job
+}
 
-    let due = client
-        .next_review()
-        .expect("study view after queued generation");
+/// The PR79 learner-decision gate, asserted against whatever backend `client`
+/// is pointed at: a generated draft exists but is pending, nothing is scheduled
+/// until it is explicitly kept, and keeping it schedules exactly one card.
+fn assert_pending_until_kept(client: &MemoryEngineClient) {
+    let pending = client
+        .pending_drafts()
+        .expect("pending drafts on postgres backend");
     assert_eq!(
-        due.due_count, 1,
-        "the queued job's optimistic approval must schedule the generated card on postgres too"
+        pending.len(),
+        1,
+        "the succeeded job must leave exactly one pending draft: {pending:?}"
+    );
+    assert_eq!(
+        client
+            .next_review()
+            .expect("study view before the keep decision")
+            .due_count,
+        0,
+        "nothing may be scheduled before the learner keeps the draft"
     );
 
-    server.abort();
+    client
+        .keep_draft(&pending[0].id)
+        .expect("keep the pending draft on postgres backend");
+
+    assert_eq!(
+        client
+            .next_review()
+            .expect("study view after the keep decision")
+            .due_count,
+        1,
+        "keeping the draft must schedule the generated card on postgres too"
+    );
 }
 
 fn unique_suffix() -> String {
