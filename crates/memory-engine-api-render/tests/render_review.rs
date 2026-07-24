@@ -1,10 +1,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memory_engine_api_render::{render_account_page, render_content_feedback_result_html};
-use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome, StudyViewResponse};
+use memory_engine_api_state::{
+    AccountRegistry, ApiState, AuthConfig, CreateSourceRequest, EnqueueOutcome, SourcePermission,
+    StudyViewResponse,
+};
 use memory_engine_study::BetaStudySummary;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn render_test_state(email: &str) -> ApiState {
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails([email.to_owned()]).with_anonymous_account_creation(true),
+    ))
+}
 
 fn unique_email(label: &str) -> String {
     let serial = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -26,10 +35,9 @@ fn nato_source_body() -> String {
 
 #[test]
 fn active_review_render_skips_workspace_material() {
-    let state = ApiState::default();
-    let created = state
-        .create_account(&unique_email("active"))
-        .expect("account");
+    let email = unique_email("active");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
     let account = state
         .create_browser_session(&created)
         .expect("browser session");
@@ -39,6 +47,7 @@ fn active_review_render_skips_workspace_material() {
             &CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: nato_source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");
@@ -48,7 +57,14 @@ fn active_review_render_skips_workspace_material() {
     ));
     state.run_pending_jobs_blocking();
 
-    let view = state.next_app_review(&account).expect("next review");
+    let pending = state.next_app_review(&account).expect("pending review");
+    let view = state
+        .keep_draft(
+            account.account_id(),
+            account.session_token(),
+            &pending.drafts[0].id,
+        )
+        .expect("keep review");
     assert!(
         view.current.is_some(),
         "fixture must reach an active review"
@@ -63,10 +79,9 @@ fn active_review_render_skips_workspace_material() {
 
 #[test]
 fn workspace_render_keeps_saved_material_without_active_review() {
-    let state = ApiState::default();
-    let created = state
-        .create_account(&unique_email("workspace"))
-        .expect("account");
+    let email = unique_email("workspace");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
     let account = state
         .create_browser_session(&created)
         .expect("browser session");
@@ -76,6 +91,7 @@ fn workspace_render_keeps_saved_material_without_active_review() {
             &CreateSourceRequest {
                 title: "NATO practice notes".to_owned(),
                 body: nato_source_body(),
+                permission: SourcePermission::default(),
             },
         )
         .expect("source");
@@ -87,10 +103,9 @@ fn workspace_render_keeps_saved_material_without_active_review() {
 
 #[test]
 fn completed_feedback_action_requires_an_explicit_workspace_exit() {
-    let state = ApiState::default();
-    let created = state
-        .create_account(&unique_email("complete"))
-        .expect("account");
+    let email = unique_email("complete");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
     let account = state
         .create_browser_session(&created)
         .expect("browser session");
@@ -116,4 +131,27 @@ fn completed_feedback_action_requires_an_explicit_workspace_exit() {
     assert!(html.contains(r#"href="/">Back to workspace</a>"#));
     assert!(!html.contains("What do you want to remember?"));
     assert!(!html.contains("Return gently"));
+}
+
+#[test]
+fn workspace_discloses_local_only_source_permission() {
+    let email = unique_email("local-only");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    state
+        .save_app_source(
+            &account,
+            &CreateSourceRequest {
+                title: "Private notes".to_owned(),
+                body: "Never send this text to a model.".to_owned(),
+                permission: SourcePermission::LocalOnly,
+            },
+        )
+        .expect("source");
+
+    let html = render_account_page(&state, &account, None, None);
+    assert!(html.contains("Local only · never sent to a model"));
 }

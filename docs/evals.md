@@ -77,12 +77,18 @@ Run against the deterministic fake provider (the CI-safe default — no network)
 cargo run -p memory-engine-bench -- generation
 ```
 
-Run a live model field comparison (requires `OPENROUTER_API_KEY`):
+Run a live model field comparison through Mint's credential-safe egress path:
 
 ```sh
+# MINT_BASE_URL and the runtime credential alias are private environment inputs.
+OPENROUTER_BASE_URL="${MINT_BASE_URL}/proxy/https/openrouter.ai/api/v1" \
+OPENROUTER_PROXY_TOKEN="${OPENROUTER_MINT_ALIAS:?private runtime alias required}" \
 cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
   --prompt principled --out docs/evals/generation-<model>-<date>.md
 ```
+
+Never commit the private base URL or runtime credential alias. The dated
+Mint-routed field receipt is [`generation-061-live-mint-2026-07-21.md`](evals/generation-061-live-mint-2026-07-21.md).
 
 `--max-drafts <n>` changes the model draft budget for field sweeps. Keep the
 runtime prompt on `prompt-principled` unless a shaped ticket adds and proves a
@@ -103,10 +109,13 @@ pass even when the source already produced other accepted drafts. Variant
 quality checks same-concept same-stage groups for meaningfully different
 question surfaces and rejects questions that leak the answer text.
 Intent shape match is the 051 capture-anything oracle: fixtures annotate
-verbatim memorization, concept understanding, fact recall, and
-procedure/process sources, and the provider must emit different activity
-kinds, stages, and distractor shapes rather than collapsing them into generic
-recognition quizzes. The receipt also runs the selected provider through a
+verbatim memorization, enumerable sets, concept understanding, fact recall, and
+procedure/process sources, and the provider must emit different activity kinds,
+stages, and distractor shapes rather than collapsing them into generic
+recognition quizzes. Enumerable and sequential sources additionally pass
+through deterministic source coverage policy so a model cannot omit a required
+mapping or recitation unit; conceptual prose keeps the fewer-better path. The
+receipt also runs the selected provider through a
 bridge-material fixture that must use the recent failed attempt context,
 produce lower-stage items, stay faithful to the parent concept, and avoid
 duplicates against the parent item. The receipt also reports tokens, dollars,

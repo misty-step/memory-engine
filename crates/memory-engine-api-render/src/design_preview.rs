@@ -18,7 +18,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use memory_engine_core::{Rating, ReviewUnitId, Verdict};
-use memory_engine_persistence::GeneratedLearningActivityKind;
+use memory_engine_persistence::{GeneratedLearningActivityKind, SourcePermission};
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyFeedback,
     BetaStudyGrade, BetaStudyItemHistory, BetaStudySummary,
@@ -26,11 +26,17 @@ use memory_engine_study::{
 
 use crate::{render_app_shell, render_login_requested};
 use memory_engine_api_state::{
-    ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
+    AccountRegistry, ApiState, AppAccount, AuthConfig, GenerationJob, JobStatus, SourceRecord,
+    StudyViewResponse,
 };
 
 fn account() -> AppAccount {
-    let state = ApiState::default();
+    let state = ApiState::new(
+        AccountRegistry::default().with_auth_config(
+            AuthConfig::allow_emails(["preview@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
     let created = state
         .create_account("preview@example.com")
         .unwrap_or_else(|error| panic!("preview account must be valid: {}", error.message));
@@ -44,6 +50,7 @@ fn source(id: &str, title: &str) -> SourceRecord {
         source_id: id.to_owned(),
         title: title.to_owned(),
         body: String::new(),
+        permission: SourcePermission::default(),
         project_key: None,
         ttl_expires_at: None,
     }
@@ -398,9 +405,9 @@ fn emit_preview_pages() -> Result<(), Box<dyn std::error::Error>> {
     let mut index = String::from(
         "<!doctype html><html lang=en><meta charset=utf-8>\
 <meta name=viewport content='width=device-width,initial-scale=1'>\
-<title>Memory Engine — design preview</title>\
+<title>Scry — design preview</title>\
 <body style='margin:0;background:#525252;font-family:system-ui,sans-serif'>\
-<p style='color:#fff;font:13px/1.4 system-ui;padding:14px 18px;margin:0'>Memory Engine — every UI state. Each frame is a full rendered page.</p>",
+<p style='color:#fff;font:13px/1.4 system-ui;padding:14px 18px;margin:0'>Scry — every UI state. Each frame is a full rendered page.</p>",
     );
     for (name, html) in &pages {
         fs::write(out.join(format!("{name}.html")), html)?;

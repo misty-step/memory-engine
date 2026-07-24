@@ -21,22 +21,25 @@ use memory_engine_core::{
     Verdict,
 };
 use memory_engine_generation::{
-    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation_with_provider,
-    run_remediation_pack_generation_with_provider, BetaGenerationError, BetaGenerationRequest,
-    BetaGenerationStore, BridgeGenerationRequest, BridgeMaterialProvider, DraftProvider,
-    FakeModelProvider, ReferenceNoteProvider, ReferenceNoteRequest,
-    RemediationPackGenerationRequest,
+    run_beta_generation, run_beta_generation_with_provider, run_bridge_generation,
+    run_bridge_generation_with_provider, run_remediation_pack_generation_with_provider,
+    BetaGenerationError, BetaGenerationRequest, BetaGenerationStore, BridgeGenerationRequest,
+    BridgeMaterialProvider, DraftProvider, FakeModelProvider, ReferenceNoteProvider,
+    ReferenceNoteRequest, RemediationPackGenerationRequest, SourceAuthorizationContext,
+    SourceAuthorizationError,
 };
 use memory_engine_persistence::{
-    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    BetaStoreSnapshot, ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, RemediationPackRecord, RemediationPackStatus, SourceDocument,
-    SourceDocumentKind, SourcePermission,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
+    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
+    GeneratedPromptValidationStatus, LearnerDraftDecision, RemediationPackRecord,
+    RemediationPackStatus, SourceDocument, SourceDocumentKind,
 };
 use memory_engine_service::{
     GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ReviewAppliedResult, ServiceError,
 };
 use serde::{Deserialize, Serialize};
+
+pub use memory_engine_persistence::SourcePermission;
 
 pub const DEFAULT_BETA_STUDY_NOW: i64 = 1_779_465_600_000;
 pub const DEFAULT_SKIP_DEFER_MS: i64 = 15 * 60 * 1_000;
@@ -84,6 +87,7 @@ pub struct BetaStudySourceInput {
     pub body: String,
     pub project_key: Option<String>,
     pub ttl_expires_at: Option<i64>,
+    pub permission: SourcePermission,
 }
 
 impl BetaStudySourceInput {
@@ -96,6 +100,7 @@ impl BetaStudySourceInput {
             body,
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         }
     }
 }
@@ -124,7 +129,27 @@ pub struct BetaStudySourceRow {
     pub id: String,
     pub title: String,
     pub kind: SourceDocumentKind,
+    pub permission: SourcePermission,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BetaStudyReferenceSpanRow {
+    pub id: String,
+    pub source_document_id: String,
+    pub label: String,
+    pub text: String,
+    pub locator: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BetaStudyGenerationProvenance {
+    pub generation_run_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -141,6 +166,9 @@ pub struct BetaStudyDraftRow {
     pub validation_reasons: Vec<String>,
     pub worked_solution: Option<String>,
     pub approved: bool,
+    pub learner_decision: Option<LearnerDraftDecision>,
+    pub source_spans: Vec<BetaStudyReferenceSpanRow>,
+    pub provenance: Option<BetaStudyGenerationProvenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -255,6 +283,7 @@ pub enum BetaStudyError<E = BetaStoreError> {
     Store(E),
     Generation(BetaGenerationError<E>),
     Service(ServiceError<E>),
+    UnknownReferenceSpan(String),
     NoActiveReviewUnit,
     NoConceptKey,
 }
@@ -268,6 +297,7 @@ where
             Self::Store(error) => write!(formatter, "store error: {error}"),
             Self::Generation(error) => write!(formatter, "generation error: {error}"),
             Self::Service(error) => write!(formatter, "service error: {error}"),
+            Self::UnknownReferenceSpan(id) => write!(formatter, "Unknown reference span: {id}"),
             Self::NoActiveReviewUnit => {
                 formatter.write_str("Beta study session has no active review unit")
             }
@@ -285,7 +315,7 @@ where
             Self::Store(error) => Some(error),
             Self::Generation(error) => Some(error),
             Self::Service(error) => Some(error),
-            Self::NoActiveReviewUnit | Self::NoConceptKey => None,
+            Self::UnknownReferenceSpan(_) | Self::NoActiveReviewUnit | Self::NoConceptKey => None,
         }
     }
 }
@@ -332,19 +362,57 @@ pub trait BetaStudyStore:
         archived_at: i64,
     ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
 
-    /// Promote an accepted generated draft into a review unit.
+    /// Update an active source's model-sharing permission.
     ///
     /// # Errors
     ///
-    /// Returns the store error when the draft is unknown, rejected, or cannot be
-    /// promoted.
-    fn approve_generated_prompt_draft(
+    /// Returns the store error when the source is unknown, archived, or cannot
+    /// be persisted.
+    fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error>;
+
+    /// Promote an accepted generated draft into the learner queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, already decided, or
+    /// cannot be persisted.
+    fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
+        decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
 
-    /// Replace the prompt text and expected answer for an approved review unit.
+    /// Edit an accepted generated draft and promote it into the learner queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, invalid, already
+    /// decided, or cannot be persisted.
+    fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
+
+    /// Record a terminal rejection for an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the draft is unknown, already decided, or
+    /// cannot be persisted.
+    fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error>;
+
+    /// Replace the prompt text and expected answer for an kept review unit.
     ///
     /// # Errors
     ///
@@ -422,12 +490,48 @@ impl BetaStudyStore for BetaPersistenceStore {
         BetaPersistenceStore::archive_source_document(self, source_document_id, archived_at)
     }
 
-    fn approve_generated_prompt_draft(
+    fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::update_source_document_permission(
+            self,
+            source_document_id,
+            permission,
+        )
+    }
+
+    fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
+        decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
-        BetaPersistenceStore::approve_generated_prompt_draft(self, draft_id, options)
+        BetaPersistenceStore::keep_generated_prompt_draft(self, draft_id, decided_at)
+    }
+
+    fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::edit_and_keep_generated_prompt_draft(
+            self,
+            draft_id,
+            prompt_text,
+            expected_answer,
+            decided_at,
+        )
+    }
+
+    fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error> {
+        BetaPersistenceStore::reject_generated_prompt_draft(self, draft_id, decided_at)
     }
 
     fn update_review_unit_prompt_text(
@@ -624,7 +728,7 @@ where
                 project_key: input.project_key,
                 body: Some(body),
                 uri: None,
-                permission: SourcePermission::ModelEligible,
+                permission: input.permission,
                 freshness: Some((self.now)()),
                 ttl_expires_at: input.ttl_expires_at,
                 created_at: (self.now)(),
@@ -632,6 +736,24 @@ where
             })
             .map_err(BetaStudyError::Store)?;
         self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Update the sharing permission of an active source document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the source is unknown, archived, or
+    /// persistence fails.
+    pub fn update_source_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.invalidate_snapshot();
+        self.store
+            .update_source_document_permission(source_document_id, permission)
+            .map_err(BetaStudyError::Store)?;
         self.view()
     }
 
@@ -775,7 +897,7 @@ where
         source_document_ids: Option<Vec<String>>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request = self.generation_request(&snapshot, source_document_ids);
+        let request = self.generation_request(&snapshot, source_document_ids)?;
         self.invalidate_snapshot();
         run_beta_generation(&mut self.store, request)?;
         self.status = BetaStudyStatus::Drafting;
@@ -795,8 +917,35 @@ where
         run_id: impl Into<String>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request =
-            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into());
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            false,
+        )?;
+        self.invalidate_snapshot();
+        run_beta_generation(&mut self.store, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Generate drafts for a queued worker while keeping them pending until lease publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when generation or store writes fail.
+    pub fn generate_with_run_id_pending(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            true,
+        )?;
         self.invalidate_snapshot();
         run_beta_generation(&mut self.store, request)?;
         self.status = BetaStudyStatus::Drafting;
@@ -818,11 +967,66 @@ where
         provider: &dyn DraftProvider,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request = self.generation_request(&snapshot, source_document_ids);
+        let request = self.generation_request(&snapshot, source_document_ids)?;
         self.invalidate_snapshot();
         run_beta_generation_with_provider(&mut self.store, provider, request)?;
         self.status = BetaStudyStatus::Drafting;
         self.view()
+    }
+
+    /// Provider-backed queued generation that remains pending until lease publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when provider generation or store writes fail.
+    pub fn generate_with_provider_and_run_id_pending(
+        &mut self,
+        source_document_ids: Option<Vec<String>>,
+        provider: &dyn DraftProvider,
+        run_id: impl Into<String>,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            true,
+        )?;
+        self.invalidate_snapshot();
+        run_beta_generation_with_provider(&mut self.store, provider, request)?;
+        self.status = BetaStudyStatus::Drafting;
+        self.view()
+    }
+
+    /// Remove a generation run after its worker lease fence rejects the commit.
+    ///
+    /// # Errors
+    /// Returns the underlying store error when rollback cannot be committed.
+    pub fn discard_generation_run(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .discard_generation_run(run_id)
+            .map_err(BetaStudyError::Store)
+    }
+
+    /// Atomically fence a generation run and remove stale output when needed.
+    /// The persistence adapter performs this under its account-scoped lock.
+    ///
+    /// # Errors
+    /// Returns the underlying store error when finalization cannot commit.
+    pub fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.store
+            .finalize_generation_run(run_id, generation_attempt, lease_token, now_ms, lease_valid)
+            .map_err(BetaStudyError::Store)
     }
 
     /// Provider-backed counterpart to [`Self::generate_with_run_id`].
@@ -837,8 +1041,12 @@ where
         run_id: impl Into<String>,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let snapshot = self.snapshot()?;
-        let request =
-            self.generation_request_with_run_id(&snapshot, source_document_ids, run_id.into());
+        let request = self.generation_request_with_run_id(
+            &snapshot,
+            source_document_ids,
+            run_id.into(),
+            false,
+        )?;
         self.invalidate_snapshot();
         run_beta_generation_with_provider(&mut self.store, provider, request)?;
         self.status = BetaStudyStatus::Drafting;
@@ -849,11 +1057,12 @@ where
         &self,
         snapshot: &BetaStoreSnapshot,
         source_document_ids: Option<Vec<String>>,
-    ) -> BetaGenerationRequest {
+    ) -> Result<BetaGenerationRequest, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.generation_request_with_run_id(
             snapshot,
             source_document_ids,
             format!("study-run-{}", snapshot.generation_runs.len() + 1),
+            false,
         )
     }
 
@@ -862,42 +1071,96 @@ where
         snapshot: &BetaStoreSnapshot,
         source_document_ids: Option<Vec<String>>,
         run_id: String,
-    ) -> BetaGenerationRequest {
-        let active_source_ids = active_source_ids(snapshot);
+        pending: bool,
+    ) -> Result<BetaGenerationRequest, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let requested_ids = source_document_ids.unwrap_or_else(|| {
-            active_source_ids
+            active_source_ids(snapshot)
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect()
         });
-        let ids = requested_ids
-            .into_iter()
-            .filter(|source_id| active_source_ids.contains(source_id))
-            .collect();
+        for source_id in &requested_ids {
+            let source = snapshot
+                .source_documents
+                .iter()
+                .find(|source| &source.id == source_id)
+                .ok_or_else(|| {
+                    BetaStudyError::Generation(BetaGenerationError::UnknownSourceDocument(
+                        source_id.clone(),
+                    ))
+                })?;
+            if source.archived_at.is_some() {
+                return Err(BetaStudyError::Generation(
+                    BetaGenerationError::ArchivedSourceDocument(source_id.clone()),
+                ));
+            }
+        }
 
-        BetaGenerationRequest {
+        Ok(BetaGenerationRequest {
             run_id,
-            source_document_ids: ids,
+            source_document_ids: requested_ids,
             parent_review_unit_id: None,
             started_at: (self.now)(),
             completed_at: Some((self.now)()),
             default_due: (self.now)() - 60_000,
             model: None,
-        }
+            pending,
+        })
     }
 
-    /// Approve one accepted draft and select the next candidate.
+    /// Keep one accepted draft and select the next candidate.
     ///
     /// # Errors
     ///
-    /// Returns [`BetaStudyError`] when approval or queue selection fails.
-    pub fn approve_draft(
+    /// Returns [`BetaStudyError`] when keeping a draft or selecting a queue item fails.
+    pub fn keep_draft(
         &mut self,
         draft_id: &str,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.invalidate_snapshot();
         self.store
-            .approve_generated_prompt_draft(draft_id, ApproveGeneratedPromptDraftOptions::default())
+            .keep_generated_prompt_draft(draft_id, (self.now)())
+            .map_err(BetaStudyError::Store)?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Edit one accepted draft, keep it, and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the draft decision or queue selection fails.
+    pub fn edit_and_keep_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.invalidate_snapshot();
+        self.store
+            .edit_and_keep_generated_prompt_draft(
+                draft_id,
+                prompt_text,
+                expected_answer,
+                (self.now)(),
+            )
+            .map_err(BetaStudyError::Store)?;
+        self.select_next()?;
+        self.view()
+    }
+
+    /// Reject one accepted draft and select the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the draft decision or queue selection fails.
+    pub fn reject_draft(
+        &mut self,
+        draft_id: &str,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.invalidate_snapshot();
+        self.store
+            .reject_generated_prompt_draft(draft_id, (self.now)())
             .map_err(BetaStudyError::Store)?;
         self.select_next()?;
         self.view()
@@ -911,7 +1174,7 @@ where
     pub fn learn_more(
         &mut self,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        self.learn_more_with_provider(&FakeModelProvider)
+        self.learn_more_internal(&FakeModelProvider, false)
     }
 
     /// Show reference material, generating and caching a concept note when no source span exists.
@@ -928,11 +1191,47 @@ where
         &mut self,
         provider: &dyn ReferenceNoteProvider,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.learn_more_internal(provider, true)
+    }
+
+    /// Return the active review unit's source authorization context.
+    ///
+    /// This lets higher layers choose the local deterministic path whenever a
+    /// `LocalOnly` source is active, without reimplementing source lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError::NoActiveReviewUnit`] when nothing is active,
+    /// or a generation/store error when source resolution fails.
+    pub fn current_source_authorization(
+        &mut self,
+    ) -> Result<SourceAuthorizationContext, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let current = self
+            .current
+            .as_ref()
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        let draft = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|draft| draft.review_unit_id == current.review_unit_id)
+            .ok_or(BetaStudyError::NoActiveReviewUnit)?;
+        ensure_active_source_model_eligible(&snapshot, draft, false)
+    }
+
+    fn learn_more_internal(
+        &mut self,
+        provider: &dyn ReferenceNoteProvider,
+        enforce_source_permission: bool,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
             .ok_or(BetaStudyError::NoActiveReviewUnit)?;
         let snapshot = self.snapshot()?;
+        validate_reference_spans::<<S as MemoryServiceStore>::Error>(&snapshot, active)?;
+        let authorization =
+            ensure_active_source_model_eligible(&snapshot, active, enforce_source_permission)?;
         if let Some(text) = reference_text(&snapshot, active) {
             self.reference_text = Some(text);
             return self.view();
@@ -949,13 +1248,14 @@ where
         }
 
         let note = provider
-            .explain_concept(&ReferenceNoteRequest {
-                concept_key: concept_key.clone(),
+            .explain_concept(&ReferenceNoteRequest::new(
+                concept_key.clone(),
                 concept_label,
-                prompt: prompt_text(&active.prompt).to_owned(),
-                expected_answer: prompt_expected_answer(&active.prompt),
-                recent_performance: Vec::new(),
-            })
+                prompt_text(&active.prompt),
+                prompt_expected_answer(&active.prompt),
+                Vec::new(),
+                authorization,
+            ))
             .map_err(|failure| {
                 BetaStudyError::Generation(BetaGenerationError::ProviderFailure(
                     failure.to_string(),
@@ -1146,7 +1446,7 @@ where
     pub fn generate_bridge_material(
         &mut self,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
-        self.generate_bridge_material_with_provider(&FakeModelProvider)
+        self.generate_bridge_material_internal(&FakeModelProvider, false)
     }
 
     /// Generate easier bridge items for the active review and defer the parent.
@@ -1163,6 +1463,14 @@ where
         &mut self,
         provider: &dyn BridgeMaterialProvider,
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        self.generate_bridge_material_internal(provider, true)
+    }
+
+    fn generate_bridge_material_internal(
+        &mut self,
+        provider: &dyn BridgeMaterialProvider,
+        enforce_source_permission: bool,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         let active = self
             .current
             .as_ref()
@@ -1176,26 +1484,20 @@ where
             .find(|unit| unit.review_unit_id == active.review_unit_id)
             .map_or(now - 60_000, |unit| unit.queue.due.saturating_sub(1_000));
         self.invalidate_snapshot();
-        let bridge = run_bridge_generation_with_provider(
-            &mut self.store,
-            provider,
-            BridgeGenerationRequest {
-                run_id: format!("bridge-run-{}", snapshot.generation_runs.len() + 1),
-                parent_review_unit_id: active.review_unit_id.clone(),
-                started_at: now,
-                completed_at: Some(now),
-                default_due: bridge_due,
-                model: None,
-            },
-        )?;
-        for draft_id in bridge.accepted_draft_ids {
-            self.store
-                .approve_generated_prompt_draft(
-                    &draft_id,
-                    ApproveGeneratedPromptDraftOptions::default(),
-                )
-                .map_err(BetaStudyError::Store)?;
-        }
+        let bridge_request = BridgeGenerationRequest {
+            run_id: format!("bridge-run-{}", snapshot.generation_runs.len() + 1),
+            parent_review_unit_id: active.review_unit_id.clone(),
+            started_at: now,
+            completed_at: Some(now),
+            default_due: bridge_due,
+            model: None,
+        };
+        let _bridge = if enforce_source_permission {
+            run_bridge_generation_with_provider(&mut self.store, provider, bridge_request)?
+        } else {
+            run_bridge_generation(&mut self.store, bridge_request)?
+        };
+        // Accepted bridge drafts remain pending for learner review.
         self.store
             .snooze_review_unit_until(&active.review_unit_id, now + DEFAULT_BRIDGE_PARENT_DEFER_MS)
             .map_err(BetaStudyError::Store)?;
@@ -1308,14 +1610,9 @@ where
                 model: None,
             },
         )?;
-        for draft_id in &outcome.accepted_draft_ids {
-            self.store
-                .approve_generated_prompt_draft(
-                    draft_id,
-                    ApproveGeneratedPromptDraftOptions::default(),
-                )
-                .map_err(BetaStudyError::Store)?;
-        }
+        // Accepted remediation drafts remain pending for an explicit learner
+        // decision (keep/edit/reject) — the boundary never auto-schedules
+        // generated material, remediation packs included.
         if outcome.pack.status == RemediationPackStatus::Active {
             self.store
                 .snooze_review_unit_until(
@@ -1533,7 +1830,10 @@ where
         let active_drafts = snapshot
             .generated_prompt_drafts
             .iter()
-            .filter(|draft| draft_has_active_source(draft, &active_source_ids))
+            .filter(|draft| {
+                draft_has_active_source(draft, &active_source_ids)
+                    && draft_run_is_finalized(draft, &snapshot)
+            })
             .collect::<Vec<_>>();
         let now = (self.now)();
         let active_queue = queue
@@ -1564,7 +1864,7 @@ where
             drafts: active_drafts
                 .iter()
                 .copied()
-                .map(|draft| draft_row(draft, &snapshot.review_units))
+                .map(|draft| draft_row(draft, &snapshot))
                 .collect(),
             queue: active_queue
                 .iter()
@@ -1778,6 +2078,7 @@ fn source_row(source: &SourceDocument) -> BetaStudySourceRow {
         id: source.id.clone(),
         title: source.title.clone(),
         kind: source.kind.clone(),
+        permission: source.permission.clone(),
         created_at: source.created_at,
     }
 }
@@ -1858,6 +2159,65 @@ fn draft_references_source(draft: &GeneratedPromptDraft, source_document_id: &st
         .any(|id| id == source_document_id)
 }
 
+fn ensure_active_source_model_eligible<E>(
+    snapshot: &BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+    enforce_source_permission: bool,
+) -> Result<SourceAuthorizationContext, BetaStudyError<E>> {
+    if enforce_source_permission && draft.source_document_ids.is_empty() {
+        return Err(BetaStudyError::Generation(
+            BetaGenerationError::UnknownSourceDocument(draft.review_unit_id.to_string()),
+        ));
+    }
+    let mut sources = Vec::with_capacity(draft.source_document_ids.len());
+    for source_id in &draft.source_document_ids {
+        let source = snapshot
+            .source_documents
+            .iter()
+            .find(|source| &source.id == source_id)
+            .ok_or_else(|| {
+                BetaStudyError::Generation(BetaGenerationError::UnknownSourceDocument(
+                    source_id.clone(),
+                ))
+            })?;
+        if source.archived_at.is_some() {
+            return Err(BetaStudyError::Generation(
+                BetaGenerationError::ArchivedSourceDocument(source.id.clone()),
+            ));
+        }
+        if source.permission == SourcePermission::LocalOnly {
+            sources.push(source.clone());
+            continue;
+        }
+        sources.push(source.clone());
+    }
+    let authorization =
+        SourceAuthorizationContext::from_sources(&sources).map_err(|error| match error {
+            SourceAuthorizationError::ArchivedSourceDocument(id) => {
+                BetaStudyError::Generation(BetaGenerationError::ArchivedSourceDocument(id))
+            }
+        })?;
+    if let Some(source_id) = authorization
+        .local_only_source_id()
+        .filter(|_| enforce_source_permission)
+    {
+        return Err(BetaStudyError::Generation(
+            BetaGenerationError::LocalOnlySource(source_id.to_owned()),
+        ));
+    }
+
+    Ok(authorization)
+}
+
+fn draft_run_is_finalized(draft: &GeneratedPromptDraft, snapshot: &BetaStoreSnapshot) -> bool {
+    snapshot
+        .generation_runs
+        .iter()
+        .find(|run| run.id == draft.generation_run_id.as_deref().unwrap_or_default())
+        .and_then(|run| run.completed_at)
+        .is_some_and(|completed_at| completed_at != i64::MIN)
+}
+
 fn draft_has_active_source(
     draft: &GeneratedPromptDraft,
     active_source_ids: &BTreeSet<String>,
@@ -1892,10 +2252,7 @@ fn review_unit_has_active_source(
         .is_none_or(|draft| draft_has_active_source(&draft, active_source_ids))
 }
 
-fn draft_row(
-    draft: &GeneratedPromptDraft,
-    review_units: &[memory_engine_persistence::BetaReviewUnitRecord],
-) -> BetaStudyDraftRow {
+fn draft_row(draft: &GeneratedPromptDraft, snapshot: &BetaStoreSnapshot) -> BetaStudyDraftRow {
     BetaStudyDraftRow {
         id: draft.id.clone(),
         review_unit_id: draft.review_unit_id.clone(),
@@ -1907,9 +2264,36 @@ fn draft_row(
         validation_status: draft.validation.status.clone(),
         validation_reasons: draft.validation.reasons.clone(),
         worked_solution: draft.worked_solution.clone(),
-        approved: review_units
+        approved: snapshot
+            .review_units
             .iter()
             .any(|unit| unit.generated_prompt_draft_id.as_deref() == Some(draft.id.as_str())),
+        learner_decision: draft.learner_decision.clone(),
+        source_spans: draft
+            .reference_span_ids
+            .iter()
+            .filter_map(|id| snapshot.reference_spans.iter().find(|span| &span.id == id))
+            .map(|span| BetaStudyReferenceSpanRow {
+                id: span.id.clone(),
+                source_document_id: span.source_document_id.clone(),
+                label: span.label.clone(),
+                text: span.text.clone(),
+                locator: span.locator.clone(),
+            })
+            .collect(),
+        provenance: draft.generation_run_id.as_ref().and_then(|run_id| {
+            snapshot
+                .generation_runs
+                .iter()
+                .find(|run| &run.id == run_id)
+                .map(|run| BetaStudyGenerationProvenance {
+                    generation_run_id: Some(run.id.clone()),
+                    provider: run.provider.clone(),
+                    model: run.model.clone(),
+                    prompt_version: (!run.prompt_version.is_empty())
+                        .then(|| run.prompt_version.clone()),
+                })
+        }),
     }
 }
 
@@ -2568,6 +2952,24 @@ fn reference_text(snapshot: &BetaStoreSnapshot, draft: &GeneratedPromptDraft) ->
         })
         .map(|note| note.body.trim().to_owned())
         .filter(|body| !body.is_empty())
+}
+
+fn validate_reference_spans<E>(
+    snapshot: &BetaStoreSnapshot,
+    draft: &GeneratedPromptDraft,
+) -> Result<(), BetaStudyError<E>> {
+    for reference_span_id in &draft.reference_span_ids {
+        if !snapshot
+            .reference_spans
+            .iter()
+            .any(|span| &span.id == reference_span_id)
+        {
+            return Err(BetaStudyError::UnknownReferenceSpan(
+                reference_span_id.clone(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn concept_identity_for_draft(draft: &GeneratedPromptDraft) -> (String, String) {

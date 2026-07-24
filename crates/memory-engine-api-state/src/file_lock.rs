@@ -10,9 +10,37 @@ pub(crate) struct FileDescriptorLock {
 }
 
 pub(crate) fn acquire(path: &Path) -> Result<FileDescriptorLock, ApiFailure> {
-    try_acquire(path)?.ok_or_else(|| {
+    acquire_transient_tolerant(path)?.ok_or_else(|| {
         ApiFailure::conflict("The shared file state is busy; try the operation again.")
     })
+}
+
+/// Acquire, waiting out transient holders for a bounded window.
+///
+/// A logically free lock can appear held: spawning any subprocess forks this
+/// process, and until the child execs (closing its CLOEXEC copy of the fd
+/// table) it co-owns every open flock — including locks it has nothing to do
+/// with. Those windows are tiny, but on a slow machine they are wide enough
+/// to make a nonblocking acquire refuse a lock nobody logically holds, which
+/// silently dropped notification claims and completions (memory-engine-101).
+/// Genuine holders do microsecond-scale read-modify-write work, so a short
+/// bounded retry preserves refusal semantics for real contention: `None` is
+/// returned only when the lock stays held past the deadline. Correctness
+/// never depends on winning the lock — the persisted claim/fence state does —
+/// so waiting is always safe.
+pub(crate) fn acquire_transient_tolerant(
+    path: &Path,
+) -> Result<Option<FileDescriptorLock>, ApiFailure> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        if let Some(lock) = try_acquire(path)? {
+            return Ok(Some(lock));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 #[cfg(unix)]

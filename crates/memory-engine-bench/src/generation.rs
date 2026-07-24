@@ -20,6 +20,7 @@ use memory_engine_generation::{
     references_source_artifact, run_beta_generation_with_provider, BetaGenerationRequest,
     BetaGenerationStore, BridgeMaterialProvider, BridgeMaterialRequest, DraftCandidate,
     DraftProvider, FakeModelProvider, LearningIntent, ReviewPerformanceContext,
+    SourceAuthorizationContext,
 };
 use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider, PromptVariant};
 use memory_engine_persistence::{
@@ -337,6 +338,7 @@ fn score_source(
         completed_at: Some(NOW),
         default_due: NOW,
         model: None,
+        pending: false,
     };
     let fallback_learning_intent = Some(classify_learning_intent(&document).intent);
     let mut bench_store = BenchGenerationStore::new(document);
@@ -1341,20 +1343,21 @@ fn bridge_quality_fixture<P>(provider: &P) -> Result<BridgeQualityScore, String>
 where
     P: BridgeMaterialProvider + ?Sized,
 {
-    let request = BridgeMaterialRequest {
-        concept_key: "nato-cat-composition".to_owned(),
-        concept_label: "nato cat composition".to_owned(),
-        parent_review_unit_id: ReviewUnitId::new("parent-nato-cat"),
-        parent_prompt: "Spell CAT over the phone using the NATO phonetic alphabet.".to_owned(),
-        parent_expected_answer: "CHARLIE ALFA TANGO".to_owned(),
-        parent_stage_order: 4,
-        cached_reference_note: None,
-        recent_performance: vec![ReviewPerformanceContext {
+    let request = BridgeMaterialRequest::new(
+        "nato-cat-composition",
+        "nato cat composition",
+        ReviewUnitId::new("parent-nato-cat"),
+        "Spell CAT over the phone using the NATO phonetic alphabet.",
+        "CHARLIE ALFA TANGO",
+        4,
+        None,
+        vec![ReviewPerformanceContext {
             review_unit_id: "parent-nato-cat".to_owned(),
             submitted_answer: "CHARLIE TANGO".to_owned(),
             verdict: Some("wrong".to_owned()),
         }],
-    };
+        SourceAuthorizationContext::none(),
+    );
     let material = provider
         .generate_bridge_material(&request)
         .map_err(|failure| failure.to_string())?;
@@ -1530,13 +1533,14 @@ mod tests {
     }
 
     const BODY: &str = "A is Alfa. B is Bravo. C is Charlie.";
+    const CORPUS_SOURCE_BODY: &str = "The source explains Alfa and Bravo as code words.";
 
     fn corpus_source() -> CorpusSource {
         CorpusSource {
             id: "letters".to_owned(),
             title: "Letters".to_owned(),
             category: "fixture".to_owned(),
-            body: BODY.to_owned(),
+            body: CORPUS_SOURCE_BODY.to_owned(),
             expect: expectations(),
         }
     }
@@ -1922,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn presidents_fixture_records_current_fake_provider_gap_as_red() {
+    fn presidents_fixture_is_exhaustively_supported_by_the_fake_provider() {
         let source = load_corpus()
             .expect("corpus")
             .into_iter()
@@ -1933,11 +1937,12 @@ mod tests {
         let enumerable = score.enumerable_set.expect("enumerable score");
 
         assert_eq!(enumerable.expected, 47);
+        assert_eq!(enumerable.observed, 47);
+        assert_eq!(enumerable.covered, 47);
         assert!(
-            !enumerable.passes(),
-            "the fixture must expose the current gap"
+            enumerable.passes(),
+            "the canonical fixture must pass: {enumerable:?}"
         );
-        assert!(enumerable.missing > 0);
     }
 
     #[test]
@@ -1960,6 +1965,7 @@ mod tests {
             [
                 "concept_understanding",
                 "fact_recall",
+                "enumerable_set",
                 "procedure_process",
                 "verbatim_memorization",
             ]
@@ -2010,14 +2016,15 @@ mod tests {
 
         fn generate_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
         ) -> Result<ProviderDrafts, ProviderFailure> {
+            let evidence = source.body.clone().unwrap_or_default();
             Ok(ProviderDrafts {
                 model: self.model(),
                 learning_intent: None,
                 candidates: vec![
-                    candidate("What is A?", "Alfa", "A is Alfa."),
-                    candidate("What is A?", "Alfa", "A is Alfa."),
+                    candidate("What is A?", "Alfa", &evidence),
+                    candidate("What is A?", "Alfa", &evidence),
                 ],
                 failures: Vec::new(),
                 usage: None,
@@ -2036,9 +2043,11 @@ mod tests {
 
         fn generate_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
         ) -> Result<ProviderDrafts, ProviderFailure> {
+            let evidence = source.body.clone().unwrap_or_default();
             let mut rejected = candidate("What is A?", "Alfa", "A is Alfa.");
+            rejected.evidence = Some(evidence.clone());
             rejected.unsupported = true;
 
             Ok(ProviderDrafts {
@@ -2057,12 +2066,13 @@ mod tests {
 
         fn repair_drafts(
             &self,
-            _source: &SourceDocument,
+            source: &SourceDocument,
             rejections: &[DraftRejection],
         ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
             assert_eq!(rejections.len(), 1);
             self.repair_calls.set(self.repair_calls.get() + 1);
-            let mut repaired = candidate("What is B?", "Bravo", "B is Bravo.");
+            let evidence = source.body.clone().unwrap_or_default();
+            let mut repaired = candidate("What is B?", "Bravo", &evidence);
             repaired.index = 2;
 
             Ok(Some(ProviderDrafts {
@@ -2115,13 +2125,14 @@ mod tests {
         ) -> Result<BridgeMaterial, ProviderFailure> {
             Ok(BridgeMaterial {
                 model: self.model(),
-                reference_note: self.explain_concept(&ReferenceNoteRequest {
-                    concept_key: request.concept_key.clone(),
-                    concept_label: request.concept_label.clone(),
-                    prompt: request.parent_prompt.clone(),
-                    expected_answer: request.parent_expected_answer.clone(),
-                    recent_performance: request.recent_performance.clone(),
-                })?,
+                reference_note: self.explain_concept(&ReferenceNoteRequest::new(
+                    request.concept_key.clone(),
+                    request.concept_label.clone(),
+                    request.parent_prompt.clone(),
+                    request.parent_expected_answer.clone(),
+                    request.recent_performance.clone(),
+                    request.authorization().clone(),
+                ))?,
                 candidates: vec![DraftCandidate {
                     index: 1,
                     concept: request.concept_label.clone(),

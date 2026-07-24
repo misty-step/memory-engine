@@ -25,7 +25,8 @@ error-handling shape).
 
 | Tool | Composes | Intent |
 |---|---|---|
-| `create_deck` | `POST project-decks` -> `POST sources/{id}/generate` -> `POST drafts/{id}/approve` (per accepted draft) | Capture material as a study deck that is immediately due, not just a saved source record. |
+| `create_deck` | `POST project-decks` -> `POST sources/{id}/generate` | Capture material as a project-scoped deck while leaving accepted drafts pending for provenance review. |
+| `keep_draft` / `edit_draft` / `reject_draft` | `POST drafts/{id}/keep`, `/edit`, or `/reject` | Make an explicit learner decision; only keep or edit-and-keep creates a due card, while reject remains terminal and exportable. |
 | `list_decks` | `GET sources`, filtered to `projectKey.is_some()` | Check what decks exist, or find a `deck_id` to invalidate. |
 | `invalidate_deck` | `POST project-decks/{id}/invalidate` | Retire every card from one deck after an external event (029's project-deck lifecycle). |
 | `list_due` | `POST review/next` | Lightweight status check: how many are due, one-line teaser of the next prompt. |
@@ -42,22 +43,21 @@ different backend methods for different UI intents.
 
 ## Credential model
 
-Same env vars `docs/runbook.md` and `docs/dogfood/morning-review-cli.md`
-already use: `MEMORY_ENGINE_ACCOUNT_ID` / `MEMORY_ENGINE_SESSION_TOKEN`. There
-is no interactive `login` subcommand — stdin is the JSON-RPC channel, not a
-terminal — so a brand-new local server instead bootstraps its own account
-non-interactively from `MEMORY_ENGINE_MCP_EMAIL`, persisting the result to
-`~/.memory-engine/mcp/credentials.json` (mode `0600`) for reuse across
-restarts. `MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
+Credentials are provisioned through the invite magic-link or operator service-session
+flows before this stdio server starts. Anonymous account creation is disabled.
+There is no interactive `login` subcommand — stdin is the JSON-RPC channel, not a
+terminal — so import a pre-provisioned pair through `MEMORY_ENGINE_ACCOUNT_ID` /
+`MEMORY_ENGINE_SESSION_TOKEN`, or place the same pair in
+`~/.memory-engine/mcp/credentials.json` (mode `0600`).
+`MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL (default
 `https://memory-engine-api-i2xcr.ondigitalocean.app`, matching
 `memory-engine-review`).
 
-Resolution order: env vars -> credentials file -> `MEMORY_ENGINE_MCP_EMAIL`
-bootstrap -> fail loudly. There is no in-memory fallback
-(`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the
-server exits non-zero with no stdout before reading any stdin when none of
-the three resolve) — the same lesson `powder-mcp` encoded after an
-ephemeral in-memory mode silently evaporated claims on process exit.
+Resolution order: env vars -> credentials file -> fail loudly. There is no
+anonymous bootstrap or in-memory fallback.
+`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the real binary
+exits non-zero with no stdout before reading stdin when no pre-provisioned
+credential resolves.
 
 ## Commands
 
@@ -139,50 +139,57 @@ identical to the table above rendered as JSON Schema):
 
 ```json
 >>> {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
-<<< {"id":2,"jsonrpc":"2.0","result":{"tools":[{"name":"create_deck",...},{"name":"list_decks",...},{"name":"invalidate_deck",...},{"name":"list_due",...},{"name":"review_next",...},{"name":"submit_answer",...}]}}
+<<< {"id":2,"jsonrpc":"2.0","result":{"tools":[{"name":"create_deck",...},{"name":"keep_draft",...},{"name":"edit_draft",...},{"name":"reject_draft",...},{"name":"list_decks",...},{"name":"invalidate_deck",...},{"name":"list_due",...},{"name":"review_next",...},{"name":"submit_answer",...}]}}
 ```
 
-**3. `create_deck`** — one call saves the source, generates a quiz card, and
-approves it. `approvedCardCount: 1` proves the composition, not a bare save:
+**3. `create_deck`** — one call saves the source and generates a quiz draft, but
+leaves it pending. `pendingDrafts` returns the generated prompt and provenance for explicit review:
 
 ```json
 >>> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_deck","arguments":{"project_key":"nato-onboarding","title":"NATO letter A fixture","body":"Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\nDistractors: BRAVO, CHARLIE\nReference: The NATO phonetic alphabet word for A is ALFA."}}}
-<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"approvedCardCount\": 1,\n  \"deck\": {\n    \"deckId\": \"deck_0d32f2a69298d5d8\",\n    \"projectKey\": \"nato-onboarding\",\n    \"source\": {\"sourceId\": \"deck_0d32f2a69298d5d8\", \"title\": \"NATO letter A fixture\", ...}\n  }\n}"}]}}
+<<< {"id":3,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"pendingDrafts\": [{\n    \"id\": \"draft_...\",\n    \"sourceSpans\": [...],\n    \"provenance\": {...}\n  }],\n  \"deck\": {\n    \"deckId\": \"deck_0d32f2a69298d5d8\",\n    \"projectKey\": \"nato-onboarding\",\n    \"source\": {\"sourceId\": \"deck_0d32f2a69298d5d8\", \"title\": \"NATO letter A fixture\", ...}\n  }\n}"}]}}
 ```
 
-**4. `list_decks`** — the new deck is visible, scoped to its `project_key`:
+**4. `keep_draft`** — inspect the returned `pendingDrafts` row, then make the learner decision explicitly:
 
 ```json
->>> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_decks","arguments":{"project_key":"nato-onboarding"}}}
+>>> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"keep_draft","arguments":{"draft_id":"draft_..."}}}
+<<< {"id":4,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{... study view ...}"}]}}
+```
+
+**5. `list_decks`** — the new deck is visible, scoped to its `project_key`:
+
+```json
+>>> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_decks","arguments":{"project_key":"nato-onboarding"}}}
 <<< {"id":4,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"[{\"sourceId\": \"deck_0d32f2a69298d5d8\", \"projectKey\": \"nato-onboarding\", \"title\": \"NATO letter A fixture\", ...}]"}]}}
 ```
 
-**5. `list_due`** — a lightweight peek, one due card:
+**6. `list_due`** — a lightweight peek, one due card:
 
 ```json
->>> {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_due","arguments":{}}}
+>>> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_due","arguments":{}}}
 <<< {"id":5,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"dueCount\": 1,\n  \"nextPrompt\": \"In the NATO phonetic alphabet, which code word represents the letter A?\"\n}"}]}}
 ```
 
-**6. `review_next`** — full detail, including `reviewUnitId` needed to
+**7. `review_next`** — full detail, including `reviewUnitId` needed to
 answer:
 
 ```json
->>> {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"review_next","arguments":{}}}
+>>> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"review_next","arguments":{}}}
 <<< {"id":6,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"choices\": [\"ARCHER\", \"APEX\", \"ALFA\", \"AMBER\"],\n    \"prompt\": \"In the NATO phonetic alphabet, which code word represents the letter A?\",\n    \"reviewUnitId\": \"generated-quiz-deck-0d32f2a69298d5d8-1-nato-alphabet-a\"\n  },\n  \"dueCount\": 1\n}"}]}}
 ```
 
-**7. `submit_answer`** — correct answer, `dueCount` drops to 0:
+**8. `submit_answer`** — correct answer, `dueCount` drops to 0:
 
 ```json
->>> {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"submit_answer","arguments":{"review_unit_id":"generated-quiz-deck-0d32f2a69298d5d8-1-nato-alphabet-a","answer":"ALFA"}}}
+>>> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"submit_answer","arguments":{"review_unit_id":"generated-quiz-deck-0d32f2a69298d5d8-1-nato-alphabet-a","answer":"ALFA"}}}
 <<< {"id":7,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": {\n    \"grade\": {\"isCorrect\": true, \"rating\": 3, \"verdict\": \"correct\"},\n    \"expectedAnswer\": \"ALFA\"\n  },\n  \"dueCount\": 0\n}"}]}}
 ```
 
-**8. `invalidate_deck`** — retires the deck:
+**9. `invalidate_deck`** — retires the deck:
 
 ```json
->>> {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"invalidate_deck","arguments":{"deck_id":"deck_0d32f2a69298d5d8","event":"onboarding project closed"}}}
+>>> {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"invalidate_deck","arguments":{"deck_id":"deck_0d32f2a69298d5d8","event":"onboarding project closed"}}}
 <<< {"id":8,"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\n  \"current\": null,\n  \"drafts\": [],\n  \"dueCount\": 0\n}"}]}}
 ```
 

@@ -21,10 +21,10 @@ use memory_engine_core::{
 };
 use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
-    parse_strict_boolean_answer, AppliedReviewReceipt, ApproveGeneratedPromptDraftOptions,
-    BetaReviewUnitRecord, BetaStoreSnapshot, ConceptReferenceNote, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, GenerationRun, ReferenceSpan, RemediationPackRecord,
-    ScheduleRecord, SourceDocument,
+    parse_strict_boolean_answer, AppliedReviewReceipt, BetaReviewUnitRecord, BetaStoreSnapshot,
+    ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus, GenerationRun,
+    LearnerDraftDecision, LearnerDraftDecisionExport, ReferenceSpan, RemediationPackRecord,
+    ScheduleRecord, SourceDocument, SourcePermission,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -39,7 +39,12 @@ static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
              WHERE account_id = $1::TEXT AND job_id = $2::TEXT AND lease_token = $3::TEXT
-               AND status = 'running' AND lease_expires_at_ms > $4::BIGINT";
+               AND status = 'running' AND lease_expires_at_ms > $4::BIGINT
+               AND EXISTS (
+                   SELECT 1 FROM memory_engine_generation_job_attempts attempt
+                   WHERE attempt.account_id = $1::TEXT AND attempt.job_id = $2::TEXT
+                     AND attempt.lease_token = $3::TEXT AND attempt.status = 'running'
+               )";
 
 const FINISH_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET status = CASE
@@ -81,24 +86,9 @@ CREATE TABLE IF NOT EXISTS memory_engine_accounts (
     created_at_ms BIGINT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS memory_engine_api_sessions (
-    account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
-    session_token TEXT NOT NULL,
-    updated_at_ms BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
-    session_id_hash TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
-    session_token TEXT NOT NULL,
-    csrf_token_hash TEXT NOT NULL,
-    created_at_ms BIGINT NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    revoked_at_ms BIGINT
-);
-
-CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
-    ON memory_engine_browser_sessions(account_id, expires_at_ms);
+-- API and browser session tables are created by migration 6. Keeping their
+-- DDL out of the base migration lets version 6 inspect and rename the raw
+-- pre-migration tables before any new indexes are parsed.
 
 CREATE TABLE IF NOT EXISTS memory_engine_rate_limits (
     rate_limit_key TEXT PRIMARY KEY,
@@ -242,6 +232,109 @@ CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
     ON memory_engine_content_feedback(account_id, review_unit_id, occurred_at_ms);
 ";
 
+/// Upgrade the pre-PR73 raw session tables without a compatibility auth path.
+///
+/// The migration runs in the same transaction as its schema-version marker. It
+/// hashes legacy rows into the replacement tables, preserves their expiry
+/// metadata, and drops the raw-token copies only after the replacement insert
+/// succeeds. A failed transaction leaves the legacy schema intact for retry.
+const SESSION_SCHEMA_MIGRATION_SQL: &str = r"
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_api_sessions'
+                 AND column_name = 'session_token') THEN
+        ALTER TABLE memory_engine_api_sessions
+            RENAME CONSTRAINT memory_engine_api_sessions_pkey
+            TO memory_engine_api_sessions_legacy_v1_pkey;
+        ALTER INDEX IF EXISTS memory_engine_api_sessions_account_idx
+            RENAME TO memory_engine_api_sessions_legacy_v1_account_idx;
+        ALTER TABLE memory_engine_api_sessions
+            RENAME TO memory_engine_api_sessions_legacy_v1;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS memory_engine_api_sessions (
+    session_token_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    revoked_at_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS memory_engine_api_sessions_account_idx
+    ON memory_engine_api_sessions(account_id, expires_at_ms);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_api_sessions_legacy_v1') THEN
+        INSERT INTO memory_engine_api_sessions
+            (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+        SELECT encode(digest(session_token, 'sha256'), 'hex'), account_id,
+               updated_at_ms, updated_at_ms + 1209600000, NULL
+          FROM memory_engine_api_sessions_legacy_v1
+        ON CONFLICT (session_token_hash) DO NOTHING;
+        DROP TABLE memory_engine_api_sessions_legacy_v1;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_browser_sessions'
+                 AND column_name = 'session_token') THEN
+        ALTER TABLE memory_engine_browser_sessions
+            RENAME CONSTRAINT memory_engine_browser_sessions_pkey
+            TO memory_engine_browser_sessions_legacy_v1_pkey;
+        ALTER INDEX IF EXISTS memory_engine_browser_sessions_account_idx
+            RENAME TO memory_engine_browser_sessions_legacy_v1_account_idx;
+        ALTER TABLE memory_engine_browser_sessions
+            RENAME TO memory_engine_browser_sessions_legacy_v1;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS memory_engine_browser_sessions (
+    session_id_hash TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    session_token_hash TEXT NOT NULL,
+    csrf_token_hash TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    expires_at_ms BIGINT NOT NULL,
+    revoked_at_ms BIGINT
+);
+CREATE INDEX IF NOT EXISTS memory_engine_browser_sessions_account_idx
+    ON memory_engine_browser_sessions(account_id, expires_at_ms);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = current_schema()
+                 AND table_name = 'memory_engine_browser_sessions_legacy_v1') THEN
+        INSERT INTO memory_engine_browser_sessions
+            (session_id_hash, account_id, session_token_hash, csrf_token_hash,
+             created_at_ms, expires_at_ms, revoked_at_ms)
+        SELECT session_id_hash, account_id,
+               encode(digest(session_token, 'sha256'), 'hex'),
+               encode(digest(
+                   'csrf_' || encode(
+                       digest('csrf:' || encode(digest(session_token, 'sha256'), 'hex'), 'sha256'),
+                       'hex'
+                   ),
+                   'sha256'
+               ), 'hex'),
+               created_at_ms, expires_at_ms, revoked_at_ms
+          FROM memory_engine_browser_sessions_legacy_v1
+        ON CONFLICT (session_id_hash) DO NOTHING;
+        DROP TABLE memory_engine_browser_sessions_legacy_v1;
+    END IF;
+END $$;
+";
+
 const CLAIM_RETURN_NOTIFICATION_SQL: &str = r"
 UPDATE memory_engine_return_notification_preferences
  SET claim_id = $6,
@@ -357,6 +450,32 @@ CREATE INDEX IF NOT EXISTS memory_engine_remediation_packs_attempt_idx
     ON memory_engine_remediation_packs(account_id, attempt_id);
 ";
 
+/// Production waitlist storage: one row per normalized email plus an
+/// append-only audit log of every join/invite/delete transition. The
+/// audit log is intentionally separate from the operational row so a
+/// `delete` can remove an address from the live waitlist while the
+/// operator still has a durable record that the address existed and what
+/// happened to it.
+const WAITLIST_MIGRATION_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS memory_engine_waitlist_entries (
+    email_normalized TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    invited_at_ms BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS memory_engine_waitlist_audit_log (
+    audit_id BIGSERIAL PRIMARY KEY,
+    email_normalized TEXT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('joined', 'invited', 'deleted')),
+    occurred_at_ms BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_waitlist_audit_log_email_idx
+    ON memory_engine_waitlist_audit_log(email_normalized, occurred_at_ms);
+";
+
 /// The complete schema text remains available for smoke checks and operators.
 /// Runtime migration application uses the versioned list below.
 pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -366,6 +485,8 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL,
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
         REMEDIATION_PACKS_MIGRATION_SQL,
+        WAITLIST_MIGRATION_SQL,
+        SESSION_SCHEMA_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -392,6 +513,8 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, GENERATION_JOBS_COMPATIBILITY_MIGRATION_SQL),
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
     (5, REMEDIATION_PACKS_MIGRATION_SQL),
+    (6, WAITLIST_MIGRATION_SQL),
+    (7, SESSION_SCHEMA_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -454,6 +577,17 @@ pub enum PostgresEnqueueOutcome {
     Rejected(String),
 }
 
+/// One waitlist row as read back from Postgres. Mirrors
+/// `memory_engine_api_state::WaitlistEntry`; kept as a separate type so this
+/// crate never depends on the HTTP-facing boundary crate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostgresWaitlistEntry {
+    pub email: String,
+    pub source: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub invited_at_ms: Option<i64>,
+}
 impl AccountScope {
     /// Build an account scope for all subsequent store operations.
     ///
@@ -656,6 +790,25 @@ pub struct PostgresStudyStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthChallengeSessionOutcome {
+    Invalid,
+    NotAdmitted,
+    Created { email: String },
+}
+
+#[derive(Debug)]
+pub struct AuthChallengeSessionRequest<'a> {
+    pub challenge_hash: &'a str,
+    pub now_ms: i64,
+    pub configured_allowed: bool,
+    pub account_id: &'a str,
+    pub session_token_hash: &'a str,
+    pub browser_session_id_hash: &'a str,
+    pub csrf_token_hash: &'a str,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserSession {
     pub account_id: String,
     pub session_token: String,
@@ -792,6 +945,190 @@ fn retry_connect<T, E>(mut connect: impl FnMut() -> Result<T, E>) -> Result<T, E
     }
 }
 
+trait TransactionOps {
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement;
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement;
+
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error>
+    where
+        T: ?Sized + ToStatement;
+}
+
+impl TransactionOps for postgres::Transaction<'_> {
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        postgres::Transaction::query(self, query, params)
+    }
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        postgres::Transaction::query_opt(self, query, params)
+    }
+
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        postgres::Transaction::execute(self, query, params)
+    }
+}
+
+impl TransactionOps for CountingTransaction<'_> {
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        CountingTransaction::query(self, query, params)
+    }
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<postgres::Row>, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        CountingTransaction::query_opt(self, query, params)
+    }
+
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error>
+    where
+        T: ?Sized + ToStatement,
+    {
+        CountingTransaction::execute(self, query, params)
+    }
+}
+
+fn cleanup_generation_run<T: TransactionOps>(
+    transaction: &mut T,
+    account_id: &str,
+    run_id: &str,
+) -> Result<(), PostgresStoreError> {
+    let stale = transaction.query(
+        "SELECT draft_id, draft->'referenceSpanIds'
+         FROM memory_engine_generated_prompt_drafts
+         WHERE account_id = $1::TEXT
+           AND draft->>'generationRunId' = $2::TEXT",
+        &[&account_id, &run_id],
+    )?;
+    let mut stale_draft_ids = Vec::with_capacity(stale.len());
+    let mut stale_review_unit_ids = std::collections::BTreeSet::new();
+    let mut stale_reference_span_ids = std::collections::BTreeSet::new();
+    for row in stale {
+        let draft_id: String = row.get(0);
+        let references: serde_json::Value = row.get(1);
+        stale_draft_ids.push(draft_id);
+        for reference in references.as_array().into_iter().flatten() {
+            if let Some(reference_id) = reference.as_str() {
+                stale_reference_span_ids.insert(reference_id.to_owned());
+            }
+        }
+    }
+    if !stale_draft_ids.is_empty() {
+        let owned_units = transaction.query(
+            "SELECT review_unit_id
+             FROM memory_engine_review_units
+             WHERE account_id = $1::TEXT
+               AND record->>'generatedPromptDraftId' = ANY($2::TEXT[])",
+            &[&account_id, &stale_draft_ids],
+        )?;
+        for row in owned_units {
+            stale_review_unit_ids.insert(row.get::<_, String>(0));
+        }
+    }
+    for review_unit_id in &stale_review_unit_ids {
+        transaction.execute(
+            "DELETE FROM memory_engine_review_units
+             WHERE account_id = $1::TEXT AND review_unit_id = $2::TEXT",
+            &[&account_id, review_unit_id],
+        )?;
+    }
+    for draft_id in &stale_draft_ids {
+        transaction.execute(
+            "DELETE FROM memory_engine_generated_prompt_drafts
+             WHERE account_id = $1::TEXT AND draft_id = $2::TEXT",
+            &[&account_id, draft_id],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM memory_engine_generation_runs
+         WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
+        &[&account_id, &run_id],
+    )?;
+    for reference_id in stale_reference_span_ids {
+        let referenced_by_draft = transaction
+            .query_opt(
+                "SELECT 1
+                 FROM memory_engine_generated_prompt_drafts
+                 WHERE account_id = $1::TEXT
+                   AND draft->'referenceSpanIds' ? $2::TEXT
+                 LIMIT 1",
+                &[&account_id, &reference_id],
+            )?
+            .is_some();
+        let referenced_by_review = transaction
+            .query_opt(
+                "SELECT 1
+                 FROM memory_engine_review_units
+                 WHERE account_id = $1::TEXT
+                   AND record->'referenceSpanIds' ? $2::TEXT
+                 LIMIT 1",
+                &[&account_id, &reference_id],
+            )?
+            .is_some();
+        if !referenced_by_draft && !referenced_by_review {
+            transaction.execute(
+                "DELETE FROM memory_engine_reference_spans
+                 WHERE account_id = $1::TEXT AND reference_span_id = $2::TEXT",
+                &[&account_id, &reference_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl PostgresStudyStore {
     /// Connect to Postgres, negotiating TLS per the URL's `sslmode`.
     ///
@@ -867,8 +1204,7 @@ impl PostgresStudyStore {
         Ok(row.is_some())
     }
 
-    /// Check whether the supplied API session token is current without creating
-    /// the account.
+    /// Check one hashed API session without creating the account.
     ///
     /// # Errors
     ///
@@ -876,14 +1212,15 @@ impl PostgresStudyStore {
     pub fn api_session_matches(
         &mut self,
         account_id: &str,
-        session_token: &str,
+        session_token_hash: &str,
+        now_ms: i64,
     ) -> Result<bool, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
             "SELECT 1 FROM memory_engine_api_sessions
-             WHERE account_id = $1 AND session_token = $2",
-            &[&account_id, &session_token],
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL AND expires_at_ms > $3",
+            &[&account_id, &session_token_hash, &now_ms],
         )?;
-
         Ok(row.is_some())
     }
 
@@ -903,11 +1240,11 @@ impl PostgresStudyStore {
     ) -> Result<(), PostgresStoreError> {
         self.client.borrow_mut().execute(
             "INSERT INTO memory_engine_browser_sessions
-                (session_id_hash, account_id, session_token, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
+                (session_id_hash, account_id, session_token_hash, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
              VALUES ($1, $2, $3, $4, $5, $6, NULL)
              ON CONFLICT (session_id_hash) DO UPDATE
              SET account_id = EXCLUDED.account_id,
-                 session_token = EXCLUDED.session_token,
+                 session_token_hash = EXCLUDED.session_token_hash,
                  csrf_token_hash = EXCLUDED.csrf_token_hash,
                  created_at_ms = EXCLUDED.created_at_ms,
                  expires_at_ms = EXCLUDED.expires_at_ms,
@@ -936,7 +1273,7 @@ impl PostgresStudyStore {
         now_ms: i64,
     ) -> Result<Option<BrowserSession>, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
-            "SELECT account_id, session_token, csrf_token_hash, expires_at_ms
+            "SELECT account_id, session_token_hash, csrf_token_hash, expires_at_ms
              FROM memory_engine_browser_sessions
              WHERE session_id_hash = $1
                AND revoked_at_ms IS NULL
@@ -969,6 +1306,27 @@ impl PostgresStudyStore {
             &[&session_id_hash, &now_ms],
         )?;
 
+        Ok(())
+    }
+
+    /// Revoke every browser session for one account while retaining the rows
+    /// and timestamps for audit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    /// Revokes every browser credential for an account in one durable transaction.
+    pub fn revoke_browser_sessions_for_account(
+        &mut self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        self.client.borrow_mut().execute(
+            "UPDATE memory_engine_browser_sessions
+             SET revoked_at_ms = COALESCE(revoked_at_ms, $2)
+             WHERE account_id = $1 AND revoked_at_ms IS NULL",
+            &[&account_id, &now_ms],
+        )?;
         Ok(())
     }
 
@@ -1090,6 +1448,131 @@ impl PostgresStudyStore {
         )?;
 
         Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Read the admitted email bound to a live challenge before beginning the
+    /// session-creation transaction. The transaction revalidates the challenge
+    /// and admission under the same advisory lock, so this read is only a
+    /// credential-shaping hint and never an authorization decision.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn auth_challenge_email(
+        &mut self,
+        challenge_hash: &str,
+        now_ms: i64,
+    ) -> Result<Option<String>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT email_normalized
+             FROM memory_engine_auth_challenges
+             WHERE challenge_hash = $1
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2",
+            &[&challenge_hash, &now_ms],
+        )?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Consume a magic-link challenge and create its account/API/browser
+    /// credentials in one transaction. The email advisory lock is shared with
+    /// invite mark/delete operations, preventing another replica from changing
+    /// admission between the recheck and session inserts.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when Postgres rejects the transaction.
+    pub fn consume_auth_challenge_and_create_sessions(
+        &mut self,
+        request: &AuthChallengeSessionRequest<'_>,
+    ) -> Result<AuthChallengeSessionOutcome, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let Some(hint) = transaction.query_opt(
+            "SELECT email_normalized
+             FROM memory_engine_auth_challenges
+             WHERE challenge_hash = $1
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2",
+            &[&request.challenge_hash, &request.now_ms],
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(AuthChallengeSessionOutcome::Invalid);
+        };
+        let email: String = hint.get(0);
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email],
+        )?;
+        let Some(challenge) = transaction.query_opt(
+            "UPDATE memory_engine_auth_challenges
+             SET consumed_at_ms = $2
+             WHERE challenge_hash = $1
+               AND email_normalized = $3
+               AND consumed_at_ms IS NULL
+               AND expires_at_ms > $2
+             RETURNING email_normalized",
+            &[&request.challenge_hash, &request.now_ms, &email],
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(AuthChallengeSessionOutcome::Invalid);
+        };
+        let email: String = challenge.get(0);
+        if !request.configured_allowed {
+            let invited = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM memory_engine_waitlist_entries
+                     WHERE email_normalized = $1 AND invited_at_ms IS NOT NULL
+                     FOR UPDATE",
+                    &[&email],
+                )?
+                .is_some();
+            if !invited {
+                transaction.commit()?;
+                return Ok(AuthChallengeSessionOutcome::NotAdmitted);
+            }
+        }
+        transaction.execute(
+            "INSERT INTO memory_engine_accounts (account_id, created_at_ms)
+             VALUES ($1, $2)
+             ON CONFLICT (account_id) DO NOTHING",
+            &[&request.account_id, &request.now_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_api_sessions
+                (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, NULL)
+             ON CONFLICT (session_token_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id, created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms, revoked_at_ms = NULL",
+            &[
+                &request.session_token_hash,
+                &request.account_id,
+                &request.now_ms,
+                &request.expires_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_browser_sessions
+                (session_id_hash, account_id, session_token_hash, csrf_token_hash,
+                 created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)
+             ON CONFLICT (session_id_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id, session_token_hash = EXCLUDED.session_token_hash,
+                 csrf_token_hash = EXCLUDED.csrf_token_hash, created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms, revoked_at_ms = NULL",
+            &[
+                &request.browser_session_id_hash,
+                &request.account_id,
+                &request.session_token_hash,
+                &request.csrf_token_hash,
+                &request.now_ms,
+                &request.expires_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(AuthChallengeSessionOutcome::Created { email })
     }
 
     /// Persist the learner's explicit due-count reminder choice.
@@ -1410,6 +1893,7 @@ impl PostgresStudyStore {
         AccountStudyStore {
             client: &self.client,
             scope,
+            generation_lease_fence: None,
         }
     }
 
@@ -1620,10 +2104,17 @@ impl PostgresStudyStore {
         now_ms: i64,
         lease_ms: i64,
     ) -> Result<bool, PostgresStoreError> {
-        let changed = self.client.borrow_mut().execute(
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+            &[&account_id],
+        )?;
+        let changed = transaction.execute(
             RENEW_GENERATION_JOB_SQL,
             &[&account_id, &job_id, &lease_token, &now_ms, &lease_ms],
         )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -1666,40 +2157,6 @@ impl PostgresStudyStore {
             &[&account_id, &run_id],
         )?;
         Ok(row.get(0))
-    }
-
-    /// Check whether a durable generation attempt still owns the exact lease
-    /// token and remains unexpired at the commit boundary.
-    ///
-    /// # Errors
-    /// Returns the Postgres error when the receipt cannot be read.
-    pub fn generation_job_attempt_has_commit_fence(
-        &mut self,
-        account_id: &str,
-        run_id: &str,
-        attempt: i32,
-        lease_token: &str,
-        now_ms: i64,
-    ) -> Result<bool, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT 1
-             FROM memory_engine_generation_job_attempts attempt
-             JOIN memory_engine_generation_jobs job
-               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
-             WHERE attempt.account_id = $1::TEXT
-               AND attempt.generation_run_id = $2::TEXT
-               AND attempt.attempt = $3::INTEGER
-               AND attempt.lease_token = $4::TEXT
-               AND attempt.status = 'running'
-               AND job.status = 'running'
-               AND job.attempts = attempt.attempt
-               AND job.lease_token = attempt.lease_token
-               AND job.lease_expires_at_ms > $5::BIGINT
-             FOR UPDATE OF attempt, job
-             LIMIT 1",
-            &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
-        )?;
-        Ok(row.is_some())
     }
 
     /// Read the receipt for one exact durable provider attempt.
@@ -1792,7 +2249,27 @@ impl PostgresStudyStore {
             "SELECT pg_advisory_xact_lock($1::BIGINT)",
             &[&9_301_093_i64],
         )?;
-        transaction.execute(
+        let stale_account_rows = transaction.query(
+            "SELECT DISTINCT attempt.account_id
+             FROM memory_engine_generation_job_attempts attempt
+             JOIN memory_engine_generation_jobs job
+               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
+             WHERE job.status = 'running' AND job.attempts = attempt.attempt
+               AND job.lease_token = attempt.lease_token
+               AND (job.lease_expires_at_ms IS NULL
+                    OR job.lease_expires_at_ms + $2::BIGINT < $1::BIGINT)
+               AND attempt.status = 'running'
+             ORDER BY attempt.account_id",
+            &[&now_ms, &reclaim_grace_ms],
+        )?;
+        for row in stale_account_rows {
+            let account_id: String = row.get(0);
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+                &[&account_id],
+            )?;
+        }
+        let stale_run_rows = transaction.query(
             "UPDATE memory_engine_generation_job_attempts attempt
              SET status = 'stale',
                  cost_usd_micros = CASE
@@ -1818,9 +2295,26 @@ impl PostgresStudyStore {
                AND job.lease_token = attempt.lease_token
                AND (job.lease_expires_at_ms IS NULL
                     OR job.lease_expires_at_ms + $2::BIGINT < $1::BIGINT)
-               AND attempt.status = 'running'",
+               AND attempt.status = 'running'
+             RETURNING attempt.account_id, attempt.generation_run_id",
             &[&now_ms, &reclaim_grace_ms],
         )?;
+        for row in stale_run_rows {
+            let account_id: String = row.get(0);
+            let run_id: Option<String> = row.get(1);
+            let Some(run_id) = run_id else { continue };
+            let unfinalized = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_engine_generation_runs
+                     WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT
+                       AND COALESCE(run->>'status', '') <> 'finalized'",
+                    &[&account_id, &run_id],
+                )?
+                .is_some();
+            if unfinalized {
+                cleanup_generation_run(&mut transaction, &account_id, &run_id)?;
+            }
+        }
         transaction.execute(
             "UPDATE memory_engine_generation_jobs
              SET status = 'failed', error = 'Maximum generation attempts exhausted.',
@@ -1933,6 +2427,10 @@ impl PostgresStudyStore {
         };
         let mut client = self.client.borrow_mut();
         let mut transaction = client.transaction()?;
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::TEXT, 0))",
+            &[&account_id],
+        )?;
         let attempt_row = transaction.query_opt(
             "SELECT attempt, reservation_cost_usd_micros, generation_run_id
              FROM memory_engine_generation_job_attempts
@@ -1951,14 +2449,14 @@ impl PostgresStudyStore {
         let run_cost = generation_run_id.as_deref().and_then(|run_id| {
             transaction
                 .query_opt(
-                    "SELECT COALESCE((run->'usage'->>'costUsdMicros')::BIGINT, 0)::BIGINT
+                    "SELECT (run->'usage'->>'costUsdMicros')::BIGINT
                      FROM memory_engine_generation_runs
                      WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
                     &[&account_id, &run_id],
                 )
                 .ok()
                 .flatten()
-                .map(|row| row.get(0))
+                .and_then(|row| row.get::<_, Option<i64>>(0))
         });
         let current = transaction.query_opt(
             "SELECT status, lease_token, lease_expires_at_ms
@@ -2053,6 +2551,150 @@ impl PostgresStudyStore {
         )?;
         Ok(changed == 1)
     }
+
+    /// Record a waitlist join and append a `joined` audit-log entry.
+    /// Idempotent on normalized email: a repeat join only bumps
+    /// `updated_at_ms` and still appends its own audit row, so the log
+    /// reflects every touch, not just the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn waitlist_join(
+        &mut self,
+        email_normalized: &str,
+        source: &str,
+        now_ms: i64,
+    ) -> Result<(), PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_waitlist_entries
+                (email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms)
+             VALUES ($1, $2, $3, $3, NULL)
+             ON CONFLICT (email_normalized) DO UPDATE
+             SET updated_at_ms = EXCLUDED.updated_at_ms",
+            &[&email_normalized, &source, &now_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+             VALUES ($1, 'joined', $2)",
+            &[&email_normalized, &now_ms],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// List every waitlist entry, ordered by normalized email.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn waitlist_list(&mut self) -> Result<Vec<PostgresWaitlistEntry>, PostgresStoreError> {
+        let rows = self.client.borrow_mut().query(
+            "SELECT email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms
+             FROM memory_engine_waitlist_entries
+             ORDER BY email_normalized",
+            &[],
+        )?;
+        Ok(rows.iter().map(waitlist_entry_from_row).collect())
+    }
+
+    /// Mark one waitlist entry invited, idempotently, appending an
+    /// `invited` audit-log entry only on the first transition. Returns
+    /// `None` when no entry matches the normalized email.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read or write.
+    pub fn waitlist_mark_invited(
+        &mut self,
+        email_normalized: &str,
+        now_ms: i64,
+    ) -> Result<Option<PostgresWaitlistEntry>, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
+        let Some(row) = transaction.query_opt(
+            "SELECT email_normalized, source, created_at_ms, updated_at_ms, invited_at_ms
+             FROM memory_engine_waitlist_entries
+             WHERE email_normalized = $1
+             FOR UPDATE",
+            &[&email_normalized],
+        )?
+        else {
+            transaction.rollback()?;
+            return Ok(None);
+        };
+        let existing_invited_at_ms: Option<i64> = row.get(4);
+        if existing_invited_at_ms.is_none() {
+            transaction.execute(
+                "UPDATE memory_engine_waitlist_entries
+                 SET invited_at_ms = $2
+                 WHERE email_normalized = $1",
+                &[&email_normalized, &now_ms],
+            )?;
+            transaction.execute(
+                "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+                 VALUES ($1, 'invited', $2)",
+                &[&email_normalized, &now_ms],
+            )?;
+        }
+        let entry = PostgresWaitlistEntry {
+            email: row.get(0),
+            source: row.get(1),
+            created_at_ms: row.get(2),
+            updated_at_ms: row.get(3),
+            invited_at_ms: Some(existing_invited_at_ms.unwrap_or(now_ms)),
+        };
+        transaction.commit()?;
+        Ok(Some(entry))
+    }
+
+    /// Delete one waitlist entry and append a `deleted` audit-log entry.
+    /// Returns `false` when no entry matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
+    pub fn waitlist_delete(
+        &mut self,
+        email_normalized: &str,
+        now_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        transaction.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&email_normalized],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM memory_engine_waitlist_entries WHERE email_normalized = $1",
+            &[&email_normalized],
+        )?;
+        if deleted > 0 {
+            transaction.execute(
+                "INSERT INTO memory_engine_waitlist_audit_log (email_normalized, event, occurred_at_ms)
+                 VALUES ($1, 'deleted', $2)",
+                &[&email_normalized, &now_ms],
+            )?;
+            transaction.execute(
+                "UPDATE memory_engine_auth_challenges
+                 SET consumed_at_ms = $2
+                 WHERE email_normalized = $1 AND consumed_at_ms IS NULL",
+                &[&email_normalized, &now_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
 }
 
 fn generation_job_from_row(row: &postgres::Row) -> PostgresGenerationJob {
@@ -2078,13 +2720,48 @@ fn generation_job_from_row(row: &postgres::Row) -> PostgresGenerationJob {
     }
 }
 
+fn waitlist_entry_from_row(row: &postgres::Row) -> PostgresWaitlistEntry {
+    PostgresWaitlistEntry {
+        email: row.get(0),
+        source: row.get(1),
+        created_at_ms: row.get(2),
+        updated_at_ms: row.get(3),
+        invited_at_ms: row.get(4),
+    }
+}
+
+enum PostgresLearnerDecision {
+    Keep,
+    Edit {
+        prompt_text: String,
+        expected_answer: String,
+    },
+    Reject,
+}
+
+#[derive(Clone)]
+struct GenerationLeaseFence {
+    run_id: String,
+    attempt: i32,
+    lease_token: String,
+}
+
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
     client: &'a RefCell<CountingClient>,
     scope: AccountScope,
+    generation_lease_fence: Option<GenerationLeaseFence>,
 }
 
 impl AccountStudyStore<'_> {
+    pub fn set_generation_lease_fence(&mut self, run_id: &str, attempt: i32, lease_token: &str) {
+        self.generation_lease_fence = Some(GenerationLeaseFence {
+            run_id: run_id.to_owned(),
+            attempt,
+            lease_token: lease_token.to_owned(),
+        });
+    }
+
     /// Serialize every per-account study mutation across Postgres connections.
     ///
     /// The concept selector takes this same key before reading review units,
@@ -2102,6 +2779,35 @@ impl AccountStudyStore<'_> {
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&account_id],
         )?;
+        if let Some(fence) = self.generation_lease_fence.as_ref() {
+            let valid = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM memory_engine_generation_job_attempts attempt
+                     JOIN memory_engine_generation_jobs job
+                       ON job.account_id = attempt.account_id
+                      AND job.job_id = attempt.job_id
+                     WHERE attempt.account_id = $1::TEXT
+                       AND attempt.generation_run_id = $2::TEXT
+                       AND attempt.attempt = $3::INTEGER
+                       AND attempt.lease_token = $4::TEXT
+                       AND attempt.status = 'running'
+                       AND job.status = 'running'
+                       AND job.attempts = attempt.attempt
+                       AND job.lease_token = attempt.lease_token
+                     LIMIT 1",
+                    &[
+                        &account_id,
+                        &fence.run_id,
+                        &fence.attempt,
+                        &fence.lease_token,
+                    ],
+                )?
+                .is_some();
+            if !valid {
+                return Err(PostgresStoreError::GenerationLeaseLost);
+            }
+        }
         let result = operation(&mut transaction)?;
         transaction.commit()?;
         Ok(result)
@@ -2192,41 +2898,100 @@ impl AccountStudyStore<'_> {
         Ok(())
     }
 
-    /// Persist the latest API session token for the scoped account.
+    /// Persist one independently expiring API session. The caller supplies the
+    /// SHA-256 token hash; raw bearer credentials never cross this adapter.
     ///
     /// # Errors
     ///
-    /// Returns [`PostgresStoreError`] when the session cannot be saved.
+    /// Returns [`PostgresStoreError`] when Postgres rejects the write.
     pub fn save_api_session(
         &mut self,
-        session_token: &str,
-        updated_at_ms: i64,
+        session_token_hash: &str,
+        created_at_ms: i64,
+        expires_at_ms: i64,
     ) -> Result<(), PostgresStoreError> {
         self.client.borrow_mut().execute(
-            "INSERT INTO memory_engine_api_sessions (account_id, session_token, updated_at_ms)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (account_id) DO UPDATE
-             SET session_token = EXCLUDED.session_token,
-                 updated_at_ms = EXCLUDED.updated_at_ms",
-            &[&self.scope.account_id, &session_token, &updated_at_ms],
+            "INSERT INTO memory_engine_api_sessions
+                (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
+             VALUES ($1, $2, $3, $4, NULL)
+             ON CONFLICT (session_token_hash) DO UPDATE
+             SET account_id = EXCLUDED.account_id,
+                 created_at_ms = EXCLUDED.created_at_ms,
+                 expires_at_ms = EXCLUDED.expires_at_ms,
+                 revoked_at_ms = NULL",
+            &[
+                &session_token_hash,
+                &self.scope.account_id,
+                &created_at_ms,
+                &expires_at_ms,
+            ],
         )?;
-
         Ok(())
     }
 
-    /// Check whether the supplied API session token is current for this account.
+    /// Check one hashed API session while enforcing expiry and revocation.
     ///
     /// # Errors
     ///
     /// Returns [`PostgresStoreError`] when Postgres rejects the read.
-    pub fn api_session_matches(&self, session_token: &str) -> Result<bool, PostgresStoreError> {
+    pub fn api_session_matches(
+        &self,
+        session_token_hash: &str,
+        now_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
         let row = self.client.borrow_mut().query_opt(
             "SELECT 1 FROM memory_engine_api_sessions
-             WHERE account_id = $1 AND session_token = $2",
-            &[&self.scope.account_id, &session_token],
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL AND expires_at_ms > $3",
+            &[&self.scope.account_id, &session_token_hash, &now_ms],
         )?;
-
         Ok(row.is_some())
+    }
+
+    /// Revoke one API session without affecting other credentials for the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn revoke_api_session(
+        &mut self,
+        session_token_hash: &str,
+        revoked_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let changed = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_api_sessions
+             SET revoked_at_ms = $3
+             WHERE account_id = $1 AND session_token_hash = $2
+               AND revoked_at_ms IS NULL",
+            &[&self.scope.account_id, &session_token_hash, &revoked_at_ms],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Revoke every standalone API session for the account. Browser
+    /// sessions are an independent scope: any API session currently backing
+    /// a live (non-revoked) row in `memory_engine_browser_sessions` is
+    /// preserved, not revoked. Use
+    /// [`PostgresStudyStore::revoke_browser_sessions_for_account`] to sign
+    /// out browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn revoke_api_sessions(&mut self, revoked_at_ms: i64) -> Result<u64, PostgresStoreError> {
+        self.client
+            .borrow_mut()
+            .execute(
+                "UPDATE memory_engine_api_sessions
+                 SET revoked_at_ms = $2
+                 WHERE account_id = $1 AND revoked_at_ms IS NULL
+                   AND session_token_hash NOT IN (
+                       SELECT session_token_hash FROM memory_engine_browser_sessions
+                       WHERE account_id = $1 AND revoked_at_ms IS NULL
+                   )",
+                &[&self.scope.account_id, &revoked_at_ms],
+            )
+            .map_err(Into::into)
     }
 
     /// Check whether a client review idempotency key already applied.
@@ -2284,24 +3049,72 @@ impl AccountStudyStore<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected, or has
-    /// no saved generation run.
-    pub fn approve_generated_prompt_draft(
+    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected,
+    /// already decided, or cannot be persisted.
+    pub fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
+        decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
-        let ApproveGeneratedPromptDraftOptions {
-            initial_schedule_state,
-        } = options;
+        self.decide_learner_draft(draft_id, &PostgresLearnerDecision::Keep, decided_at)?
+            .1
+            .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
+    }
+
+    /// Edit an accepted generated draft and promote it into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, invalid,
+    /// already decided, or cannot be persisted.
+    pub fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
+        self.decide_learner_draft(
+            draft_id,
+            &PostgresLearnerDecision::Edit {
+                prompt_text: prompt_text.to_owned(),
+                expected_answer: expected_answer.to_owned(),
+            },
+            decided_at,
+        )?
+        .1
+        .ok_or(PostgresStoreError::RejectedGeneratedPromptDraft)
+    }
+
+    /// Record a terminal rejection for an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, already
+    /// decided, or cannot be persisted.
+    pub fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, PostgresStoreError> {
+        self.decide_learner_draft(draft_id, &PostgresLearnerDecision::Reject, decided_at)?
+            .0
+            .ok_or_else(|| PostgresStoreError::UnknownGeneratedPromptDraft(draft_id.to_owned()))
+    }
+
+    fn decide_learner_draft(
+        &mut self,
+        draft_id: &str,
+        decision: &PostgresLearnerDecision,
+        decided_at: i64,
+    ) -> Result<(Option<GeneratedPromptDraft>, Option<BetaReviewUnitRecord>), PostgresStoreError>
+    {
         let account_id = self.scope.account_id.clone();
         let draft_id = draft_id.to_owned();
         self.with_account_transaction(|transaction| {
-            let draft: GeneratedPromptDraft = transaction
+            let mut draft: GeneratedPromptDraft = transaction
                 .query_opt(
-                    "SELECT draft FROM memory_engine_generated_prompt_drafts
-                     WHERE account_id = $1 AND draft_id = $2
-                     FOR UPDATE",
+                    "SELECT draft FROM memory_engine_generated_prompt_drafts WHERE account_id = $1 AND draft_id = $2 FOR UPDATE",
                     &[&account_id, &draft_id],
                 )?
                 .map(|row| {
@@ -2313,24 +3126,57 @@ impl AccountStudyStore<'_> {
             if draft.validation.status != GeneratedPromptValidationStatus::Accepted {
                 return Err(PostgresStoreError::RejectedGeneratedPromptDraft);
             }
-            let generation_run_exists = draft
-                .generation_run_id
-                .as_ref()
-                .map(|run_id| {
-                    transaction
-                        .query_opt(
-                            "SELECT 1 FROM memory_engine_generation_runs
-                             WHERE account_id = $1 AND generation_run_id = $2",
-                            &[&account_id, run_id],
-                        )
-                        .map(|row| row.is_some())
-                })
-                .transpose()?
-                .unwrap_or(false);
-            if !generation_run_exists {
+            if let Some(recorded) = draft.learner_decision.as_ref() {
+                if learner_decision_matches(&draft, recorded, decision) {
+                    if matches!(decision, &PostgresLearnerDecision::Reject) {
+                        return Ok((Some(draft), None));
+                    }
+                    let existing = review_unit_from_transaction(transaction, &account_id, &draft.review_unit_id)?;
+                    return Ok((Some(draft), Some(existing)));
+                }
+                return Err(PostgresStoreError::LearnerDraftDecisionAlreadyRecorded(draft_id.clone()));
+            }
+            let run_id = draft.generation_run_id.as_ref().ok_or(PostgresStoreError::MissingGenerationRunForAcceptedDraft)?;
+            let run_exists = transaction
+                .query_opt(
+                    "SELECT 1
+                     FROM memory_engine_generation_runs
+                     WHERE account_id = $1 AND generation_run_id = $2
+                       AND (run->>'status' = 'finalized'
+                            OR (run->>'status' IS NULL AND (run->>'completedAt') IS NOT NULL
+                                AND (run->>'completedAt')::BIGINT <> -9223372036854775808))",
+                    &[&account_id, run_id],
+                )?
+                .is_some();
+            if !run_exists {
                 return Err(PostgresStoreError::MissingGenerationRunForAcceptedDraft);
             }
-
+            let reject = matches!(decision, &PostgresLearnerDecision::Reject);
+            let edited = matches!(decision, &PostgresLearnerDecision::Edit { .. });
+            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = decision {
+                let prompt_text = prompt_text.trim();
+                let expected_answer = expected_answer.trim();
+                assert_non_blank(prompt_text, "Learner prompt")?;
+                assert_non_blank(expected_answer, "Learner expected answer")?;
+                replace_prompt_text(&mut draft.prompt, prompt_text);
+                replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+                if !draft.critique_notes.iter().any(|note| note == "Learner edited pending wording.") {
+                    draft.critique_notes.push("Learner edited pending wording.".to_owned());
+                }
+            }
+            draft.learner_decision = Some(if reject {
+                LearnerDraftDecision::Rejected { decided_at }
+            } else {
+                LearnerDraftDecision::Kept { edited, decided_at }
+            });
+            let draft_value = serde_json::to_value(&draft)?;
+            transaction.execute(
+                "UPDATE memory_engine_generated_prompt_drafts SET draft = $3 WHERE account_id = $1 AND draft_id = $2",
+                &[&account_id, &draft_id, &draft_value],
+            )?;
+            if reject {
+                return Ok((Some(draft), None));
+            }
             let review_unit = BetaReviewUnitRecord {
                 review_unit_id: draft.review_unit_id.clone(),
                 prompt_id: draft.prompt_id.clone(),
@@ -2346,45 +3192,22 @@ impl AccountStudyStore<'_> {
             };
             let value = serde_json::to_value(&review_unit)?;
             let inserted = transaction.execute(
-                "INSERT INTO memory_engine_review_units
-                    (account_id, review_unit_id, record, created_at_ms, archived_at_ms)
-                 VALUES ($1, $2, $3, $4, NULL)
-                 ON CONFLICT (account_id, review_unit_id) DO NOTHING",
-                &[
-                    &account_id,
-                    &review_unit.review_unit_id.as_str(),
-                    &value,
-                    &review_unit.created_at,
-                ],
+                "INSERT INTO memory_engine_review_units (account_id, review_unit_id, record, created_at_ms, archived_at_ms) VALUES ($1, $2, $3, $4, NULL) ON CONFLICT (account_id, review_unit_id) DO NOTHING",
+                &[&account_id, &review_unit.review_unit_id.as_str(), &value, &review_unit.created_at],
             )?;
             if inserted == 0 {
-                return review_unit_from_transaction(
-                    transaction,
-                    &account_id,
-                    &review_unit.review_unit_id,
-                );
+                return Ok((Some(draft), Some(review_unit_from_transaction(transaction, &account_id, &review_unit.review_unit_id)?)));
             }
-            if let Some(schedule_state) = initial_schedule_state.as_ref() {
-                let schedule_value = serde_json::to_value(schedule_state)?;
-                transaction.execute(
-                    "INSERT INTO memory_engine_schedules
-                        (account_id, review_unit_id, state, updated_at_ms)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (account_id, review_unit_id) DO UPDATE
-                     SET state = EXCLUDED.state,
-                         updated_at_ms = EXCLUDED.updated_at_ms",
-                    &[
-                        &account_id,
-                        &review_unit.review_unit_id.as_str(),
-                        &schedule_value,
-                        &draft.created_at,
-                    ],
-                )?;
-            }
-            Ok(review_unit)
+            Ok((Some(draft), Some(review_unit)))
         })
     }
 
+    /// Promote an accepted generated draft into a review unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the draft is unknown, rejected, or has
+    /// no saved generation run.
     /// Replace review prompt text while preserving the same review unit.
     ///
     /// # Errors
@@ -2430,11 +3253,11 @@ impl AccountStudyStore<'_> {
                 if !draft
                     .critique_notes
                     .iter()
-                    .any(|note| note == "Learner edited approved wording.")
+                    .any(|note| note == "Learner edited kept wording.")
                 {
                     draft
                         .critique_notes
-                        .push("Learner edited approved wording.".to_owned());
+                        .push("Learner edited kept wording.".to_owned());
                 }
                 let draft_value = serde_json::to_value(draft)?;
                 transaction.execute(
@@ -2803,6 +3626,40 @@ impl AccountStudyStore<'_> {
         })
     }
 
+    /// Update a source permission within this account. Archived sources are
+    /// retained for provenance but are not editable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the source is unknown, archived, or
+    /// persistence fails.
+    pub fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: memory_engine_persistence::SourcePermission,
+    ) -> Result<SourceDocument, PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        let source_document_id = source_document_id.to_owned();
+        self.with_account_transaction(|transaction| {
+            let mut document =
+                source_document_from_transaction(transaction, &account_id, &source_document_id)?;
+            if document.archived_at.is_some() {
+                return Err(PostgresStoreError::SourceDocumentArchived(
+                    source_document_id.clone(),
+                ));
+            }
+            document.permission = permission;
+            let value = serde_json::to_value(&document)?;
+            transaction.execute(
+                "UPDATE memory_engine_source_documents
+                 SET document = $3
+                 WHERE account_id = $1 AND source_document_id = $2",
+                &[&account_id, &source_document_id, &value],
+            )?;
+            Ok(document)
+        })
+    }
+
     /// Save or replace a source reference span for the scoped account.
     ///
     /// # Errors
@@ -2841,7 +3698,12 @@ impl AccountStudyStore<'_> {
     ///
     /// Returns [`PostgresStoreError`] when serialization or persistence fails.
     pub fn save_generation_run(&mut self, run: &GenerationRun) -> Result<(), PostgresStoreError> {
-        let value = serde_json::to_value(run)?;
+        let mut value = serde_json::to_value(run)?;
+        if run.completed_at == Some(i64::MIN) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("status".to_owned(), serde_json::json!("pending"));
+            }
+        }
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
             transaction.execute(
@@ -2855,45 +3717,6 @@ impl AccountStudyStore<'_> {
             )?;
             Ok(())
         })
-    }
-
-    /// Check whether a generation run still belongs to the currently active
-    /// job attempt for the scoped account and exact lease token.
-    ///
-    /// # Errors
-    /// Returns [`PostgresStoreError`] when the receipt cannot be read.
-    pub fn generation_job_attempt_has_commit_fence(
-        &mut self,
-        run_id: &str,
-        attempt: i32,
-        lease_token: &str,
-        now_ms: i64,
-    ) -> Result<bool, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_opt(
-            "SELECT 1
-             FROM memory_engine_generation_job_attempts attempt
-             JOIN memory_engine_generation_jobs job
-               ON job.account_id = attempt.account_id AND job.job_id = attempt.job_id
-             WHERE attempt.account_id = $1::TEXT
-               AND attempt.generation_run_id = $2::TEXT
-               AND attempt.attempt = $3::INTEGER
-               AND attempt.lease_token = $4::TEXT
-               AND attempt.status = 'running'
-               AND job.status = 'running'
-               AND job.attempts = attempt.attempt
-               AND job.lease_token = attempt.lease_token
-               AND job.lease_expires_at_ms > $5::BIGINT
-             FOR UPDATE OF attempt, job
-             LIMIT 1",
-            &[
-                &self.scope.account_id,
-                &run_id,
-                &attempt,
-                &lease_token,
-                &now_ms,
-            ],
-        )?;
-        Ok(row.is_some())
     }
 
     /// Execute a block of mutations inside one SQL transaction.
@@ -2975,6 +3798,226 @@ impl AccountStudyStore<'_> {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Remove pending output for one account-scoped generation run.
+    ///
+    /// The operation is idempotent and never touches another run or account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when the transaction cannot be committed.
+    pub fn discard_generation_run(&mut self, run_id: &str) -> Result<(), PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            // Keep a draft that was explicitly decided while the worker lease
+            // was being fenced. The advisory transaction lock serializes this
+            // rollback with learner keep/edit/reject decisions on every replica.
+            let stale = transaction.query(
+                "SELECT draft_id, draft->'referenceSpanIds'
+                 FROM memory_engine_generated_prompt_drafts
+                 WHERE account_id = $1
+                   AND draft->>'generationRunId' = $2
+                   AND draft->'learnerDecision' IS NULL",
+                &[&account_id, &run_id],
+            )?;
+            let mut stale_draft_ids = Vec::with_capacity(stale.len());
+            let mut stale_reference_span_ids = std::collections::BTreeSet::new();
+            for row in stale {
+                let draft_id: String = row.get(0);
+                let references: serde_json::Value = row.get(1);
+                stale_draft_ids.push(draft_id);
+                for reference in references.as_array().into_iter().flatten() {
+                    if let Some(reference_id) = reference.as_str() {
+                        stale_reference_span_ids.insert(reference_id.to_owned());
+                    }
+                }
+                // Review-unit ownership is stored on the promoted record.
+                // The draft's deterministic review_unit_id can be reused by
+                // another run and is not a safe deletion key.
+            }
+            if !stale_draft_ids.is_empty() {
+                let owned_units = transaction.query(
+                    "SELECT review_unit_id
+                     FROM memory_engine_review_units
+                     WHERE account_id = $1
+                       AND record->>'generatedPromptDraftId' = ANY($2::TEXT[])",
+                    &[&account_id, &stale_draft_ids],
+                )?;
+                for row in owned_units {
+                    transaction.execute(
+                        "DELETE FROM memory_engine_review_units
+                         WHERE account_id = $1 AND review_unit_id = $2",
+                        &[&account_id, &row.get::<_, String>(0)],
+                    )?;
+                }
+            }
+            for draft_id in &stale_draft_ids {
+                transaction.execute(
+                    "DELETE FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1 AND draft_id = $2",
+                    &[&account_id, draft_id],
+                )?;
+            }
+            let run_has_decided_draft = transaction
+                .query_opt(
+                    "SELECT 1 FROM memory_engine_generated_prompt_drafts
+                     WHERE account_id = $1 AND draft->>'generationRunId' = $2
+                     LIMIT 1",
+                    &[&account_id, &run_id],
+                )?
+                .is_some();
+            if !run_has_decided_draft {
+                transaction.execute(
+                    "DELETE FROM memory_engine_generation_runs
+                     WHERE account_id = $1 AND generation_run_id = $2",
+                    &[&account_id, &run_id],
+                )?;
+            }
+            for reference_id in stale_reference_span_ids {
+                let referenced_by_draft = transaction
+                    .query_opt(
+                        "SELECT 1 FROM memory_engine_generated_prompt_drafts
+                         WHERE account_id = $1 AND draft->'referenceSpanIds' ? $2
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                let referenced_by_review = transaction
+                    .query_opt(
+                        "SELECT 1 FROM memory_engine_review_units
+                         WHERE account_id = $1 AND record->'referenceSpanIds' ? $2
+                         LIMIT 1",
+                        &[&account_id, &reference_id],
+                    )?
+                    .is_some();
+                if !referenced_by_draft && !referenced_by_review {
+                    transaction.execute(
+                        "DELETE FROM memory_engine_reference_spans
+                         WHERE account_id = $1 AND reference_span_id = $2",
+                        &[&account_id, &reference_id],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically fence a generation attempt and remove its complete stale
+    /// output closure when the lease is no longer owned.
+    #[allow(clippy::too_many_lines)]
+    ///
+    /// The account advisory transaction lock serializes this fence with every
+    /// learner decision on every connection. Generation-job attempt ledger rows
+    /// are intentionally retained for recovery and audit.
+    ///
+    /// # Errors
+    /// Returns [`PostgresStoreError`] when the transaction cannot be committed.
+    pub fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, PostgresStoreError> {
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            let lease_row = if lease_valid {
+                transaction.query_opt(
+                    "SELECT attempt.job_id
+                         FROM memory_engine_generation_job_attempts attempt
+                         JOIN memory_engine_generation_jobs job
+                           ON job.account_id = attempt.account_id
+                          AND job.job_id = attempt.job_id
+                         WHERE attempt.account_id = $1::TEXT
+                           AND attempt.generation_run_id = $2::TEXT
+                           AND attempt.attempt = $3::INTEGER
+                           AND attempt.lease_token = $4::TEXT
+                           AND attempt.status = 'running'
+                           AND job.status = 'running'
+                           AND job.attempts = attempt.attempt
+                           AND job.lease_token = attempt.lease_token
+                           AND job.lease_expires_at_ms > $5::BIGINT
+                         FOR UPDATE OF attempt, job
+                         LIMIT 1",
+                    &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
+                )?
+            } else {
+                None
+            };
+            if let Some(lease_row) = lease_row {
+                let job_id: String = lease_row.get(0);
+                let updated = transaction.execute(
+                    "UPDATE memory_engine_generation_runs
+                     SET run = jsonb_set(
+                         jsonb_set(run, '{completedAt}', to_jsonb($3::BIGINT), true),
+                         '{status}', '\"finalized\"'::JSONB, true)
+                     WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT",
+                    &[&account_id, &run_id, &now_ms],
+                )?;
+                if updated != 1 {
+                    return Ok(false);
+                }
+                let attempt_updated = transaction.execute(
+                    "UPDATE memory_engine_generation_job_attempts
+                     SET status = 'succeeded', cost_usd_micros = COALESCE(
+                         (SELECT (run->'usage'->>'costUsdMicros')::BIGINT
+                          FROM memory_engine_generation_runs
+                          WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT),
+                         reservation_cost_usd_micros,
+                         0::BIGINT),
+                         reserved_cost_usd_micros = 0::BIGINT, error = NULL::TEXT,
+                         completed_at_ms = $3::BIGINT, updated_at_ms = $3::BIGINT
+                     WHERE account_id = $1::TEXT AND job_id = $4::TEXT
+                       AND attempt = $5::INTEGER AND lease_token = $6::TEXT
+                       AND status = 'running'",
+                    &[
+                        &account_id,
+                        &run_id,
+                        &now_ms,
+                        &job_id,
+                        &attempt,
+                        &lease_token,
+                    ],
+                )?;
+                let job_updated = transaction.execute(
+                    "UPDATE memory_engine_generation_jobs
+                     SET status = 'succeeded', card_count = 0,
+                         cost_usd_micros = COALESCE(
+                             (SELECT (run->'usage'->>'costUsdMicros')::BIGINT
+                              FROM memory_engine_generation_runs
+                              WHERE account_id = $1::TEXT AND generation_run_id = $6::TEXT),
+                             (SELECT cost_usd_micros
+                              FROM memory_engine_generation_job_attempts
+                              WHERE account_id = $1::TEXT AND job_id = $3::TEXT
+                                AND attempt = $4::INTEGER AND lease_token = $5::TEXT),
+                             0::BIGINT),
+                         error = NULL::TEXT, retry_at_ms = NULL::BIGINT,
+                         lease_owner = NULL::TEXT,
+                         lease_expires_at_ms = NULL::BIGINT, lease_token = NULL::TEXT,
+                         reserved_cost_usd_micros = 0::BIGINT, updated_at_ms = $2::BIGINT
+                     WHERE account_id = $1::TEXT AND job_id = $3::TEXT
+                       AND attempts = $4::INTEGER AND lease_token = $5::TEXT
+                       AND status = 'running'",
+                    &[
+                        &account_id,
+                        &now_ms,
+                        &job_id,
+                        &attempt,
+                        &lease_token,
+                        &run_id,
+                    ],
+                )?;
+                if attempt_updated != 1 || job_updated != 1 {
+                    return Err(PostgresStoreError::GenerationFinalizationIncomplete);
+                }
+                return Ok(true);
+            }
+
+            cleanup_generation_run(transaction, &account_id, run_id)?;
+            Ok(false)
         })
     }
 
@@ -3095,6 +4138,31 @@ impl AccountStudyStore<'_> {
             .map_err(|error| PostgresStoreError::StudySession(error.to_string()))
     }
 
+    /// Export every durable learner draft decision with source and model provenance.
+    ///
+    /// The query is account-scoped and uses the same export contract as the file
+    /// store, so calibration receipts remain portable between backends.
+    ///
+    /// # Errors
+    /// Returns `PostgresStoreError` when the scoped snapshot cannot be read or
+    /// a decision cannot resolve its generation-run provenance.
+    pub fn export_learner_draft_decisions(
+        &self,
+    ) -> Result<Vec<LearnerDraftDecisionExport>, PostgresStoreError> {
+        let snapshot = self.snapshot()?;
+        memory_engine_persistence::export_learner_draft_decisions(&snapshot)
+            .map_err(|error| PostgresStoreError::StudySession(error.to_string()))
+    }
+
+    /// Export durable learner draft decisions as JSON.
+    ///
+    /// # Errors
+    /// Returns `PostgresStoreError` when snapshot reads or JSON encoding fail.
+    pub fn export_learner_draft_decisions_json(&self) -> Result<String, PostgresStoreError> {
+        serde_json::to_string_pretty(&self.export_learner_draft_decisions()?)
+            .map_err(PostgresStoreError::Json)
+    }
+
     /// Set or clear the schedule for a review unit in the scoped account.
     ///
     /// # Errors
@@ -3187,6 +4255,28 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
 
         Ok(pack)
     }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        AccountStudyStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        generation_attempt: i32,
+        lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        AccountStudyStore::finalize_generation_run(
+            self,
+            run_id,
+            generation_attempt,
+            lease_token,
+            now_ms,
+            lease_valid,
+        )
+    }
 }
 
 impl ContentFeedbackStore for AccountStudyStore<'_> {
@@ -3218,12 +4308,44 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         AccountStudyStore::archive_source_document(self, source_document_id, archived_at)
     }
 
-    fn approve_generated_prompt_draft(
+    fn update_source_document_permission(
+        &mut self,
+        source_document_id: &str,
+        permission: SourcePermission,
+    ) -> Result<SourceDocument, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::update_source_document_permission(self, source_document_id, permission)
+    }
+
+    fn keep_generated_prompt_draft(
         &mut self,
         draft_id: &str,
-        options: ApproveGeneratedPromptDraftOptions,
+        decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
-        AccountStudyStore::approve_generated_prompt_draft(self, draft_id, options)
+        AccountStudyStore::keep_generated_prompt_draft(self, draft_id, decided_at)
+    }
+
+    fn edit_and_keep_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        prompt_text: &str,
+        expected_answer: &str,
+        decided_at: i64,
+    ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::edit_and_keep_generated_prompt_draft(
+            self,
+            draft_id,
+            prompt_text,
+            expected_answer,
+            decided_at,
+        )
+    }
+
+    fn reject_generated_prompt_draft(
+        &mut self,
+        draft_id: &str,
+        decided_at: i64,
+    ) -> Result<GeneratedPromptDraft, <Self as MemoryServiceStore>::Error> {
+        AccountStudyStore::reject_generated_prompt_draft(self, draft_id, decided_at)
     }
 
     fn update_review_unit_prompt_text(
@@ -3653,11 +4775,15 @@ pub enum PostgresStoreError {
     InvalidBooleanAnswer,
     NoConceptKey,
     UnknownSourceDocument(String),
+    SourceDocumentArchived(String),
     UnknownReviewUnit(ReviewUnitId),
     ReviewUnitArchived(ReviewUnitId),
     UnknownGeneratedPromptDraft(String),
     RejectedGeneratedPromptDraft,
+    LearnerDraftDecisionAlreadyRecorded(String),
     MissingGenerationRunForAcceptedDraft,
+    GenerationLeaseLost,
+    GenerationFinalizationIncomplete,
     ReviewUnitMismatch,
     ScheduleLastReviewMismatch,
     DuplicateAppliedReview(String),
@@ -3686,6 +4812,9 @@ impl fmt::Display for PostgresStoreError {
             }
             Self::NoConceptKey => formatter.write_str("The active review unit has no concept key"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::SourceDocumentArchived(id) => {
+                write!(formatter, "Source document is archived: {id}")
+            }
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::ReviewUnitArchived(id) => write!(formatter, "Review unit is archived: {id}"),
             Self::UnknownGeneratedPromptDraft(id) => {
@@ -3694,8 +4823,15 @@ impl fmt::Display for PostgresStoreError {
             Self::RejectedGeneratedPromptDraft => {
                 formatter.write_str("Generated prompt draft is not accepted")
             }
+            Self::LearnerDraftDecisionAlreadyRecorded(id) => {
+                write!(formatter, "Learner decision already recorded for draft: {id}")
+            }
             Self::MissingGenerationRunForAcceptedDraft => {
                 formatter.write_str("Accepted generated prompt draft requires a generation run")
+            }
+            Self::GenerationLeaseLost => formatter.write_str("Generation lease lost before persistence"),
+            Self::GenerationFinalizationIncomplete => {
+                formatter.write_str("Generation finalization did not update its attempt and job atomically")
             }
             Self::ReviewUnitMismatch => formatter.write_str("Review unit ids must match"),
             Self::ScheduleLastReviewMismatch => {
@@ -3748,11 +4884,15 @@ impl Error for PostgresStoreError {
             | Self::InvalidBooleanAnswer
             | Self::NoConceptKey
             | Self::UnknownSourceDocument(_)
+            | Self::SourceDocumentArchived(_)
             | Self::UnknownReviewUnit(_)
             | Self::ReviewUnitArchived(_)
             | Self::UnknownGeneratedPromptDraft(_)
             | Self::RejectedGeneratedPromptDraft
+            | Self::LearnerDraftDecisionAlreadyRecorded(_)
             | Self::MissingGenerationRunForAcceptedDraft
+            | Self::GenerationLeaseLost
+            | Self::GenerationFinalizationIncomplete
             | Self::ReviewUnitMismatch
             | Self::ScheduleLastReviewMismatch
             | Self::DuplicateAppliedReview(_)
@@ -3790,7 +4930,8 @@ impl From<memory_engine_study::BetaStudyError<PostgresStoreError>> for PostgresS
             memory_engine_study::BetaStudyError::Service(error) => {
                 Self::StudySession(error.to_string())
             }
-            memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
+            memory_engine_study::BetaStudyError::UnknownReferenceSpan(_)
+            | memory_engine_study::BetaStudyError::NoActiveReviewUnit => {
                 Self::StudySession(error.to_string())
             }
             memory_engine_study::BetaStudyError::NoConceptKey => Self::NoConceptKey,
@@ -3831,6 +4972,43 @@ fn reject_archived(review_unit: &BetaReviewUnitRecord) -> Result<(), PostgresSto
         .is_none()
         .then_some(())
         .ok_or_else(|| PostgresStoreError::ReviewUnitArchived(review_unit.review_unit_id.clone()))
+}
+
+fn learner_decision_matches(
+    draft: &GeneratedPromptDraft,
+    recorded: &LearnerDraftDecision,
+    requested: &PostgresLearnerDecision,
+) -> bool {
+    match (recorded, requested) {
+        (LearnerDraftDecision::Kept { edited: false, .. }, PostgresLearnerDecision::Keep)
+        | (LearnerDraftDecision::Rejected { .. }, PostgresLearnerDecision::Reject) => true,
+        (
+            LearnerDraftDecision::Kept { edited: true, .. },
+            PostgresLearnerDecision::Edit {
+                prompt_text,
+                expected_answer,
+            },
+        ) => {
+            prompt_text_for_export(&draft.prompt) == prompt_text.trim()
+                && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
+        }
+        _ => false,
+    }
+}
+
+fn prompt_text_for_export(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Mcq { prompt, .. } | Prompt::Boolean { prompt, .. } => prompt.clone(),
+        Prompt::Exact(prompt) => prompt.prompt.clone(),
+    }
+}
+
+fn prompt_expected_answer_for_export(prompt: &Prompt) -> String {
+    match prompt {
+        Prompt::Mcq { correct_choice, .. } => correct_choice.clone(),
+        Prompt::Boolean { correct_answer, .. } => correct_answer.to_string(),
+        Prompt::Exact(prompt) => prompt.accepted_answers.first().cloned().unwrap_or_default(),
+    }
 }
 
 fn replace_prompt_text(prompt: &mut Prompt, text: &str) {
@@ -4004,7 +5182,7 @@ mod tests {
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
         GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage,
         PersistedQueueCandidate, ReferenceSpan, RemediationPackRecord, RemediationPackStatus,
-        SourceDocument, SourceDocumentKind, SourcePermission,
+        SourceDocument, SourceDocumentKind, SourcePermission, SourcePermissionReceipt,
     };
     use memory_engine_service::{
         record_content_feedback, ContentFeedbackError, ContentFeedbackVerdict,
@@ -4031,6 +5209,7 @@ mod tests {
     #[test]
     fn migration_uses_account_scoped_primary_keys_and_durable_receipts() {
         let sql = migration_sql();
+        let session_sql = super::SESSION_SCHEMA_MIGRATION_SQL;
         let jobs_sql = generation_jobs_migration_sql();
 
         assert!(sql.contains("memory_engine_accounts"));
@@ -4043,8 +5222,23 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (account_id, receipt_key)"));
         assert!(sql.contains("memory_engine_applied_reviews"));
         assert!(sql.contains("memory_engine_browser_sessions"));
-        assert!(sql.contains("session_id_hash TEXT PRIMARY KEY"));
-        assert!(sql.contains("csrf_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("session_id_hash TEXT PRIMARY KEY"));
+        assert!(session_sql.contains("session_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("expires_at_ms BIGINT NOT NULL"));
+        assert!(session_sql.contains("revoked_at_ms BIGINT"));
+        assert!(session_sql.contains("csrf_token_hash TEXT NOT NULL"));
+        assert!(session_sql.contains("memory_engine_api_sessions_legacy_v1"));
+        assert!(session_sql.contains("RENAME CONSTRAINT memory_engine_api_sessions_pkey"));
+        assert!(session_sql.contains("memory_engine_api_sessions_legacy_v1_account_idx"));
+        assert!(session_sql.contains("RENAME CONSTRAINT memory_engine_browser_sessions_pkey"));
+        assert!(session_sql.contains("memory_engine_browser_sessions_legacy_v1_account_idx"));
+        assert!(session_sql.contains("encode(digest(session_token, 'sha256'), 'hex')"));
+        assert!(session_sql.contains(
+            "digest('csrf:' || encode(digest(session_token, 'sha256'), 'hex'), 'sha256')"
+        ));
+        assert!(!session_sql.contains("session_token TEXT NOT NULL"));
+        assert!(sql.contains("memory_engine_waitlist_entries"));
+        assert!(super::MIGRATIONS.iter().any(|(version, _)| *version == 6));
         assert!(sql.contains("memory_engine_auth_challenges"));
         assert!(sql.contains("memory_engine_content_feedback"));
         assert!(sql.contains("PRIMARY KEY (account_id, feedback_id)"));
@@ -4064,6 +5258,107 @@ mod tests {
         assert!(jobs_sql.contains("memory_engine_generation_jobs"));
         assert!(jobs_sql.contains("lease_expires_at_ms"));
         assert!(jobs_sql.contains("status IN ('queued', 'running', 'retry')"));
+    }
+
+    #[test]
+    fn live_legacy_session_migration_rehearses_pk_renames_and_is_idempotent() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live legacy session migration rehearsal; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!("memory_engine_auth_v6_{}_{}", std::process::id(), NOW);
+        let mut admin = super::connect_client(&database_url).expect("connect migration admin");
+        admin
+            .batch_execute("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;")
+            .expect("install pgcrypto");
+        let extension_schema: String = admin
+            .query_one(
+                "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pgcrypto'",
+                &[],
+            )
+            .expect("find pgcrypto schema")
+            .get(0);
+        let scoped_url = format!(
+            "{}{}options=-csearch_path%3D{}%2C{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema,
+            extension_schema
+        );
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create migration schema");
+        let result = (|| -> Result<(), String> {
+            let mut setup =
+                super::connect_client(&scoped_url).map_err(|error| format!("{error:?}"))?;
+            setup
+                .batch_execute(
+                    "CREATE TABLE memory_engine_accounts (account_id TEXT PRIMARY KEY, created_at_ms BIGINT NOT NULL);
+                     CREATE TABLE memory_engine_api_sessions (
+                         account_id TEXT PRIMARY KEY REFERENCES memory_engine_accounts(account_id),
+                         session_token TEXT NOT NULL, updated_at_ms BIGINT NOT NULL
+                     );
+                     CREATE TABLE memory_engine_browser_sessions (
+                         session_id_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id),
+                         session_token TEXT NOT NULL, csrf_token_hash TEXT NOT NULL, created_at_ms BIGINT NOT NULL,
+                         expires_at_ms BIGINT NOT NULL, revoked_at_ms BIGINT
+                     );
+                     CREATE INDEX memory_engine_browser_sessions_account_idx ON memory_engine_browser_sessions(account_id);
+                     INSERT INTO memory_engine_accounts(account_id, created_at_ms) VALUES ('acct_legacy_v6', 1);
+                     INSERT INTO memory_engine_api_sessions(account_id, session_token, updated_at_ms)
+                         VALUES ('acct_legacy_v6', 'legacy-api-token', 2);
+                     INSERT INTO memory_engine_browser_sessions
+                         (session_id_hash, account_id, session_token, csrf_token_hash, created_at_ms, expires_at_ms, revoked_at_ms)
+                         VALUES ('legacy-browser-id', 'acct_legacy_v6', 'legacy-browser-token', 'legacy-csrf', 2, 9999999999999, NULL);",
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            let mut store = super::PostgresStudyStore::connect(&scoped_url)
+                .map_err(|error| format!("{error:?}"))?;
+            store.migrate().map_err(|error| format!("{error:?}"))?;
+            store.migrate().map_err(|error| format!("{error:?}"))?;
+            let mut verify =
+                super::connect_client(&scoped_url).map_err(|error| format!("{error:?}"))?;
+            let api_count: i64 = verify
+                .query_one("SELECT count(*) FROM memory_engine_api_sessions", &[])
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            let browser_count: i64 = verify
+                .query_one("SELECT count(*) FROM memory_engine_browser_sessions", &[])
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert_eq!(api_count, 1);
+            assert_eq!(browser_count, 1);
+            let api_hash: String = verify
+                .query_one(
+                    "SELECT session_token_hash FROM memory_engine_api_sessions",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert_eq!(api_hash.len(), 64);
+            assert_ne!(api_hash, "legacy-api-token");
+            let legacy_api: bool = verify
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_engine_api_sessions_legacy_v1')",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            let legacy_browser: bool = verify
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_engine_browser_sessions_legacy_v1')",
+                    &[],
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .get(0);
+            assert!(!legacy_api);
+            assert!(!legacy_browser);
+            Ok(())
+        })();
+        let _ = admin.batch_execute(&format!(r#"DROP SCHEMA IF EXISTS "{schema}" CASCADE;"#));
+        result.expect("legacy session migration rehearsal");
     }
 
     #[test]
@@ -4253,6 +5548,16 @@ mod tests {
                 3,
                 1_000,
             )?);
+            assert!(
+                !after_lease.renew_generation_job(
+                    "acct_jobs",
+                    "job-1",
+                    claimed.lease_token.as_deref().expect("first lease token"),
+                    NOW + 20,
+                    10,
+                )?,
+                "a finished stale attempt cannot be renewed afterward"
+            );
             let stale_attempt = after_lease
                 .generation_job_attempt(
                     "acct_jobs",
@@ -4512,6 +5817,127 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("started receipt regression");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn finish_generation_job_uses_reservation_when_usage_cost_is_null() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres null-cost finish regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_finish_null_cost_{}_{}",
+            std::process::id(),
+            NOW + 1
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect null-cost admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create null-cost schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), PostgresStoreError> {
+            let mut store = PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+            {
+                let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                account.ensure_account(NOW)?;
+            }
+            for (job_id, reservation) in [
+                ("job-null-success", 50_i64),
+                ("job-null-failure", 60_i64),
+                ("job-null-finalizer", 70_i64),
+            ] {
+                let source_id = format!("source-{job_id}");
+                store.client.borrow_mut().execute(
+                    "INSERT INTO memory_engine_generation_jobs
+                        (account_id, job_id, source_id, title, status, model_key,
+                         cost_usd_micros, created_at_ms, updated_at_ms, reserved_cost_usd_micros)
+                     VALUES ($1::TEXT, $2::TEXT, $3::TEXT, $4::TEXT, 'queued',
+                             $5::TEXT, 0::BIGINT, $6::BIGINT, $6::BIGINT, $7::BIGINT)",
+                    &[
+                        &"acct_null_cost",
+                        &job_id,
+                        &source_id,
+                        &job_id,
+                        &"model-null-cost",
+                        &NOW,
+                        &reservation,
+                    ],
+                )?;
+                let claimed = store
+                    .claim_generation_job("worker-null-cost", NOW, 10, 0, 1, 3)?
+                    .expect("null-cost job claim");
+                let run_id = format!("job:{}:attempt:{}", claimed.id, claimed.attempts);
+                assert!(store.bind_generation_job_attempt_run(
+                    "acct_null_cost",
+                    job_id,
+                    claimed.attempts,
+                    claimed.lease_token.as_deref().expect("lease token"),
+                    &run_id,
+                )?);
+                let mut run = generation_run(&run_id, &[&source_id], &[]);
+                run.usage = Some(GenerationRunUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cost_usd_micros: None,
+                    latency_ms: 1,
+                });
+                let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                account.save_generation_run(&run)?;
+                drop(account);
+                let succeeded = job_id == "job-null-success";
+                let finalized = job_id == "job-null-finalizer";
+                if finalized {
+                    let mut account = store.for_account(AccountScope::new("acct_null_cost")?);
+                    assert!(account.finalize_generation_run(
+                        &run_id,
+                        i32::try_from(claimed.attempts).expect("attempt fits"),
+                        claimed.lease_token.as_deref().expect("lease token"),
+                        NOW + 1,
+                        true,
+                    )?);
+                } else {
+                    assert!(store.finish_generation_job(
+                        "acct_null_cost",
+                        job_id,
+                        claimed.lease_token.as_deref().expect("lease token"),
+                        NOW + 1,
+                        if succeeded {
+                            Ok((1, 0))
+                        } else {
+                            Err("provider failed".to_owned())
+                        },
+                        3,
+                        1_000,
+                    )?);
+                }
+                let attempt = store
+                    .generation_job_attempt(
+                        "acct_null_cost",
+                        job_id,
+                        claimed.attempts,
+                        claimed.lease_token.as_deref().expect("lease token"),
+                    )?
+                    .expect("finished attempt");
+                assert_eq!(attempt.cost_usd_micros, reservation);
+                assert_eq!(attempt.reserved_cost_usd_micros, 0);
+                let job = store
+                    .generation_job("acct_null_cost", job_id)?
+                    .expect("finished job");
+                assert_eq!(job.cost_usd_micros, reservation);
+                if succeeded || finalized {
+                    assert_eq!(job.reserved_cost_usd_micros, 0);
+                } else {
+                    assert_eq!(job.reserved_cost_usd_micros, reservation);
+                }
+            }
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop null-cost schema");
+        result.expect("null-cost finish reservation fallback");
     }
 
     #[test]
@@ -4857,6 +6283,477 @@ mod tests {
     }
 
     #[test]
+    fn live_postgres_revoke_api_sessions_preserves_browser_backed_session() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres revoke-api-sessions test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_revoke_api_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), PostgresStoreError> {
+            let mut store = PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+
+            let account_id = "acct-revoke-api-sessions";
+            {
+                let mut account = store.for_account(AccountScope::new(account_id)?);
+                account.ensure_account(NOW)?;
+                account.save_api_session("browser-backing-hash", NOW, NOW + 1_000_000)?;
+                account.save_api_session("machine-only-hash", NOW, NOW + 1_000_000)?;
+            }
+            // A browser session wraps one of the two API sessions; revoking
+            // "all API sessions" is the machine-facing logout-all and must
+            // not sign out this browser.
+            store.save_browser_session(
+                "browser-session-id-hash",
+                account_id,
+                "browser-backing-hash",
+                "csrf-hash",
+                NOW,
+                NOW + 1_000_000,
+            )?;
+
+            let mut account = store.for_account(AccountScope::new(account_id)?);
+            account.revoke_api_sessions(NOW + 1)?;
+            assert!(
+                account.api_session_matches("browser-backing-hash", NOW + 1)?,
+                "browser-backed API session must survive revoke-all"
+            );
+            assert!(
+                !account.api_session_matches("machine-only-hash", NOW + 1)?,
+                "standalone machine API session must be revoked"
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live postgres revoke-api-sessions contract");
+    }
+
+    #[test]
+    fn live_postgres_finalized_run_allows_second_connection_decision() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres finalized publication; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_publication_{}_{}",
+            std::process::id(),
+            NOW + 4
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect publication admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create publication schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-publication");
+            let reference = reference_span("reference-generation-publication", &source.id);
+            let unit = ReviewUnitId::new("unit-generation-publication");
+            let draft = accepted_draft(
+                "draft-generation-publication",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-publication"),
+            );
+            let run = generation_run("run-generation-publication", &[&source.id], &[&draft.id]);
+            let (attempt, token) = {
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-publication")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-publication",
+                    "job-generation-publication",
+                    &source.id,
+                    "Publication",
+                    "model-publication",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-publication", NOW, 10, 0, 1, 3)?
+                    .expect("publication claim");
+                let token = claimed.lease_token.clone().expect("publication token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-publication",
+                    "job-generation-publication",
+                    claimed.attempts,
+                    &token,
+                    &run.id,
+                )?);
+                (
+                    i32::try_from(claimed.attempts).expect("attempt fits i32"),
+                    token,
+                )
+            };
+            let mut publisher = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut account =
+                publisher.for_account(AccountScope::new("acct-generation-publication")?);
+            assert!(account.finalize_generation_run(&run.id, attempt, &token, NOW + 1, true)?);
+            drop(account);
+            let mut learner_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut learner =
+                learner_store.for_account(AccountScope::new("acct-generation-publication")?);
+            learner.keep_generated_prompt_draft(&draft.id, NOW + 2)?;
+            let snapshot = learner.snapshot()?;
+            assert_eq!(snapshot.generation_runs[0].completed_at, Some(NOW + 1));
+            assert!(snapshot.generated_prompt_drafts[0]
+                .learner_decision
+                .is_some());
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop publication schema");
+        result.expect("generation publication contract");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_postgres_stale_finalizer_wins_against_second_connection_decisions() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres stale finalizer race; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_finalizer_{}_{}",
+            std::process::id(),
+            NOW + 3
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect finalizer race admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create finalizer race schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-finalizer");
+            let reference_keep = reference_span("reference-generation-finalizer-keep", &source.id);
+            let reference_edit = reference_span("reference-generation-finalizer-edit", &source.id);
+            let keep_unit = ReviewUnitId::new("unit-generation-finalizer-keep");
+            let edit_unit = ReviewUnitId::new("unit-generation-finalizer-edit");
+            let keep_draft = accepted_draft(
+                "draft-generation-finalizer-keep",
+                &keep_unit,
+                &[&source.id],
+                &[&reference_keep.id],
+                Some("run-generation-finalizer"),
+            );
+            let edit_draft = accepted_draft(
+                "draft-generation-finalizer-edit",
+                &edit_unit,
+                &[&source.id],
+                &[&reference_edit.id],
+                Some("run-generation-finalizer"),
+            );
+            let mut run = generation_run(
+                "run-generation-finalizer",
+                &[&source.id],
+                &[&keep_draft.id, &edit_draft.id],
+            );
+            run.completed_at = Some(i64::MIN);
+            let old_attempt;
+            let old_token;
+            {
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-finalizer")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference_keep)?;
+                account.save_reference_span(&reference_edit)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&keep_draft)?;
+                account.save_generated_prompt_draft(&edit_draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-finalizer",
+                    "job-generation-finalizer",
+                    &source.id,
+                    "Finalizer race",
+                    "model-finalizer",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-a", NOW, 10, 0, 1, 3)?
+                    .expect("first finalizer claim");
+                old_attempt = i32::try_from(claimed.attempts).expect("attempt fits i32");
+                old_token = claimed.lease_token.clone().expect("first lease token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-finalizer",
+                    "job-generation-finalizer",
+                    claimed.attempts,
+                    &old_token,
+                    &run.id,
+                )?);
+            }
+            let mut reclaim_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            reclaim_store.migrate()?;
+            let reclaimed_job = reclaim_store
+                .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
+                .expect("expired first lease is reclaimed");
+            assert_eq!(reclaimed_job.attempts, 2);
+            let reclaimed_account =
+                reclaim_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            let reclaimed_snapshot = reclaimed_account.snapshot()?;
+            assert!(
+                reclaimed_snapshot.generated_prompt_drafts.is_empty(),
+                "reclaim must remove orphaned pending drafts before retry"
+            );
+            assert!(
+                reclaimed_snapshot.generation_runs.is_empty(),
+                "reclaim must remove the bound unfinalized generation run"
+            );
+            drop(reclaimed_account);
+
+            let mut stale_writer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            stale_writer_store.migrate()?;
+            let mut stale_writer =
+                stale_writer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            stale_writer.set_generation_lease_fence(&run.id, old_attempt, &old_token);
+            assert!(matches!(
+                stale_writer.save_generation_run(&run),
+                Err(super::PostgresStoreError::GenerationLeaseLost)
+            ));
+            drop(stale_writer);
+
+            // A retry may publish a fresh pending run after reclaim; it must not
+            // inherit the orphaned attempt's drafts or create duplicate candidates.
+            let retry_reference =
+                reference_span("reference-generation-finalizer-retry", &source.id);
+            let retry_unit = ReviewUnitId::new("unit-generation-finalizer-retry");
+            let retry_draft = accepted_draft(
+                "draft-generation-finalizer-retry",
+                &retry_unit,
+                &[&source.id],
+                &[&retry_reference.id],
+                Some("run-generation-finalizer-retry"),
+            );
+            let mut retry_run = generation_run(
+                "run-generation-finalizer-retry",
+                &[&source.id],
+                &[&retry_draft.id],
+            );
+            retry_run.completed_at = Some(i64::MIN);
+            let mut retry_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            retry_store.migrate()?;
+            let mut retry_account =
+                retry_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            retry_account.save_reference_span(&retry_reference)?;
+            retry_account.save_generation_run(&retry_run)?;
+            retry_account.save_generated_prompt_draft(&retry_draft)?;
+            drop(retry_account);
+
+            // Reclaimed output is gone, so no stale decision can become a duplicate candidate.
+            // Commit both learner decisions from independent connections before
+            // the stale worker finalizer. The advisory transaction lock must let
+            // finalization win over these already-committed decisions.
+            let mut keep_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut keep_account =
+                keep_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            assert!(matches!(
+                keep_account.keep_generated_prompt_draft(&keep_draft.id, NOW + 17),
+                Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))
+            ));
+            drop(keep_account);
+            let mut edit_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut edit_account =
+                edit_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            assert!(matches!(
+                edit_account.edit_and_keep_generated_prompt_draft(
+                    &edit_draft.id,
+                    "Edited stale prompt",
+                    "Edited stale answer",
+                    NOW + 18,
+                ),
+                Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))
+            ));
+            drop(edit_account);
+
+            let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut finalizer =
+                finalizer_store.for_account(AccountScope::new("acct-generation-finalizer")?);
+            assert!(!finalizer.finalize_generation_run(
+                &run.id,
+                old_attempt,
+                &old_token,
+                NOW + 19,
+                true,
+            )?);
+            assert!(!finalizer.finalize_generation_run(
+                &run.id,
+                old_attempt,
+                &old_token,
+                NOW + 20,
+                true,
+            )?);
+            let snapshot = finalizer.snapshot()?;
+            assert_eq!(snapshot.generated_prompt_drafts.len(), 1);
+            assert_eq!(snapshot.generated_prompt_drafts[0].id, retry_draft.id);
+            assert!(snapshot.review_units.is_empty());
+            assert!(snapshot.schedules.is_empty());
+            assert!(snapshot.attempts.is_empty());
+            assert!(snapshot.content_feedback.is_empty());
+            assert!(snapshot.applied_reviews.is_empty());
+            assert_eq!(snapshot.generation_runs.len(), 1);
+            assert_eq!(snapshot.generation_runs[0].id, retry_run.id);
+            assert_eq!(snapshot.reference_spans.len(), 1);
+            assert!(finalizer.list_queue_candidates()?.is_empty());
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop finalizer race schema");
+        result.expect("generation stale finalizer race contract");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_postgres_generation_discard_serializes_with_second_instance_keep() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres generation race; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_race_{}_{}",
+            std::process::id(),
+            NOW + 2
+        );
+        let mut admin =
+            crate::connect_client(&database_url).expect("connect generation race admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create generation race schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-race");
+            let reference = reference_span("reference-generation-race", &source.id);
+            let draft = accepted_draft(
+                "draft-generation-race",
+                &ReviewUnitId::new("unit-generation-race"),
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-race"),
+            );
+            let run = generation_run("run-generation-race", &[&source.id], &[&draft.id]);
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-generation-race")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+            }
+            drop(setup);
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let draft_id = draft.id.clone();
+            let run_id = run.id.clone();
+            let keep_url = scoped_url.clone();
+            let discard_url = scoped_url.clone();
+            let (keep_result, discard_result) = std::thread::scope(|scope| {
+                let keep_barrier = barrier.clone();
+                let keep = scope.spawn(move || -> Result<_, super::PostgresStoreError> {
+                    let mut store = super::PostgresStudyStore::connect(&keep_url)?;
+                    let mut account = store.for_account(AccountScope::new("acct-generation-race")?);
+                    keep_barrier.wait();
+                    account.keep_generated_prompt_draft(&draft_id, NOW)
+                });
+                let discard_barrier = barrier;
+                let discard = scope.spawn(move || -> Result<(), super::PostgresStoreError> {
+                    let mut store = super::PostgresStudyStore::connect(&discard_url)?;
+                    let mut account = store.for_account(AccountScope::new("acct-generation-race")?);
+                    discard_barrier.wait();
+                    account.discard_generation_run(&run_id)
+                });
+                (
+                    keep.join().expect("keep race thread"),
+                    discard.join().expect("discard race thread"),
+                )
+            });
+            assert!(
+                discard_result.is_ok(),
+                "discard race must commit: {discard_result:?}"
+            );
+            assert!(
+                keep_result.is_ok()
+                    || matches!(
+                        keep_result,
+                        Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))
+                    ),
+                "keep race must either win or observe an atomic discard: {keep_result:?}"
+            );
+
+            let mut verify = super::PostgresStudyStore::connect(&scoped_url)?;
+            let account = verify.for_account(AccountScope::new("acct-generation-race")?);
+            let snapshot = account.snapshot()?;
+            let draft_present = snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|item| item.id == draft.id);
+            let unit_present = snapshot
+                .review_units
+                .iter()
+                .any(|item| item.review_unit_id == draft.review_unit_id);
+            let run_present = snapshot
+                .generation_runs
+                .iter()
+                .any(|item| item.id == run.id);
+            let reference_present = snapshot
+                .reference_spans
+                .iter()
+                .any(|item| item.id == reference.id);
+            assert_eq!(
+                (draft_present, unit_present, run_present, reference_present),
+                (
+                    keep_result.is_ok(),
+                    keep_result.is_ok(),
+                    keep_result.is_ok(),
+                    keep_result.is_ok()
+                ),
+                "race rollback must preserve or remove the complete provenance closure",
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop generation race schema");
+        result.expect("generation discard race contract");
+    }
+
+    #[test]
     // This intentionally keeps the two database race scenarios together so
     // their shared setup and cleanup are visible in one acceptance oracle.
     #[allow(clippy::too_many_lines)]
@@ -5046,6 +6943,100 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result.expect("live postgres rate limit contract");
+    }
+
+    #[test]
+    fn live_postgres_reads_legacy_source_without_permission_as_model_eligible() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_legacy_source_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = super::connect_client(&database_url).expect("admin connection");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut store = super::PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+            let scope = super::AccountScope::new("acct-legacy")?;
+            {
+                let mut account = store.for_account(scope.clone());
+                account.ensure_account(NOW)?;
+            }
+            let legacy = serde_json::json!({
+                "id": "legacy-source",
+                "kind": "text",
+                "title": "Legacy source",
+                "body": "old notes",
+                "uri": null,
+                "freshness": NOW,
+                "createdAt": NOW
+            });
+            store.client.borrow_mut().execute(
+                "INSERT INTO memory_engine_source_documents
+                    (account_id, source_document_id, document, created_at_ms)
+                 VALUES ($1, $2, $3, $4)",
+                &[&"acct-legacy", &"legacy-source", &legacy, &NOW],
+            )?;
+            let account = store.for_account(scope.clone());
+            let source = account.snapshot()?.source_documents[0].clone();
+            assert_eq!(source.permission, SourcePermission::ModelEligible);
+            drop(account);
+            let mut account = store.for_account(scope.clone());
+            let updated = account
+                .update_source_document_permission("legacy-source", SourcePermission::LocalOnly)?;
+            assert_eq!(updated.permission, SourcePermission::LocalOnly);
+            account.archive_source_document("legacy-source", NOW)?;
+            assert!(matches!(
+                account.update_source_document_permission(
+                    "legacy-source",
+                    SourcePermission::ModelEligible
+                ),
+                Err(super::PostgresStoreError::SourceDocumentArchived(id)) if id == "legacy-source"
+            ));
+            drop(account);
+            let other_scope = super::AccountScope::new("acct-other")?;
+            let mut other = store.for_account(other_scope);
+            other.ensure_account(NOW)?;
+            assert!(matches!(
+                other.update_source_document_permission(
+                    "legacy-source",
+                    SourcePermission::ModelEligible
+                ),
+                Err(super::PostgresStoreError::UnknownSourceDocument(id)) if id == "legacy-source"
+            ));
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("legacy source read");
+    }
+
+    #[test]
+    fn live_postgres_waitlist_join_invite_and_delete_round_trip() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!("memory_engine_test_waitlist_{}_{}", std::process::id(), NOW);
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = run_live_postgres_waitlist_contract(&scoped_url);
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("live postgres waitlist contract");
     }
 
     #[test]
@@ -5421,7 +7412,7 @@ mod tests {
                     "app-account-ip:203.0.113.11".to_owned(),
                 ];
                 let mut store = PostgresStudyStore::connect(&database_url)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| format!("{error:?}"))?;
                 barrier.wait();
                 store
                     .record_rate_limit_attempts(
@@ -5449,6 +7440,72 @@ mod tests {
             "app-account-ip:203.0.113.11".to_owned(),
         ];
         assert!(!store.record_rate_limit_attempts(&keys, NOW + 60_000, 900_000, MAX_ATTEMPTS)?);
+
+        Ok(())
+    }
+
+    fn run_live_postgres_waitlist_contract(database_url: &str) -> Result<(), PostgresStoreError> {
+        let mut store = PostgresStudyStore::connect(database_url)?;
+        store.migrate()?;
+
+        // A fresh join creates one row and a `joined` audit entry.
+        store.waitlist_join("waitlist-live@example.com", "first-run", NOW)?;
+        let entries = store.waitlist_list()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].email, "waitlist-live@example.com");
+        assert_eq!(entries[0].source, "first-run");
+        assert_eq!(entries[0].created_at_ms, NOW);
+        assert_eq!(entries[0].updated_at_ms, NOW);
+        assert_eq!(entries[0].invited_at_ms, None);
+
+        // A duplicate join is idempotent: same row, bumped `updated_at_ms`,
+        // unchanged `created_at_ms`, still exactly one row.
+        store.waitlist_join("waitlist-live@example.com", "first-run", NOW + 1_000)?;
+        let entries = store.waitlist_list()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].created_at_ms, NOW);
+        assert_eq!(entries[0].updated_at_ms, NOW + 1_000);
+
+        // Marking invited transitions once and is idempotent thereafter.
+        let invited = store
+            .waitlist_mark_invited("waitlist-live@example.com", NOW + 2_000)?
+            .expect("entry exists");
+        assert_eq!(invited.invited_at_ms, Some(NOW + 2_000));
+        let invited_again = store
+            .waitlist_mark_invited("waitlist-live@example.com", NOW + 3_000)?
+            .expect("entry exists");
+        assert_eq!(invited_again.invited_at_ms, Some(NOW + 2_000));
+
+        // Marking an unknown email invited is a clean `None`, not an error.
+        assert_eq!(
+            store.waitlist_mark_invited("unknown@example.com", NOW + 3_000)?,
+            None
+        );
+
+        // Every join/invite transition left its own append-only audit row.
+        let mut raw = crate::connect_client(database_url)?;
+        let audit_rows = raw.query(
+            "SELECT email_normalized, event FROM memory_engine_waitlist_audit_log ORDER BY audit_id",
+            &[],
+        )?;
+        let audit_events: Vec<(String, String)> = audit_rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            audit_events,
+            vec![
+                ("waitlist-live@example.com".to_owned(), "joined".to_owned()),
+                ("waitlist-live@example.com".to_owned(), "joined".to_owned()),
+                ("waitlist-live@example.com".to_owned(), "invited".to_owned()),
+            ]
+        );
+
+        // Delete removes the operational row; the audit trail above proves
+        // the history stays intact because delete never touches that table.
+        assert!(store.waitlist_delete("waitlist-live@example.com", NOW + 4_000)?);
+        assert_eq!(store.waitlist_list()?, Vec::new());
+        assert!(!store.waitlist_delete("waitlist-live@example.com", NOW + 5_000)?);
 
         Ok(())
     }
@@ -5627,7 +7684,7 @@ mod tests {
         assert!(edited_draft
             .critique_notes
             .iter()
-            .any(|note| note == "Learner edited approved wording."));
+            .any(|note| note == "Learner edited kept wording."));
         account.archive_review_unit(&review_unit_id, NOW + 1_000)?;
         assert!(matches!(
             account.update_review_unit_prompt_text(
@@ -5732,7 +7789,7 @@ mod tests {
             assert_eq!(generated.summary.accepted_draft_count, 2);
 
             let approved =
-                study.approve_draft("study-run-1-draft-src-nato-live-2-nato-cat-composition")?;
+                study.keep_draft("study-run-1-draft-src-nato-live-2-nato-cat-composition")?;
             assert_eq!(approved.status, BetaStudyStatus::Answering);
             assert_eq!(approved.summary.approved_review_unit_count, 1);
 
@@ -5810,7 +7867,7 @@ mod tests {
             assert!(edited_draft
                 .critique_notes
                 .iter()
-                .any(|note| note == "Learner edited approved wording."));
+                .any(|note| note == "Learner edited kept wording."));
             assert_eq!(
                 edited_draft.validation.status,
                 GeneratedPromptValidationStatus::Accepted
@@ -5979,6 +8036,7 @@ mod tests {
             .join("\n"),
             project_key: None,
             ttl_expires_at: None,
+            permission: SourcePermission::ModelEligible,
         }
     }
 
@@ -6012,6 +8070,15 @@ mod tests {
             completed_at: Some(NOW),
             validation_failures: Vec::new(),
             usage: None,
+            source_permissions: source_document_ids
+                .iter()
+                .map(|source_document_id| SourcePermissionReceipt {
+                    source_document_id: (*source_document_id).to_owned(),
+                    permission: SourcePermission::ModelEligible,
+                    consented: true,
+                })
+                .collect(),
+            prompt_version: "prompt-v1".to_owned(),
         }
     }
 
@@ -6023,6 +8090,7 @@ mod tests {
         generation_run_id: Option<&str>,
     ) -> GeneratedPromptDraft {
         GeneratedPromptDraft {
+            learner_decision: None,
             id: id.to_owned(),
             source_document_ids: source_document_ids
                 .iter()
@@ -6150,5 +8218,115 @@ mod tests {
             idempotency_key: Some(idempotency_key.to_owned()),
             grade: None,
         }
+    }
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_postgres_stale_cleanup_preserves_replacement_owner() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live Postgres cleanup ownership test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_cleanup_owner_{}_{}",
+            std::process::id(),
+            NOW + 31
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect cleanup owner admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create cleanup owner schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("cleanup-owner-source");
+            let reference = reference_span("cleanup-owner-reference", &source.id);
+            let unit = ReviewUnitId::new("cleanup-owner-unit");
+            let old_draft = accepted_draft(
+                "cleanup-owner-old-draft",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("cleanup-owner-old-run"),
+            );
+            let replacement = accepted_draft(
+                "cleanup-owner-replacement-draft",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("cleanup-owner-replacement-run"),
+            );
+            let mut old_run =
+                generation_run("cleanup-owner-old-run", &[&source.id], &[&old_draft.id]);
+            old_run.completed_at = Some(i64::MIN);
+            let replacement_run = generation_run(
+                "cleanup-owner-replacement-run",
+                &[&source.id],
+                &[&replacement.id],
+            );
+            {
+                let mut account = setup.for_account(AccountScope::new("acct-cleanup-owner")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&old_run)?;
+                account.save_generated_prompt_draft(&old_draft)?;
+                account.save_generation_run(&replacement_run)?;
+                account.save_generated_prompt_draft(&replacement)?;
+                let kept = account.keep_generated_prompt_draft(&replacement.id, NOW)?;
+                account.set_schedule_state(
+                    &kept.review_unit_id,
+                    Some(&schedule_state(1, ScheduleStatus::Review, NOW)),
+                    NOW,
+                )?;
+                account.record_attempt(service_attempt(
+                    &kept.review_unit_id,
+                    "cleanup-owner-receipt",
+                    NOW + 1,
+                ))?;
+            }
+            let mut pending_reader = super::PostgresStudyStore::connect(&scoped_url)?;
+            pending_reader.migrate()?;
+            let pending_account =
+                pending_reader.for_account(AccountScope::new("acct-cleanup-owner")?);
+            let pending_view = BetaStudySession::from_store(pending_account, || NOW).view()?;
+            assert_eq!(pending_view.drafts.len(), 1);
+            assert_eq!(pending_view.drafts[0].id, replacement.id);
+
+            let mut finalizer_store = super::PostgresStudyStore::connect(&scoped_url)?;
+            finalizer_store.migrate()?;
+            let mut finalizer =
+                finalizer_store.for_account(AccountScope::new("acct-cleanup-owner")?);
+            assert!(!finalizer.finalize_generation_run(
+                "cleanup-owner-old-run",
+                1,
+                "stale-owner-token",
+                NOW + 1,
+                false,
+            )?);
+            let snapshot = finalizer.snapshot()?;
+            assert!(snapshot
+                .generated_prompt_drafts
+                .iter()
+                .any(|draft| draft.id == replacement.id));
+            assert!(snapshot
+                .review_units
+                .iter()
+                .any(|record| record.review_unit_id == unit));
+            assert!(snapshot
+                .schedules
+                .iter()
+                .any(|schedule| schedule.review_unit_id == unit));
+            assert!(snapshot.attempts.iter().any(|attempt| {
+                attempt.review_unit_id == unit
+                    && attempt.idempotency_key.as_deref() == Some("cleanup-owner-receipt")
+            }));
+            assert_eq!(finalizer.list_queue_candidates()?.len(), 1);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop cleanup owner schema");
+        result.expect("cleanup ownership contract");
     }
 }

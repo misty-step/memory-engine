@@ -27,8 +27,12 @@ use axum::{
     Json,
 };
 use hmac::Hmac;
+#[cfg(test)]
+use memory_engine_generation::DraftProvider;
 use memory_engine_generation::FallbackProvider;
-use memory_engine_openrouter::{OpenRouterConfig, OpenRouterProvider};
+pub use memory_engine_openrouter::OpenRouterConfig;
+use memory_engine_openrouter::OpenRouterProvider;
+pub use memory_engine_persistence::SourcePermission;
 use memory_engine_persistence::{BetaPersistenceStore, BetaStoreError};
 use memory_engine_persistence_postgres::{
     AccountScope, AccountStudyStore, PostgresStoreError, PostgresStudyStore,
@@ -47,9 +51,11 @@ mod file_lock;
 mod jobs;
 mod registry;
 mod storage;
+mod waitlist;
 
 pub use jobs::{EnqueueOutcome, GenerationJob, JobBroadcast, JobQueue, JobStatus};
 pub use storage::StudyStorage;
+pub use waitlist::WaitlistEntry;
 
 use storage::StudyStorageConfig;
 
@@ -137,9 +143,87 @@ impl ApiState {
         self.accounts.create_account(email)
     }
 
-    /// Issue (or rotate) the service-session credential for an allowlisted
-    /// account, gated by the operator admin token. Reissuing revokes the
-    /// prior credential immediately.
+    /// Create a guest account with a server-generated local address,
+    /// bypassing the static email allowlist. Local/dev only: gated by
+    /// [`Self::anonymous_account_creation_allowed`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when anonymous account creation is disabled
+    /// or persistence rejects the account.
+    pub fn create_guest_account(&self) -> Result<AccountCreated, ApiFailure> {
+        self.accounts.create_guest_account()
+    }
+
+    #[must_use]
+    pub fn anonymous_account_creation_allowed(&self) -> bool {
+        self.accounts.anonymous_account_creation_allowed()
+    }
+
+    /// Join the invite-beta waitlist. Idempotent on normalized email and
+    /// silent about allowlist/account state: a repeat join or a join by an
+    /// address that already has access looks identical to a brand-new one.
+    /// Persists to Postgres in production and to the file store locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns bad request on a malformed email, too-many-requests when the
+    /// per-email or per-IP limit is spent, and service-unavailable when
+    /// storage rejects the write.
+    pub fn join_waitlist(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .join_waitlist(email, source, client_rate_limit_key)
+    }
+
+    /// List every waitlist entry for the operator, gated by the admin token.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// and service-unavailable when storage rejects the read.
+    pub fn list_waitlist(&self, admin_token: &str) -> Result<Vec<WaitlistEntry>, ApiFailure> {
+        self.accounts.list_waitlist(admin_token)
+    }
+
+    /// Mark one waitlist entry invited for the operator, gated by the admin
+    /// token. Idempotent: marking an already-invited entry again leaves its
+    /// `invitedAtMs` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the read or write.
+    pub fn mark_waitlist_invited(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<WaitlistEntry, ApiFailure> {
+        self.accounts.mark_waitlist_invited(admin_token, email)
+    }
+
+    /// Delete one waitlist entry for the operator, gated by the admin token.
+    /// The append-only audit trail keeps a record of what happened to the
+    /// address; only the operational row is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the write.
+    pub fn delete_waitlist_entry(&self, admin_token: &str, email: &str) -> Result<(), ApiFailure> {
+        self.accounts.delete_waitlist_entry(admin_token, email)
+    }
+
+    /// Issue an independent, expiring service-session credential for an
+    /// allowlisted account, gated by the operator admin token. Reissuing
+    /// creates another credential; prior sessions remain valid until expiry
+    /// or explicit revocation.
     ///
     /// # Errors
     ///
@@ -162,6 +246,18 @@ impl ApiState {
     /// mismatched.
     pub fn verify_admin_token(&self, admin_token: &str) -> Result<(), ApiFailure> {
         self.accounts.verify_admin_token(admin_token)
+    }
+
+    /// Revoke one active invite before magic-link consumption.
+    ///
+    /// The operation is synchronized with challenge consumption so no link can
+    /// create an account after the revocation becomes visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the address is malformed, invite policy is deny-by-default, or persistence rejects the revocation.
+    pub fn revoke_invite(&self, email: &str) -> Result<(), ApiFailure> {
+        self.accounts.revoke_invite(email)
     }
 
     /// Request an auth magic link.
@@ -187,6 +283,20 @@ impl ApiState {
     /// invalid.
     pub fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
         self.accounts.verify_magic_link(token)
+    }
+
+    /// Verify a magic link with the trusted edge identity for abuse controls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when verification, rate limiting, or persistence rejects the link.
+    pub fn verify_magic_link_for_client(
+        &self,
+        token: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<AppAccount, ApiFailure> {
+        self.accounts
+            .verify_magic_link_for_client(token, client_rate_limit_key)
     }
 
     /// Create a browser session for an already-created account.
@@ -252,6 +362,50 @@ impl ApiState {
         csrf_token: &str,
     ) -> Result<(), ApiFailure> {
         self.accounts.revoke_browser_session(headers, csrf_token)
+    }
+
+    /// Revoke every browser session for the authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the browser session or CSRF token is invalid.
+    pub fn revoke_all_browser_sessions(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .revoke_all_browser_sessions(headers, csrf_token)
+    }
+
+    /// Revoke one API bearer session for its account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the token is invalid or persistence rejects revocation.
+    pub fn revoke_api_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.revoke_api_session(account_id, session_token)
+    }
+
+    /// Revoke every API bearer session for its account. Browser sessions
+    /// are an independent scope and are not affected: a signed-in browser
+    /// stays signed in. Use [`Self::revoke_all_browser_sessions`] to sign
+    /// out browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the token is invalid or persistence rejects revocation.
+    pub fn revoke_all_api_sessions(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .revoke_all_api_sessions(account_id, session_token)
     }
 
     /// Save material through the API state boundary.
@@ -327,6 +481,22 @@ impl ApiState {
         self.accounts.list_sources(account_id, session_token)
     }
 
+    /// Update an active source's model-sharing permission for an authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the account, source, or persistence boundary rejects it.
+    pub fn update_source_permission(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts
+            .update_source_permission(account_id, session_token, source_id, permission)
+    }
+
     /// List saved material for a browser-authenticated account.
     ///
     /// # Errors
@@ -351,6 +521,25 @@ impl ApiState {
             account.account_id(),
             account.session_token(),
             Some(timings),
+        )
+    }
+
+    /// Update an active source's model-sharing permission for a browser account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the source is unknown, archived, or cannot be persisted.
+    pub fn update_app_source_permission(
+        &self,
+        account: &AppAccount,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        self.accounts.update_source_permission(
+            account.account_id(),
+            account.session_token(),
+            source_id,
+            permission,
         )
     }
 
@@ -418,19 +607,59 @@ impl ApiState {
             .archive_source(account.account_id(), account.session_token(), source_id)
     }
 
-    /// Approve a generated draft.
+    /// Keep an accepted generated draft and schedule it for review.
     ///
     /// # Errors
     ///
-    /// Returns an API failure when auth, draft lookup, or persistence fails.
-    pub fn approve_draft(
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
+    pub fn keep_draft(
         &self,
         account_id: &str,
         session_token: &str,
         draft_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.accounts
-            .approve_draft(account_id, session_token, draft_id)
+            .keep_draft(account_id, session_token, draft_id)
+    }
+
+    /// Edit and keep an accepted generated draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, validation, draft decision, or
+    /// persistence rejects the request.
+    pub fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.edit_pending_draft(
+            account_id,
+            session_token,
+            draft_id,
+            prompt,
+            expected_answer,
+        )
+    }
+
+    /// Reject an accepted generated draft without scheduling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when authentication, draft decision, or persistence
+    /// rejects the request.
+    pub fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .reject_pending_draft(account_id, session_token, draft_id)
     }
 
     /// Fetch the next due review.
@@ -677,7 +906,12 @@ impl ApiState {
             .auth_config
             .scheduler_manual_token
             .clone();
-        if configured.as_deref().is_none_or(|value| value != token) {
+        // Compare hashes, not raw strings: SHA-256 preimage resistance makes
+        // the non-constant-time equality useless to a timing attacker probing
+        // this privileged credential (same rationale as `verify_admin_token`).
+        if configured.as_deref().is_none_or(|configured| {
+            configured.is_empty() || secret_hash(configured) != secret_hash(token)
+        }) {
             return Err(ApiFailure::forbidden(
                 "Scheduled reminder trigger is not authorized.",
             ));
@@ -1233,17 +1467,23 @@ pub struct AuthConfig {
     unsubscribe_secret: String,
     scheduler_manual_token: Option<String>,
     admin_token: Option<String>,
+    allow_anonymous_account_creation: bool,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            allowed_emails: None,
+            // An empty allowlist keeps the invite beta deny-by-default.
+            // Operators must explicitly provision addresses before issuing links.
+            allowed_emails: Some(BTreeSet::new()),
             expose_debug_links: false,
             link_delivery: AuthLinkDelivery::None,
             unsubscribe_secret: format!("unsubscribe_{:032x}", rand::random::<u128>()),
             scheduler_manual_token: None,
             admin_token: None,
+            // Public credential minting is opt-in for local fixtures only.
+            // Production hosts must use invite magic-link or operator service-session flows.
+            allow_anonymous_account_creation: false,
         }
     }
 }
@@ -1385,6 +1625,22 @@ impl AuthConfig {
         }
     }
 
+    /// Build the permissive in-memory configuration used by non-production unit fixtures.
+    ///
+    /// The production binary never calls this constructor; its environment bootstrap
+    /// requires a non-empty invite allowlist and disables anonymous account creation
+    /// when `MEMORY_ENGINE_ENVIRONMENT` is production or missing.
+    ///
+    /// This explicit seam keeps local fixture setup separate from production policy.
+    #[must_use]
+    pub fn for_local_tests() -> Self {
+        Self {
+            allowed_emails: None,
+            allow_anonymous_account_creation: true,
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn with_debug_links(mut self, expose_debug_links: bool) -> Self {
         self.expose_debug_links = expose_debug_links;
@@ -1427,6 +1683,17 @@ impl AuthConfig {
         self
     }
 
+    /// Configure whether public account creation may mint credentials.
+    #[must_use]
+    pub fn with_anonymous_account_creation(mut self, allowed: bool) -> Self {
+        self.allow_anonymous_account_creation = allowed;
+        self
+    }
+
+    pub(crate) fn anonymous_account_creation_allowed(&self) -> bool {
+        self.allow_anonymous_account_creation
+    }
+
     fn email_allowed(&self, email: &str) -> bool {
         self.allowed_emails
             .as_ref()
@@ -1437,6 +1704,9 @@ impl AuthConfig {
 #[derive(Clone, Debug, Default)]
 pub struct AccountRegistry {
     inner: Arc<Mutex<AccountRegistryData>>,
+    /// Serializes invite mutation with magic-link consume and the final
+    /// allowlist check, so removal cannot race account/session creation.
+    auth_lock: Arc<Mutex<()>>,
     /// Per-account locks that serialize study-store read-modify-write, so
     /// concurrent generation jobs for one account can't clobber each other's
     /// cards (059). Shared across clones — the worker runs on clones — and keyed
@@ -1452,6 +1722,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::file(store_root),
                 ..AccountRegistryData::default()
             })),
+            auth_lock: Arc::default(),
             store_locks: Arc::default(),
         }
     }
@@ -1463,6 +1734,7 @@ impl AccountRegistry {
                 storage: StudyStorageConfig::postgres(database_url),
                 ..AccountRegistryData::default()
             })),
+            auth_lock: Arc::default(),
             store_locks: Arc::default(),
         }
     }
@@ -1473,6 +1745,21 @@ impl AccountRegistry {
     pub fn with_auth_config(self, auth_config: AuthConfig) -> Self {
         let mut data = self.lock_data();
         data.auth_config = auth_config;
+        drop(data);
+        self
+    }
+
+    /// Inject the model-generation config used by the study routes.
+    ///
+    /// Production should set this from the environment; tests can pass an
+    /// explicit config to exercise the exact route-selection code path.
+    #[must_use]
+    pub fn with_generation_provider_config(
+        self,
+        generation_provider_config: Option<OpenRouterConfig>,
+    ) -> Self {
+        let mut data = self.lock_data();
+        data.generation_provider_config = generation_provider_config;
         drop(data);
         self
     }
@@ -1525,6 +1812,16 @@ impl AccountRegistry {
         }
     }
 
+    /// Where the waitlist should persist entries, or `None` when there is no
+    /// local file store. `_waitlist.json` sits beside the other store-root
+    /// sidecars (`_jobs.json`, `_rate_limits`).
+    pub(crate) fn waitlist_store_path(&self) -> Option<PathBuf> {
+        match &self.lock_data().storage {
+            StudyStorageConfig::File { store_root } => Some(store_root.join("_waitlist.json")),
+            StudyStorageConfig::Postgres { .. } => None,
+        }
+    }
+
     pub(crate) fn postgres_url(&self) -> Option<String> {
         match &self.lock_data().storage {
             StudyStorageConfig::Postgres { database_url } => Some(database_url.clone()),
@@ -1565,10 +1862,11 @@ impl AccountRegistry {
 }
 
 #[derive(Debug)]
-struct AccountRegistryData {
+pub(crate) struct AccountRegistryData {
     accounts: BTreeMap<String, AccountRecord>,
     browser_sessions: BTreeMap<String, BrowserSessionRecord>,
     auth_config: AuthConfig,
+    generation_provider_config: Option<OpenRouterConfig>,
     storage: StudyStorageConfig,
     now_fn: fn() -> i64,
 }
@@ -1579,6 +1877,7 @@ impl Default for AccountRegistryData {
             accounts: BTreeMap::new(),
             browser_sessions: BTreeMap::new(),
             auth_config: AuthConfig::default(),
+            generation_provider_config: None,
             storage: StudyStorageConfig::default(),
             now_fn: wall_clock_ms,
         }
@@ -1587,7 +1886,6 @@ impl Default for AccountRegistryData {
 
 #[derive(Clone, Debug)]
 struct AccountRecord {
-    session_token: String,
     store_path: PathBuf,
     sources: BTreeMap<String, SourceRecord>,
     submitted_reviews: BTreeMap<String, StudyViewResponse>,
@@ -1596,6 +1894,7 @@ struct AccountRecord {
 #[derive(Clone, Debug)]
 struct BrowserSessionRecord {
     account_id: String,
+    /// SHA-256 of the API bearer credential; the raw value never persists.
     session_token: String,
     csrf_token_hash: String,
     expires_at_ms: i64,
@@ -1624,6 +1923,8 @@ pub struct AccountCreated {
 pub struct CreateSourceRequest {
     pub title: String,
     pub body: String,
+    #[serde(default = "default_source_permission")]
+    pub permission: SourcePermission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1632,10 +1933,15 @@ pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
     pub body: String,
+    pub permission: SourcePermission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_expires_at: Option<i64>,
+}
+
+fn default_source_permission() -> SourcePermission {
+    SourcePermission::ModelEligible
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1740,6 +2046,24 @@ pub enum SubmitViewport {
     Mobile,
     Tablet,
     Desktop,
+}
+
+/// One browser-reported completion for a single `/app/submit` round trip:
+/// the five raw phase durations from tap to graded-visible, joined to the
+/// server request/trace ids, plus the viewport class. Groups what would
+/// otherwise be an eight-argument call into one coherent value so
+/// [`report_submit_browser_performance`] stays within clippy's
+/// `too_many_arguments` limit.
+#[derive(Clone, Copy, Debug)]
+pub struct BrowserSubmitReceipt<'a> {
+    pub request_id: &'a str,
+    pub trace_id: &'a str,
+    pub tap_to_ack_ms: u64,
+    pub request_to_response_ms: u64,
+    pub transfer_ms: u64,
+    pub navigation_ms: u64,
+    pub graded_visible_ms: u64,
+    pub viewport: SubmitViewport,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1942,6 +2266,22 @@ impl ApiFailure {
     pub fn is_magic_link_recovery(&self) -> bool {
         self.status == StatusCode::FORBIDDEN && self.message == "Magic link is invalid or expired."
     }
+
+    /// True when this failure came from validating or acting on a
+    /// return-notification (due-count reminder) unsubscribe token: signature
+    /// mismatch, malformed payload, unknown/rotated nonce, or a token whose
+    /// `expires_at_ms` has passed. All three call sites in
+    /// [`AccountRegistry::verify_unsubscribe_token`],
+    /// [`AccountRegistry::validate_return_notification_token`], and
+    /// [`AccountRegistry::disable_return_notification`] use
+    /// [`ApiFailure::forbidden`] with a message that starts with this exact
+    /// prefix, so it is a safe, precise discriminator distinct from every
+    /// other `Forbidden` failure in the app surface (e.g.
+    /// `forbidden_account`).
+    #[must_use]
+    pub fn is_return_notification_link_invalid(&self) -> bool {
+        self.status == StatusCode::FORBIDDEN && self.message.starts_with("That unsubscribe link")
+    }
 }
 
 /// Process-wide Canary reporter, installed once by the binary entry point.
@@ -2002,12 +2342,21 @@ pub fn report_submit_server_performance(duration_ms: u64, outcome: SubmitPerform
     report_performance_observation(marker, duration_ms);
 }
 
-pub fn report_submit_browser_performance(
-    tap_to_ack_ms: u64,
-    graded_visible_ms: u64,
-    viewport: SubmitViewport,
-) {
-    let viewport = match viewport {
+/// Emits the two Canary-aggregated completion phases plus a queryable,
+/// content-free receipt of the full five-duration decomposition.
+///
+/// `memory_engine_performance::CompletionPhase` is a frozen v1 contract
+/// (`cardinality_payload_and_rate_budgets_are_calculated_and_bounded` pins its
+/// series count; growing it requires a new schema version). Only
+/// `ImmediateAck` and `VisibleAfterTwoAnimationFrames` have a matching phase
+/// there, so those two remain the Canary-aggregated observations exactly as
+/// before. `request_to_response_ms`, `transfer_ms`, and `navigation_ms` are
+/// the intermediate breakdown of `graded_visible_ms` and have no phase to
+/// attach to under v1; [`report_browser_submit_durations_receipt`] keeps them
+/// queryable through the same production-log path the Canary batch export
+/// already relies on, without bumping the frozen series cardinality.
+pub fn report_submit_browser_performance(receipt: BrowserSubmitReceipt<'_>) {
+    let performance_viewport = match receipt.viewport {
         SubmitViewport::Mobile => memory_engine_performance::Viewport::Mobile,
         SubmitViewport::Tablet => memory_engine_performance::Viewport::Tablet,
         SubmitViewport::Desktop => memory_engine_performance::Viewport::Desktop,
@@ -2015,11 +2364,11 @@ pub fn report_submit_browser_performance(
     for (phase, duration_ms) in [
         (
             memory_engine_performance::CompletionPhase::ImmediateAck,
-            tap_to_ack_ms,
+            receipt.tap_to_ack_ms,
         ),
         (
             memory_engine_performance::CompletionPhase::VisibleAfterTwoAnimationFrames,
-            graded_visible_ms,
+            receipt.graded_visible_ms,
         ),
     ] {
         let marker = memory_engine_performance::CompletionMarker::browser(
@@ -2029,10 +2378,35 @@ pub fn report_submit_browser_performance(
             phase,
             memory_engine_performance::Outcome::Succeeded,
             memory_engine_performance::Navigation::FullPage,
-            viewport,
+            performance_viewport,
         );
         report_performance_observation(marker, duration_ms);
     }
+    println!("{}", report_browser_submit_durations_receipt(receipt));
+}
+
+/// Build (without printing) the queryable five-duration receipt for one
+/// browser submit completion. Pure and side-effect free so the full
+/// decomposition can be asserted on directly in tests; see
+/// [`report_submit_browser_performance`] for why this exists alongside the
+/// two Canary observations.
+fn report_browser_submit_durations_receipt(receipt: BrowserSubmitReceipt<'_>) -> serde_json::Value {
+    let viewport = match receipt.viewport {
+        SubmitViewport::Mobile => "mobile",
+        SubmitViewport::Tablet => "tablet",
+        SubmitViewport::Desktop => "desktop",
+    };
+    serde_json::json!({
+        "schema": "memory_engine.browser_submit_durations.v1",
+        "request_id": receipt.request_id,
+        "trace_id": receipt.trace_id,
+        "viewport": viewport,
+        "tap_to_ack_ms": receipt.tap_to_ack_ms,
+        "request_to_response_ms": receipt.request_to_response_ms,
+        "transfer_ms": receipt.transfer_ms,
+        "navigation_ms": receipt.navigation_ms,
+        "graded_visible_ms": receipt.graded_visible_ms,
+    })
 }
 
 fn report_performance_observation(
@@ -2149,6 +2523,10 @@ pub fn read_session_token(headers: &HeaderMap) -> Result<&str, ApiFailure> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .or_else(|| read_bearer_session_token(headers))
+        // A persisted SHA-256 digest is an internal lookup key, never a wire
+        // credential. Reject hash-shaped presentations before they reach the
+        // registry so a store reader cannot replay an at-rest session digest.
+        .filter(|value| !is_secret_hash(value))
         .ok_or_else(ApiFailure::missing_session)
 }
 
@@ -2176,22 +2554,6 @@ fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
             })
         })
         .ok_or_else(ApiFailure::missing_session)
-}
-
-#[must_use]
-pub fn client_rate_limit_key(headers: &HeaderMap) -> String {
-    ["do-connecting-ip", "x-real-ip", "x-forwarded-for"]
-        .into_iter()
-        .find_map(|header| {
-            headers
-                .get(header)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub fn csrf_token(value: Option<&String>) -> &str {
@@ -2245,12 +2607,9 @@ fn secret_hash(value: &str) -> String {
     encoded
 }
 
-fn require_account_session(account: &AccountRecord, session_token: &str) -> Result<(), ApiFailure> {
-    if account.session_token == session_token {
-        return Ok(());
-    }
-
-    Err(ApiFailure::forbidden_account())
+#[must_use]
+pub(crate) fn is_secret_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn account_id_for(email: &str) -> String {
@@ -2269,17 +2628,13 @@ fn new_browser_session_id() -> String {
     format!("browser_{:032x}", rand::random::<u128>())
 }
 
-/// Derive a session's CSRF token from its server-side session secret.
+/// Derive a browser session's CSRF token from its durable API-session hash.
 ///
-/// The token is a pure function of `session_token`, which never leaves the
-/// server — the browser cookie carries only the opaque session id. So any
-/// cookie-authenticated render, including a plain `GET /` of the home, can emit
-/// valid CSRF-protected forms without the token being stored or threaded
-/// through. An attacker mounting a cross-site request knows neither the session
-/// secret nor this one-way derivation of it, so they cannot forge the token; and
-/// because the digest is one-way, exposing a form's CSRF token never reveals the
-/// session secret. Validation stays hash-based: the session record holds
-/// `secret_hash(session_csrf_token(session_token))`, unchanged.
+/// API credentials are issued once to the caller, but only their SHA-256 hash
+/// crosses the browser-session persistence boundary. The browser cookie carries
+/// only an opaque session id; a signed-in render can derive the form token from
+/// that stored hash without persisting another raw credential. Validation stays
+/// hash-based: the session record holds `secret_hash(session_csrf_token(session_token))`.
 fn session_csrf_token(session_token: &str) -> String {
     format!("csrf_{}", secret_hash(&format!("csrf:{session_token}")))
 }
@@ -2294,6 +2649,10 @@ pub const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 pub const MAX_SOURCE_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_SOURCE_TITLE_BYTES: usize = 512;
 const APP_ACCOUNT_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
+/// Same policy shape as the magic-link request limiter: five attempts per
+/// window, keyed by normalized email and by client IP.
+pub const WAITLIST_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
+const WAITLIST_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 // 30 minutes: links travel through email, where spam checks and device
 // switches routinely burn ten minutes. Found in dogfood: a link expired
 // before the operator could click it.
@@ -2327,10 +2686,6 @@ fn project_deck_id_for(account_id: &str, project_key: &str, title: &str, body: &
 
 fn account_store_path(store_root: &FsPath, account_id: &str) -> PathBuf {
     store_root.join(account_id).join("study.json")
-}
-
-fn account_session_path(store_root: &FsPath, account_id: &str) -> PathBuf {
-    store_root.join(account_id).join("session.token")
 }
 
 fn browser_session_path(store_root: &FsPath, session_id: &str) -> PathBuf {
@@ -2387,49 +2742,89 @@ pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Generate drafts for one source using the configured provider.
 ///
-/// When `OPENROUTER_API_KEY` is set, arbitrary prose routes to the model via
-/// a [`FallbackProvider`] whose primary is the deterministic structured-block
-/// parser, so hand-written `Concept:/Question:/Answer:` blocks keep their free
-/// path. Without a key the structured parser runs alone, which is what CI and
-/// key-less deployments use.
+/// When `OPENROUTER_API_KEY` is set, `ModelEligible` arbitrary prose routes to
+/// the model via a [`FallbackProvider`] whose primary is the deterministic
+/// structured-block parser. `LocalOnly` sources always take the structured
+/// parser path, so they remain usable without model or network access.
 fn run_source_generation<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let run_id = format!("study-run-{:032x}", rand::random::<u128>());
-    run_source_generation_with_run_id(study, source_id, &run_id)
+    run_source_generation_inner(study, source_id, &run_id, generation_provider_config, false)
 }
 
 pub(crate) fn run_source_generation_with_run_id<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
     run_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
+where
+    S: memory_engine_study::BetaStudyStore,
+    <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
+{
+    run_source_generation_inner(study, source_id, run_id, generation_provider_config, true)
+}
+
+fn run_source_generation_inner<S>(
+    study: &mut BetaStudySession<S>,
+    source_id: &str,
+    run_id: &str,
+    generation_provider_config: Option<OpenRouterConfig>,
+    mark_pending: bool,
 ) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
     let ids = Some(vec![source_id.to_owned()]);
-    match OpenRouterConfig::from_env() {
-        Ok(config) => {
-            let model = OpenRouterProvider::new(config);
-            let provider = FallbackProvider::new(&model);
-            study.generate_with_provider_and_run_id(ids, &provider, run_id)
+    let local_only = study
+        .view()
+        .map_err(study_failure)?
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
+    let generated = if local_only {
+        if mark_pending {
+            study.generate_with_run_id_pending(ids, run_id)
+        } else {
+            study.generate_with_run_id(ids, run_id)
         }
-        Err(_) => study.generate_with_run_id(ids, run_id),
-    }
-    .map_err(study_failure)
+    } else {
+        match generation_provider_config {
+            Some(config) => {
+                let model = OpenRouterProvider::new(config);
+                let provider = FallbackProvider::new(&model);
+                if mark_pending {
+                    study.generate_with_provider_and_run_id_pending(ids, &provider, run_id)
+                } else {
+                    study.generate_with_provider_and_run_id(ids, &provider, run_id)
+                }
+            }
+            None => {
+                if mark_pending {
+                    study.generate_with_run_id_pending(ids, run_id)
+                } else {
+                    study.generate_with_run_id(ids, run_id)
+                }
+            }
+        }
+    };
+    generated.map_err(study_failure)
 }
 
 #[cfg(test)]
 pub(crate) fn run_source_generation_with_provider<S>(
     study: &mut BetaStudySession<S>,
     source_id: &str,
-    provider: &dyn memory_engine_generation::DraftProvider,
+    provider: Option<&dyn DraftProvider>,
 ) -> Result<
     BetaStudyView,
     memory_engine_study::BetaStudyError<<S as memory_engine_service::MemoryServiceStore>::Error>,
@@ -2437,53 +2832,68 @@ pub(crate) fn run_source_generation_with_provider<S>(
 where
     S: memory_engine_study::BetaStudyStore,
 {
-    study.generate_with_provider(Some(vec![source_id.to_owned()]), provider)
+    let local_only = study
+        .view()?
+        .sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .is_some_and(|source| source.permission == SourcePermission::LocalOnly);
+    let ids = Some(vec![source_id.to_owned()]);
+    if local_only {
+        study.generate(ids)
+    } else if let Some(provider) = provider {
+        study.generate_with_provider(ids, provider)
+    } else {
+        study.generate(ids)
+    }
 }
 
-fn run_reference_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_reference_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.learn_more().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.learn_more().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.learn_more_with_provider(&model)
-            }
-            Err(_) => study.learn_more(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.learn_more_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.learn_more(),
     }
+    .map_err(study_failure)
 }
 
-fn run_bridge_generation<S>(study: &mut BetaStudySession<S>) -> Result<BetaStudyView, ApiFailure>
+fn run_bridge_generation<S>(
+    study: &mut BetaStudySession<S>,
+    generation_provider_config: Option<OpenRouterConfig>,
+) -> Result<BetaStudyView, ApiFailure>
 where
     S: memory_engine_study::BetaStudyStore,
     <S as memory_engine_service::MemoryServiceStore>::Error: std::fmt::Display,
 {
-    #[cfg(test)]
-    {
-        study.generate_bridge_material().map_err(study_failure)
+    let authorization = study
+        .current_source_authorization()
+        .map_err(study_failure)?;
+    if authorization.local_only_source_id().is_some() {
+        return study.generate_bridge_material().map_err(study_failure);
     }
-
-    #[cfg(not(test))]
-    {
-        match OpenRouterConfig::from_env() {
-            Ok(config) => {
-                let model = OpenRouterProvider::new(config);
-                study.generate_bridge_material_with_provider(&model)
-            }
-            Err(_) => study.generate_bridge_material(),
+    match generation_provider_config {
+        Some(config) => {
+            let model = OpenRouterProvider::new(config);
+            study.generate_bridge_material_with_provider(&model)
         }
-        .map_err(study_failure)
+        None => study.generate_bridge_material(),
     }
+    .map_err(study_failure)
 }
 
 fn open_study_session(path: &FsPath, now: fn() -> i64) -> Result<BetaStudySession, ApiFailure> {
@@ -2665,7 +3075,64 @@ fn migrate_postgres_store(
     Ok(())
 }
 
+trait LearnerDecisionApiError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure>;
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence::BetaStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer | Self::AttemptAnswerBlank => Some(
+                ApiFailure::bad_request("The learner decision request is invalid."),
+            ),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl LearnerDecisionApiError for memory_engine_persistence_postgres::PostgresStoreError {
+    fn learner_decision_api_failure(&self) -> Option<ApiFailure> {
+        match self {
+            Self::UnknownSourceDocument(_)
+            | Self::UnknownReviewUnit(_)
+            | Self::UnknownGeneratedPromptDraft(_) => Some(ApiFailure::not_found(
+                "Generated draft or review unit not found.",
+            )),
+            Self::SourceDocumentArchived(_) | Self::ReviewUnitArchived(_) => Some(
+                ApiFailure::conflict("The source or review unit is archived."),
+            ),
+            Self::Blank { .. } | Self::InvalidBooleanAnswer => Some(ApiFailure::bad_request(
+                "The learner decision request is invalid.",
+            )),
+            Self::RejectedGeneratedPromptDraft => Some(ApiFailure::bad_request(
+                "Rejected generated drafts cannot be kept or edited.",
+            )),
+            Self::LearnerDraftDecisionAlreadyRecorded(_) => Some(ApiFailure::conflict(
+                "A learner decision is already recorded for this draft.",
+            )),
+            _ => None,
+        }
+    }
+}
+
 fn postgres_failure(error: memory_engine_persistence_postgres::PostgresStoreError) -> ApiFailure {
+    if let Some(failure) = error.learner_decision_api_failure() {
+        return failure;
+    }
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
@@ -2727,6 +3194,7 @@ fn persisted_sources(path: &FsPath) -> Result<Vec<SourceRecord>, ApiFailure> {
             source_id: source.id,
             title: source.title,
             body: source.body.unwrap_or_default(),
+            permission: source.permission,
             project_key: source.project_key,
             ttl_expires_at: source.ttl_expires_at,
         })
@@ -2758,6 +3226,30 @@ fn study_failure<E: std::fmt::Display>(
     let message = error.to_string();
     drop(error);
     ApiFailure::internal(message)
+}
+
+fn file_study_failure(
+    error: memory_engine_study::BetaStudyError<memory_engine_persistence::BetaStoreError>,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
+}
+
+fn postgres_study_failure(
+    error: memory_engine_study::BetaStudyError<
+        memory_engine_persistence_postgres::PostgresStoreError,
+    >,
+) -> ApiFailure {
+    if let memory_engine_study::BetaStudyError::Store(store_error) = &error {
+        if let Some(failure) = store_error.learner_decision_api_failure() {
+            return failure;
+        }
+    }
+    study_failure(error)
 }
 
 fn require_current_review(
@@ -2794,17 +3286,68 @@ fn require_current_review_postgres(
 mod tests {
     use super::*;
 
-    #[test]
-    fn client_rate_limit_key_prefers_digitalocean_client_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("do-connecting-ip", HeaderValue::from_static("203.0.113.10"));
-        headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.1"));
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("10.0.0.2, 10.0.0.3"),
-        );
+    #[derive(Default)]
+    struct CountingConfiguredProvider {
+        calls: std::cell::Cell<usize>,
+    }
 
-        assert_eq!(client_rate_limit_key(&headers), "203.0.113.10");
+    impl memory_engine_generation::DraftProvider for CountingConfiguredProvider {
+        fn model(&self) -> memory_engine_persistence::GeneratedPromptModel {
+            memory_engine_persistence::GeneratedPromptModel {
+                provider: "counting".to_owned(),
+                name: "configured".to_owned(),
+                version: "test".to_owned(),
+            }
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &memory_engine_persistence::SourceDocument,
+        ) -> Result<
+            memory_engine_generation::ProviderDrafts,
+            memory_engine_generation::ProviderFailure,
+        > {
+            self.calls.set(self.calls.get() + 1);
+            Ok(memory_engine_generation::ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: Vec::new(),
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn manual_scheduler_trigger_rejects_absent_and_wrong_token_but_accepts_configured_token() {
+        let state =
+            ApiState::new(AccountRegistry::default().with_auth_config(
+                AuthConfig::default().with_scheduler_manual_token("correct-token"),
+            ));
+
+        let absent = state.run_manual_return_notification_scheduler("");
+        let absent_error = absent.expect_err("empty token must fail closed");
+        assert_eq!(absent_error.status, StatusCode::FORBIDDEN);
+
+        let wrong = state.run_manual_return_notification_scheduler("wrong-token");
+        let wrong_error = wrong.expect_err("mismatched token must fail closed");
+        assert_eq!(wrong_error.status, StatusCode::FORBIDDEN);
+
+        let ok = state.run_manual_return_notification_scheduler("correct-token");
+        assert_eq!(
+            ok.expect("configured token starts the scheduler run")
+                .examined,
+            0
+        );
+    }
+
+    #[test]
+    fn manual_scheduler_trigger_fails_closed_when_unconfigured() {
+        let state = ApiState::default();
+        let error = state
+            .run_manual_return_notification_scheduler("anything")
+            .expect_err("no configured token must fail closed");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -2845,5 +3388,391 @@ mod tests {
         assert_eq!(readiness.status, "not_ready");
         assert!(!readiness.worker_started);
         assert!(readiness.postgres);
+    }
+
+    #[test]
+    fn local_only_generation_uses_structured_path_when_external_provider_is_configured() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+        let provider = CountingConfiguredProvider::default();
+
+        let view = run_source_generation_with_provider(&mut study, "local-source", Some(&provider))
+            .expect("local generation");
+
+        assert!(!view.drafts.is_empty(), "local source should produce cards");
+        assert_eq!(
+            provider.calls.get(),
+            0,
+            "configured model must not be called"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn local_only_reference_and_bridge_ignore_the_runtime_generation_provider_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "memory-engine-api-state-local-only-reference-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("study.json");
+        let mut study = BetaStudySession::open(BetaStudyOptions::new(&path)).expect("study");
+        study
+            .add_source(memory_engine_study::BetaStudySourceInput {
+                id: "local-source".to_owned(),
+                title: "Local source".to_owned(),
+                body: "Concept: NATO letter A\nQuestion: What word cues A?\nAnswer: ALFA"
+                    .to_owned(),
+                project_key: None,
+                ttl_expires_at: None,
+                permission: SourcePermission::LocalOnly,
+            })
+            .expect("source");
+
+        let config = OpenRouterConfig {
+            api_key: "test-key".to_owned(),
+            model: "test-model".to_owned(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            timeout: std::time::Duration::from_millis(1),
+            prompt: memory_engine_openrouter::PromptVariant::Principled,
+            max_drafts: 1,
+            proxy_socket: None,
+        };
+
+        let generated = study.generate(None).expect("generate");
+        let draft_id = generated.drafts.first().expect("draft").id.clone();
+        study.keep_draft(&draft_id).expect("keep");
+        study.start().expect("start reference session");
+
+        let reference = run_reference_generation(&mut study, Some(config.clone()))
+            .expect("local reference generation");
+        assert!(
+            reference.current.is_some(),
+            "local reference should still render"
+        );
+
+        study.start().expect("start bridge session");
+        let bridge =
+            run_bridge_generation(&mut study, Some(config)).expect("local bridge generation");
+        assert!(
+            bridge.current.is_none(),
+            "local bridge generation must remain pending"
+        );
+        assert!(
+            bridge
+                .drafts
+                .iter()
+                .any(|draft| draft.review_unit_id.as_str().starts_with("bridge-")),
+            "local bridge drafts should remain inspectable"
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn browser_submit_durations_receipt_retains_all_five_durations() {
+        // memory-engine-109 review finding: report_submit_browser_performance
+        // used to accept and forward only tap_to_ack_ms/graded_visible_ms,
+        // silently discarding request_to_response_ms/transfer_ms/navigation_ms
+        // at ingestion. The receipt must carry every one of the five raw
+        // values through unchanged, joined to the same request/trace ids.
+        let receipt = report_browser_submit_durations_receipt(BrowserSubmitReceipt {
+            request_id: "req_0123456789abcdef0123456789abcdef",
+            trace_id: "trace_0123456789abcdef0123456789abcdef",
+            tap_to_ack_ms: 11,
+            request_to_response_ms: 22,
+            transfer_ms: 33,
+            navigation_ms: 44,
+            graded_visible_ms: 99,
+            viewport: SubmitViewport::Mobile,
+        });
+        assert_eq!(
+            receipt,
+            serde_json::json!({
+                "schema": "memory_engine.browser_submit_durations.v1",
+                "request_id": "req_0123456789abcdef0123456789abcdef",
+                "trace_id": "trace_0123456789abcdef0123456789abcdef",
+                "viewport": "mobile",
+                "tap_to_ack_ms": 11,
+                "request_to_response_ms": 22,
+                "transfer_ms": 33,
+                "navigation_ms": 44,
+                "graded_visible_ms": 99,
+            })
+        );
+    }
+    #[test]
+    fn file_sessions_are_independent_hashed_expiring_and_invite_revocation_is_final() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-auth-hardening-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["invite@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_anonymous_account_creation(true),
+                ),
+        );
+        let first = state
+            .create_account("invite@example.com")
+            .expect("first session");
+        let request = state
+            .request_magic_link("invite@example.com", "edge-a")
+            .expect("request second session");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let second = state
+            .verify_magic_link_for_client(token, "edge-a")
+            .expect("second browser session");
+        assert_ne!(first.session_token, second.session_token());
+        assert!(state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&first.account_id, &first.session_token, None)
+            .expect("first remains valid"));
+        assert!(root
+            .join("_api_sessions")
+            .read_dir()
+            .expect("api session rows")
+            .flatten()
+            .all(
+                |entry| std::fs::read_to_string(entry.path().join("session"))
+                    .map(|body| !body.contains(&first.session_token))
+                    .unwrap_or(true)
+            ));
+        NOW.store(
+            now() + app_session_max_age_ms() + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(!state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&first.account_id, &first.session_token, None)
+            .expect("expired first session"));
+        let root2 = std::env::temp_dir().join(format!(
+            "memory-engine-auth-revoke-{}",
+            rand::random::<u128>()
+        ));
+        let state2 = ApiState::new(
+            AccountRegistry::with_store_root(&root2)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["revoke@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_anonymous_account_creation(true),
+                ),
+        );
+        let pending = state2
+            .request_magic_link("revoke@example.com", "edge-b")
+            .expect("pending invite");
+        let pending_token = pending
+            .debug_link
+            .expect("pending debug link")
+            .split("token=")
+            .nth(1)
+            .expect("pending token")
+            .to_owned();
+        state2
+            .revoke_invite("revoke@example.com")
+            .expect("revoke invite");
+        assert_eq!(
+            state2
+                .verify_magic_link_for_client(&pending_token, "edge-b")
+                .expect_err("revoked invite must fail")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root2);
+    }
+
+    #[test]
+    fn revoking_all_api_sessions_preserves_the_signed_in_browser_session() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-auth-revoke-all-api-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    AuthConfig::allow_emails(["revoke-all@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        // Sign in through the browser: this mints both the browser-session
+        // wrapper and its backing account/API session row.
+        let request = state
+            .request_magic_link("revoke-all@example.com", "edge-a")
+            .expect("request browser session");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let browser = state
+            .verify_magic_link_for_client(token, "edge-a")
+            .expect("browser session");
+
+        // A machine client independently mints its own service session for
+        // the same account.
+        let machine = state
+            .issue_service_session("test-admin-token", "revoke-all@example.com")
+            .expect("service session");
+        assert_eq!(browser.account_id(), machine.account_id);
+
+        // The machine calls "revoke all API sessions" using its own credential.
+        state
+            .revoke_all_api_sessions(&machine.account_id, &machine.session_token)
+            .expect("revoke all api sessions");
+
+        // The browser stays signed in: its underlying account/API session
+        // survives because it backs a live browser session.
+        assert!(state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(
+                browser.account_id(),
+                browser.session_token(),
+                None
+            )
+            .expect("browser session survives revoke-all"));
+
+        // The machine credential that performed the revoke is itself gone.
+        assert!(!state
+            .accounts
+            .storage()
+            .account_session_matches_with_timings(&machine.account_id, &machine.session_token, None)
+            .expect("machine session is revoked"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn set_return_notification_admits_a_durably_invited_email() {
+        static NOW: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(1_800_000_000_000);
+        fn now() -> i64 {
+            NOW.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-durable-invite-reminder-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root)
+                .with_clock(now)
+                .with_auth_config(
+                    // Deliberately excludes the durably invited email below:
+                    // it must be admitted through the persisted waitlist,
+                    // not the static allowlist.
+                    AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                        .with_debug_links(true)
+                        .with_admin_token("test-admin-token"),
+                ),
+        );
+
+        state
+            .join_waitlist("durable@example.com", "landing", "edge-a")
+            .expect("join waitlist");
+        state
+            .mark_waitlist_invited("test-admin-token", "durable@example.com")
+            .expect("mark invited");
+
+        // Sign in through the durable invite, not the static allowlist.
+        let request = state
+            .request_magic_link("durable@example.com", "edge-b")
+            .expect("request magic link for durably invited email");
+        let link = request.debug_link.expect("debug link");
+        let token = link.split("token=").nth(1).expect("token");
+        let account = state
+            .verify_magic_link_for_client(token, "edge-b")
+            .expect("durable invite signs in");
+
+        // Enabling reminders for that same durably invited email must
+        // succeed even though it is absent from the static allowlist.
+        state
+            .set_return_notification(&account, Some("durable@example.com"), true)
+            .expect("durably invited email may enable reminders");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_bypasses_the_static_allowlist() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                // The allowlist deliberately contains no guest address:
+                // guest emails are server-generated and unpredictable, so
+                // there is nothing for an allowlist to vet.
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(true),
+            ),
+        );
+
+        let guest = state
+            .create_guest_account()
+            .expect("guest account creation bypasses the static allowlist");
+        assert!(guest.account_id.starts_with("acct_"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_guest_account_stays_disabled_outside_local_dev() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-guest-account-disabled-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(
+                AuthConfig::allow_emails(["operator@example.com".to_owned()])
+                    .with_anonymous_account_creation(false),
+            ),
+        );
+
+        assert_eq!(
+            state
+                .create_guest_account()
+                .expect_err("guest creation stays deny-by-default")
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

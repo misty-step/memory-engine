@@ -2,26 +2,42 @@ use std::{collections::BTreeMap, fmt::Write as _, fs, io::Write as _, process::C
 
 use axum::http::HeaderMap;
 use hmac::{KeyInit, Mac};
-use memory_engine_persistence::GeneratedPromptValidationStatus;
+use memory_engine_persistence::SourcePermission;
+use memory_engine_persistence_postgres::{
+    AuthChallengeSessionOutcome, AuthChallengeSessionRequest, PostgresWaitlistEntry,
+};
 use memory_engine_service::RecordContentFeedbackCommand;
 
-use crate::storage::GenerationCommitFence;
 use crate::{
     account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
     new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
-    read_browser_session_id, require_account_session, secret_hash, session_csrf_token,
-    source_id_for, AccountCreated, AccountRecord, AccountRegistry, ApiFailure, AppAccount,
-    AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
-    CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
-    ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
+    read_browser_session_id, secret_hash, session_csrf_token, source_id_for, AccountCreated,
+    AccountRecord, AccountRegistry, AccountRegistryData, ApiFailure, AppAccount, AuthConfig,
+    AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest, CreateProjectDeckRequest,
+    CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
+    ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
     ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
-    SubmitReviewRequest, SubmitReviewTimings, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
+    SubmitReviewRequest, SubmitReviewTimings, WaitlistEntry, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
     APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
-    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
+    RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
+    WAITLIST_RATE_LIMIT_WINDOW_MS,
 };
 
 const RETURN_NOTIFICATION_CLAIM_TTL_MS: i64 = 5 * 60 * 1_000;
+const MAGIC_LINK_VERIFY_RATE_LIMIT_MAX_ATTEMPTS: u32 = 10;
+const MAGIC_LINK_VERIFY_RATE_LIMIT_WINDOW_MS: i64 = 15 * 60 * 1_000;
 
+/// Map a Postgres-backed waitlist row onto the public, backend-agnostic
+/// [`WaitlistEntry`] the API returns regardless of storage.
+fn waitlist_entry_from_postgres(entry: PostgresWaitlistEntry) -> WaitlistEntry {
+    WaitlistEntry {
+        email: entry.email,
+        created_at_ms: entry.created_at_ms,
+        updated_at_ms: entry.updated_at_ms,
+        source: entry.source,
+        invited_at_ms: entry.invited_at_ms,
+    }
+}
 impl AccountRegistry {
     /// Create a local account record for the production shell.
     ///
@@ -32,7 +48,18 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
+    pub(crate) fn anonymous_account_creation_allowed(&self) -> bool {
+        self.lock_data()
+            .auth_config
+            .anonymous_account_creation_allowed()
+    }
+
     pub(crate) fn create_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
+        if !self.anonymous_account_creation_allowed() {
+            return Err(ApiFailure::forbidden(
+                "Anonymous account creation is disabled.",
+            ));
+        }
         // Found live during ticket-42 QA: this route issued a session token to
         // any email, bypassing the allowlist the magic-link flow enforces.
         let allowed = {
@@ -44,6 +71,27 @@ impl AccountRegistry {
                 "This email is not allowed to register.",
             ));
         }
+        self.create_account_unchecked(email)
+    }
+
+    /// Mint a guest account with a server-generated local address.
+    ///
+    /// Skips the static allowlist entirely: the ticket-42 check in
+    /// [`Self::create_account`] guards a caller-supplied email, but a guest
+    /// address is generated right here and never caller-controlled, so
+    /// there is nothing for an allowlist to vet. Still gated by
+    /// [`Self::anonymous_account_creation_allowed`] (local/dev only).
+    pub(crate) fn create_guest_account(&self) -> Result<AccountCreated, ApiFailure> {
+        if !self.anonymous_account_creation_allowed() {
+            return Err(ApiFailure::forbidden(
+                "Anonymous account creation is disabled.",
+            ));
+        }
+        let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
+        self.create_account_unchecked(&email)
+    }
+
+    fn create_account_unchecked(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
         let account_id = account_id_for(email);
         if self.account_exists(&account_id)? {
             return Err(ApiFailure::conflict("Account already exists."));
@@ -55,16 +103,13 @@ impl AccountRegistry {
         let storage = self.storage();
         storage.save_account_session(&account_id, &account.session_token)?;
         let mut data = self.lock_data();
-        let record = data
-            .accounts
+        data.accounts
             .entry(account.account_id.clone())
             .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
                 store_path: storage.account_store_path(&account_id),
                 sources: BTreeMap::new(),
                 submitted_reviews: BTreeMap::new(),
             });
-        record.session_token.clone_from(&account.session_token);
         drop(data);
 
         Ok(account)
@@ -105,17 +150,13 @@ impl AccountRegistry {
         storage.copy_account(source_account_id, &target_account_id, &source.store_path)?;
 
         let mut data = self.lock_data();
-        let record = data
-            .accounts
+        data.accounts
             .entry(target.account_id.clone())
             .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
                 store_path: target_store_path,
                 sources: source.sources.clone(),
                 submitted_reviews: BTreeMap::new(),
             });
-        record.session_token.clone_from(&target.session_token);
-
         Ok(target)
     }
 
@@ -140,7 +181,7 @@ impl AccountRegistry {
             let data = self.lock_data();
             data.auth_config.clone()
         };
-        if !auth_config.email_allowed(&email) {
+        if !auth_config.email_allowed(&email) && !self.persisted_invite_allows(&email) {
             return Ok(MagicLinkRequest { debug_link: None });
         }
 
@@ -159,20 +200,337 @@ impl AccountRegistry {
         })
     }
 
+    /// Consult the durable waitlist before issuing a magic link. The process
+    /// allowlist remains useful for configured operators, but invited access
+    /// must survive restart and work across replicas for both adapters.
+    fn persisted_invite_allows(&self, email: &str) -> bool {
+        if let Some(database_url) = self.postgres_url() {
+            return crate::with_postgres_store(&database_url, |store| {
+                Ok(store
+                    .waitlist_list()
+                    .map_err(crate::postgres_failure)?
+                    .into_iter()
+                    .any(|entry| entry.email == email && entry.invited_at_ms.is_some()))
+            })
+            .unwrap_or(false);
+        }
+        let Some(store_path) = self.waitlist_store_path() else {
+            return false;
+        };
+        crate::waitlist::list(&store_path)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .any(|entry| entry.email == email && entry.invited_at_ms.is_some())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Join the invite-beta waitlist.
+    ///
+    /// Rate limiting runs through the shared per-key attempt counter (the
+    /// same mechanism backing `record_app_account_request`) so it works for
+    /// both storage backends. A malformed email still spends the IP quota,
+    /// exactly like `request_magic_link`, so a scripted probe can't skip the
+    /// limiter by sending garbage.
+    ///
+    /// # Errors
+    ///
+    /// Returns bad request on a malformed email, too-many-requests when the
+    /// per-email or per-IP limit is spent, and service-unavailable when
+    /// storage rejects the write.
+    pub(crate) fn join_waitlist(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let Some(email) = normalize_email(email) else {
+            self.record_waitlist_request(None, client_rate_limit_key)?;
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        self.record_waitlist_request(Some(&email), client_rate_limit_key)?;
+        let now = self.now();
+        if let Some(database_url) = self.postgres_url() {
+            return crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_join(&email, source, now)
+                    .map_err(crate::postgres_failure)
+            });
+        }
+        let Some(store_path) = self.waitlist_store_path() else {
+            return Err(ApiFailure::service_unavailable(
+                "Waitlist persistence is not configured.".to_owned(),
+            ));
+        };
+        crate::waitlist::join(&store_path, &email, source, now)
+    }
+
+    /// List every waitlist entry for the operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// and service-unavailable when storage rejects the read.
+    pub(crate) fn list_waitlist(
+        &self,
+        admin_token: &str,
+    ) -> Result<Vec<WaitlistEntry>, ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        if let Some(database_url) = self.postgres_url() {
+            return crate::with_postgres_store(&database_url, |store| {
+                Ok(store
+                    .waitlist_list()
+                    .map_err(crate::postgres_failure)?
+                    .into_iter()
+                    .map(waitlist_entry_from_postgres)
+                    .collect())
+            });
+        }
+        let Some(store_path) = self.waitlist_store_path() else {
+            return Err(ApiFailure::service_unavailable(
+                "Waitlist persistence is not configured.".to_owned(),
+            ));
+        };
+        crate::waitlist::list(&store_path)
+    }
+
+    /// Mark one waitlist entry invited for the operator. Idempotent: marking
+    /// an already-invited entry again leaves its `invited_at_ms` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the read or write.
+    pub(crate) fn mark_waitlist_invited(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<WaitlistEntry, ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        let Some(email) = normalize_email(email) else {
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        let now = self.now();
+        let entry = if let Some(database_url) = self.postgres_url() {
+            crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_mark_invited(&email, now)
+                    .map_err(crate::postgres_failure)
+            })?
+            .map(waitlist_entry_from_postgres)
+        } else {
+            let Some(store_path) = self.waitlist_store_path() else {
+                return Err(ApiFailure::service_unavailable(
+                    "Waitlist persistence is not configured.".to_owned(),
+                ));
+            };
+            crate::waitlist::mark_invited(&store_path, &email, now)?
+        };
+        let entry = entry.ok_or_else(|| ApiFailure::not_found("Waitlist entry not found."))?;
+        // Admission reads the durable invited_at_ms row on every request;
+        // do not copy this state into a process-local allowlist.
+        Ok(entry)
+    }
+
+    /// Delete one waitlist entry for the operator. The append-only audit
+    /// trail keeps a record of the join and any invite that preceded the
+    /// deletion; only the operational row is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns forbidden when the admin token is unconfigured or mismatched,
+    /// not-found when no entry matches the normalized email, and
+    /// service-unavailable when storage rejects the write.
+    pub(crate) fn delete_waitlist_entry(
+        &self,
+        admin_token: &str,
+        email: &str,
+    ) -> Result<(), ApiFailure> {
+        self.verify_admin_token(admin_token)?;
+        let Some(email) = normalize_email(email) else {
+            return Err(ApiFailure::bad_request(
+                "Email must contain one @ and a domain.",
+            ));
+        };
+        let now = self.now();
+        let _auth_guard = self
+            .auth_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deleted = if let Some(database_url) = self.postgres_url() {
+            crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_delete(&email, now)
+                    .map_err(crate::postgres_failure)
+            })?
+        } else {
+            let Some(store_path) = self.waitlist_store_path() else {
+                return Err(ApiFailure::service_unavailable(
+                    "Waitlist persistence is not configured.".to_owned(),
+                ));
+            };
+            crate::waitlist::delete(&store_path, &email, now)?
+        };
+        if deleted {
+            // Removing the durable row also revokes outstanding challenges in
+            // the same adapter operation; admission sees the removal after a
+            // restart or from another replica.
+            Ok(())
+        } else {
+            Err(ApiFailure::not_found("Waitlist entry not found."))
+        }
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
+    /// Remove one address from the live invite allowlist. Existing challenges
+    /// remain single-use records, but consume rechecks this same state before
+    /// creating an account or browser session.
+    pub fn revoke_invite(&self, email: &str) -> Result<(), ApiFailure> {
+        let email = normalize_email(email).ok_or_else(|| {
+            ApiFailure::bad_request("Account email must contain one @ and a domain.")
+        })?;
+        let _auth_guard = self
+            .auth_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _durable_auth_lock = self
+            .waitlist_store_path()
+            .map(|path| crate::file_lock::acquire(&path.with_file_name("auth.lock")))
+            .transpose()?;
+        let now = self.now();
+        if let Some(database_url) = self.postgres_url() {
+            crate::with_postgres_store(&database_url, |store| {
+                store
+                    .waitlist_delete(&email, now)
+                    .map_err(crate::postgres_failure)
+            })?;
+        } else if let Some(store_path) = self.waitlist_store_path() {
+            let _ = crate::waitlist::delete(&store_path, &email, now)?;
+        }
+        let mut data = self.lock_data();
+        let Some(allowed) = data.auth_config.allowed_emails.as_mut() else {
+            return Err(ApiFailure::forbidden("Invite policy is deny-by-default."));
+        };
+        allowed.remove(&email);
+        Ok(())
+    }
+
     pub(crate) fn verify_magic_link(&self, token: &str) -> Result<AppAccount, ApiFailure> {
+        self.verify_magic_link_for_client(token, "unknown")
+    }
+
+    pub(crate) fn verify_magic_link_for_client(
+        &self,
+        token: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<AppAccount, ApiFailure> {
         let token_hash = secret_hash(token.trim());
+        self.record_magic_link_verification(&token_hash, client_rate_limit_key)?;
+        let _auth_guard = self
+            .auth_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _durable_auth_lock = self
+            .waitlist_store_path()
+            .map(|path| crate::file_lock::acquire(&path.with_file_name("auth.lock")))
+            .transpose()?;
+        if let Some(database_url) = self.postgres_url() {
+            let now_ms = self.now();
+            let email = crate::with_postgres_store(&database_url, |store| {
+                store
+                    .auth_challenge_email(&token_hash, now_ms)
+                    .map_err(crate::postgres_failure)
+            })?
+            .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
+            let configured_allowed = {
+                let data = self.lock_data();
+                data.auth_config.email_allowed(&email)
+            };
+            let account_id = account_id_for(&email);
+            let session_token = new_session_token();
+            let session_token_hash = secret_hash(&session_token);
+            let browser_session_id = new_browser_session_id();
+            let csrf_token = session_csrf_token(&session_token_hash);
+            let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+            let browser_session_id_hash = secret_hash(&browser_session_id);
+            let csrf_token_hash = secret_hash(&csrf_token);
+            let outcome = crate::with_postgres_store(&database_url, |store| {
+                store
+                    .consume_auth_challenge_and_create_sessions(&AuthChallengeSessionRequest {
+                        challenge_hash: &token_hash,
+                        now_ms,
+                        configured_allowed,
+                        account_id: &account_id,
+                        session_token_hash: &session_token_hash,
+                        browser_session_id_hash: &browser_session_id_hash,
+                        csrf_token_hash: &csrf_token_hash,
+                        expires_at_ms,
+                    })
+                    .map_err(crate::postgres_failure)
+            })?;
+            return match outcome {
+                AuthChallengeSessionOutcome::Invalid => {
+                    Err(ApiFailure::forbidden("Magic link is invalid or expired."))
+                }
+                AuthChallengeSessionOutcome::NotAdmitted => {
+                    Err(ApiFailure::forbidden("This invite is no longer active."))
+                }
+                AuthChallengeSessionOutcome::Created {
+                    email: committed_email,
+                } => {
+                    debug_assert_eq!(committed_email, email);
+                    let storage = self.storage();
+                    let mut data = self.lock_data();
+                    data.accounts
+                        .entry(account_id.clone())
+                        .or_insert_with(|| AccountRecord {
+                            store_path: storage.account_store_path(&account_id),
+                            sources: BTreeMap::new(),
+                            submitted_reviews: BTreeMap::new(),
+                        });
+                    data.browser_sessions.insert(
+                        browser_session_id.clone(),
+                        BrowserSessionRecord {
+                            account_id: account_id.clone(),
+                            session_token: session_token_hash.clone(),
+                            csrf_token_hash,
+                            expires_at_ms,
+                        },
+                    );
+                    Ok(AppAccount {
+                        browser_session_id,
+                        account_id,
+                        session_token: session_token_hash,
+                        csrf_token,
+                    })
+                }
+            };
+        }
         let email = self
             .storage()
             .consume_auth_challenge(&token_hash, self.now())?
             .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
-        let account = self.login_account(&email)?;
-
-        self.create_browser_session(&account)
+        let configured_allowed = {
+            let data = self.lock_data();
+            data.auth_config.email_allowed(&email)
+        };
+        if !configured_allowed && !self.persisted_invite_allows(&email) {
+            return Err(ApiFailure::forbidden("This invite is no longer active."));
+        }
+        let storage = self.storage();
+        let mut data = self.lock_data();
+        let account = Self::login_account_locked(&mut data, &storage, &email)?;
+        Self::create_browser_session_locked(&mut data, &storage, &account)
     }
 
     /// Check a caller-supplied token against the configured operator admin
@@ -193,18 +551,17 @@ impl AccountRegistry {
         if configured.as_deref().is_none_or(|configured| {
             configured.is_empty() || secret_hash(configured) != secret_hash(admin_token)
         }) {
-            return Err(ApiFailure::forbidden(
-                "Service session issuance is not authorized.",
-            ));
+            return Err(ApiFailure::forbidden("Admin token is not authorized."));
         }
         Ok(())
     }
 
-    /// Issue (or rotate) the account-scoped service-session credential.
+    /// Issue an independent, expiring account-scoped service-session
+    /// credential.
     ///
     /// Gated by the operator admin token; the account is created on first
-    /// issue, and every issue mints a fresh token that immediately replaces
-    /// the prior one, so reissue doubles as revocation.
+    /// issue, and every issue mints a fresh token. Existing sessions remain
+    /// valid until expiry or explicit revocation.
     ///
     /// # Errors
     ///
@@ -260,10 +617,15 @@ impl AccountRegistry {
             (false, _, None) => return Ok(()),
         };
         if enabled {
+            // Mirror `request_magic_link`: a durably invited account (per
+            // the persisted waitlist) is authenticated the same as one
+            // admitted through the static allowlist. Without this, a
+            // learner invited only through the durable flow can sign in
+            // and study but can never enable reminders.
             let allowed = {
                 let data = self.lock_data();
                 data.auth_config.email_allowed(&email)
-            };
+            } || self.persisted_invite_allows(&email);
             if !allowed {
                 return Err(ApiFailure::forbidden(
                     "That reminder email is not allowed for this account.",
@@ -571,26 +933,79 @@ impl AccountRegistry {
         Ok(())
     }
 
+    fn record_waitlist_request(
+        &self,
+        email: Option<&str>,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let storage = self.storage();
+        let now_ms = self.now();
+        let mut keys = Vec::with_capacity(2);
+        if let Some(email) = email {
+            keys.push(format!("waitlist-email:{email}"));
+        }
+        keys.push(format!("waitlist-ip:{client_rate_limit_key}"));
+
+        if !storage.record_rate_limit_attempts(
+            &keys,
+            now_ms,
+            WAITLIST_RATE_LIMIT_WINDOW_MS,
+            WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
+        )? {
+            return Err(ApiFailure::too_many_requests(
+                "Too many waitlist attempts. Try again later.",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn record_magic_link_verification(
+        &self,
+        token_hash: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<(), ApiFailure> {
+        let keys = vec![
+            format!("magic-link-verify-token:{token_hash}"),
+            format!("magic-link-verify-ip:{client_rate_limit_key}"),
+        ];
+        if !self.storage().record_rate_limit_attempts(
+            &keys,
+            self.now(),
+            MAGIC_LINK_VERIFY_RATE_LIMIT_WINDOW_MS,
+            MAGIC_LINK_VERIFY_RATE_LIMIT_MAX_ATTEMPTS,
+        )? {
+            return Err(ApiFailure::too_many_requests(
+                "Too many verification attempts. Try again later.",
+            ));
+        }
+        Ok(())
+    }
+
     fn login_account(&self, email: &str) -> Result<AccountCreated, ApiFailure> {
+        let storage = self.storage();
+        let mut data = self.lock_data();
+        Self::login_account_locked(&mut data, &storage, email)
+    }
+
+    fn login_account_locked(
+        data: &mut AccountRegistryData,
+        storage: &StudyStorage,
+        email: &str,
+    ) -> Result<AccountCreated, ApiFailure> {
         let account_id = account_id_for(email);
         let account = AccountCreated {
             account_id: account_id.clone(),
             session_token: new_session_token(),
         };
-        let storage = self.storage();
         storage.save_account_session(&account_id, &account.session_token)?;
-        let mut data = self.lock_data();
-        let record = data
-            .accounts
+        data.accounts
             .entry(account.account_id.clone())
             .or_insert_with(|| AccountRecord {
-                session_token: String::new(),
                 store_path: storage.account_store_path(&account_id),
                 sources: BTreeMap::new(),
                 submitted_reviews: BTreeMap::new(),
             });
-        record.session_token.clone_from(&account.session_token);
-
         Ok(account)
     }
 
@@ -612,6 +1027,7 @@ impl AccountRegistry {
             source_id: source_id_for(account_id, &title, &body),
             title,
             body,
+            permission: request.permission.clone(),
             project_key: None,
             ttl_expires_at: None,
         };
@@ -654,6 +1070,7 @@ impl AccountRegistry {
             source_id: project_deck_id_for(account_id, &project_key, &title, &body),
             title,
             body,
+            permission: SourcePermission::ModelEligible,
             project_key: Some(project_key.clone()),
             ttl_expires_at: request.ttl_expires_at,
         };
@@ -728,6 +1145,25 @@ impl AccountRegistry {
             .list_sources_with_timings(account_id, &account.store_path, timings)
     }
 
+    pub(crate) fn update_source_permission(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        source_id: &str,
+        permission: SourcePermission,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let storage = self.storage();
+        if !storage
+            .list_sources(account_id, &account.store_path)?
+            .iter()
+            .any(|source| source.source_id == source_id)
+        {
+            return Err(ApiFailure::not_found("Source not found."));
+        }
+        storage.update_source_permission(account_id, &account.store_path, source_id, permission)
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors
@@ -749,15 +1185,14 @@ impl AccountRegistry {
             .generate_source(account_id, &account.store_path, source_id)
     }
 
-    /// Run a queued generation job end to end on a worker thread: generate from
-    /// the already-saved source, then optimistically approve (schedule) every
-    /// accepted card. Returns how many cards were scheduled.
+    /// Runs a queued generation job end to end on a worker thread. Accepted
+    /// drafts remain pending until the learner explicitly keeps or edits them.
+    /// Returns the scheduled review-card count, which is zero until a decision
+    /// promotes a draft.
     ///
     /// Session-free by design — enqueueing was already authorized in the request
     /// that created the job, and the background worker is trusted, so it keys off
     /// the account id alone rather than carrying a credential.
-    /// Runs an API registry operation.
-    ///
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
@@ -779,41 +1214,36 @@ impl AccountRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let storage = self.storage();
         let store_path = storage.account_store_path(account_id);
-        storage.generate_source_with_run_id(account_id, &store_path, source_id, run_id)?;
-        if !lease_valid() {
+        storage.generate_source_with_run_id(
+            account_id,
+            &store_path,
+            source_id,
+            run_id,
+            generation_attempt,
+            lease_token,
+        )?;
+        // Evaluate the in-memory cancellation fence first. The durable adapter
+        // then validates the exact Postgres attempt/lease under the same account
+        // advisory transaction lock, or commits the file rollback under its lock.
+        let local_lease_valid = lease_valid();
+        let finalized = storage.finalize_generation_run(
+            account_id,
+            &store_path,
+            run_id,
+            generation_attempt,
+            lease_token,
+            self.now(),
+            local_lease_valid,
+        )?;
+        if !finalized {
             return Err(ApiFailure::conflict(
                 "Generation lease lost before cards could be committed.",
             ));
         }
-        let view = storage.study_view(account_id, &store_path)?;
-        let pending = view
-            .drafts
-            .iter()
-            .filter(|draft| {
-                draft.validation_status == GeneratedPromptValidationStatus::Accepted
-                    && !draft.approved
-            })
-            .map(|draft| draft.id.clone())
-            .collect::<Vec<_>>();
-        let card_count = pending.len();
-        for draft_id in pending {
-            if !lease_valid() {
-                return Err(ApiFailure::conflict(
-                    "Generation lease lost before cards could be committed.",
-                ));
-            }
-            storage.approve_draft(
-                account_id,
-                &store_path,
-                &draft_id,
-                Some(GenerationCommitFence {
-                    generation_run_id: run_id,
-                    generation_attempt,
-                    lease_token,
-                }),
-            )?;
-        }
-        Ok(card_count)
+        let _view = storage.study_view(account_id, &store_path)?;
+        // card_count is the number of scheduled cards, and generation never
+        // schedules. Pending accepted drafts are visible in the study view.
+        Ok(0)
     }
 
     /// Runs the typed content-feedback command for one authenticated account.
@@ -882,7 +1312,7 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// Returns an API failure when auth, storage, or study state rejects the operation.
-    pub(crate) fn approve_draft(
+    pub(crate) fn keep_draft(
         &self,
         account_id: &str,
         session_token: &str,
@@ -894,14 +1324,48 @@ impl AccountRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.storage()
-            .approve_draft(account_id, &account.store_path, draft_id, None)
+            .keep_draft(account_id, &account.store_path, draft_id)
     }
 
-    /// Runs an API registry operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an API failure when auth, storage, or study state rejects the operation.
+    pub(crate) fn edit_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let prompt = normalize_required_text(prompt, "Learner prompt")?;
+        let expected_answer = normalize_required_text(expected_answer, "Learner expected answer")?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage().edit_pending_draft(
+            account_id,
+            &account.store_path,
+            draft_id,
+            &prompt,
+            &expected_answer,
+        )
+    }
+
+    pub(crate) fn reject_pending_draft(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        draft_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        let store_lock = self.store_lock(account_id);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.storage()
+            .reject_pending_draft(account_id, &account.store_path, draft_id)
+    }
+
     pub(crate) fn next_review(
         &self,
         account_id: &str,
@@ -1158,7 +1622,6 @@ impl AccountRegistry {
             .accounts
             .entry(account_id.to_owned())
             .or_insert_with(|| account.clone());
-        require_account_session(record, session_token)?;
         record
             .submitted_reviews
             .insert(idempotency_key, response.clone());
@@ -1175,24 +1638,33 @@ impl AccountRegistry {
         &self,
         account: &AccountCreated,
     ) -> Result<AppAccount, ApiFailure> {
+        let storage = self.storage();
+        let mut data = self.lock_data();
+        Self::create_browser_session_locked(&mut data, &storage, account)
+    }
+
+    fn create_browser_session_locked(
+        data: &mut AccountRegistryData,
+        storage: &StudyStorage,
+        account: &AccountCreated,
+    ) -> Result<AppAccount, ApiFailure> {
         let browser_session_id = new_browser_session_id();
-        let csrf_token = session_csrf_token(&account.session_token);
+        let session_token_hash = secret_hash(&account.session_token);
+        let csrf_token = session_csrf_token(&session_token_hash);
         let session = BrowserSessionRecord {
             account_id: account.account_id.clone(),
-            session_token: account.session_token.clone(),
+            session_token: session_token_hash.clone(),
             csrf_token_hash: secret_hash(&csrf_token),
-            expires_at_ms: self.now().saturating_add(app_session_max_age_ms()),
+            expires_at_ms: (data.now_fn)().saturating_add(app_session_max_age_ms()),
         };
-        self.storage()
-            .save_browser_session(&browser_session_id, &session)?;
-        let mut data = self.lock_data();
+        storage.save_browser_session(&browser_session_id, &session)?;
         data.browser_sessions
             .insert(browser_session_id.clone(), session);
 
         Ok(AppAccount {
             browser_session_id,
             account_id: account.account_id.clone(),
-            session_token: account.session_token.clone(),
+            session_token: session_token_hash,
             csrf_token,
         })
     }
@@ -1226,20 +1698,9 @@ impl AccountRegistry {
         mut timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let mut session = {
-            let data = self.lock_data();
-            data.browser_sessions.get(session_id).cloned()
-        };
-        if session.is_none() {
-            session = self
-                .storage()
-                .load_browser_session_with_timings(session_id, timings.as_deref_mut())?;
-            if let Some(session) = &session {
-                let mut data = self.lock_data();
-                data.browser_sessions
-                    .insert(session_id.to_owned(), session.clone());
-            }
-        }
+        let session = self
+            .storage()
+            .load_browser_session_with_timings(session_id, timings.as_deref_mut())?;
         let session = session.ok_or_else(ApiFailure::missing_session)?;
         if session.expires_at_ms <= self.now() {
             let mut data = self.lock_data();
@@ -1276,18 +1737,7 @@ impl AccountRegistry {
         headers: &HeaderMap,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let mut session = {
-            let data = self.lock_data();
-            data.browser_sessions.get(session_id).cloned()
-        };
-        if session.is_none() {
-            session = self.storage().load_browser_session(session_id)?;
-            if let Some(session) = &session {
-                let mut data = self.lock_data();
-                data.browser_sessions
-                    .insert(session_id.to_owned(), session.clone());
-            }
-        }
+        let session = self.storage().load_browser_session(session_id)?;
         let session = session.ok_or_else(ApiFailure::missing_session)?;
         if session.expires_at_ms <= self.now() {
             let mut data = self.lock_data();
@@ -1325,6 +1775,20 @@ impl AccountRegistry {
         Ok(())
     }
 
+    pub(crate) fn revoke_all_browser_sessions(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+    ) -> Result<(), ApiFailure> {
+        let account = self.require_browser_session(headers, csrf_token)?;
+        self.storage()
+            .revoke_browser_sessions_for_account(&account.account_id, self.now())?;
+        let mut data = self.lock_data();
+        data.browser_sessions
+            .retain(|_, session| session.account_id != account.account_id);
+        Ok(())
+    }
+
     pub(crate) fn authenticate_account(
         &self,
         account_id: &str,
@@ -1333,9 +1797,34 @@ impl AccountRegistry {
         self.require_account(account_id, session_token).map(drop)
     }
 
+    pub(crate) fn revoke_api_session(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.require_account(account_id, session_token)?;
+        self.storage()
+            .revoke_account_session(account_id, session_token, self.now())?
+            .then_some(())
+            .ok_or_else(ApiFailure::forbidden_account)
+    }
+
+    /// Browser sessions are an independent scope and are preserved; see
+    /// [`StudyStorage::revoke_account_sessions_for_account`].
+    pub(crate) fn revoke_all_api_sessions(
+        &self,
+        account_id: &str,
+        session_token: &str,
+    ) -> Result<(), ApiFailure> {
+        self.require_account(account_id, session_token)?;
+        self.storage()
+            .revoke_account_sessions_for_account(account_id, self.now())
+    }
+
     pub(crate) fn storage(&self) -> StudyStorage {
         let data = self.lock_data();
-        data.storage.storage(data.now_fn)
+        data.storage
+            .storage(data.now_fn, data.generation_provider_config.clone())
     }
 
     fn account_exists(&self, account_id: &str) -> Result<bool, ApiFailure> {
@@ -1365,33 +1854,29 @@ impl AccountRegistry {
         mut timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<AccountRecord, ApiFailure> {
         let storage = self.storage();
-        {
-            let data = self.lock_data();
-            if let Some(account) = data.accounts.get(account_id) {
-                require_account_session(account, session_token)?;
-
-                return Ok(account.clone());
-            }
-        }
-
-        if storage.account_session_matches_with_timings(
+        // Always consult durable storage first. An in-memory account cache must
+        // never bypass expiry or revocation after another request or replica
+        // changed the authoritative session row.
+        if !storage.account_session_matches_with_timings(
             account_id,
             session_token,
             timings.as_deref_mut(),
         )? {
-            return Ok(AccountRecord {
-                session_token: session_token.to_owned(),
-                store_path: storage.account_store_path(account_id),
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            });
+            if storage.account_exists_with_timings(account_id, timings)? {
+                return Err(ApiFailure::forbidden_account());
+            }
+            return Err(ApiFailure::unknown_account());
         }
 
-        if storage.account_exists_with_timings(account_id, timings)? {
-            return Err(ApiFailure::forbidden_account());
+        let data = self.lock_data();
+        if let Some(account) = data.accounts.get(account_id) {
+            return Ok(account.clone());
         }
-
-        Err(ApiFailure::unknown_account())
+        Ok(AccountRecord {
+            store_path: storage.account_store_path(account_id),
+            sources: BTreeMap::new(),
+            submitted_reviews: BTreeMap::new(),
+        })
     }
 }
 

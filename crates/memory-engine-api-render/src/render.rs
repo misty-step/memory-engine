@@ -14,12 +14,21 @@
 
 use std::fmt::Write as _;
 
-use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent};
+use memory_engine_persistence::GeneratedPromptValidationStatus;
+use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, SourcePermission};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
     SubmitReviewTimings,
 };
+
+#[cfg(test)]
+fn render_test_state(email: &str) -> ApiState {
+    use memory_engine_api_state::{AccountRegistry, AuthConfig};
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails([email.to_owned()]).with_anonymous_account_creation(true),
+    ))
+}
 
 pub struct ContentFeedbackRecovery<'a> {
     pub review_unit_id: &'a str,
@@ -383,11 +392,7 @@ pub fn render_analytics_page(
     options: AnalyticsViewOptions,
 ) -> String {
     let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -412,6 +417,39 @@ pub fn render_login_requested(debug_link: Option<&str>) -> String {
         r#"<p class="ae-lede"><span class="ae-item">Check your email.</span> If that address can sign in, a link is on the way.</p>
 {debug}
 <p><a class="ae-accent" href="/">Back to start</a></p>"#
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_waitlist_joined() -> String {
+    let view = r#"<div class="me-cover">
+<p class="me-kicker">You're on the list</p>
+<h1 class="me-display">Thanks for joining.</h1>
+<p class="ae-lede ae-dim me-support">We’ll email you when a spot opens. No account was created and nothing else happens until then.</p>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#;
+    document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_waitlist_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Waitlist</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<section class="ae-group me-capture-hero">
+<form action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-recovery-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button" type="submit">Try again</button></div>
+</form>
+</section>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
     );
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
@@ -478,9 +516,24 @@ pub fn render_return_notification_disabled() -> String {
 <p class="me-kicker">Return gently</p>
 <h1 class="me-display">Reminders are off.</h1>
 <p class="ae-lede ae-dim me-support">You will not receive further due-count reminders. You can opt in again from your study space.</p>
-<p><a class="ae-accent" href="/">Back to Memory Engine</a></p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_return_notification_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Return gently</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
 
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
@@ -501,7 +554,7 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<title>Memory Engine</title>
+<title>Scry</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/favicon.png" type="image/png">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
@@ -534,7 +587,7 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
     format!(
         r#"<div class="ae-screen">
 <header class="ae-bar">
-<a class="ae-name" href="/">MEMORY ENGINE</a>
+<a class="ae-name" href="/">SCRY</a>
 {header_right}
 </header>
 <main class="{stage}">
@@ -552,19 +605,30 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
 fn render_signed_out(notice: Option<&str>) -> String {
     // Onboarding is auth-first. Accounts are required (the magic-link
     // allowlist), so anonymous visitors never see the capture form — they would
-    // only dead-end on it. The display promise leads, then one action: enter an
-    // email and get a sign-in link. Capture and review live behind auth.
+    // only dead-end on it. The display promise leads, then two actions: sign in
+    // with an allowlisted email, or join the invite-beta waitlist below it. Both
+    // forms read identically to a visitor who doesn't know their own allowlist
+    // state, so neither response can be used to probe it.
     let view = format!(
         r#"<div class="me-cover">
 {notice}
-<p class="me-kicker">Spaced repetition, made effortless</p>
-<h1 class="me-display">Read it once.<br>Remember it for good.</h1>
+<p class="me-kicker">Scry</p>
+<h1 class="me-display">Remember everything.</h1>
 <p class="ae-lede ae-dim me-support">Capture anything worth remembering. We bring it back when it matters.</p>
 <section class="ae-group me-capture-hero">
 <form action="/app/account" method="post">
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
 <div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
+</form>
+</section>
+<section class="ae-group me-capture-hero">
+<p class="me-kicker">New here?</p>
+<form class="me-waitlist-form" action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
+<p class="me-waitlist-status ae-dim" aria-live="polite"></p>
 </form>
 </section>
 </div>"#,
@@ -597,7 +661,11 @@ fn render_signed_in(
         SignedInSurface::ReviewComplete => render_review_complete(),
         SignedInSurface::Workspace => view.and_then(|view| view.current.as_ref()).map_or_else(
             || render_workspace(account, sources, view, jobs),
-            |current| render_current_review(account, current),
+            |current| {
+                let mut review = render_current_review(account, current);
+                review.push_str(&render_pending_drafts(account, view));
+                review
+            },
         ),
     };
     render_signed_in_body(account, due, notice, jobs, &body)
@@ -611,11 +679,7 @@ fn render_signed_in_body(
     body: &str,
 ) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
 }
@@ -657,10 +721,8 @@ fn render_workspace(
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
 ) -> String {
-    // Generation is non-blocking: capture is the persistent action, the activity
-    // log shows jobs running in the background (live over SSE, but also correct
-    // on every full load), and review is always one tap away. No keep gate —
-    // successful jobs are already scheduled.
+    // Generation is non-blocking. Accepted drafts stay pending until the learner
+    // inspects their evidence and explicitly keeps, edits, or rejects them.
     let mut html = String::new();
     if let Some(view) = view {
         html.push_str(&render_review_status(account, view));
@@ -673,6 +735,7 @@ fn render_workspace(
     html.push_str(&render_capture(account));
     html.push_str(&render_return_notifications(account));
     html.push_str(&render_jobs(account, jobs));
+    html.push_str(&render_pending_drafts(account, view));
     html.push_str(&render_sources(account, sources, jobs));
     if let Some(view) = view {
         html.push_str(&render_concept_progress(&view.concept_progress));
@@ -760,11 +823,88 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
+<label class="ae-label" for="me-capture-permission">Permission</label>
+<select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
+<p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
 <div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
         csrf = hidden_csrf_input(account),
     )
+}
+
+fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>) -> String {
+    let Some(view) = view else {
+        return String::new();
+    };
+    let pending = view.drafts.iter().filter(|draft| {
+        !draft.approved
+            && draft.learner_decision.is_none()
+            && draft.validation_status == GeneratedPromptValidationStatus::Accepted
+    });
+    let mut rows = String::new();
+    for draft in pending {
+        let spans = if draft.source_spans.is_empty() {
+            String::new()
+        } else {
+            let mut rendered = String::from("<ul class=\"me-provenance-spans\">");
+            for span in &draft.source_spans {
+                let _ = write!(
+                    rendered,
+                    "<li><strong>{}</strong> · {} <span class=\"ae-dim\">{}</span></li>",
+                    escape_html(&span.label),
+                    escape_html(&span.text),
+                    escape_html(&span.locator)
+                );
+            }
+            rendered.push_str("</ul>");
+            rendered
+        };
+        let provenance = draft.provenance.as_ref().map_or_else(String::new, |p| {
+            format!(
+                "<p class=\"ae-dim me-draft-provenance\">Provider: {} · Model: {}{}</p>",
+                escape_html(&p.provider),
+                escape_html(&p.model),
+                p.prompt_version
+                    .as_deref()
+                    .map_or_else(String::new, |v| format!(" · Prompt {}", escape_html(v)))
+            )
+        });
+        let _ = write!(
+            rows,
+            r#"<article class="me-pending-draft">
+<p class="me-kicker">Pending draft</p>
+<h3 class="ae-h">{}</h3>
+<p class="me-prompt">{}</p>
+<p class="ae-dim">Expected answer: <span class="ae-item">{}</span></p>
+{}
+{}
+<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
+<div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
+</article>"#,
+            escape_html(&draft.concept_label),
+            escape_html(&draft.prompt),
+            escape_html(&draft.answer),
+            provenance,
+            spans,
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.prompt),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.answer),
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            hidden_csrf_input(account),
+            escape_html(&draft.id)
+        );
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
 }
 
 fn render_sources(
@@ -787,10 +927,37 @@ fn render_sources(
                 id = escape_html(&source.source_id),
             )
         };
+        let permission = match &source.permission {
+            SourcePermission::LocalOnly => {
+                "<span class=\"ae-dim me-source-permission\">Local only · never sent to a model</span>"
+            }
+            SourcePermission::ModelEligible => {
+                "<span class=\"ae-dim me-source-permission\">Model eligible</span>"
+            }
+        };
+        let edit_permission = format!(
+            r#"<form class="me-source-permission" action="/app/source/permission" method="post">{csrf}<input type="hidden" name="sourceId" value="{id}"><label class="ae-label" for="permission-{id_label}">Change permission</label><select class="ae-input" id="permission-{id_label}" name="permission" aria-label="Change permission for {title_attr}"><option value="model-eligible" {model_selected}>Allow model help</option><option value="local-only" {local_selected}>Keep local / Never send to a model</option></select><button class="ae-button-quiet ae-button-compact" type="submit">Save permission</button></form>"#,
+            csrf = hidden_csrf_input(account),
+            id = escape_html(&source.source_id),
+            id_label = escape_html(&source.source_id),
+            title_attr = escape_html(&source.title),
+            model_selected = if source.permission == SourcePermission::ModelEligible {
+                "selected"
+            } else {
+                ""
+            },
+            local_selected = if source.permission == SourcePermission::LocalOnly {
+                "selected"
+            } else {
+                ""
+            },
+        );
         let _ = write!(
             rows,
             r#"<article class="me-source">
 <p class="ae-item">{title}</p>
+{permission}
+{edit_permission}
 <div class="me-row-actions">
 {generate}
 <details class="me-remove-confirm">
@@ -801,6 +968,7 @@ fn render_sources(
 </div>
 </article>"#,
             title = escape_html(&source.title),
+            permission = permission,
             csrf_archive = hidden_csrf_input(account),
             id_archive = escape_html(&source.source_id),
         );
@@ -887,11 +1055,9 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
         JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
-        JobStatus::Succeeded => format!(
-            "{} {} · scheduled for review",
-            job.card_count,
-            plural(job.card_count, "card", "cards")
-        ),
+        JobStatus::Succeeded => {
+            "Generation succeeded; accepted drafts are pending your review.".to_owned()
+        }
         JobStatus::Failed => escape_html(
             job.error
                 .as_deref()
@@ -1644,6 +1810,20 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     )
 }
 
+/// Shared "Signed in" footer for the account and workspace screens: sign
+/// out this browser session, or sign out every browser session for the
+/// account via `/app/logout-all`. Machine/service-session credentials are
+/// an independent scope and are unaffected; there is no PWA control for
+/// those today.
+fn signed_in_footer(account: &AppAccount) -> String {
+    let csrf = hidden_csrf_input(account);
+    format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
+    )
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1652,7 +1832,7 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">A memory instrument</span>"#;
+const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">Scry — Remember everything</span>"#;
 
 // Lucide icons (ISC), inlined for `.ae-icon`: 1.5px stroke, currentColor, no
 // fill. Status hue rides the glyph; the sentence stays ink.
@@ -1679,9 +1859,10 @@ const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden=
 mod source_loading_tests {
     use std::cell::Cell;
 
-    use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_api_state::{CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_persistence::SourcePermission;
 
-    use super::render_account_page_with_loaders;
+    use super::{render_account_page_with_loaders, render_capture};
 
     fn source_body() -> String {
         [
@@ -1698,7 +1879,7 @@ mod source_loading_tests {
 
     #[test]
     fn active_review_loads_only_data_used_by_the_rendered_branch() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-loader-active@example.com");
         let created = state
             .create_account("render-loader-active@example.com")
             .unwrap();
@@ -1709,6 +1890,7 @@ mod source_loading_tests {
                 &CreateSourceRequest {
                     title: "NATO practice notes".to_owned(),
                     body: source_body(),
+                    permission: SourcePermission::default(),
                 },
             )
             .unwrap();
@@ -1717,8 +1899,14 @@ mod source_loading_tests {
             EnqueueOutcome::Started(_)
         ));
         state.run_pending_jobs_blocking();
-        let active_view = state.next_app_review(&account).unwrap();
-
+        let pending_view = state.next_app_review(&account).unwrap();
+        let active_view = state
+            .keep_draft(
+                account.account_id(),
+                account.session_token(),
+                &pending_view.drafts[0].id,
+            )
+            .unwrap();
         let active_source_loads = Cell::new(0);
         let active_job_loads = Cell::new(0);
         render_account_page_with_loaders(
@@ -1737,7 +1925,6 @@ mod source_loading_tests {
         );
         assert_eq!(active_source_loads.get(), 0);
         assert_eq!(active_job_loads.get(), 0);
-
         render_account_page_with_loaders(
             &state,
             &account,
@@ -1754,7 +1941,6 @@ mod source_loading_tests {
             1,
             "a generation notice still needs live jobs to suppress stale UI"
         );
-
         let notice_page = render_account_page_with_loaders(
             &state,
             &account,
@@ -1772,8 +1958,11 @@ mod source_loading_tests {
             "an unconditional notice does not require job history"
         );
         assert!(notice_page.contains("That job can't be retried."));
+        assert_workspace_render_loads_all();
+    }
 
-        let workspace_state = ApiState::default();
+    fn assert_workspace_render_loads_all() {
+        let workspace_state = super::render_test_state("render-loader-workspace@example.com");
         let workspace_created = workspace_state
             .create_account("render-loader-workspace@example.com")
             .unwrap();
@@ -1798,6 +1987,22 @@ mod source_loading_tests {
         );
         assert_eq!(workspace_source_loads.get(), 1);
         assert_eq!(workspace_job_loads.get(), 1);
+    }
+
+    #[test]
+    fn capture_form_exposes_an_accessible_permission_choice_and_default() {
+        let state = super::render_test_state("render-permission@example.com");
+        let account = state
+            .create_account("render-permission@example.com")
+            .and_then(|account| state.create_browser_session(&account))
+            .expect("account");
+        let html = render_capture(&account);
+
+        assert!(html.contains(r#"id="me-capture-permission" name="permission""#));
+        assert!(html.contains(r#"aria-describedby="me-capture-permission-hint""#));
+        assert!(html.contains(r#"value="model-eligible" selected"#));
+        assert!(html.contains("Keep local / Never send to a model"));
+        assert!(html.contains("prevent model providers from receiving this capture"));
     }
 }
 
@@ -1943,7 +2148,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_is_a_complete_document_with_one_asset_contract() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-document@example.com");
         let created = state
             .create_account("analytics-document@example.com")
             .expect("account");
@@ -2012,7 +2217,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_applies_untried_filter_to_a_study_view_response() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-untried@example.com");
         let created = state
             .create_account("analytics-untried@example.com")
             .expect("account");

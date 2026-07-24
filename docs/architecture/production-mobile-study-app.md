@@ -82,7 +82,7 @@ tests > type system > code > docs > memory/lore
   store and contract reference, not the production database adapter.
 - `crates/memory-engine-generation/src/lib.rs` — deterministic generation
   boundary to preserve while adding provider adapters.
-- `crates/memory-engine-study/src/lib.rs` — source/generate/approve/reveal/
+- `crates/memory-engine-study/src/lib.rs` — source/generate/keep/reveal/
   submit choreography to reuse as product pressure.
 - `crates/memory-engine-beta-app/src/lib.rs` — mobile server-rendered dogfood
   shell and route tests.
@@ -171,14 +171,14 @@ single-writer and no account-isolation guarantees.
     spans, generation runs, generated drafts, review units, schedules,
     attempts, durable applied-review receipts, service-store queue reads, and
     beta-store snapshot reconstruction. `crates/memory-engine-study` now uses a
-    generic storage contract, and its source/generate/approve/reveal/submit flow
+    generic storage contract, and its source/generate/keep/reveal/submit flow
     passes against an account-scoped Postgres store in the opt-in live contract
     test.
   - `crates/memory-engine-api` now selects the Postgres account store at runtime
     when `MEMORY_ENGINE_POSTGRES_URL` is present, with
     `MEMORY_ENGINE_API_STORE_DIR` retained only as an explicitly opted-in local
     file-backed fallback. A live API test drives the JSON
-    source/generate/approve/reveal/submit routes through an isolated Postgres
+    source/generate/keep/reveal/submit routes through an isolated Postgres
     schema and verifies source persistence after API state recreation.
   - `fly.toml` no longer configures a mounted JSON volume. Staging and
     production must provide `MEMORY_ENGINE_POSTGRES_URL` as a secret.

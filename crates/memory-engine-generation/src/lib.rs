@@ -16,11 +16,12 @@ mod provider;
 use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
-    classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
-    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure, ProviderUsage,
-    ReferenceNoteDraft, ReferenceNoteProvider, ReferenceNoteRequest, ReviewPerformanceContext,
-    StructuredBlockProvider,
+    classify_learning_intent, enforce_content_policy, BridgeMaterial, BridgeMaterialProvider,
+    BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider,
+    FallbackProvider, LearningIntent, LearningIntentClassification, ProviderDrafts,
+    ProviderFailure, ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    ReferenceNoteRequest, ReviewPerformanceContext, SourceAuthorizationContext,
+    SourceAuthorizationError, StructuredBlockProvider,
 };
 
 use memory_engine_core::{
@@ -32,6 +33,7 @@ use memory_engine_persistence::{
     GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
     GenerationRun, GenerationRunUsage, PersistedQueueCandidate, ReferenceSpan,
     RemediationPackRecord, RemediationPackStatus, SourceDocument, SourceDocumentKind,
+    SourcePermission, SourcePermissionReceipt,
 };
 
 /// The text a world-knowledge card grounds in: the captured input itself. A
@@ -61,6 +63,8 @@ pub struct BetaGenerationRequest {
     pub completed_at: Option<i64>,
     pub default_due: i64,
     pub model: Option<GeneratedPromptModel>,
+    /// Keep queued output decision-ineligible until the worker lease fence publishes it.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +132,8 @@ pub struct RemediationPackGenerationResult {
 pub enum BetaGenerationError<E = BetaStoreError> {
     Store(E),
     UnknownSourceDocument(String),
+    ArchivedSourceDocument(String),
+    LocalOnlySource(String),
     UnknownReviewUnit(ReviewUnitId),
     SourceDocumentHasNoTextBody(String),
     ProviderFailure(String),
@@ -141,6 +147,11 @@ where
         match self {
             Self::Store(error) => write!(formatter, "store error: {error}"),
             Self::UnknownSourceDocument(id) => write!(formatter, "Unknown source document: {id}"),
+            Self::ArchivedSourceDocument(id) => write!(formatter, "Archived source document: {id}"),
+            Self::LocalOnlySource(id) => write!(
+                formatter,
+                "Local-only source {id} cannot be sent to the model provider."
+            ),
             Self::UnknownReviewUnit(id) => write!(formatter, "Unknown review unit: {id}"),
             Self::SourceDocumentHasNoTextBody(id) => {
                 write!(formatter, "Source document has no text body: {id}")
@@ -158,6 +169,8 @@ where
         match self {
             Self::Store(error) => Some(error),
             Self::UnknownSourceDocument(_)
+            | Self::ArchivedSourceDocument(_)
+            | Self::LocalOnlySource(_)
             | Self::UnknownReviewUnit(_)
             | Self::SourceDocumentHasNoTextBody(_)
             | Self::ProviderFailure(_) => None,
@@ -229,6 +242,30 @@ pub trait BetaGenerationStore {
         &mut self,
         pack: RemediationPackRecord,
     ) -> Result<RemediationPackRecord, Self::Error>;
+
+    /// Remove pending output when a durable worker lease loses its commit fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when rollback cannot be persisted.
+    fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Atomically fence a run and remove all stale output when the lease is lost.
+    ///
+    /// # Errors
+    /// Returns the store error when finalization cannot be persisted.
+    fn finalize_generation_run(
+        &mut self,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 impl BetaGenerationStore for BetaPersistenceStore {
@@ -269,6 +306,21 @@ impl BetaGenerationStore for BetaPersistenceStore {
     ) -> Result<RemediationPackRecord, Self::Error> {
         BetaPersistenceStore::save_remediation_pack(self, pack)
     }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        BetaPersistenceStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        BetaPersistenceStore::finalize_generation_run(self, run_id, now_ms, lease_valid)
+    }
 }
 
 /// Generate deterministic beta drafts from structured source blocks.
@@ -287,7 +339,7 @@ pub fn run_beta_generation<S>(
 where
     S: BetaGenerationStore,
 {
-    run_beta_generation_with_provider(store, &StructuredBlockProvider, request)
+    run_beta_generation_internal(store, &StructuredBlockProvider, request, false)
 }
 
 /// Generate beta drafts from the given provider's candidates.
@@ -308,15 +360,25 @@ pub fn run_beta_generation_with_provider<S>(
 where
     S: BetaGenerationStore,
 {
-    let model = request.model.clone().unwrap_or_else(|| provider.model());
+    run_beta_generation_internal(store, provider, request, true)
+}
+
+fn run_beta_generation_internal<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    request: BetaGenerationRequest,
+    enforce_source_permission: bool,
+) -> Result<BetaGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
-    let sources = request
-        .source_document_ids
-        .iter()
-        .map(|source_document_id| {
-            require_source::<S::Error>(&snapshot.source_documents, source_document_id)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let sources = load_sources::<S::Error>(&snapshot, &request.source_document_ids)?;
+    ensure_sources_not_archived(&sources)?;
+    if enforce_source_permission {
+        ensure_model_eligible(&sources)?;
+    }
+    let model = request.model.clone().unwrap_or_else(|| provider.model());
     let mut validation_failures = Vec::new();
     let mut draft_ids = Vec::new();
     let mut accepted_draft_ids = Vec::new();
@@ -328,66 +390,33 @@ where
     // rather than last-write-wins. Per-draft model stamping stays exact.
     let mut producing_models: Vec<GeneratedPromptModel> = Vec::new();
 
-    save_generation_run_progress(store, &request, &model, RunProgress::Started)?;
+    save_generation_run_progress(
+        store,
+        &request,
+        &model,
+        RunProgress::Started,
+        source_permission_receipts(&sources),
+    )?;
     let mut seen_signatures =
         existing_accepted_candidate_signatures(&snapshot.generated_prompt_drafts);
     for source in &sources {
-        let drafts = match provider.generate_drafts(source) {
-            Ok(drafts) => drafts,
-            Err(failure) => {
-                validation_failures.push(format!("{}: {failure}", source.id));
-                continue;
-            }
-        };
-        validation_failures.extend(drafts.failures);
-        usage = merge_usage(usage, drafts.usage);
-        // Stamp drafts with the provider that actually generated them, not the
-        // composite's declared identity. A caller override still wins.
-        let source_model = request.model.clone().unwrap_or(drafts.model);
-        if !drafts.candidates.is_empty() && !producing_models.contains(&source_model) {
-            producing_models.push(source_model.clone());
-        }
-
-        // Grounding is decided per card, by the generator, not by a heuristic
-        // over the source: a card that cites a verbatim quote is source-grounded
-        // (the quote must verify); a card with no quote is a world-knowledge
-        // expansion grounded in the captured topic itself.
-        let mut source_rejections = Vec::new();
-        let mut max_candidate_index = 0;
-        persist_candidates(
+        let Some(source_usage) = process_generation_source(
             store,
+            provider,
+            &request,
             source,
-            drafts.candidates,
-            &mut PersistCandidatesContext {
-                request: &request,
-                source_model: &source_model,
-                seen_signatures: &mut seen_signatures,
-                validation_failures: &mut validation_failures,
-                draft_ids: &mut draft_ids,
-                accepted_draft_ids: &mut accepted_draft_ids,
-                rejected_draft_ids: &mut rejected_draft_ids,
-                source_rejections: &mut source_rejections,
-                max_candidate_index: &mut max_candidate_index,
-            },
-        )?;
-
-        usage = merge_usage(
-            usage,
-            try_repair_source(
-                store,
-                provider,
-                source,
-                &request,
-                &source_rejections,
-                &mut seen_signatures,
-                &mut validation_failures,
-                &mut draft_ids,
-                &mut accepted_draft_ids,
-                &mut rejected_draft_ids,
-                &mut producing_models,
-                &mut max_candidate_index,
-            )?,
-        );
+            &mut seen_signatures,
+            &mut validation_failures,
+            &mut draft_ids,
+            &mut accepted_draft_ids,
+            &mut rejected_draft_ids,
+            &mut producing_models,
+        )?
+        else {
+            continue;
+        };
+        usage = merge_usage(usage, source_usage.drafts);
+        usage = merge_usage(usage, source_usage.repair);
         save_generation_run_progress(
             store,
             &request,
@@ -397,6 +426,7 @@ where
                 validation_failures: validation_failures.clone(),
                 usage: usage.clone(),
             },
+            source_permission_receipts(&sources),
         )?;
     }
 
@@ -413,6 +443,7 @@ where
             validation_failures: validation_failures.clone(),
             usage,
         },
+        source_permission_receipts(&sources),
     )?;
 
     Ok(BetaGenerationResult {
@@ -422,6 +453,108 @@ where
         rejected_draft_ids,
         validation_failures,
     })
+}
+
+/// The two provider-usage additions [`process_generation_source`] accumulated
+/// for one source, mirrored in the same order the original inline loop body
+/// merged them: draft generation first, then repair.
+struct SourceGenerationUsage {
+    drafts: Option<ProviderUsage>,
+    repair: Option<ProviderUsage>,
+}
+
+/// Runs generation and repair for one source, mutating the run's shared
+/// accumulators in place. Returns `None` when draft generation itself failed
+/// for this source (the caller records the failure and skips this source's
+/// progress checkpoint, matching the prior inline-loop `continue`), or
+/// `Some(usage)` mirroring the two provider-usage additions the original
+/// inline loop body accumulated.
+#[allow(clippy::too_many_arguments)]
+fn process_generation_source<S>(
+    store: &mut S,
+    provider: &dyn DraftProvider,
+    request: &BetaGenerationRequest,
+    source: &SourceDocument,
+    seen_signatures: &mut Vec<CandidateSignature>,
+    validation_failures: &mut Vec<String>,
+    draft_ids: &mut Vec<String>,
+    accepted_draft_ids: &mut Vec<String>,
+    rejected_draft_ids: &mut Vec<String>,
+    producing_models: &mut Vec<GeneratedPromptModel>,
+) -> Result<Option<SourceGenerationUsage>, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let drafts = match provider.generate_drafts(source) {
+        Ok(drafts) => drafts,
+        Err(failure) => {
+            validation_failures.push(format!("{}: {failure}", source.id));
+            return Ok(None);
+        }
+    };
+    let drafts = enforce_content_policy(source, drafts);
+    validation_failures.extend(drafts.failures);
+    // Stamp drafts with the provider that actually generated them, not the
+    // composite's declared identity. A caller override still wins.
+    let source_model = request.model.clone().unwrap_or(drafts.model);
+    if !drafts.candidates.is_empty() && !producing_models.contains(&source_model) {
+        producing_models.push(source_model.clone());
+    }
+
+    // Grounding is decided per card, by the generator, not by a heuristic
+    // over the source: a card that cites a verbatim quote is source-grounded
+    // (the quote must verify); a card with no quote is a world-knowledge
+    // expansion grounded in the captured topic itself.
+    let mut source_rejections = Vec::new();
+    let mut max_candidate_index = 0;
+    let learning_intent = drafts.learning_intent;
+    persist_candidates(
+        store,
+        source,
+        drafts.candidates,
+        &mut PersistCandidatesContext {
+            request,
+            source_model: &source_model,
+            seen_signatures,
+            validation_failures,
+            draft_ids,
+            accepted_draft_ids,
+            rejected_draft_ids,
+            source_rejections: &mut source_rejections,
+            max_candidate_index: &mut max_candidate_index,
+            learning_intent,
+        },
+    )?;
+
+    let repair_usage = try_repair_source(
+        store,
+        provider,
+        source,
+        request,
+        &source_rejections,
+        seen_signatures,
+        validation_failures,
+        draft_ids,
+        accepted_draft_ids,
+        rejected_draft_ids,
+        producing_models,
+        &mut max_candidate_index,
+    )?;
+
+    Ok(Some(SourceGenerationUsage {
+        drafts: drafts.usage,
+        repair: repair_usage,
+    }))
+}
+
+fn load_sources<E>(
+    snapshot: &BetaStoreSnapshot,
+    source_document_ids: &[String],
+) -> Result<Vec<SourceDocument>, BetaGenerationError<E>> {
+    source_document_ids
+        .iter()
+        .map(|source_document_id| require_source(&snapshot.source_documents, source_document_id))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -456,8 +589,10 @@ where
             return Ok(None);
         }
     };
+    let repair = enforce_content_policy(source, repair);
     validation_failures.extend(repair.failures);
     let usage = repair.usage;
+    let learning_intent = repair.learning_intent;
     let repair_model = request.model.clone().unwrap_or(repair.model);
     if !repair.candidates.is_empty() && !producing_models.contains(&repair_model) {
         producing_models.push(repair_model.clone());
@@ -485,6 +620,7 @@ where
             rejected_draft_ids,
             source_rejections: &mut repair_rejections,
             max_candidate_index,
+            learning_intent,
         },
     )?;
 
@@ -496,12 +632,13 @@ fn save_generation_run_progress<S>(
     request: &BetaGenerationRequest,
     model: &GeneratedPromptModel,
     progress: RunProgress,
+    source_permissions: Vec<SourcePermissionReceipt>,
 ) -> Result<(), BetaGenerationError<S::Error>>
 where
     S: BetaGenerationStore,
 {
     store
-        .save_generation_run(run_receipt(request, model, progress))
+        .save_generation_run(run_receipt(request, model, progress, source_permissions))
         .map(|_| ())
         .map_err(BetaGenerationError::Store)
 }
@@ -516,6 +653,7 @@ struct PersistCandidatesContext<'a> {
     rejected_draft_ids: &'a mut Vec<String>,
     source_rejections: &'a mut Vec<DraftRejection>,
     max_candidate_index: &'a mut usize,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn persist_candidates<S>(
@@ -569,6 +707,7 @@ where
                 duplicate: false,
                 grounded,
                 quote_verified: !grounded || source_contains_quote(source, evidence),
+                learning_intent: context.learning_intent,
             },
         )?;
 
@@ -598,7 +737,7 @@ fn candidate_rejection(candidate: &DraftCandidate, reasons: Vec<String>) -> Draf
     }
 }
 
-/// Generate bridge material for one approved parent review unit.
+/// Generate bridge material for one kept parent review unit.
 ///
 /// Bridge generation is concept-backed rather than source-backed: if the
 /// concept has no cached reference note, the provider writes one first; easier
@@ -617,9 +756,43 @@ pub fn run_bridge_generation_with_provider<S>(
 where
     S: BetaGenerationStore,
 {
+    run_bridge_generation_internal(store, provider, request, true)
+}
+
+/// Generate bridge material with the deterministic local provider path.
+///
+/// # Errors
+///
+/// Returns [`BetaGenerationError`] when the parent is unknown or store writes
+/// fail.
+pub fn run_bridge_generation<S>(
+    store: &mut S,
+    request: BridgeGenerationRequest,
+) -> Result<BridgeGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    run_bridge_generation_internal(store, &FakeModelProvider, request, false)
+}
+
+fn run_bridge_generation_internal<S>(
+    store: &mut S,
+    provider: &dyn BridgeMaterialProvider,
+    request: BridgeGenerationRequest,
+    enforce_source_permission: bool,
+) -> Result<BridgeGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
-    let provider_request = bridge_material_request(&snapshot, &context);
+    let (source_document_ids, source_permissions, authorization) =
+        source_authorization_for_parent::<S::Error>(
+            &snapshot,
+            &context.parent,
+            enforce_source_permission,
+        )?;
+    let provider_request = bridge_material_request(&snapshot, &context, authorization);
     let material = provider
         .generate_bridge_material(&provider_request)
         .map_err(|failure| BetaGenerationError::ProviderFailure(failure.to_string()))?;
@@ -630,9 +803,14 @@ where
     let (note, note_body, reference_note_created) =
         bridge_reference_note(&context, &material, &model, request.started_at);
 
-    let run_request = bridge_run_request(&request);
+    let run_request = bridge_run_request(&request, &source_document_ids);
     store
-        .save_generation_run(run_receipt(&run_request, &model, RunProgress::Started))
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Started,
+            source_permissions.clone(),
+        ))
         .map_err(BetaGenerationError::Store)?;
     store
         .save_concept_reference_note(note)
@@ -655,6 +833,8 @@ where
             domain_key: "bridge",
             supersede_parent: true,
             remediation_pack_id: None,
+            source_document_ids: &source_document_ids,
+            source_key: context.parent.queue.source_key.as_ref(),
         },
     )?;
 
@@ -667,6 +847,7 @@ where
                 validation_failures: bridge_drafts.validation_failures.clone(),
                 usage: material.usage.as_ref().map(provider_usage_to_run_usage),
             },
+            source_permissions,
         ))
         .map_err(BetaGenerationError::Store)?;
 
@@ -731,7 +912,9 @@ where
 
     let pack_id = format!("remediation-pack:{}", request.attempt_id);
     let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
-    let provider_request = bridge_material_request(&snapshot, &context);
+    let (source_document_ids, source_permissions, authorization) =
+        source_authorization_for_parent::<S::Error>(&snapshot, &context.parent, true)?;
+    let provider_request = bridge_material_request(&snapshot, &context, authorization);
     let material = provider
         .generate_bridge_material(&provider_request)
         .map_err(|failure| BetaGenerationError::ProviderFailure(failure.to_string()))?;
@@ -742,9 +925,14 @@ where
     let (note, note_body, _) =
         bridge_reference_note(&context, &material, &model, request.started_at);
 
-    let run_request = remediation_pack_run_request(request);
+    let run_request = remediation_pack_run_request(request, &source_document_ids);
     store
-        .save_generation_run(run_receipt(&run_request, &model, RunProgress::Started))
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Started,
+            source_permissions.clone(),
+        ))
         .map_err(BetaGenerationError::Store)?;
     store
         .save_concept_reference_note(note)
@@ -767,6 +955,8 @@ where
             domain_key: "remediation",
             supersede_parent: false,
             remediation_pack_id: Some(&pack_id),
+            source_document_ids: &source_document_ids,
+            source_key: context.parent.queue.source_key.as_ref(),
         },
     )?;
 
@@ -779,6 +969,7 @@ where
                 validation_failures: pack_drafts.validation_failures.clone(),
                 usage: material.usage.as_ref().map(provider_usage_to_run_usage),
             },
+            source_permissions,
         ))
         .map_err(BetaGenerationError::Store)?;
 
@@ -814,15 +1005,17 @@ where
 
 fn remediation_pack_run_request(
     request: &RemediationPackGenerationRequest,
+    source_document_ids: &[String],
 ) -> BetaGenerationRequest {
     BetaGenerationRequest {
         run_id: request.run_id.clone(),
-        source_document_ids: Vec::new(),
+        source_document_ids: source_document_ids.to_vec(),
         parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
         started_at: request.started_at,
         completed_at: request.completed_at,
         default_due: request.default_due,
         model: request.model.clone(),
+        pending: false,
     }
 }
 
@@ -832,6 +1025,44 @@ struct BridgeGenerationContext {
     concept_label: String,
     cached_note: Option<ConceptReferenceNote>,
     parent_stage_order: u32,
+}
+
+/// Resolve a parent review unit's source documents into the trio every
+/// bridge/remediation generation path needs: the source ids to stamp on the
+/// generated run, their permission receipts, and the [`SourceAuthorizationContext`]
+/// an arbitrary model provider must respect. `enforce` gates both requiring
+/// provenance to exist and rejecting a `LocalOnly` source before any provider
+/// call, matching the `_with_provider` (production) path; the deterministic
+/// local path passes `false`.
+fn source_authorization_for_parent<E>(
+    snapshot: &BetaStoreSnapshot,
+    parent: &BetaReviewUnitRecord,
+    enforce: bool,
+) -> Result<
+    (
+        Vec<String>,
+        Vec<SourcePermissionReceipt>,
+        SourceAuthorizationContext,
+    ),
+    BetaGenerationError<E>,
+> {
+    let source_documents = parent_source_documents::<E>(snapshot, parent, enforce)?;
+    let source_document_ids = source_documents
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    let source_permissions = source_permission_receipts(&source_documents);
+    let authorization = SourceAuthorizationContext::from_sources(&source_documents).map_err(
+        |error| match error {
+            SourceAuthorizationError::ArchivedSourceDocument(id) => {
+                BetaGenerationError::ArchivedSourceDocument(id)
+            }
+        },
+    )?;
+    if enforce {
+        ensure_model_eligible_receipts(&source_permissions)?;
+    }
+    Ok((source_document_ids, source_permissions, authorization))
 }
 
 fn bridge_generation_context<E>(
@@ -877,17 +1108,19 @@ fn bridge_generation_context<E>(
 fn bridge_material_request(
     snapshot: &BetaStoreSnapshot,
     context: &BridgeGenerationContext,
+    authorization: SourceAuthorizationContext,
 ) -> BridgeMaterialRequest {
-    BridgeMaterialRequest {
-        concept_key: context.concept_key.clone(),
-        concept_label: context.concept_label.clone(),
-        parent_review_unit_id: context.parent.review_unit_id.clone(),
-        parent_prompt: prompt_text(&context.parent.prompt),
-        parent_expected_answer: expected_answer(&context.parent.prompt),
-        parent_stage_order: context.parent_stage_order,
-        cached_reference_note: context.cached_note.as_ref().map(|note| note.body.clone()),
-        recent_performance: recent_performance_for_concept(snapshot, &context.concept_key),
-    }
+    BridgeMaterialRequest::new(
+        context.concept_key.clone(),
+        context.concept_label.clone(),
+        context.parent.review_unit_id.clone(),
+        prompt_text(&context.parent.prompt),
+        expected_answer(&context.parent.prompt),
+        context.parent_stage_order,
+        context.cached_note.as_ref().map(|note| note.body.clone()),
+        recent_performance_for_concept(snapshot, &context.concept_key),
+        authorization,
+    )
 }
 
 fn bridge_reference_note(
@@ -929,6 +1162,8 @@ struct BridgeDraftBaseContext<'a> {
     domain_key: &'a str,
     supersede_parent: bool,
     remediation_pack_id: Option<&'a str>,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 struct BridgeDraftPersistence {
@@ -981,6 +1216,8 @@ where
                 domain_key: base.domain_key,
                 supersede_parent: base.supersede_parent,
                 remediation_pack_id: base.remediation_pack_id,
+                source_document_ids: base.source_document_ids,
+                source_key: base.source_key,
             },
         );
         drafts.push(draft);
@@ -1041,15 +1278,19 @@ fn record_bridge_draft(result: &mut BridgeDraftPersistence, draft: &GeneratedPro
     result.draft_ids.push(draft.id.clone());
 }
 
-fn bridge_run_request(request: &BridgeGenerationRequest) -> BetaGenerationRequest {
+fn bridge_run_request(
+    request: &BridgeGenerationRequest,
+    source_document_ids: &[String],
+) -> BetaGenerationRequest {
     BetaGenerationRequest {
         run_id: request.run_id.clone(),
-        source_document_ids: Vec::new(),
+        source_document_ids: source_document_ids.to_vec(),
         parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
         started_at: request.started_at,
         completed_at: request.completed_at,
         default_due: request.default_due,
         model: request.model.clone(),
+        pending: false,
     }
 }
 
@@ -1059,6 +1300,7 @@ struct PersistParams<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 /// Save one candidate's reference span and draft, returning the stored draft.
@@ -1104,6 +1346,7 @@ where
                 duplicate: params.duplicate,
                 grounded: params.grounded,
                 quote_verified: params.quote_verified,
+                learning_intent: params.learning_intent,
             },
         ))
         .map_err(BetaGenerationError::Store)
@@ -1127,21 +1370,36 @@ fn run_receipt(
     request: &BetaGenerationRequest,
     model: &GeneratedPromptModel,
     progress: RunProgress,
+    source_permissions: Vec<SourcePermissionReceipt>,
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
-        RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::Started => (
+            Vec::new(),
+            request.pending.then_some(i64::MIN),
+            Vec::new(),
+            None,
+        ),
         RunProgress::InProgress {
             draft_ids,
             validation_failures,
             usage,
-        } => (draft_ids, None, validation_failures, usage),
+        } => (
+            draft_ids,
+            request.pending.then_some(i64::MIN),
+            validation_failures,
+            usage,
+        ),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
             usage,
         } => (
             draft_ids,
-            Some(request.completed_at.unwrap_or(request.started_at)),
+            Some(if request.pending {
+                i64::MIN
+            } else {
+                request.completed_at.unwrap_or(request.started_at)
+            }),
             validation_failures,
             usage,
         ),
@@ -1158,7 +1416,86 @@ fn run_receipt(
         completed_at,
         validation_failures,
         usage,
+        source_permissions,
+        prompt_version: model.version.clone(),
     }
+}
+
+fn source_permission_receipts(sources: &[SourceDocument]) -> Vec<SourcePermissionReceipt> {
+    sources
+        .iter()
+        .map(|source| SourcePermissionReceipt {
+            source_document_id: source.id.clone(),
+            permission: source.permission.clone(),
+            consented: source.permission == SourcePermission::ModelEligible,
+        })
+        .collect()
+}
+
+fn ensure_model_eligible<E>(sources: &[SourceDocument]) -> Result<(), BetaGenerationError<E>> {
+    ensure_sources_not_archived(sources)?;
+    ensure_model_eligible_receipts(&source_permission_receipts(sources))
+}
+
+fn ensure_sources_not_archived<E>(
+    sources: &[SourceDocument],
+) -> Result<(), BetaGenerationError<E>> {
+    if let Some(source) = sources.iter().find(|source| source.archived_at.is_some()) {
+        return Err(BetaGenerationError::ArchivedSourceDocument(
+            source.id.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_model_eligible_receipts<E>(
+    receipts: &[SourcePermissionReceipt],
+) -> Result<(), BetaGenerationError<E>> {
+    if let Some(receipt) = receipts
+        .iter()
+        .find(|receipt| receipt.permission == SourcePermission::LocalOnly)
+    {
+        return Err(BetaGenerationError::LocalOnlySource(
+            receipt.source_document_id.clone(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parent_source_documents<E>(
+    snapshot: &BetaStoreSnapshot,
+    parent: &BetaReviewUnitRecord,
+    require_provenance: bool,
+) -> Result<Vec<SourceDocument>, BetaGenerationError<E>> {
+    let draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == parent.review_unit_id);
+    let mut source_ids = draft
+        .map(|draft| draft.source_document_ids.clone())
+        .unwrap_or_default();
+    if let Some(source_key) = parent.queue.source_key.as_ref() {
+        if !source_ids.iter().any(|id| id == source_key) {
+            source_ids.push(source_key.clone());
+        }
+    }
+    if require_provenance && source_ids.is_empty() {
+        return Err(BetaGenerationError::UnknownSourceDocument(
+            parent.review_unit_id.to_string(),
+        ));
+    }
+    let mut sources = Vec::with_capacity(source_ids.len());
+    for source_id in &source_ids {
+        let source = snapshot
+            .source_documents
+            .iter()
+            .find(|source| &source.id == source_id)
+            .ok_or_else(|| BetaGenerationError::UnknownSourceDocument(source_id.clone()))?;
+        sources.push(source.clone());
+    }
+    ensure_sources_not_archived(&sources)?;
+    Ok(sources)
 }
 
 struct DraftContext<'a> {
@@ -1170,6 +1507,7 @@ struct DraftContext<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn merge_usage(
@@ -1321,6 +1659,7 @@ fn build_draft(
     };
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: generated_id(context.run_id, "draft", &source.id, candidate),
         source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
@@ -1328,7 +1667,7 @@ fn build_draft(
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        prompt: build_prompt(candidate, &unit_id, context.learning_intent),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due,
@@ -1368,6 +1707,8 @@ struct BridgeDraftContext<'a> {
     domain_key: &'a str,
     supersede_parent: bool,
     remediation_pack_id: Option<&'a str>,
+    source_document_ids: &'a [String],
+    source_key: Option<&'a String>,
 }
 
 fn bridge_draft(
@@ -1410,19 +1751,23 @@ fn bridge_draft(
         .unwrap_or_else(|| context.concept_key.to_owned());
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: bridge_generated_id(
             context.run_id,
             "draft",
             context.parent_review_unit_id,
             candidate,
         ),
-        source_document_ids: Vec::new(),
+        source_document_ids: context.source_document_ids.to_vec(),
         reference_span_ids: Vec::new(),
         concept_reference_note_key: Some(context.concept_key.to_owned()),
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        // Bridge material is an easier derivative, not the original source's
+        // verbatim intent; keep its exercise tolerant unless a future typed
+        // bridge contract explicitly opts into recitation.
+        prompt: build_prompt(candidate, &unit_id, None),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due.saturating_add(i64::from(stage_order)),
@@ -1438,7 +1783,10 @@ fn bridge_draft(
                 },
             }),
             concept_key: Some(context.concept_key.to_owned()),
-            source_key: None,
+            source_key: context
+                .source_key
+                .cloned()
+                .or_else(|| context.source_document_ids.first().cloned()),
             domain_key: Some(context.domain_key.to_owned()),
         },
         activity_kind: candidate.activity_kind.clone(),
@@ -1478,7 +1826,11 @@ fn bridge_validation_reasons(
     reasons
 }
 
-fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
+fn build_prompt(
+    candidate: &DraftCandidate,
+    review_unit_id: &ReviewUnitId,
+    learning_intent: Option<LearningIntent>,
+) -> Prompt {
     if candidate.activity_kind == GeneratedLearningActivityKind::Quiz
         && candidate.distractors.len() >= 2
     {
@@ -1495,10 +1847,15 @@ fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Pr
     }
 
     Prompt::Exact(ExactPrompt {
-        kind: if candidate.activity_kind == GeneratedLearningActivityKind::Exercise {
-            ExactPromptKind::Recitation
-        } else {
-            ExactPromptKind::ShortAnswer
+        kind: match learning_intent {
+            Some(LearningIntent::VerbatimMemorization) => ExactPromptKind::Recitation,
+            Some(
+                LearningIntent::EnumerableSet
+                | LearningIntent::ConceptUnderstanding
+                | LearningIntent::FactRecall
+                | LearningIntent::ProcedureProcess,
+            )
+            | None => ExactPromptKind::ShortAnswer,
         },
         review_unit_id: review_unit_id.clone(),
         prompt: candidate.question.clone(),

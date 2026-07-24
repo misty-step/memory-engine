@@ -60,6 +60,7 @@ impl ContentKind {
                 Self::VerbatimSequential,
                 Some(LearningIntent::VerbatimMemorization)
             ) | (Self::Conceptual, Some(LearningIntent::ConceptUnderstanding))
+                | (Self::EnumerableSet, Some(LearningIntent::EnumerableSet))
                 | (Self::FactRecall, Some(LearningIntent::FactRecall))
                 | (
                     Self::ProcedureProcess,
@@ -503,12 +504,12 @@ mod tests {
 
         let nato = score(
             Some(&nato_expect),
-            Some(LearningIntent::FactRecall),
+            Some(LearningIntent::EnumerableSet),
             &nato_candidates,
         )
         .expect("nato content fit");
 
-        assert_eq!(nato.classification, ContentFitCheck::Fail);
+        assert_eq!(nato.classification, ContentFitCheck::Pass);
         assert_eq!(nato.covered_units, 2);
         assert_eq!(nato.required_units, 3);
         assert!((nato.coverage - (2.0 / 3.0)).abs() < 0.01);
@@ -726,17 +727,18 @@ mod tests {
         );
 
         let nato = scores.get("nato-alphabet").expect("nato fit");
-        assert_eq!(nato.classification, ContentFitCheck::Fail);
-        assert_eq!(nato.covered_units, 5);
+        assert_eq!(nato.classification, ContentFitCheck::Pass);
+        assert_eq!(nato.covered_units, 26);
         assert_eq!(nato.required_units, 26);
-        assert_eq!(nato.shape, ContentFitCheck::Fail);
-        assert!(!nato.passes());
+        assert_eq!(nato.shape, ContentFitCheck::Pass);
+        assert_eq!(nato.directionality, ContentFitCheck::Pass);
+        assert!(nato.passes());
 
         let creed = scores.get("apostles-creed").expect("creed fit");
-        assert_eq!(creed.classification, ContentFitCheck::Fail);
-        assert_eq!(creed.covered_units, 0);
+        assert_eq!(creed.classification, ContentFitCheck::Pass);
+        assert_eq!(creed.covered_units, 6);
         assert_eq!(creed.required_units, 6);
-        assert_eq!(creed.shape, ContentFitCheck::Fail);
-        assert!(!creed.passes());
+        assert_eq!(creed.shape, ContentFitCheck::Pass);
+        assert!(creed.passes());
     }
 }

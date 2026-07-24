@@ -10,17 +10,27 @@ fn script_path() -> std::path::PathBuf {
 }
 
 fn start_mock_resend(expected_requests: usize) -> (String, JoinHandle<Vec<String>>) {
+    start_mock_resend_response(expected_requests, "200 OK", r#"{"id":"email_test_123"}"#)
+}
+
+fn start_mock_resend_response(
+    expected_requests: usize,
+    status: &str,
+    body: &str,
+) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Resend");
     let address = listener.local_addr().expect("mock address");
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
     let server = thread::spawn(move || {
         (0..expected_requests)
             .map(|_| {
                 let (mut stream, _) = listener.accept().expect("accept Resend request");
                 let request = read_http_request(&mut stream);
                 stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                    )
+                    .write_all(response.as_bytes())
                     .expect("write Resend response");
                 request
             })
@@ -67,7 +77,13 @@ fn header(request: &str, name: &str) -> Option<String> {
     })
 }
 
-fn run_mailer(resend_api_url: &str, reminder_key: Option<&str>, magic_link: bool) -> Output {
+fn run_mailer_with_inputs(
+    resend_api_url: &str,
+    reminder_key: Option<&str>,
+    magic_link: bool,
+    email: &str,
+    link: &str,
+) -> Output {
     let mut command = Command::new(script_path());
     command
         .env_clear()
@@ -90,17 +106,11 @@ fn run_mailer(resend_api_url: &str, reminder_key: Option<&str>, magic_link: bool
     }
     if magic_link {
         command
-            .env("MEMORY_ENGINE_AUTH_EMAIL", "learner@example.test")
-            .env(
-                "MEMORY_ENGINE_AUTH_LINK",
-                "/app/login/verify?token=magic-test",
-            );
+            .env("MEMORY_ENGINE_AUTH_EMAIL", email)
+            .env("MEMORY_ENGINE_AUTH_LINK", link);
     } else {
         command
-            .env(
-                "MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL",
-                "learner@example.test",
-            )
+            .env("MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL", email)
             .env("MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT", "3")
             .env(
                 "MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE",
@@ -108,6 +118,16 @@ fn run_mailer(resend_api_url: &str, reminder_key: Option<&str>, magic_link: bool
             );
     }
     command.output().expect("run bundled mailer")
+}
+
+fn run_mailer(resend_api_url: &str, reminder_key: Option<&str>, magic_link: bool) -> Output {
+    run_mailer_with_inputs(
+        resend_api_url,
+        reminder_key,
+        magic_link,
+        "learner@example.test",
+        "/app/login/verify?token=magic-test",
+    )
 }
 
 #[test]
@@ -148,4 +168,193 @@ fn bundled_resend_mailer_magic_link_mode_does_not_require_or_send_key() {
     let requests = server.join().expect("mock Resend server");
     assert_eq!(requests.len(), 1);
     assert!(header(&requests[0], "Idempotency-Key").is_none());
+    assert!(
+        requests[0].contains(r#"text":"Sign in: https://memory.example.test/app/login/verify?token=magic-test\n\nThe link"#),
+        "message newlines must be encoded once in JSON: {}",
+        requests[0]
+    );
+    assert!(
+        !requests[0].contains(r"\\n"),
+        "message must not contain double-escaped newline literals: {}",
+        requests[0]
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_escapes_untrusted_email_and_reports_bounded_provider_id() {
+    let (resend_api_url, server) = start_mock_resend(1);
+    let output = run_mailer_with_inputs(
+        &resend_api_url,
+        None,
+        true,
+        r#"learner"quoted@example.test"#,
+        "/app/login/verify?token=magic-test",
+    );
+    assert!(
+        output.status.success(),
+        "escaped magic link failed: {output:?}"
+    );
+    let requests = server.join().expect("mock Resend server");
+    assert!(
+        requests[0].contains(r#""to":["learner\"quoted@example.test"]"#),
+        "recipient was not JSON escaped: {}",
+        requests[0]
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resend_status=accepted"),
+        "missing bounded status: {stderr}"
+    );
+    assert!(
+        stderr.contains("resend_id=email_test_123"),
+        "missing provider id: {stderr}"
+    );
+    assert!(
+        !stderr.contains("quoted@example.test"),
+        "recipient leaked to diagnostics: {stderr}"
+    );
+    assert!(
+        !stderr.contains("magic-test"),
+        "token leaked to diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_rejects_control_characters_before_provider_call() {
+    for email in ["learner\n@example.test", "learner\r@example.test"] {
+        let output = run_mailer_with_inputs(
+            "http://127.0.0.1:1",
+            None,
+            true,
+            email,
+            "/app/login/verify?token=magic-test",
+        );
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("mailer input contains unsupported control characters"),
+            "unexpected control failure: {stderr}"
+        );
+        assert!(
+            !stderr.contains("learner"),
+            "recipient leaked to diagnostics: {stderr}"
+        );
+        assert!(
+            !stderr.contains("magic-test"),
+            "token leaked to diagnostics: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn bundled_resend_mailer_reports_provider_failure_without_body_or_curl_noise() {
+    let (resend_api_url, server) = start_mock_resend_response(
+        1,
+        "422 Unprocessable Entity",
+        r#"{"message":"provider detail"}"#,
+    );
+    let output = run_mailer_with_inputs(
+        &resend_api_url,
+        None,
+        true,
+        "learner@example.test",
+        "/app/login/verify?token=magic-test",
+    );
+    assert!(!output.status.success());
+    let _requests = server.join().expect("mock Resend server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resend_status=failed http_status=422"),
+        "missing bounded provider failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("provider detail"),
+        "provider body leaked to diagnostics: {stderr}"
+    );
+    assert!(
+        !stderr.contains("curl:"),
+        "curl transport noise leaked to diagnostics: {stderr}"
+    );
+    assert!(
+        !stderr.contains("magic-test"),
+        "token leaked to diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_suppresses_transport_diagnostics() {
+    let output = run_mailer_with_inputs(
+        "http://127.0.0.1:1",
+        None,
+        true,
+        "learner@example.test",
+        "/app/login/verify?token=magic-test",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.trim(), "resend_status=transport_error");
+}
+#[test]
+fn bundled_resend_mailer_rejects_control_characters_in_idempotency_key() {
+    let output = run_mailer_with_inputs(
+        "http://127.0.0.1:1",
+        Some("retry\ninjected"),
+        false,
+        "learner@example.test",
+        "/app/login/verify?token=magic-test",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mailer input contains unsupported control characters"),
+        "unexpected key failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("injected"),
+        "idempotency key leaked to diagnostics: {stderr}"
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_escapes_backslashes_in_json_fields() {
+    let (resend_api_url, server) = start_mock_resend(1);
+    let output = run_mailer_with_inputs(
+        &resend_api_url,
+        None,
+        true,
+        r"learner\quoted@example.test",
+        "/app/login/verify?token=magic-test",
+    );
+    assert!(
+        output.status.success(),
+        "backslash input failed: {output:?}"
+    );
+    let requests = server.join().expect("mock Resend server");
+    assert!(
+        requests[0].contains(r#""to":["learner\\quoted@example.test"]"#),
+        "backslash was not JSON escaped: {}",
+        requests[0]
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_escapes_json_fields_without_a_subprocess_per_character() {
+    // json_escape used to spawn a `grep` (and `printf`) subprocess for every
+    // ordinary character in the recipient, sender, subject, and message.
+    // The fix checks each value for disallowed control characters once,
+    // then escapes with pure shell built-ins. A hard wall-clock assertion
+    // here would trade one flaky shared-host timing test for another (see
+    // `waitlist_join_file_store_handler_overhead_is_negligible`): this
+    // machine measured 1.28s before the fix and 0.08-0.11s after under
+    // normal load, but a single contended run still touched 0.88s, close
+    // enough to a "generous" fixed threshold to flake. Assert correctness
+    // here; the before/after timing is recorded in the fix's commit
+    // message as reproducible, non-gating evidence.
+    let (resend_api_url, server) = start_mock_resend(1);
+    let started = std::time::Instant::now();
+    let output = run_mailer(&resend_api_url, None, true);
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "mailer failed: {output:?}");
+    server.join().expect("mock Resend server");
+    eprintln!("magic-link send completed in {elapsed:?} (informational only)");
 }

@@ -3,11 +3,11 @@ use memory_engine_core::{
     ReviewUnitLifecycle, ScheduleState, ScheduleStatus,
 };
 use memory_engine_persistence::{
-    ApproveGeneratedPromptDraftOptions, BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError,
-    ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
-    GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
-    GenerationRun, PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-    SourcePermission,
+    BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, ConceptReferenceNote,
+    GeneratedLearningActivityKind, GeneratedPromptDraft, GeneratedPromptModel,
+    GeneratedPromptValidation, GeneratedPromptValidationStatus, GenerationRun,
+    PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind, SourcePermission,
+    SourcePermissionReceipt,
 };
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, ContentFeedbackSource, ContentFeedbackVerdict,
@@ -16,6 +16,51 @@ use memory_engine_service::{
 };
 
 const NOW: i64 = 1_779_989_400_000;
+
+#[test]
+fn reads_legacy_source_snapshot_without_permission_as_model_eligible() {
+    let directory = TempDirectory::new("legacy-permission");
+    let path = directory.path().join("store.json");
+    fs::write(
+        &path,
+        r#"{"version":1,"sourceDocuments":[{"id":"legacy-source","kind":"text","title":"Legacy source","body":"old notes","uri":null,"freshness":1779989400000,"createdAt":1779989400000}],"referenceSpans":[],"generatedPromptDrafts":[],"reviewUnits":[],"schedules":[],"attempts":[],"generationRuns":[],"appliedReviews":[],"conceptReferenceNotes":[]}"#,
+    )
+    .expect("legacy snapshot");
+
+    let store = BetaPersistenceStore::open(path).expect("legacy source loads");
+    assert_eq!(
+        store.snapshot().source_documents[0].permission,
+        SourcePermission::ModelEligible
+    );
+}
+
+#[test]
+fn updates_source_permission_but_rejects_archived_sources() {
+    let directory = TempDirectory::new("permission-update");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(path).expect("open store");
+    store
+        .save_source_document(source_document("editable-source"))
+        .expect("source");
+
+    let updated = store
+        .update_source_document_permission("editable-source", SourcePermission::LocalOnly)
+        .expect("permission update");
+    assert_eq!(updated.permission, SourcePermission::LocalOnly);
+    assert_eq!(
+        store.snapshot().source_documents[0].permission,
+        SourcePermission::LocalOnly
+    );
+    store
+        .archive_source_document("editable-source", NOW)
+        .expect("archive");
+    assert_eq!(
+        store.update_source_document_permission("editable-source", SourcePermission::ModelEligible),
+        Err(BetaStoreError::SourceDocumentArchived(
+            "editable-source".to_owned()
+        ))
+    );
+}
 
 #[test]
 fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
@@ -46,13 +91,14 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
         ))
         .expect("run");
     store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
-            },
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("keep");
+    store
+        .set_schedule_state(
+            &draft.review_unit_id,
+            Some(schedule_state(2, ScheduleStatus::Review)),
         )
-        .expect("approve");
+        .expect("schedule kept draft");
 
     let mut service = MemoryService::with_clock(store, mastered_after_three_reviews, || NOW);
     let review = service
@@ -75,7 +121,14 @@ fn persists_sources_drafts_reviews_attempts_and_queue_across_reload() {
 
     assert_eq!(snapshot.source_documents, [source]);
     assert_eq!(snapshot.reference_spans, [reference]);
-    assert_eq!(snapshot.generated_prompt_drafts, [draft]);
+    assert_eq!(snapshot.generated_prompt_drafts[0].id, draft.id);
+    assert_eq!(
+        snapshot.generated_prompt_drafts[0].learner_decision,
+        Some(memory_engine_persistence::LearnerDraftDecision::Kept {
+            edited: false,
+            decided_at: NOW
+        }),
+    );
     assert_eq!(snapshot.generation_runs.len(), 1);
     assert_eq!(snapshot.attempts, [review.attempt]);
     assert_eq!(
@@ -452,6 +505,7 @@ fn validates_generated_drafts_before_promotion() {
         .expect("reference");
 
     let rejected = GeneratedPromptDraft {
+        learner_decision: None,
         validation: GeneratedPromptValidation {
             status: GeneratedPromptValidationStatus::Rejected,
             reasons: vec!["Unsupported claim.".to_owned()],
@@ -469,15 +523,13 @@ fn validates_generated_drafts_before_promotion() {
         .expect("rejected draft persists");
     assert_eq!(
         store
-            .approve_generated_prompt_draft(
-                &rejected.id,
-                ApproveGeneratedPromptDraftOptions::default()
-            )
-            .expect_err("cannot approve rejected"),
+            .keep_generated_prompt_draft(&rejected.id, NOW)
+            .expect_err("cannot keep rejected"),
         BetaStoreError::RejectedGeneratedPromptDraft
     );
 
     let missing_reference = GeneratedPromptDraft {
+        learner_decision: None,
         id: "draft-missing-reference".to_owned(),
         reference_span_ids: vec!["missing-reference".to_owned()],
         ..accepted_draft(
@@ -523,11 +575,42 @@ fn validates_generated_drafts_before_promotion() {
         .expect("accepted draft");
     assert_eq!(
         store
-            .approve_generated_prompt_draft(
-                &accepted_without_run.id,
-                ApproveGeneratedPromptDraftOptions::default()
-            )
+            .keep_generated_prompt_draft(&accepted_without_run.id, NOW)
             .expect_err("missing generation run"),
+        BetaStoreError::MissingGenerationRunForAcceptedDraft
+    );
+}
+
+#[test]
+fn unfinished_generation_run_is_not_decision_eligible() {
+    let directory = TempDirectory::new("unfinished-run-decision");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    store
+        .save_source_document(source_document("src-unfinished"))
+        .expect("source");
+    store
+        .save_reference_span(reference_span("ref-unfinished", "src-unfinished"))
+        .expect("reference");
+
+    let mut run = generation_run("run-unfinished", &["src-unfinished"], &["draft-unfinished"]);
+    run.completed_at = None;
+    store.save_generation_run(run).expect("unfinished run");
+    let draft = accepted_draft(
+        "draft-unfinished",
+        "unfinished-unit",
+        &["src-unfinished"],
+        &["ref-unfinished"],
+        Some("run-unfinished"),
+    );
+    store
+        .save_generated_prompt_draft(draft.clone())
+        .expect("draft");
+
+    assert_eq!(
+        store
+            .keep_generated_prompt_draft(&draft.id, NOW)
+            .expect_err("unfinished run must reject keep"),
         BetaStoreError::MissingGenerationRunForAcceptedDraft
     );
 }
@@ -567,7 +650,7 @@ fn revises_snoozes_and_archives_review_units_without_rewriting_schedule_history(
             .critique_notes
             .last()
             .map(String::as_str),
-        Some("Learner edited approved wording.")
+        Some("Learner edited kept wording.")
     );
     assert_eq!(
         prompt_text(
@@ -1036,8 +1119,8 @@ fn boolean_prompt_edit_rejects_invalid_answer_without_mutation() {
 }
 
 #[test]
-fn repeated_draft_approval_returns_existing_record_without_rewriting_schedule() {
-    let directory = TempDirectory::new("repeat-approval");
+fn repeated_draft_keep_returns_existing_record_without_rewriting_schedule() {
+    let directory = TempDirectory::new("repeat-keep");
     let path = directory.path().join("store.json");
     let (mut store, draft) = lifecycle_store(&path);
     let unit_id = draft.review_unit_id.clone();
@@ -1058,17 +1141,12 @@ fn repeated_draft_approval_returns_existing_record_without_rewriting_schedule() 
         .set_schedule_state(&unit_id, Some(newer_schedule.clone()))
         .expect("newer schedule");
 
-    let reapproved = store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(1, ScheduleStatus::New)),
-            },
-        )
-        .expect("repeat approval");
-    assert_eq!(reapproved.prompt, newer_prompt.prompt);
-    assert_eq!(reapproved.queue.lifecycle, newer_lifecycle.queue.lifecycle);
-    assert_eq!(reapproved.snoozed_until, newer_snooze.snoozed_until);
+    let rekept = store
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("repeat keep");
+    assert_eq!(rekept.prompt, newer_prompt.prompt);
+    assert_eq!(rekept.queue.lifecycle, newer_lifecycle.queue.lifecycle);
+    assert_eq!(rekept.snoozed_until, newer_snooze.snoozed_until);
 
     let snapshot = store.snapshot();
     assert_eq!(
@@ -1107,13 +1185,14 @@ fn lifecycle_store(path: &std::path::Path) -> (BetaPersistenceStore, GeneratedPr
         ))
         .expect("run");
     store
-        .approve_generated_prompt_draft(
-            &draft.id,
-            ApproveGeneratedPromptDraftOptions {
-                initial_schedule_state: Some(schedule_state(2, ScheduleStatus::Review)),
-            },
+        .keep_generated_prompt_draft(&draft.id, NOW)
+        .expect("keep");
+    store
+        .set_schedule_state(
+            &draft.review_unit_id,
+            Some(schedule_state(2, ScheduleStatus::Review)),
         )
-        .expect("approve");
+        .expect("schedule kept draft");
 
     (store, draft)
 }
@@ -1149,6 +1228,187 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
 
 fn mastered_after_three_reviews(schedule: &ScheduleState) -> bool {
     schedule.state == ScheduleStatus::Review && schedule.reps >= 3
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
+    let directory = TempDirectory::new("learner-trust-driver");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let source = store
+        .save_source_document(source_document("trust-source"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("trust-reference", &source.id))
+        .expect("reference");
+    let draft_ids = ["trust-keep", "trust-edit", "trust-reject"];
+    for (index, draft_id) in draft_ids.iter().enumerate() {
+        let run_id = format!("trust-run-{index}");
+        let draft = store
+            .save_generated_prompt_draft(accepted_draft(
+                draft_id,
+                &format!("trust-unit-{index}"),
+                &[source.id.as_str()],
+                &[reference.id.as_str()],
+                Some(&run_id),
+            ))
+            .expect("pending draft");
+        store
+            .save_generation_run(generation_run(
+                &run_id,
+                &[source.id.as_str()],
+                &[draft.id.as_str()],
+            ))
+            .expect("generation run");
+    }
+    let stale_reference = store
+        .save_reference_span(reference_span("stale-reference", &source.id))
+        .expect("stale reference");
+    let stale_draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "stale-draft",
+            "stale-unit",
+            &[source.id.as_str()],
+            &[stale_reference.id.as_str()],
+            Some("stale-run"),
+        ))
+        .expect("stale draft");
+    store
+        .save_generation_run(generation_run(
+            "stale-run",
+            &[source.id.as_str()],
+            &[stale_draft.id.as_str()],
+        ))
+        .expect("stale run");
+    assert!(
+        !store
+            .finalize_generation_run("stale-run", NOW, false)
+            .expect("finalize stale run"),
+        "stale file finalizer must reject the lost lease"
+    );
+    assert!(
+        !store
+            .finalize_generation_run("stale-run", NOW, false)
+            .expect("repeat stale finalizer"),
+        "repeated stale finalization remains idempotent"
+    );
+    let after_discard = store.snapshot();
+    assert!(!after_discard
+        .generated_prompt_drafts
+        .iter()
+        .any(|draft| draft.id == stale_draft.id));
+    assert!(!after_discard
+        .generation_runs
+        .iter()
+        .any(|run| run.id == "stale-run"));
+    assert!(!after_discard
+        .reference_spans
+        .iter()
+        .any(|span| span.id == stale_reference.id));
+
+    let pending = store.snapshot();
+    assert!(
+        pending.review_units.is_empty(),
+        "generation must not promote drafts"
+    );
+    assert!(
+        pending.schedules.is_empty(),
+        "generation must not schedule drafts"
+    );
+
+    let kept = store
+        .keep_generated_prompt_draft(draft_ids[0], NOW)
+        .expect("keep");
+    let edited = store
+        .edit_and_keep_generated_prompt_draft(
+            draft_ids[1],
+            "  Edited trust prompt  ",
+            "  Edited trust answer  ",
+            NOW + 1,
+        )
+        .expect("edit and keep");
+    assert_decision_retries(&mut store, &draft_ids, &kept, &edited);
+
+    let due = store.list_queue_candidates().expect("due queue");
+    assert_eq!(due.len(), 2, "only kept and edited-kept drafts can be due");
+    assert_eq!(
+        due.iter()
+            .map(|candidate| candidate.review_unit_id.clone())
+            .collect::<Vec<_>>(),
+        vec![kept.review_unit_id, edited.review_unit_id]
+    );
+    let export = store
+        .export_learner_draft_decisions_json()
+        .expect("decision export");
+    let export: serde_json::Value = serde_json::from_str(&export).expect("export JSON");
+    assert_eq!(export.as_array().expect("export array").len(), 3);
+    assert!(export
+        .as_array()
+        .expect("export array")
+        .iter()
+        .all(
+            |entry| entry["sourceDocumentIds"] == serde_json::json!(["trust-source"])
+                && entry["referenceSpanIds"] == serde_json::json!(["trust-reference"])
+                && entry["generationRunId"].is_string()
+                && entry["provider"] == "fixture"
+                && entry["model"] == "deterministic-draft"
+        ));
+
+    let reloaded = BetaPersistenceStore::open(&path).expect("reload");
+    let reloaded_due = reloaded
+        .list_queue_candidates()
+        .expect("reloaded due queue");
+    assert_eq!(reloaded_due, due);
+    let reloaded_export = reloaded
+        .export_learner_draft_decisions_json()
+        .expect("reloaded export");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reloaded_export).expect("reloaded export JSON"),
+        export
+    );
+}
+
+fn assert_decision_retries(
+    store: &mut BetaPersistenceStore,
+    draft_ids: &[&str; 3],
+    kept: &BetaReviewUnitRecord,
+    edited: &BetaReviewUnitRecord,
+) {
+    assert_eq!(
+        store
+            .keep_generated_prompt_draft(draft_ids[0], NOW + 3)
+            .expect("idempotent keep"),
+        *kept
+    );
+    assert_eq!(
+        store
+            .edit_and_keep_generated_prompt_draft(
+                draft_ids[1],
+                "Edited trust prompt",
+                "Edited trust answer",
+                NOW + 4,
+            )
+            .expect("idempotent edit"),
+        *edited
+    );
+    assert!(store
+        .edit_and_keep_generated_prompt_draft(
+            draft_ids[1],
+            "Different trust prompt",
+            "Edited trust answer",
+            NOW + 5,
+        )
+        .is_err());
+    store
+        .reject_generated_prompt_draft(draft_ids[2], NOW + 2)
+        .expect("reject");
+    store
+        .reject_generated_prompt_draft(draft_ids[2], NOW + 6)
+        .expect("idempotent reject");
+    assert!(store
+        .keep_generated_prompt_draft(draft_ids[2], NOW + 7)
+        .is_err());
 }
 
 fn source_document(id: &str) -> SourceDocument {
@@ -1198,6 +1458,7 @@ fn save_concept_backed_bridge_draft(store: &mut BetaPersistenceStore) {
         .save_concept_reference_note(concept_reference_note("nato-letter-a"))
         .expect("concept note");
     let concept_backed_bridge = GeneratedPromptDraft {
+        learner_decision: None,
         source_document_ids: Vec::new(),
         reference_span_ids: Vec::new(),
         concept_reference_note_key: Some("nato-letter-a".to_owned()),
@@ -1224,6 +1485,7 @@ fn accepted_draft(
     let review_unit_id = review_unit_id(unit_id);
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: id.to_owned(),
         source_document_ids: source_document_ids
             .iter()
@@ -1272,6 +1534,15 @@ fn generation_run(id: &str, source_document_ids: &[&str], draft_ids: &[&str]) ->
         completed_at: Some(NOW),
         validation_failures: Vec::new(),
         usage: None,
+        source_permissions: source_document_ids
+            .iter()
+            .map(|source_document_id| SourcePermissionReceipt {
+                source_document_id: (*source_document_id).to_owned(),
+                permission: SourcePermission::ModelEligible,
+                consented: true,
+            })
+            .collect(),
+        prompt_version: "prompt-v1".to_owned(),
     }
 }
 
@@ -1390,3 +1661,79 @@ impl Drop for TempDirectory {
     }
 }
 use std::{fs, path::PathBuf};
+
+#[test]
+fn stale_finalizer_preserves_replacement_run_reusing_review_unit_id() {
+    let directory = TempDirectory::new("stale-finalizer-owner");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let source = store
+        .save_source_document(source_document("owner-source"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("owner-reference", &source.id))
+        .expect("reference");
+    let old_draft = store
+        .save_generated_prompt_draft(accepted_draft(
+            "owner-old-draft",
+            "owner-unit",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("owner-old-run"),
+        ))
+        .expect("old draft");
+    store
+        .save_generation_run(generation_run(
+            "owner-old-run",
+            &[source.id.as_str()],
+            &[old_draft.id.as_str()],
+        ))
+        .expect("old run");
+    let replacement = store
+        .save_generated_prompt_draft(accepted_draft(
+            "owner-replacement-draft",
+            "owner-unit",
+            &[source.id.as_str()],
+            &[reference.id.as_str()],
+            Some("owner-replacement-run"),
+        ))
+        .expect("replacement draft");
+    store
+        .save_generation_run(generation_run(
+            "owner-replacement-run",
+            &[source.id.as_str()],
+            &[replacement.id.as_str()],
+        ))
+        .expect("replacement run");
+    let kept = store
+        .keep_generated_prompt_draft(&replacement.id, NOW)
+        .expect("keep replacement");
+    store
+        .set_schedule_state(
+            &kept.review_unit_id,
+            Some(schedule_state(1, ScheduleStatus::Review)),
+        )
+        .expect("schedule replacement");
+
+    assert!(!store
+        .finalize_generation_run("owner-old-run", NOW + 1, false)
+        .expect("stale finalizer"));
+    let snapshot = store.snapshot();
+    assert!(snapshot
+        .generated_prompt_drafts
+        .iter()
+        .any(|draft| draft.id == replacement.id));
+    assert!(snapshot
+        .review_units
+        .iter()
+        .any(|unit| unit.review_unit_id == kept.review_unit_id));
+    assert!(snapshot
+        .schedules
+        .iter()
+        .any(|schedule| schedule.review_unit_id == kept.review_unit_id));
+    assert!(store
+        .list_queue_candidates()
+        .expect("replacement queue")
+        .iter()
+        .any(|candidate| candidate.review_unit_id == kept.review_unit_id));
+}

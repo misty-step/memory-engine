@@ -11,7 +11,7 @@
 use std::{error::Error, fmt};
 
 use memory_engine_persistence::{
-    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument,
+    GeneratedLearningActivityKind, GeneratedPromptModel, SourceDocument, SourcePermission,
 };
 
 /// One generated draft candidate before validation.
@@ -75,12 +75,120 @@ pub struct ReviewPerformanceContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceAuthorizationError {
+    ArchivedSourceDocument(String),
+}
+
+impl fmt::Display for SourceAuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArchivedSourceDocument(id) => {
+                write!(
+                    formatter,
+                    "Archived source document cannot be authorized: {id}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for SourceAuthorizationError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedSourceDocument {
+    id: String,
+    permission: SourcePermission,
+}
+
+impl AuthorizedSourceDocument {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Explicit source authorization attached to every reference/bridge request.
+///
+/// The wrapper is intentionally constructed from active persisted source
+/// documents. A low-level provider therefore cannot receive an archived source
+/// request without the authorization step failing first.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceAuthorizationContext {
+    sources: Vec<AuthorizedSourceDocument>,
+}
+
+impl SourceAuthorizationContext {
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Authorize source documents for a local or external provider boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any source is archived.
+    pub fn from_sources(sources: &[SourceDocument]) -> Result<Self, SourceAuthorizationError> {
+        let mut authorized = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.archived_at.is_some() {
+                return Err(SourceAuthorizationError::ArchivedSourceDocument(
+                    source.id.clone(),
+                ));
+            }
+            authorized.push(AuthorizedSourceDocument {
+                id: source.id.clone(),
+                permission: source.permission.clone(),
+            });
+        }
+        Ok(Self {
+            sources: authorized,
+        })
+    }
+
+    #[must_use]
+    pub fn local_only_source_id(&self) -> Option<&str> {
+        self.sources
+            .iter()
+            .find(|source| source.permission == SourcePermission::LocalOnly)
+            .map(AuthorizedSourceDocument::id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceNoteRequest {
     pub concept_key: String,
     pub concept_label: String,
     pub prompt: String,
     pub expected_answer: String,
     pub recent_performance: Vec<ReviewPerformanceContext>,
+    authorization: SourceAuthorizationContext,
+}
+
+impl ReferenceNoteRequest {
+    #[must_use]
+    pub fn new(
+        concept_key: impl Into<String>,
+        concept_label: impl Into<String>,
+        prompt: impl Into<String>,
+        expected_answer: impl Into<String>,
+        recent_performance: Vec<ReviewPerformanceContext>,
+        authorization: SourceAuthorizationContext,
+    ) -> Self {
+        Self {
+            concept_key: concept_key.into(),
+            concept_label: concept_label.into(),
+            prompt: prompt.into(),
+            expected_answer: expected_answer.into(),
+            recent_performance,
+            authorization,
+        }
+    }
+
+    #[must_use]
+    pub fn authorization(&self) -> &SourceAuthorizationContext {
+        &self.authorization
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +207,40 @@ pub struct BridgeMaterialRequest {
     pub parent_stage_order: u32,
     pub cached_reference_note: Option<String>,
     pub recent_performance: Vec<ReviewPerformanceContext>,
+    authorization: SourceAuthorizationContext,
+}
+
+impl BridgeMaterialRequest {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        concept_key: impl Into<String>,
+        concept_label: impl Into<String>,
+        parent_review_unit_id: memory_engine_core::ReviewUnitId,
+        parent_prompt: impl Into<String>,
+        parent_expected_answer: impl Into<String>,
+        parent_stage_order: u32,
+        cached_reference_note: Option<String>,
+        recent_performance: Vec<ReviewPerformanceContext>,
+        authorization: SourceAuthorizationContext,
+    ) -> Self {
+        Self {
+            concept_key: concept_key.into(),
+            concept_label: concept_label.into(),
+            parent_review_unit_id,
+            parent_prompt: parent_prompt.into(),
+            parent_expected_answer: parent_expected_answer.into(),
+            parent_stage_order,
+            cached_reference_note,
+            recent_performance,
+            authorization,
+        }
+    }
+
+    #[must_use]
+    pub fn authorization(&self) -> &SourceAuthorizationContext {
+        &self.authorization
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,9 +259,17 @@ pub struct BridgeMaterial {
 /// returned a 5xx/429) versus a permanent failure (a 4xx rejection, a malformed
 /// response) — so a caller can retry the former without re-classifying a string.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderFailureKind {
+    General,
+    LocalOnlySource(String),
+    ArchivedSource(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderFailure {
     message: String,
     transient: bool,
+    kind: ProviderFailureKind,
 }
 
 impl ProviderFailure {
@@ -130,6 +280,7 @@ impl ProviderFailure {
         Self {
             message: message.into(),
             transient: false,
+            kind: ProviderFailureKind::General,
         }
     }
 
@@ -140,7 +291,37 @@ impl ProviderFailure {
         Self {
             message: message.into(),
             transient: true,
+            kind: ProviderFailureKind::General,
         }
+    }
+
+    #[must_use]
+    pub fn local_only_source(source_document_id: impl Into<String>) -> Self {
+        let source_document_id = source_document_id.into();
+        Self {
+            message: format!(
+                "Local-only source {source_document_id} cannot be sent to the model provider."
+            ),
+            transient: false,
+            kind: ProviderFailureKind::LocalOnlySource(source_document_id),
+        }
+    }
+
+    #[must_use]
+    pub fn archived_source(source_document_id: impl Into<String>) -> Self {
+        let source_document_id = source_document_id.into();
+        Self {
+            message: format!(
+                "Archived source {source_document_id} cannot be sent to the model provider."
+            ),
+            transient: false,
+            kind: ProviderFailureKind::ArchivedSource(source_document_id),
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &ProviderFailureKind {
+        &self.kind
     }
 
     /// Whether an identical retry might succeed. See [`ProviderFailure::transient`].
@@ -224,6 +405,7 @@ pub trait BridgeMaterialProvider: ReferenceNoteProvider {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LearningIntent {
     VerbatimMemorization,
+    EnumerableSet,
     ConceptUnderstanding,
     FactRecall,
     ProcedureProcess,
@@ -234,6 +416,7 @@ impl LearningIntent {
     pub fn label(self) -> &'static str {
         match self {
             Self::VerbatimMemorization => "verbatim_memorization",
+            Self::EnumerableSet => "enumerable_set",
             Self::ConceptUnderstanding => "concept_understanding",
             Self::FactRecall => "fact_recall",
             Self::ProcedureProcess => "procedure_process",
@@ -244,6 +427,7 @@ impl LearningIntent {
     pub fn from_label(label: &str) -> Option<Self> {
         match label.trim() {
             "verbatim_memorization" => Some(Self::VerbatimMemorization),
+            "enumerable_set" => Some(Self::EnumerableSet),
             "concept_understanding" => Some(Self::ConceptUnderstanding),
             "fact_recall" => Some(Self::FactRecall),
             "procedure_process" => Some(Self::ProcedureProcess),
@@ -267,16 +451,44 @@ pub struct LearningIntentClassification {
 #[must_use]
 pub fn classify_learning_intent(source: &SourceDocument) -> LearningIntentClassification {
     let body = source.body.as_deref().unwrap_or_default();
-    let normalized = body.to_lowercase();
+    let has_source_body = !body.trim().is_empty();
+    let normalized = format!("{} {}", source.title, body).to_lowercase();
     let lines = non_empty_lines(body);
     let list_facts = count_fact_sentences(body);
-    if looks_verbatim(&normalized, &lines) {
+    let enumerable = looks_enumerable(body, &lines);
+    let process = looks_process(&normalized);
+    let explicit_verbatim = looks_explicit_verbatim(&normalized);
+    let ordered_process = looks_ordered_process(&normalized, &lines);
+    if has_source_body && explicit_verbatim {
+        return LearningIntentClassification {
+            intent: LearningIntent::VerbatimMemorization,
+            rationale: "source explicitly calls for exact sequential memorization".to_owned(),
+        };
+    }
+    // A numbered procedure is both list-shaped and process-shaped. Let the
+    // strong ordered-action signal win that overlap, while keeping ordinary
+    // line-broken verse on the verbatim path and finite reference sets
+    // enumerable even when they mention weak process words such as "first".
+    if enumerable && ordered_process {
+        return LearningIntentClassification {
+            intent: LearningIntent::ProcedureProcess,
+            rationale: "source describes ordered actions or conditional steps".to_owned(),
+        };
+    }
+    if enumerable {
+        return LearningIntentClassification {
+            intent: LearningIntent::EnumerableSet,
+            rationale: "source contains a finite set of independently recallable entries"
+                .to_owned(),
+        };
+    }
+    if has_source_body && looks_verbatim(&normalized, &lines) {
         return LearningIntentClassification {
             intent: LearningIntent::VerbatimMemorization,
             rationale: "source reads like a quoted passage or line-broken text".to_owned(),
         };
     }
-    if looks_process(&normalized) {
+    if process {
         return LearningIntentClassification {
             intent: LearningIntent::ProcedureProcess,
             rationale: "source describes ordered actions or conditional steps".to_owned(),
@@ -348,12 +560,23 @@ impl<'a> FallbackProvider<'a> {
     }
 }
 
+fn ensure_external_source_allowed(source: &SourceDocument) -> Result<(), ProviderFailure> {
+    if source.archived_at.is_some() {
+        Err(ProviderFailure::archived_source(source.id.clone()))
+    } else if source.permission == SourcePermission::LocalOnly {
+        Err(ProviderFailure::local_only_source(source.id.clone()))
+    } else {
+        Ok(())
+    }
+}
+
 impl DraftProvider for FallbackProvider<'_> {
     fn model(&self) -> GeneratedPromptModel {
         self.fallback.model()
     }
 
     fn generate_drafts(&self, source: &SourceDocument) -> Result<ProviderDrafts, ProviderFailure> {
+        ensure_external_source_allowed(source)?;
         let primary = StructuredBlockProvider.generate_drafts(source)?;
         if primary.candidates.is_empty() {
             self.fallback.generate_drafts(source)
@@ -367,6 +590,7 @@ impl DraftProvider for FallbackProvider<'_> {
         source: &SourceDocument,
         rejections: &[DraftRejection],
     ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+        ensure_external_source_allowed(source)?;
         // Repair must stay on the provider that handled the first pass.
         // Re-run the deterministic primary router: falling through merely
         // because the primary has no repair implementation would let model
@@ -405,6 +629,7 @@ impl DraftProvider for FakeModelProvider {
         let classification = classify_learning_intent(source);
         let candidates = match classification.intent {
             LearningIntent::VerbatimMemorization => verbatim_candidates(source, &body),
+            LearningIntent::EnumerableSet => enumerable_candidates(source, &body),
             LearningIntent::ConceptUnderstanding => concept_candidates(source, &body),
             LearningIntent::FactRecall => fact_candidates(source, &body),
             LearningIntent::ProcedureProcess => procedure_candidates(source, &body),
@@ -447,13 +672,14 @@ impl BridgeMaterialProvider for FakeModelProvider {
     ) -> Result<BridgeMaterial, ProviderFailure> {
         let note = request.cached_reference_note.as_ref().map_or_else(
             || {
-                self.explain_concept(&ReferenceNoteRequest {
-                    concept_key: request.concept_key.clone(),
-                    concept_label: request.concept_label.clone(),
-                    prompt: request.parent_prompt.clone(),
-                    expected_answer: request.parent_expected_answer.clone(),
-                    recent_performance: request.recent_performance.clone(),
-                })
+                self.explain_concept(&ReferenceNoteRequest::new(
+                    request.concept_key.clone(),
+                    request.concept_label.clone(),
+                    request.parent_prompt.clone(),
+                    request.parent_expected_answer.clone(),
+                    request.recent_performance.clone(),
+                    request.authorization().clone(),
+                ))
             },
             |body| {
                 Ok(ReferenceNoteDraft {
@@ -511,16 +737,273 @@ impl BridgeMaterialProvider for FakeModelProvider {
 }
 
 fn looks_verbatim(normalized: &str, lines: &[String]) -> bool {
-    normalized.contains("recite")
-        || normalized.contains("memorize")
-        || normalized.contains("verbatim")
-        || normalized.contains("poem")
+    looks_explicit_verbatim(normalized)
         || (lines.len() >= 3
+            && lines.iter().all(|line| !line.contains(':'))
             && lines
                 .iter()
                 .filter(|line| line.chars().count() <= 96)
                 .count()
                 >= 3)
+}
+
+/// Checks whether `word` appears as a whole token in `haystack`, splitting on
+/// any non-alphanumeric byte. Plain `str::contains` would let compound words
+/// such as "universe", "diverse", or "quoted" trip on "verse"/"quote" and
+/// silently convert ordinary conceptual prose into a recitation exercise.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn looks_explicit_verbatim(normalized: &str) -> bool {
+    [
+        "recite", "memorize", "verbatim", "poem", "oath", "creed", "excerpt", "verse", "quote",
+    ]
+    .iter()
+    .any(|keyword| contains_word(normalized, keyword))
+}
+
+/// Apply deterministic content policy after a provider has classified a source.
+///
+/// Finite sets and sequential passages are safety-critical coverage cases: a
+/// model may omit entries or collapse a passage into a sampled quiz. The
+/// source itself is the authority for these two shapes, so replace only those
+/// candidates with exact, source-grounded drafts. Conceptual and ordinary fact
+/// generation remains provider-owned and therefore keeps its fewer-better
+/// behavior.
+#[must_use]
+pub fn enforce_content_policy(
+    source: &SourceDocument,
+    mut drafts: ProviderDrafts,
+) -> ProviderDrafts {
+    let classification = classify_learning_intent(source);
+    let body = source.body.as_deref().unwrap_or_default();
+    match classification.intent {
+        LearningIntent::EnumerableSet => {
+            drafts.learning_intent = Some(classification.intent);
+            drafts.candidates =
+                enumerable_candidates(source, source.body.as_deref().unwrap_or_default());
+            assert_exhaustive_indices(&drafts.candidates);
+            // The provider's own per-candidate failures described candidates
+            // that no longer exist once the policy replaced them wholesale;
+            // carrying them forward would misreport diagnostics against a
+            // fully exhaustive, policy-owned draft set.
+            drafts.failures.clear();
+        }
+        // The legacy 047/084 ordinal prose fixture remains fact-labelled for
+        // intent-shape parity, but its source-owned coverage oracle is still a
+        // finite ordinal set and must receive the complete enumerable drafts.
+        // A two-entry ordinal mapping (e.g. a binary on/off toggle) is still a
+        // finite, non-derivable set and deserves the same exhaustive coverage
+        // as three-or-more entries.
+        LearningIntent::FactRecall
+            if is_definitive_mapping(body, ordinal_mapping_entries(body).len()) =>
+        {
+            drafts.candidates = enumerable_candidates(source, body);
+            assert_exhaustive_indices(&drafts.candidates);
+            drafts.failures.clear();
+        }
+        LearningIntent::VerbatimMemorization => {
+            drafts.learning_intent = Some(classification.intent);
+            drafts.candidates =
+                verbatim_candidates(source, source.body.as_deref().unwrap_or_default());
+            assert_exhaustive_indices(&drafts.candidates);
+            drafts.failures.clear();
+        }
+        LearningIntent::ConceptUnderstanding
+        | LearningIntent::FactRecall
+        | LearningIntent::ProcedureProcess => {}
+    }
+    drafts
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnumerableEntry {
+    cue: String,
+    answer: String,
+    evidence: String,
+}
+
+/// A finite key-to-value mapping (e.g. "0 is off. 1 is on.") is a
+/// non-derivable set even with just two entries. But `mapping_entries`
+/// splits on every '.', so a two-entry match can also be an incidental
+/// fragment of an unrelated sentence buried inside a much larger,
+/// already-structured document (for example a "Reference: C is CHARLIE. A
+/// is ALFA." annotation line inside an authored multi-block source). Three
+/// or more entries are unambiguous regardless of body size; exactly two are
+/// trusted only when the whole body is small enough that the mapping is
+/// plausibly the entire point of the source.
+const TWO_ENTRY_MAPPING_BODY_WORD_LIMIT: usize = 40;
+
+fn is_definitive_mapping(body: &str, entry_count: usize) -> bool {
+    entry_count >= 3
+        || (entry_count == 2
+            && body.split_whitespace().count() <= TWO_ENTRY_MAPPING_BODY_WORD_LIMIT)
+}
+
+fn looks_enumerable(body: &str, lines: &[String]) -> bool {
+    is_definitive_mapping(body, mapping_entries(body).len()) || list_entries(lines).len() >= 3
+}
+
+fn enumerable_entries(body: &str) -> Vec<EnumerableEntry> {
+    let ordinal_mappings = ordinal_mapping_entries(body);
+    if is_definitive_mapping(body, ordinal_mappings.len()) {
+        return ordinal_mappings;
+    }
+
+    let mappings = mapping_entries(body);
+    if is_definitive_mapping(body, mappings.len()) {
+        return mappings;
+    }
+
+    list_entries(&non_empty_lines(body))
+        .into_iter()
+        .enumerate()
+        .map(|(position, (answer, _evidence))| EnumerableEntry {
+            cue: (position + 1).to_string(),
+            answer,
+            // A one-line entry such as `1. Alpha` is too short for the
+            // production provenance floor. Cite the complete source list so
+            // the draft remains grounded without weakening that trust gate.
+            evidence: body.trim().to_owned(),
+        })
+        .collect()
+}
+
+fn ordinal_mapping_entries(body: &str) -> Vec<EnumerableEntry> {
+    numbered_segments(body)
+        .into_iter()
+        .filter_map(|segment| {
+            let (cue, rest) = segment.split_once(". ")?;
+            let (answer, _fact) = rest.split_once(" is ")?;
+            Some(EnumerableEntry {
+                cue: cue.trim().to_owned(),
+                answer: answer.trim().to_owned(),
+                evidence: segment,
+            })
+        })
+        .collect()
+}
+
+fn numbered_segments(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut starts = Vec::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        let is_boundary = position == 0 || bytes[position - 1].is_ascii_whitespace();
+        if is_boundary && bytes[position].is_ascii_digit() {
+            let mut end = position;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end + 1 < bytes.len() && bytes[end] == b'.' && bytes[end + 1].is_ascii_whitespace() {
+                starts.push(position);
+            }
+            position = end;
+        } else {
+            position += 1;
+        }
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(bytes.len());
+            body[*start..end].trim().to_owned()
+        })
+        .collect()
+}
+
+fn mapping_entries(body: &str) -> Vec<EnumerableEntry> {
+    body.split(['.', '?', '!', '\n'])
+        .filter_map(|raw| {
+            let evidence = raw.trim().to_owned();
+            let (cue, answer) = raw.split_once(" is ")?;
+            let cue = cue.trim();
+            let answer = answer.trim().trim_matches(|character: char| {
+                character == ':' || character == ';' || character == ','
+            });
+            if cue.chars().count() != 1 || answer.is_empty() {
+                return None;
+            }
+            Some(EnumerableEntry {
+                cue: cue.to_owned(),
+                answer: answer.to_owned(),
+                evidence,
+            })
+        })
+        .collect()
+}
+
+fn list_entries(lines: &[String]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(answer) = trimmed
+            .strip_prefix('-')
+            .or_else(|| trimmed.strip_prefix('*'))
+            .or_else(|| trimmed.strip_prefix('•'))
+            .map(str::trim)
+            .filter(|answer| !answer.is_empty())
+        {
+            entries.push((answer.to_owned(), trimmed.to_owned()));
+            continue;
+        }
+        let Some((prefix, answer)) = trimmed.split_once(['.', ')', ':']) else {
+            continue;
+        };
+        if prefix.trim().parse::<usize>().is_ok() && !answer.trim().is_empty() {
+            entries.push((answer.trim().to_owned(), trimmed.to_owned()));
+        }
+    }
+    entries
+}
+
+fn assert_exhaustive_indices(candidates: &[DraftCandidate]) {
+    for (position, candidate) in candidates.iter().enumerate() {
+        debug_assert_eq!(
+            candidate.index,
+            position + 1,
+            "content-policy candidates must cover sequential indices [1..N]"
+        );
+    }
+}
+
+fn enumerable_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    enumerable_entries(body)
+        .into_iter()
+        .enumerate()
+        .map(|(position, entry)| {
+            let question = if entry.cue.chars().count() == 1
+                && entry.cue.chars().next().is_some_and(char::is_alphabetic)
+            {
+                format!(
+                    "In {}, which word stands for the letter {}?",
+                    source.title, entry.cue
+                )
+            } else {
+                format!(
+                    "In {}, what is the entry for number {}?",
+                    source.title, entry.cue
+                )
+            };
+            DraftCandidate {
+                index: position + 1,
+                concept: format!("{}: {}", source.title, entry.cue),
+                question,
+                answer: entry.answer.clone(),
+                evidence: Some(entry.evidence),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "production-recall".to_owned(),
+                unsupported: false,
+            }
+        })
+        .collect()
 }
 
 fn looks_process(normalized: &str) -> bool {
@@ -539,6 +1022,50 @@ fn looks_process(normalized: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn looks_ordered_process(normalized: &str, lines: &[String]) -> bool {
+    [
+        "step",
+        "steps",
+        "procedure",
+        "process",
+        "recipe",
+        "instruction",
+        "instructions",
+        "workflow",
+        "how to ",
+        "follow these",
+        "in order",
+        "sequence",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || looks_like_imperative_sequence(lines)
+}
+
+fn looks_like_imperative_sequence(lines: &[String]) -> bool {
+    let entries = list_entries(lines);
+    entries.len() >= 3
+        && entries
+            .iter()
+            .all(|(answer, _)| starts_with_action_verb(answer))
+}
+
+fn starts_with_action_verb(answer: &str) -> bool {
+    let Some(first_word) = answer.split_whitespace().next() else {
+        return false;
+    };
+    let first_word = first_word.trim_matches(|character: char| !character.is_alphabetic());
+    [
+        "add", "bake", "boil", "bring", "chop", "choose", "clean", "click", "close", "combine",
+        "cook", "create", "cut", "discard", "feed", "fill", "fold", "gather", "heat", "insert",
+        "install", "knead", "let", "load", "make", "measure", "mix", "open", "place", "pour",
+        "preheat", "press", "remove", "repeat", "rinse", "run", "save", "select", "serve", "set",
+        "start", "stir", "stop", "take", "turn", "use", "whisk", "write",
+    ]
+    .iter()
+    .any(|verb| *verb == first_word.to_ascii_lowercase())
 }
 
 fn looks_concept(normalized: &str) -> bool {
@@ -579,52 +1106,59 @@ fn count_fact_sentences(body: &str) -> usize {
 }
 
 fn verbatim_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let units = sequential_units(body);
+    let source_evidence = body.trim().to_owned();
+    units
+        .iter()
+        .enumerate()
+        .map(|(position, unit)| {
+            let (question, activity_stage) = if position == 0 {
+                (
+                    format!("Recite the opening line of {} exactly.", source.title),
+                    "free-recall",
+                )
+            } else {
+                (
+                    format!("Recite the next line after: {}", units[position - 1]),
+                    "cued-recall",
+                )
+            };
+            DraftCandidate {
+                index: position + 1,
+                concept: format!("{} line {}", source.title, position + 1),
+                question,
+                answer: unit.clone(),
+                // Keep the exact unit as the answer, but cite the complete
+                // source so short verse lines clear the production trust
+                // floor without weakening evidence_quote_matches.
+                evidence: Some(source_evidence.clone()),
+                distractors: Vec::new(),
+                worked_solution: Some(format!("The exact source line is: {unit}")),
+                activity_kind: GeneratedLearningActivityKind::Exercise,
+                activity_stage: activity_stage.to_owned(),
+                unsupported: false,
+            }
+        })
+        .collect()
+}
+
+fn sequential_units(body: &str) -> Vec<String> {
     let lines = non_empty_lines(body);
     if lines.len() >= 2 {
-        let cued_answer = lines[1].clone();
-        let cued_evidence = lines.iter().take(2).cloned().collect::<Vec<_>>().join("\n");
-        let free_answer = lines.iter().take(4).cloned().collect::<Vec<_>>().join("\n");
-        return vec![
-            DraftCandidate {
-                index: 1,
-                concept: format!("{} cued recitation", source.title),
-                question: format!("Recite the next line after: {}", lines[0]),
-                answer: cued_answer.clone(),
-                evidence: Some(cued_evidence),
-                distractors: Vec::new(),
-                worked_solution: Some(format!("The source line is: {cued_answer}")),
-                activity_kind: GeneratedLearningActivityKind::Exercise,
-                activity_stage: "cued-recall".to_owned(),
-                unsupported: false,
-            },
-            DraftCandidate {
-                index: 2,
-                concept: format!("{} free recitation", source.title),
-                question: format!("Recite the opening passage of {}.", source.title),
-                answer: free_answer.clone(),
-                evidence: Some(free_answer.clone()),
-                distractors: Vec::new(),
-                worked_solution: Some(format!("Compare your recitation against:\n{free_answer}")),
-                activity_kind: GeneratedLearningActivityKind::Exercise,
-                activity_stage: "free-recall".to_owned(),
-                unsupported: false,
-            },
-        ];
+        return lines;
     }
 
-    let sentence = split_sentences(body).into_iter().next().unwrap_or_default();
-    vec![DraftCandidate {
-        index: 1,
-        concept: format!("{} recitation", source.title),
-        question: format!("Recite {} exactly.", source.title),
-        answer: sentence.clone(),
-        evidence: Some(sentence.clone()),
-        distractors: Vec::new(),
-        worked_solution: Some(format!("Compare your answer against: {sentence}")),
-        activity_kind: GeneratedLearningActivityKind::Exercise,
-        activity_stage: "free-recall".to_owned(),
-        unsupported: false,
-    }]
+    let units = body
+        .split_inclusive(['.', '?', '!'])
+        .map(str::trim)
+        .filter(|unit| !unit.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if units.is_empty() && !body.trim().is_empty() {
+        vec![body.trim().to_owned()]
+    } else {
+        units
+    }
 }
 
 fn concept_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
@@ -749,46 +1283,70 @@ fn grounded_fact_distractors(facts: &[(String, String, String)], answer: &str) -
     }
 }
 
+/// Ordinary process/how-to prose has no authoritative step boundaries the way
+/// a numbered list does, so `procedure_candidates`'s non-list fallback stays
+/// on the fewer-better policy: a small, fixed number of representative
+/// drafts regardless of how many sentences the source happens to contain.
+/// Without this cap, `split_sentences` turns any multi-sentence prose
+/// paragraph into one card per sentence, silently reintroducing the
+/// exhaustive coverage policy that is supposed to be reserved for
+/// enumerable/verbatim sources.
+const PROCEDURE_PROSE_FALLBACK_CAP: usize = 3;
+
 fn procedure_candidates(source: &SourceDocument, body: &str) -> Vec<DraftCandidate> {
+    let lines = non_empty_lines(body);
+    let ordered_entries = list_entries(&lines);
+    if ordered_entries.len() >= 3 {
+        let source_evidence = body.trim().to_owned();
+        return ordered_entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, (answer, _entry_evidence))| DraftCandidate {
+                index: position + 1,
+                concept: format!("{} procedure step {}", source.title, position + 1),
+                question: format!(
+                    "What is ordered action {} in the {} procedure?",
+                    position + 1,
+                    source.title
+                ),
+                answer,
+                evidence: Some(source_evidence.clone()),
+                distractors: Vec::new(),
+                worked_solution: None,
+                activity_kind: GeneratedLearningActivityKind::Quiz,
+                activity_stage: "procedure-composition".to_owned(),
+                unsupported: false,
+            })
+            .collect();
+    }
+
     let sentences = split_sentences(body);
-    let evidence = sentences
-        .iter()
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(". ");
-    let evidence = if evidence.is_empty() {
-        body.trim().to_owned()
-    } else {
-        evidence
-    };
-    let mut candidates = vec![DraftCandidate {
-        index: 1,
-        concept: format!("{} procedure", source.title),
-        question: format!("Describe the process in \"{}\" in order.", source.title),
-        answer: evidence.clone(),
-        evidence: Some(evidence),
-        distractors: Vec::new(),
-        worked_solution: None,
-        activity_kind: GeneratedLearningActivityKind::Quiz,
-        activity_stage: "procedure-composition".to_owned(),
-        unsupported: false,
-    }];
-    if let Some(check_sentence) = sentences.get(2).or_else(|| sentences.get(1)) {
-        candidates.push(DraftCandidate {
-            index: 2,
-            concept: format!("{} procedure check", source.title),
-            question: format!("What condition or check matters in \"{}\"?", source.title),
-            answer: check_sentence.clone(),
-            evidence: Some(check_sentence.clone()),
+    let source_evidence = body.trim().to_owned();
+    sentences
+        .into_iter()
+        .take(PROCEDURE_PROSE_FALLBACK_CAP)
+        .enumerate()
+        .map(|(position, sentence)| DraftCandidate {
+            index: position + 1,
+            concept: format!("{} procedure step {}", source.title, position + 1),
+            question: if position == 0 {
+                format!("Describe the process in \"{}\" in order.", source.title)
+            } else {
+                format!("What further step matters in \"{}\"?", source.title)
+            },
+            answer: sentence,
+            evidence: Some(source_evidence.clone()),
             distractors: Vec::new(),
             worked_solution: None,
             activity_kind: GeneratedLearningActivityKind::Quiz,
-            activity_stage: "procedure-check".to_owned(),
+            activity_stage: if position == 0 {
+                "procedure-composition".to_owned()
+            } else {
+                "procedure-check".to_owned()
+            },
             unsupported: false,
-        });
-    }
-    candidates
+        })
+        .collect()
 }
 
 fn fact_question_answer(source: &SourceDocument, sentence: &str) -> (String, String) {
