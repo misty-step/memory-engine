@@ -1172,6 +1172,7 @@ fn request(run_id: &str, source_id: &str) -> BetaGenerationRequest {
         completed_at: Some(NOW + 1_000),
         default_due: NOW - 60_000,
         model: None,
+        pending: false,
     }
 }
 

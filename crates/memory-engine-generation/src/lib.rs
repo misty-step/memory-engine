@@ -62,6 +62,8 @@ pub struct BetaGenerationRequest {
     pub completed_at: Option<i64>,
     pub default_due: i64,
     pub model: Option<GeneratedPromptModel>,
+    /// Keep queued output decision-ineligible until the worker lease fence publishes it.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +199,30 @@ pub trait BetaGenerationStore {
         &mut self,
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error>;
+
+    /// Remove pending output when a durable worker lease loses its commit fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when rollback cannot be persisted.
+    fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Atomically fence a run and remove all stale output when the lease is lost.
+    ///
+    /// # Errors
+    /// Returns the store error when finalization cannot be persisted.
+    fn finalize_generation_run(
+        &mut self,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 impl BetaGenerationStore for BetaPersistenceStore {
@@ -229,6 +255,21 @@ impl BetaGenerationStore for BetaPersistenceStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         BetaPersistenceStore::save_generated_prompt_draft(self, draft)
+    }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        BetaPersistenceStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        BetaPersistenceStore::finalize_generation_run(self, run_id, now_ms, lease_valid)
     }
 }
 
@@ -646,7 +687,7 @@ fn candidate_rejection(candidate: &DraftCandidate, reasons: Vec<String>) -> Draf
     }
 }
 
-/// Generate bridge material for one approved parent review unit.
+/// Generate bridge material for one kept parent review unit.
 ///
 /// Bridge generation is concept-backed rather than source-backed: if the
 /// concept has no cached reference note, the provider writes one first; easier
@@ -1007,6 +1048,7 @@ fn bridge_run_request(
         completed_at: request.completed_at,
         default_due: request.default_due,
         model: request.model.clone(),
+        pending: false,
     }
 }
 
@@ -1089,19 +1131,33 @@ fn run_receipt(
     source_permissions: Vec<SourcePermissionReceipt>,
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
-        RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::Started => (
+            Vec::new(),
+            request.pending.then_some(i64::MIN),
+            Vec::new(),
+            None,
+        ),
         RunProgress::InProgress {
             draft_ids,
             validation_failures,
             usage,
-        } => (draft_ids, None, validation_failures, usage),
+        } => (
+            draft_ids,
+            request.pending.then_some(i64::MIN),
+            validation_failures,
+            usage,
+        ),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
             usage,
         } => (
             draft_ids,
-            Some(request.completed_at.unwrap_or(request.started_at)),
+            Some(if request.pending {
+                i64::MIN
+            } else {
+                request.completed_at.unwrap_or(request.started_at)
+            }),
             validation_failures,
             usage,
         ),
@@ -1361,6 +1417,7 @@ fn build_draft(
     };
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: generated_id(context.run_id, "draft", &source.id, candidate),
         source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
@@ -1442,6 +1499,7 @@ fn bridge_draft(
         .unwrap_or_else(|| context.concept_key.to_owned());
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: bridge_generated_id(
             context.run_id,
             "draft",

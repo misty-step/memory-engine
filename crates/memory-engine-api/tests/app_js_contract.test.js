@@ -29,6 +29,16 @@ function browserHarness(options = {}) {
   // *next* runAnimationFrame(), never the current one.
   let frameQueue = [];
   let verdictPresent = options.verdict ?? false;
+  const sseHandlers = new Map();
+  const navigations = [];
+  const eventSource = options.eventSource;
+  if (eventSource) {
+    eventSource.addEventListener = (name, handler) => {
+      const handlers = sseHandlers.get(name) ?? [];
+      handlers.push(handler);
+      sseHandlers.set(name, handlers);
+    };
+  }
 
   const addListener = (listeners, name, handler) => {
     const handlers = listeners.get(name) ?? [];
@@ -66,6 +76,7 @@ function browserHarness(options = {}) {
     visibilityState: options.visibilityState ?? "visible",
     addEventListener: (name, handler) => addListener(documentEvents, name, handler),
     querySelector: (selector) => (selector === ".me-verdict" && verdictPresent ? {} : null),
+    getElementById: (id) => (id === "me-jobs" ? options.jobsList ?? null : null),
     querySelectorAll(selector) {
       const match = selector.match(/^meta\[name="([^"]+)"\]$/);
       const value = match ? options.metas?.[match[1]] : undefined;
@@ -114,14 +125,16 @@ function browserHarness(options = {}) {
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
+    location: { assign: (url) => navigations.push(url) },
   };
   window.window = window;
+  if (eventSource) window.EventSource = function EventSource() { return eventSource; };
 
   vm.runInNewContext(script, {
     console,
     document,
     window,
-    EventSource: undefined,
+    EventSource: eventSource ? window.EventSource : undefined,
     URL,
   });
 
@@ -165,6 +178,12 @@ function browserHarness(options = {}) {
     handoff: () => sessionStorage.getItem(HANDOFF_KEY),
     busy: () => document.documentElement.hasAttribute("data-busy"),
     prevented: () => prevented,
+    emitJob(job) {
+      for (const handler of sseHandlers.get("job") ?? []) {
+        handler({ data: JSON.stringify(job) });
+      }
+    },
+    navigations,
   };
 }
 
@@ -523,4 +542,50 @@ test("a second pageshow on the same landing document never emits a duplicate rec
   landing.dispatchWindow("pageshow");
   expect(landing.pendingFrames()).toBe(0);
   expect(landing.fetches).toHaveLength(1);
+});
+
+
+function jobsListHarness() {
+  const meta = { textContent: "old" };
+  const row = {
+    dataset: { jobId: "job-1" },
+    querySelector: (selector) => (selector === ".me-job-meta" ? meta : null),
+  };
+  return {
+    meta,
+    querySelector: () => row,
+    insertBefore() {},
+  };
+}
+
+test("SSE patches intermediate jobs but refreshes the workspace on success", () => {
+  const eventSource = {};
+  const list = jobsListHarness();
+  const browser = browserHarness({ eventSource, jobsList: list });
+
+  browser.emitJob({ id: "job-1", status: "running" });
+  expect(list.meta.textContent).toBe("Generating cards…");
+  expect(browser.navigations).toEqual([]);
+
+  browser.emitJob({ id: "job-1", status: "succeeded" });
+  expect(browser.navigations).toEqual(["/"]);
+});
+
+test("SSE refreshes the workspace on failure for authoritative retry controls", () => {
+  const eventSource = {};
+  const list = jobsListHarness();
+  const browser = browserHarness({ eventSource, jobsList: list });
+
+  browser.emitJob({ id: "job-1", status: "failed", error: "provider unavailable" });
+  expect(list.meta.textContent).toBe("provider unavailable");
+  expect(browser.navigations).toEqual(["/"]);
+});
+
+test("SSE terminal events never navigate away from pages without the jobs surface", () => {
+  const eventSource = {};
+  const browser = browserHarness({ eventSource, jobsList: null });
+
+  browser.emitJob({ id: "job-1", status: "succeeded" });
+  browser.emitJob({ id: "job-1", status: "failed", error: "provider unavailable" });
+  expect(browser.navigations).toEqual([]);
 });

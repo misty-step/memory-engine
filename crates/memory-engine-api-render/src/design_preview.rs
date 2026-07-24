@@ -26,11 +26,17 @@ use memory_engine_study::{
 
 use crate::{render_app_shell, render_login_requested};
 use memory_engine_api_state::{
-    ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
+    AccountRegistry, ApiState, AppAccount, AuthConfig, GenerationJob, JobStatus, SourceRecord,
+    StudyViewResponse,
 };
 
 fn account() -> AppAccount {
-    let state = ApiState::default();
+    let state = ApiState::new(
+        AccountRegistry::default().with_auth_config(
+            AuthConfig::allow_emails(["preview@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
     let created = state
         .create_account("preview@example.com")
         .unwrap_or_else(|error| panic!("preview account must be valid: {}", error.message));
@@ -586,7 +592,12 @@ fn conformance_generating_notice_only_shows_while_a_job_is_actually_in_flight() 
 /// welcome lede lives on Home, the capture hint on Create.
 #[test]
 fn conformance_view_copy_trims_to_one_line_each() {
-    let state = memory_engine_api_state::ApiState::default();
+    let state = memory_engine_api_state::ApiState::new(
+        memory_engine_api_state::AccountRegistry::default().with_auth_config(
+            memory_engine_api_state::AuthConfig::allow_emails(["copy@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
     let created = state.create_account("copy@example.com").expect("account");
     let acct = state.create_browser_session(&created).expect("session");
     let home = render_app_shell(Some(&acct), &[], None, &[], None);
@@ -610,7 +621,12 @@ fn conformance_view_copy_trims_to_one_line_each() {
 /// marking the active view, and absent from the full-bleed review.
 #[test]
 fn conformance_nav_present_on_standing_views_absent_on_review() {
-    let state = memory_engine_api_state::ApiState::default();
+    let state = memory_engine_api_state::ApiState::new(
+        memory_engine_api_state::AccountRegistry::default().with_auth_config(
+            memory_engine_api_state::AuthConfig::allow_emails(["nav@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
     let created = state.create_account("nav@example.com").expect("account");
     let acct = state.create_browser_session(&created).expect("session");
 

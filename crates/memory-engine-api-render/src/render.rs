@@ -14,6 +14,7 @@
 
 use std::fmt::Write as _;
 
+use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{
     BetaStudyConceptProgress, BetaStudyCurrent, LibrarySourceRow, SourcePermission,
 };
@@ -22,6 +23,14 @@ use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
     SubmitReviewTimings,
 };
+
+#[cfg(test)]
+fn render_test_state(email: &str) -> ApiState {
+    use memory_engine_api_state::{AccountRegistry, AuthConfig};
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails([email.to_owned()]).with_anonymous_account_creation(true),
+    ))
+}
 
 pub struct ContentFeedbackRecovery<'a> {
     pub review_unit_id: &'a str,
@@ -707,8 +716,11 @@ fn render_signed_in(
         }
         SignedInSurface::Home => {
             if let Some(current) = view.and_then(|view| view.current.as_ref()) {
-                // Full-bleed review: no nav, the card owns the screen.
-                let body = render_current_review(account, current);
+                // Full-bleed review: no nav. Any drafts newly generated while
+                // the learner reviews still get their keep/edit/reject
+                // decision surfaced right below the card, not hidden away.
+                let mut body = render_current_review(account, current);
+                body.push_str(&render_pending_drafts(account, view));
                 render_signed_in_body(account, due, notice, jobs, &body, None)
             } else {
                 let body = render_home_body(account, view);
@@ -737,11 +749,7 @@ fn render_signed_in_body(
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
     let footer = match nav_active {
         Some(active) => render_nav(active, account),
-        None => format!(
-            r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-            hidden_csrf_input(account)
-        ),
+        None => signed_in_footer(account),
     };
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
@@ -760,12 +768,12 @@ fn render_nav(active: &str, account: &AppAccount) -> String {
         format!(r#"<a class="me-nav-item" href="{href}"{current}>{label}</a>"#)
     };
     format!(
-        r#"<nav class="me-nav" aria-label="Views">{}{}{}{}<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact me-nav-signout" type="submit">Sign out</button></form></nav>"#,
+        r#"<nav class="me-nav" aria-label="Views">{}{}{}{}{}</nav>"#,
         item("Home", "/", "home"),
         item("Create", "/app/create", "create"),
         item("Library", "/app/library", "library"),
         item("Analytics", "/app/analytics", "analytics"),
-        csrf = hidden_csrf_input(account),
+        signed_in_footer(account),
     )
 }
 
@@ -816,11 +824,22 @@ fn render_home_body(account: &AppAccount, view: Option<&StudyViewResponse>) -> S
         );
     }
     html.push_str(&render_return_notifications(account));
+    // Generation is non-blocking. Accepted drafts stay pending until the
+    // learner inspects their evidence and explicitly keeps, edits, or rejects
+    // them (memory-engine-079); that decision lives on Home alongside review.
+    html.push_str(&render_pending_drafts(account, view));
     html
 }
 
 /// The Library view: saved material with per-source active-card counts and
-/// concept drilldown, plus the generation activity log (memory-engine-087).
+/// concept drilldown, generated drafts pending a keep/edit/reject decision,
+/// and the generation activity log (memory-engine-087). Source management is
+/// one job-to-be-done — it never shares a scroll with capture or analytics —
+/// but a pending decision surfaces here too (alongside the activity log that
+/// produced it) as well as on Home, since a learner may look for it in
+/// either place. Generation is non-blocking: accepted drafts stay pending
+/// until the learner inspects their evidence and explicitly keeps, edits, or
+/// rejects them.
 fn render_library_body(
     account: &AppAccount,
     sources: &[SourceRecord],
@@ -830,6 +849,7 @@ fn render_library_body(
     let library = view.map_or(&[][..], |v| v.library.as_slice());
     let mut html = String::new();
     html.push_str(&render_library_sources(account, sources, library, jobs));
+    html.push_str(&render_pending_drafts(account, view));
     html.push_str(&render_jobs(account, jobs));
     html
 }
@@ -1026,6 +1046,80 @@ fn render_capture(account: &AppAccount) -> String {
     )
 }
 
+fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>) -> String {
+    let Some(view) = view else {
+        return String::new();
+    };
+    let pending = view.drafts.iter().filter(|draft| {
+        !draft.approved
+            && draft.learner_decision.is_none()
+            && draft.validation_status == GeneratedPromptValidationStatus::Accepted
+    });
+    let mut rows = String::new();
+    for draft in pending {
+        let spans = if draft.source_spans.is_empty() {
+            String::new()
+        } else {
+            let mut rendered = String::from("<ul class=\"me-provenance-spans\">");
+            for span in &draft.source_spans {
+                let _ = write!(
+                    rendered,
+                    "<li><strong>{}</strong> · {} <span class=\"ae-dim\">{}</span></li>",
+                    escape_html(&span.label),
+                    escape_html(&span.text),
+                    escape_html(&span.locator)
+                );
+            }
+            rendered.push_str("</ul>");
+            rendered
+        };
+        let provenance = draft.provenance.as_ref().map_or_else(String::new, |p| {
+            format!(
+                "<p class=\"ae-dim me-draft-provenance\">Provider: {} · Model: {}{}</p>",
+                escape_html(&p.provider),
+                escape_html(&p.model),
+                p.prompt_version
+                    .as_deref()
+                    .map_or_else(String::new, |v| format!(" · Prompt {}", escape_html(v)))
+            )
+        });
+        let _ = write!(
+            rows,
+            r#"<article class="me-pending-draft">
+<p class="me-kicker">Pending draft</p>
+<h3 class="ae-h">{}</h3>
+<p class="me-prompt">{}</p>
+<p class="ae-dim">Expected answer: <span class="ae-item">{}</span></p>
+{}
+{}
+<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
+<div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
+</article>"#,
+            escape_html(&draft.concept_label),
+            escape_html(&draft.prompt),
+            escape_html(&draft.answer),
+            provenance,
+            spans,
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.prompt),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.answer),
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            hidden_csrf_input(account),
+            escape_html(&draft.id)
+        );
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
+}
+
 /// A source whose generation is already queued, running, or done never
 /// offers "Generate cards" again — the operator's first dogfood session hit
 /// a duplicate generation run by tapping it while a job for the same source
@@ -1102,11 +1196,9 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
         JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
-        JobStatus::Succeeded => format!(
-            "{} {} · scheduled for review",
-            job.card_count,
-            plural(job.card_count, "card", "cards")
-        ),
+        JobStatus::Succeeded => {
+            "Generation succeeded; accepted drafts are pending your review.".to_owned()
+        }
         JobStatus::Failed => escape_html(
             job.error
                 .as_deref()
@@ -1838,6 +1930,20 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     )
 }
 
+/// Shared "Signed in" footer for the account and workspace screens: sign
+/// out this browser session, or sign out every browser session for the
+/// account via `/app/logout-all`. Machine/service-session credentials are
+/// an independent scope and are unaffected; there is no PWA control for
+/// those today.
+fn signed_in_footer(account: &AppAccount) -> String {
+    let csrf = hidden_csrf_input(account);
+    format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
+    )
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1873,7 +1979,7 @@ const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden=
 mod source_loading_tests {
     use std::cell::Cell;
 
-    use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_api_state::{CreateSourceRequest, EnqueueOutcome};
     use memory_engine_persistence::SourcePermission;
 
     use super::{render_account_page_with_loaders, render_capture};
@@ -1893,7 +1999,7 @@ mod source_loading_tests {
 
     #[test]
     fn active_review_loads_only_data_used_by_the_rendered_branch() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-loader-active@example.com");
         let created = state
             .create_account("render-loader-active@example.com")
             .unwrap();
@@ -1913,8 +2019,14 @@ mod source_loading_tests {
             EnqueueOutcome::Started(_)
         ));
         state.run_pending_jobs_blocking();
-        let active_view = state.next_app_review(&account).unwrap();
-
+        let pending_view = state.next_app_review(&account).unwrap();
+        let active_view = state
+            .keep_draft(
+                account.account_id(),
+                account.session_token(),
+                &pending_view.drafts[0].id,
+            )
+            .unwrap();
         let active_source_loads = Cell::new(0);
         let active_job_loads = Cell::new(0);
         render_account_page_with_loaders(
@@ -1933,7 +2045,6 @@ mod source_loading_tests {
         );
         assert_eq!(active_source_loads.get(), 0);
         assert_eq!(active_job_loads.get(), 0);
-
         render_account_page_with_loaders(
             &state,
             &account,
@@ -1950,7 +2061,6 @@ mod source_loading_tests {
             1,
             "a generation notice still needs live jobs to suppress stale UI"
         );
-
         let notice_page = render_account_page_with_loaders(
             &state,
             &account,
@@ -1968,8 +2078,11 @@ mod source_loading_tests {
             "an unconditional notice does not require job history"
         );
         assert!(notice_page.contains("That job can't be retried."));
+        assert_workspace_render_loads_all();
+    }
 
-        let workspace_state = ApiState::default();
+    fn assert_workspace_render_loads_all() {
+        let workspace_state = super::render_test_state("render-loader-workspace@example.com");
         let workspace_created = workspace_state
             .create_account("render-loader-workspace@example.com")
             .unwrap();
@@ -1998,7 +2111,7 @@ mod source_loading_tests {
 
     #[test]
     fn capture_form_exposes_an_accessible_permission_choice_and_default() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-permission@example.com");
         let account = state
             .create_account("render-permission@example.com")
             .and_then(|account| state.create_browser_session(&account))
@@ -2155,7 +2268,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_is_a_complete_document_with_one_asset_contract() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-document@example.com");
         let created = state
             .create_account("analytics-document@example.com")
             .expect("account");
@@ -2211,7 +2324,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_applies_untried_filter_to_a_study_view_response() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-untried@example.com");
         let created = state
             .create_account("analytics-untried@example.com")
             .expect("account");
