@@ -76,5 +76,5 @@ persistence contracts without moving production concerns into
 2026-06-06 staging verification deployed `memory-engine-api` to Fly Machines
 with Fly Managed Postgres cluster `memory-engine-api-pg` in `ord`, using
 `MEMORY_ENGINE_POSTGRES_URL` as the app secret. The deployed service passed
-`/healthz`, JSON account/source/generate/approve/reveal/submit, Machine
+`/healthz`, JSON account/source/generate/keep/reveal/submit, Machine
 restart/resume, and mobile 390 x 844 browser smoke.

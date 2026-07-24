@@ -42,6 +42,7 @@ MEMORY_ENGINE_API_STORE_DIR=.tmp/api-dev \
 MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com \
 MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-dev/outbox.tsv \
 MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true \
+MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dev-unsubscribe-secret \
 HOST=127.0.0.1 PORT=18080 \
 cargo run -p memory-engine-api
 # → "Memory Engine API listening on http://127.0.0.1:18080"
@@ -107,7 +108,10 @@ default a client advertises.
 ## Gotchas
 
 - **API won't boot** without a store (`MEMORY_ENGINE_POSTGRES_URL` OR the file-store trio)
-  AND `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` + a mailer/outbox — it `exit(1)`s. #1 local trap.
+  AND `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` + a mailer/outbox AND a non-empty
+  `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` — it `exit(1)`s (or prints the
+  listening banner then exits right after) on any of these being missing.
+  #1 local trap.
 - **File store is local/dev only** — production requires Neon Postgres; never use the file store in prod.
 - **Generation falls back silently** without `OPENROUTER_API_KEY` — a "green" generate
   that never touched the model. `bun run ci` fixtures replay canned output.

@@ -67,9 +67,12 @@ async fn main() {
     state.start_worker();
     let scheduler = state.start_return_notification_scheduler();
 
-    let serve_result = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let serve_result = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
     if let Err(error) = &serve_result {
         eprintln!("{error}");
     }
@@ -88,6 +91,16 @@ async fn shutdown_signal() {
     }
 }
 
+fn local_auth_environment(environment: Option<&str>) -> bool {
+    matches!(environment.map(str::trim), Some("development" | "test"))
+}
+
+fn normalized_admin_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
 fn auth_config_from_env() -> Result<AuthConfig, String> {
     let allowed = env::var("MEMORY_ENGINE_AUTH_ALLOWED_EMAILS")
         .map_err(|_| "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS is required for memory-engine-api")?;
@@ -103,7 +116,14 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
         );
     }
 
-    let mut auth_config = AuthConfig::allow_emails(allowed_emails);
+    // Anonymous account and guest credential minting is deny-by-default. Only
+    // explicit local environments may opt into that surface; missing, empty,
+    // production, staging, and typoed labels remain production-safe.
+    let local_environment =
+        local_auth_environment(env::var("MEMORY_ENGINE_ENVIRONMENT").ok().as_deref());
+    let production = !local_environment;
+    let mut auth_config =
+        AuthConfig::allow_emails(allowed_emails).with_anonymous_account_creation(local_environment);
     let unsubscribe_secret = env::var("MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET")
         .map_err(|_| "MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET is required for memory-engine-api")?;
     if unsubscribe_secret.trim().is_empty() {
@@ -116,15 +136,20 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
             auth_config = auth_config.with_scheduler_manual_token(token.to_owned());
         }
     }
-    if let Ok(token) = env::var("MEMORY_ENGINE_ADMIN_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            auth_config = auth_config.with_admin_token(token.to_owned());
-        }
+    let admin_token = normalized_admin_token(env::var("MEMORY_ENGINE_ADMIN_TOKEN").ok());
+    if let Some(token) = admin_token.as_deref() {
+        auth_config = auth_config.with_admin_token(token.to_owned());
     }
-    // Local/dev only: surface the magic link on the "check your email" page so
-    // sign-in works without a real mailer. Never enable in production.
+    if production && admin_token.is_none() {
+        return Err("MEMORY_ENGINE_ADMIN_TOKEN is required in production".to_owned());
+    }
+    // Local/dev only: surface the magic link on the "check your email" page.
     if env::var("MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS").as_deref() == Ok("true") {
+        if production {
+            return Err(
+                "MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS is forbidden in production".to_owned(),
+            );
+        }
         auth_config = auth_config.with_debug_links(true);
     }
     if let Ok(command) = env::var("MEMORY_ENGINE_AUTH_MAILER_COMMAND") {
@@ -144,4 +169,39 @@ fn auth_config_from_env() -> Result<AuthConfig, String> {
         "MEMORY_ENGINE_AUTH_MAILER_COMMAND or MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH is required for memory-engine-api"
             .to_owned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{local_auth_environment, normalized_admin_token};
+
+    #[test]
+    fn auth_bootstrap_environment_gate_is_deny_by_default() {
+        for environment in [
+            None,
+            Some(""),
+            Some("production"),
+            Some("Production"),
+            Some("staging"),
+            Some("developement"),
+            Some("Development"),
+        ] {
+            assert!(
+                !local_auth_environment(environment),
+                "unexpected local auth opt-in"
+            );
+        }
+        assert!(local_auth_environment(Some("development")));
+        assert!(local_auth_environment(Some("test")));
+    }
+
+    #[test]
+    fn auth_bootstrap_admin_token_rejects_whitespace_only_values() {
+        assert_eq!(normalized_admin_token(None), None);
+        assert_eq!(normalized_admin_token(Some("   ".to_owned())), None);
+        assert_eq!(
+            normalized_admin_token(Some("  operator-secret  ".to_owned())),
+            Some("operator-secret".to_owned())
+        );
+    }
 }

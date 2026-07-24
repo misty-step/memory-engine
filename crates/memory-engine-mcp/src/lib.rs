@@ -9,14 +9,12 @@
 //! Generation is queue-based end to end: `create_deck` enqueues a durable
 //! generation job and polls it to a bounded terminal state, never the legacy
 //! synchronous `/generate` route (refused with HTTP 409 in every production
-//! deployment — `memory-engine-api-state::registry::generate_source`). A
-//! `succeeded` job's cards arrive already scheduled — the production job
-//! runner optimistically approves every accepted draft as part of the job,
-//! a policy shared with every other caller (including the browser UI) that
-//! this ticket leaves unchanged. `approve_draft`/`list_drafts` cover drafts
-//! that reach an unapproved state some other way (a partially-committed
-//! job, or a legacy-origin draft): approving one is always an explicit,
-//! separately audited call, never composed automatically by this crate.
+//! deployment — `memory-engine-api-state::registry::generate_source`).
+//! Accepted drafts from a succeeded job remain pending until an explicit
+//! `keep_draft`, `edit_draft`, or `reject_draft` decision — generation never
+//! schedules a card by itself, and no call in this crate decides for the
+//! caller. `list_drafts` inspects every currently pending draft across the
+//! account, independent of which `create_deck` call produced it.
 
 pub mod client;
 pub mod session;
@@ -34,8 +32,23 @@ pub struct ToolDef {
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_deck",
-        description: "Capture material as a project-scoped study deck: saves the text and enqueues its generation job on the durable production queue, polling to a bounded terminal state. Returns the deck plus the generation outcome (job status, and any draft still pending an explicit decision — usually none, since a succeeded job's accepted cards are already scheduled). Use project_key to group decks by the project/source they came from, so the whole deck can be invalidated later in one call when that material goes stale.",
+        description: "Capture material as a project-scoped study deck: saves the text and enqueues its generation job on the durable production queue, polling to a bounded terminal state. Returns the deck plus every generated draft still pending an explicit keep, edit, or reject decision. Use project_key to group decks by the project/source they came from, so the whole deck can be invalidated later in one call when that material goes stale.",
         input_schema: r#"{"type":"object","required":["project_key","title","body"],"properties":{"project_key":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"ttl_expires_at":{"type":"integer","description":"Optional epoch-ms expiry after which the deck is eligible for cleanup."}}}"#,
+    },
+    ToolDef {
+        name: "keep_draft",
+        description: "Keep one accepted generated draft after inspecting its source-grounded provenance; only this explicit decision makes it due for study.",
+        input_schema: r#"{"type":"object","required":["draft_id"],"properties":{"draft_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "edit_draft",
+        description: "Edit one accepted generated draft's prompt and expected answer, then keep the edited card for study.",
+        input_schema: r#"{"type":"object","required":["draft_id","prompt","expected_answer"],"properties":{"draft_id":{"type":"string"},"prompt":{"type":"string"},"expected_answer":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "reject_draft",
+        description: "Reject one accepted generated draft; the terminal decision is exported and never scheduled.",
+        input_schema: r#"{"type":"object","required":["draft_id"],"properties":{"draft_id":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_decks",
@@ -49,13 +62,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_drafts",
-        description: "Inspect every currently pending (validator-accepted, not yet approved) generated draft across the account, with its prompt, worked solution, and validation status. Usually empty: a normal successful create_deck job already schedules its accepted cards. A non-empty result means a draft is stuck without a decision (a partially-committed generation job, or a legacy-origin draft) — use approve_draft to keep one, or leave it pending to decline it (rejection by omission; there is no separate reject call).",
+        description: "Inspect every currently pending (accepted, not yet decided) generated draft across the account, with its prompt, worked solution, and validation status. A create_deck job leaves every accepted draft pending until you call keep_draft, edit_draft, or reject_draft on it — use this to find pending drafts outside a create_deck response, e.g. after resuming a session.",
         input_schema: r#"{"type":"object","properties":{}}"#,
-    },
-    ToolDef {
-        name: "approve_draft",
-        description: "Explicitly keep one generated draft, scheduling it as a live review card. Use it for a draft list_drafts surfaced as pending (a partially-committed job, or a legacy-origin draft) — a normal create_deck job has already scheduled its own accepted cards, so this is a recovery/completion action, not a required follow-up to every generation.",
-        input_schema: r#"{"type":"object","required":["draft_id"],"properties":{"draft_id":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_due",
@@ -189,6 +197,20 @@ pub fn call_tool(client: &MemoryEngineClient, name: &str, args: &Value) -> Resul
             let (deck, outcome) = client.create_deck(project_key, title, body, ttl_expires_at)?;
             json!({ "deck": deck, "generation": generation_outcome_json(&outcome) })
         }
+        "keep_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            json!(client.keep_draft(draft_id)?)
+        }
+        "edit_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            let prompt = required_str(args, "prompt")?;
+            let expected_answer = required_str(args, "expected_answer")?;
+            json!(client.edit_draft(draft_id, prompt, expected_answer)?)
+        }
+        "reject_draft" => {
+            let draft_id = required_str(args, "draft_id")?;
+            json!(client.reject_draft(draft_id)?)
+        }
         "list_decks" => {
             let project_key = args["project_key"].as_str();
             json!(client.list_decks(project_key)?)
@@ -199,10 +221,6 @@ pub fn call_tool(client: &MemoryEngineClient, name: &str, args: &Value) -> Resul
             json!(client.invalidate_deck(deck_id, event)?)
         }
         "list_drafts" => json!(client.pending_drafts()?),
-        "approve_draft" => {
-            let draft_id = required_str(args, "draft_id")?;
-            json!(client.approve_draft(draft_id)?)
-        }
         "list_due" => {
             let view = client.next_review()?;
             json!({
@@ -330,13 +348,15 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 15);
+        assert_eq!(TOOLS.len(), 17);
         for expected in [
             "create_deck",
+            "keep_draft",
+            "edit_draft",
+            "reject_draft",
             "list_decks",
             "invalidate_deck",
             "list_drafts",
-            "approve_draft",
             "list_due",
             "review_next",
             "submit_answer",

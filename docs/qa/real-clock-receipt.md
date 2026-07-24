@@ -17,7 +17,7 @@ JSON-route loop against production, account `acct_d901fa0479c7ab34`:
    `src_3512ab1c2a3b7f6e`.
 3. `POST .../sources/{sourceId}/generate` → draft
    `study-run-1-draft-src-3512ab1c2a3b7f6e-1-nato-letter-a`.
-4. `POST .../drafts/{draftId}/approve` → 200.
+4. `POST .../drafts/{draftId}/keep` → 200.
 5. `GET .../review/next` → current =
    `generated-quiz-src-3512ab1c2a3b7f6e-1-nato-letter-a` (due).
 6. `POST .../review/{unit}/submit` answer `ALFA` →

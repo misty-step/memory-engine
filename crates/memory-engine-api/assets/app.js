@@ -25,7 +25,11 @@
     dimmed: [],
     token: null,
     timeoutId: null,
-    landingAttempted: false
+    landingAttempted: false,
+    // Bumped every pagehide so a two-RAF emission scheduled before this
+    // document was hidden (and possibly BFCache-frozen) can tell, once
+    // resumed, that it is stale rather than firing with leftover state.
+    landingEpoch: 0
   };
 
   function isFiniteNumber(value) {
@@ -427,8 +431,26 @@
     var now = absoluteEpochNow();
     if (now === null || now > handoff.expiresAtMs) return;
 
+    // A pagehide between this point and the second animation frame —
+    // including one that freezes this document into BFCache — must
+    // invalidate the scheduled emission: landingEpoch changes, and this
+    // revalidation refuses to let a stale, resumed landing consume state
+    // (or a newer handoff written after restore) that no longer describes
+    // the page the user is actually looking at.
+    var scheduledEpoch = state.landingEpoch;
+    function stillLive() {
+      return (
+        state.landingEpoch === scheduledEpoch &&
+        document.visibilityState !== "hidden" &&
+        typeof document.querySelector === "function" &&
+        !!document.querySelector(".me-verdict")
+      );
+    }
+
     window.requestAnimationFrame(function () {
+      if (!stillLive()) return;
       window.requestAnimationFrame(function () {
+        if (!stillLive()) return;
         var visibleAtMs = absoluteEpochNow();
         if (visibleAtMs === null || visibleAtMs > handoff.expiresAtMs) return;
         var responseStartEpoch = navigationEpoch(navigation, navigation.responseStart);
@@ -488,6 +510,7 @@
   }
 
   window.addEventListener("pagehide", function () {
+    state.landingEpoch += 1;
     resetState();
   });
   window.addEventListener("pageshow", function (event) {
@@ -570,8 +593,7 @@
       case "retry":
         return "Retrying after a temporary failure…";
       case "succeeded":
-        var n = job.cardCount || 0;
-        return n + " " + (n === 1 ? "card" : "cards") + " · scheduled for review";
+        return "Generation succeeded; accepted drafts are pending your review.";
       case "failed":
         return job.error || "Generation failed. Try again.";
       default:
@@ -613,12 +635,27 @@
   }
 
   var source = new EventSource("/app/jobs/events");
+  var terminalNavigationStarted = false;
   // EventSource reconnects automatically; no manual retry needed.
   source.addEventListener("job", function (event) {
     try {
-      apply(JSON.parse(event.data));
+      // Pages without the activity surface (review/answer/edit) keep the
+      // learner's unsent work: no row patch, no terminal navigation.
+      if (!list) return;
+      var job = JSON.parse(event.data);
+      apply(job);
+      if (
+        !terminalNavigationStarted &&
+        (job.status === "succeeded" || job.status === "failed")
+      ) {
+        terminalNavigationStarted = true;
+        // The POST response may be this document. Navigate with GET rather
+        // than reload so capture is never submitted twice. SSR refreshes the
+        // authoritative pending-draft/review surface and retry controls.
+        window.location.assign("/");
+      }
     } catch (err) {
-      /* ignore a malformed frame; the next event or reload corrects it */
+      /* ignore a malformed frame; the next event or navigation corrects it */
     }
   });
 })();

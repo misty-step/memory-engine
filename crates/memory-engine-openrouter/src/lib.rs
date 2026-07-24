@@ -547,12 +547,14 @@ SOURCE TEXT:
 
 {principles}First classify the input's learning_intent as exactly one of:
 - verbatim_memorization: a specific text to reproduce exactly (a poem, an oath, a quote).
+- enumerable_set: a finite set of independently recallable entries or mappings.
 - concept_understanding: a mechanism, theory, cause, or idea to understand and apply.
 - fact_recall: discrete facts, names, dates, definitions, or mappings.
 - procedure_process: ordered steps, a workflow, a recipe, or commands.
 
 Then generate cards, never exceeding {max_drafts}:
 - Coverage: if the input names a finite, enumerable set (an alphabet, the planets, the months, a fixed list), write ONE card for EVERY element, in order — cover the whole set, never collapse it into a single card. Otherwise write the highest-value cards a learner should master first, one atomic fact or idea each, and stop early rather than pad with weak cards.
+- For verbatim_memorization, write one exact recitation card for every source line or sentence in order; use the previous unit as the cue for the next unit.
 
 Decide grounding for EACH card:
 - If the answer is contained in the SOURCE TEXT above, set evidence_quote to the exact verbatim span from it that proves the answer. Never invent or paraphrase a quote.
@@ -690,7 +692,7 @@ fn drafts_schema() -> serde_json::Value {
         "properties": {
             "learning_intent": {
                 "type": "string",
-                "enum": ["verbatim_memorization", "concept_understanding", "fact_recall", "procedure_process"],
+            "enum": ["verbatim_memorization", "enumerable_set", "concept_understanding", "fact_recall", "procedure_process"],
                 "description": "The classified learning goal for this source."
             },
             "drafts": {

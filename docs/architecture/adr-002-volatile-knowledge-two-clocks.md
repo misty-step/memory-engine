@@ -113,7 +113,7 @@ The invariant is the same one used by FSRS scheduling: the caller supplies
 The API can expose project deck operations as a thin v1 surface:
 
 - Create a project deck by saving source material and optional TTL metadata.
-- Generate/approve cards through the existing source-to-review path.
+- Generate/keep cards through the existing source-to-review path.
 - Retire the deck by event, which archives or invalidates all generated review
   units linked to the project deck.
 - Verify that `review/next` no longer returns retired cards.
@@ -152,7 +152,7 @@ policy remains data-in/data-out.
 - Core unit tests: active candidates schedule normally; TTL-expired candidates
   do not schedule; invalidated candidates do not schedule; not-yet-expired
   candidates remain eligible.
-- API route test: create a project deck, generate/approve cards, observe a due
+- API route test: create a project deck, generate/keep cards, observe a due
   review, invalidate the deck by event, and observe that `review/next` no
   longer returns the retired card.
 - Local API transcript: repeat the worked example with the running service and

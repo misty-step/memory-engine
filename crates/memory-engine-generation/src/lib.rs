@@ -16,10 +16,10 @@ mod provider;
 use std::{collections::BTreeSet, error::Error, fmt};
 
 pub use provider::{
-    classify_learning_intent, BridgeMaterial, BridgeMaterialProvider, BridgeMaterialRequest,
-    DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
-    LearningIntent, LearningIntentClassification, ProviderDrafts, ProviderFailure,
-    ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
+    classify_learning_intent, enforce_content_policy, BridgeMaterial, BridgeMaterialProvider,
+    BridgeMaterialRequest, DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider,
+    FallbackProvider, LearningIntent, LearningIntentClassification, ProviderDrafts,
+    ProviderFailure, ProviderFailureKind, ProviderUsage, ReferenceNoteDraft, ReferenceNoteProvider,
     ReferenceNoteRequest, ReviewPerformanceContext, SourceAuthorizationContext,
     SourceAuthorizationError, StructuredBlockProvider,
 };
@@ -62,6 +62,8 @@ pub struct BetaGenerationRequest {
     pub completed_at: Option<i64>,
     pub default_due: i64,
     pub model: Option<GeneratedPromptModel>,
+    /// Keep queued output decision-ineligible until the worker lease fence publishes it.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +199,30 @@ pub trait BetaGenerationStore {
         &mut self,
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error>;
+
+    /// Remove pending output when a durable worker lease loses its commit fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when rollback cannot be persisted.
+    fn discard_generation_run(&mut self, _run_id: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Atomically fence a run and remove all stale output when the lease is lost.
+    ///
+    /// # Errors
+    /// Returns the store error when finalization cannot be persisted.
+    fn finalize_generation_run(
+        &mut self,
+        _run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        _now_ms: i64,
+        _lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 impl BetaGenerationStore for BetaPersistenceStore {
@@ -229,6 +255,21 @@ impl BetaGenerationStore for BetaPersistenceStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         BetaPersistenceStore::save_generated_prompt_draft(self, draft)
+    }
+
+    fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
+        BetaPersistenceStore::discard_generation_run(self, run_id)
+    }
+
+    fn finalize_generation_run(
+        &mut self,
+        run_id: &str,
+        _generation_attempt: i32,
+        _lease_token: &str,
+        now_ms: i64,
+        lease_valid: bool,
+    ) -> Result<bool, Self::Error> {
+        BetaPersistenceStore::finalize_generation_run(self, run_id, now_ms, lease_valid)
     }
 }
 
@@ -401,6 +442,7 @@ where
             return Ok(None);
         }
     };
+    let drafts = enforce_content_policy(source, drafts);
     validation_failures.extend(drafts.failures);
     // Stamp drafts with the provider that actually generated them, not the
     // composite's declared identity. A caller override still wins.
@@ -415,6 +457,7 @@ where
     // expansion grounded in the captured topic itself.
     let mut source_rejections = Vec::new();
     let mut max_candidate_index = 0;
+    let learning_intent = drafts.learning_intent;
     persist_candidates(
         store,
         source,
@@ -429,6 +472,7 @@ where
             rejected_draft_ids,
             source_rejections: &mut source_rejections,
             max_candidate_index: &mut max_candidate_index,
+            learning_intent,
         },
     )?;
 
@@ -495,8 +539,10 @@ where
             return Ok(None);
         }
     };
+    let repair = enforce_content_policy(source, repair);
     validation_failures.extend(repair.failures);
     let usage = repair.usage;
+    let learning_intent = repair.learning_intent;
     let repair_model = request.model.clone().unwrap_or(repair.model);
     if !repair.candidates.is_empty() && !producing_models.contains(&repair_model) {
         producing_models.push(repair_model.clone());
@@ -524,6 +570,7 @@ where
             rejected_draft_ids,
             source_rejections: &mut repair_rejections,
             max_candidate_index,
+            learning_intent,
         },
     )?;
 
@@ -556,6 +603,7 @@ struct PersistCandidatesContext<'a> {
     rejected_draft_ids: &'a mut Vec<String>,
     source_rejections: &'a mut Vec<DraftRejection>,
     max_candidate_index: &'a mut usize,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn persist_candidates<S>(
@@ -609,6 +657,7 @@ where
                 duplicate: false,
                 grounded,
                 quote_verified: !grounded || source_contains_quote(source, evidence),
+                learning_intent: context.learning_intent,
             },
         )?;
 
@@ -638,7 +687,7 @@ fn candidate_rejection(candidate: &DraftCandidate, reasons: Vec<String>) -> Draf
     }
 }
 
-/// Generate bridge material for one approved parent review unit.
+/// Generate bridge material for one kept parent review unit.
 ///
 /// Bridge generation is concept-backed rather than source-backed: if the
 /// concept has no cached reference note, the provider writes one first; easier
@@ -999,6 +1048,7 @@ fn bridge_run_request(
         completed_at: request.completed_at,
         default_due: request.default_due,
         model: request.model.clone(),
+        pending: false,
     }
 }
 
@@ -1008,6 +1058,7 @@ struct PersistParams<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 /// Save one candidate's reference span and draft, returning the stored draft.
@@ -1053,6 +1104,7 @@ where
                 duplicate: params.duplicate,
                 grounded: params.grounded,
                 quote_verified: params.quote_verified,
+                learning_intent: params.learning_intent,
             },
         ))
         .map_err(BetaGenerationError::Store)
@@ -1079,19 +1131,33 @@ fn run_receipt(
     source_permissions: Vec<SourcePermissionReceipt>,
 ) -> GenerationRun {
     let (draft_ids, completed_at, validation_failures, usage) = match progress {
-        RunProgress::Started => (Vec::new(), None, Vec::new(), None),
+        RunProgress::Started => (
+            Vec::new(),
+            request.pending.then_some(i64::MIN),
+            Vec::new(),
+            None,
+        ),
         RunProgress::InProgress {
             draft_ids,
             validation_failures,
             usage,
-        } => (draft_ids, None, validation_failures, usage),
+        } => (
+            draft_ids,
+            request.pending.then_some(i64::MIN),
+            validation_failures,
+            usage,
+        ),
         RunProgress::Completed {
             draft_ids,
             validation_failures,
             usage,
         } => (
             draft_ids,
-            Some(request.completed_at.unwrap_or(request.started_at)),
+            Some(if request.pending {
+                i64::MIN
+            } else {
+                request.completed_at.unwrap_or(request.started_at)
+            }),
             validation_failures,
             usage,
         ),
@@ -1199,6 +1265,7 @@ struct DraftContext<'a> {
     duplicate: bool,
     grounded: bool,
     quote_verified: bool,
+    learning_intent: Option<LearningIntent>,
 }
 
 fn merge_usage(
@@ -1350,6 +1417,7 @@ fn build_draft(
     };
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: generated_id(context.run_id, "draft", &source.id, candidate),
         source_document_ids: vec![source.id.clone()],
         reference_span_ids: vec![context.reference_span_id.to_owned()],
@@ -1357,7 +1425,7 @@ fn build_draft(
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        prompt: build_prompt(candidate, &unit_id, context.learning_intent),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due,
@@ -1431,6 +1499,7 @@ fn bridge_draft(
         .unwrap_or_else(|| context.concept_key.to_owned());
 
     GeneratedPromptDraft {
+        learner_decision: None,
         id: bridge_generated_id(
             context.run_id,
             "draft",
@@ -1443,7 +1512,10 @@ fn bridge_draft(
         generation_run_id: Some(context.run_id.to_owned()),
         review_unit_id: unit_id.clone(),
         prompt_id: format!("{unit_id}-prompt"),
-        prompt: build_prompt(candidate, &unit_id),
+        // Bridge material is an easier derivative, not the original source's
+        // verbatim intent; keep its exercise tolerant unless a future typed
+        // bridge contract explicitly opts into recitation.
+        prompt: build_prompt(candidate, &unit_id, None),
         queue: PersistedQueueCandidate {
             review_unit_id: unit_id.clone(),
             due: context.due.saturating_add(i64::from(stage_order)),
@@ -1497,7 +1569,11 @@ fn bridge_validation_reasons(
     reasons
 }
 
-fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Prompt {
+fn build_prompt(
+    candidate: &DraftCandidate,
+    review_unit_id: &ReviewUnitId,
+    learning_intent: Option<LearningIntent>,
+) -> Prompt {
     if candidate.activity_kind == GeneratedLearningActivityKind::Quiz
         && candidate.distractors.len() >= 2
     {
@@ -1514,10 +1590,15 @@ fn build_prompt(candidate: &DraftCandidate, review_unit_id: &ReviewUnitId) -> Pr
     }
 
     Prompt::Exact(ExactPrompt {
-        kind: if candidate.activity_kind == GeneratedLearningActivityKind::Exercise {
-            ExactPromptKind::Recitation
-        } else {
-            ExactPromptKind::ShortAnswer
+        kind: match learning_intent {
+            Some(LearningIntent::VerbatimMemorization) => ExactPromptKind::Recitation,
+            Some(
+                LearningIntent::EnumerableSet
+                | LearningIntent::ConceptUnderstanding
+                | LearningIntent::FactRecall
+                | LearningIntent::ProcedureProcess,
+            )
+            | None => ExactPromptKind::ShortAnswer,
         },
         review_unit_id: review_unit_id.clone(),
         prompt: candidate.question.clone(),

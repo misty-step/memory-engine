@@ -27,13 +27,6 @@ const GENERATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AccountCreated {
-    pub account_id: String,
-    pub session_token: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SourceRecord {
     pub source_id: String,
     pub title: String,
@@ -101,15 +94,14 @@ pub struct EnqueuedGenerationJob {
 #[derive(Clone, Debug)]
 pub enum GenerationOutcome {
     /// The job reached `succeeded`. `drafts` is every currently pending
-    /// (accepted, unapproved) draft account-wide — usually empty, because
-    /// the production job runner optimistically approves every accepted
-    /// draft as part of running the job, so a normal `succeeded` job has
-    /// nothing left to approve. A non-empty list means some accepted draft
-    /// exists outside that path (a partially-committed job, or a
-    /// legacy-origin draft) and is a genuine "still needs a decision" signal
-    /// worth surfacing. A source whose material yielded no usable cards
-    /// (`job.card_count == 0`) still lands here: zero cards is a valid
-    /// terminal outcome, not an error.
+    /// (accepted, not yet decided) draft account-wide, since generation
+    /// never schedules a card by itself
+    /// (`memory-engine-api-state::registry::run_generation_job`) — a normal
+    /// `succeeded` job's accepted drafts are the expected, common case
+    /// here, not an edge case. Call `keep_draft`, `edit_draft`, or
+    /// `reject_draft` on each one to resolve it. A source whose material
+    /// yielded no usable cards (`job.card_count == 0`) still lands here:
+    /// zero cards is a valid terminal outcome, not an error.
     Succeeded {
         job: GenerationJob,
         coalesced: bool,
@@ -128,10 +120,10 @@ pub enum GenerationOutcome {
 }
 
 /// One generated draft pending a learner-authority decision (`StudyDraft` in
-/// the `OpenAPI` contract). `approved` distinguishes "already kept" from
-/// "still pending"; there is no `rejected` flag — a draft an agent never
-/// approves stays pending, unscheduled, forever (implicit rejection by
-/// omission, not a mutation this contract has a dedicated route for).
+/// the `OpenAPI` contract). `approved`/`learner_decision` distinguish
+/// "already decided" from "still pending"; `keep_draft`, `edit_draft`, and
+/// `reject_draft` are the three explicit decisions — there is no implicit
+/// rejection by omission.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftRow {
@@ -145,6 +137,12 @@ pub struct DraftRow {
     pub validation_reasons: Vec<String>,
     pub worked_solution: Option<String>,
     pub approved: bool,
+    #[serde(default)]
+    pub learner_decision: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source_spans: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub provenance: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -328,18 +326,14 @@ impl MemoryEngineClient {
     }
 
     /// Save a project-scoped deck, enqueue its generation job on the durable
-    /// queue, and poll to a bounded terminal state. Never calls the legacy
-    /// synchronous generate route (refused with HTTP 409 in every production
-    /// deployment). A `succeeded` job's accepted cards arrive already
-    /// scheduled: the production job runner optimistically approves every
-    /// accepted draft as part of the job itself
-    /// (`registry.rs::run_generation_job`, unchanged by this client — that
-    /// policy is shared with every other caller, including the browser, and
-    /// is out of this ticket's scope). `approve_draft`/`list_drafts` exist
-    /// for drafts that reach an unapproved state some other way (a
-    /// partially-committed job, or a legacy-origin draft) — the caller
-    /// should not expect this call's own drafts to need a follow-up
-    /// approval in the common case.
+    /// queue, and poll it to a bounded terminal state. Never calls the
+    /// legacy synchronous generate route (refused with HTTP 409 in every
+    /// production deployment). A succeeded job's accepted draft remains
+    /// pending until an explicit `keep_draft`, `edit_draft`, or
+    /// `reject_draft` decision — generation itself never schedules a card.
+    /// Returns the deck alongside the generation outcome (job status plus
+    /// every draft still pending a decision, so an agent can inspect
+    /// provenance before choosing).
     ///
     /// # Errors
     ///
@@ -403,8 +397,9 @@ impl MemoryEngineClient {
 
     /// Poll one job to a bounded terminal state (`succeeded`/`failed`), or
     /// declare `TimedOut` after `GENERATION_POLL_MAX_ATTEMPTS`. On success,
-    /// fetches the pending (accepted, unapproved) drafts so the caller can
-    /// decide what to approve — never approves anything itself.
+    /// fetches every draft still pending a learner decision so the caller
+    /// can choose to keep, edit, or reject it — this never decides anything
+    /// itself.
     fn poll_generation_job(
         &self,
         mut job: GenerationJob,
@@ -435,8 +430,11 @@ impl MemoryEngineClient {
         }
     }
 
-    /// Every currently pending (validator-accepted, not yet approved) draft
-    /// across the account — the "inspect before you keep" read.
+    /// Every currently pending (accepted, not yet decided) draft across the
+    /// account — the "inspect before you decide" read. A draft counts as
+    /// pending when it is validator-accepted and carries neither a legacy
+    /// `approved` flag nor a `learner_decision`, mirroring the server's own
+    /// pending-draft filter (`memory-engine-api-render::render`).
     ///
     /// # Errors
     ///
@@ -446,24 +444,12 @@ impl MemoryEngineClient {
         Ok(view
             .drafts
             .into_iter()
-            .filter(|draft| draft.validation_status == "accepted" && !draft.approved)
+            .filter(|draft| {
+                draft.validation_status == "accepted"
+                    && !draft.approved
+                    && draft.learner_decision.is_none()
+            })
             .collect())
-    }
-
-    /// Explicitly keep one generated draft: schedules it for review. This is
-    /// the only mutation that turns a draft into a live review unit, so it
-    /// is never called except in direct response to a caller's own
-    /// `approve_draft` tool call — no composition calls it implicitly.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails (including approving an
-    /// already-approved or unknown draft id).
-    pub fn approve_draft(&self, draft_id: &str) -> Result<StudyView, String> {
-        self.post_empty(&format!(
-            "/v1/accounts/{}/drafts/{draft_id}/approve",
-            self.account_id
-        ))
     }
 
     /// List saved sources that belong to a project deck (`project_key` set),
@@ -497,6 +483,47 @@ impl MemoryEngineClient {
             ),
             &json!({ "event": event }),
         )
+    }
+
+    /// Keep one generated draft after inspecting its provenance.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn keep_draft(&self, draft_id: &str) -> Result<StudyView, String> {
+        self.post_empty(&format!(
+            "/v1/accounts/{}/drafts/{draft_id}/keep",
+            self.account_id
+        ))
+    }
+
+    /// Edit one generated draft and keep the edited wording.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn edit_draft(
+        &self,
+        draft_id: &str,
+        prompt: &str,
+        expected_answer: &str,
+    ) -> Result<StudyView, String> {
+        self.post_json(
+            &format!("/v1/accounts/{}/drafts/{draft_id}/edit", self.account_id),
+            &json!({
+                "prompt": prompt,
+                "expectedAnswer": expected_answer,
+            }),
+        )
+    }
+
+    /// Reject one generated draft without scheduling it.
+    ///
+    /// # Errors
+    /// Returns an error when the request fails.
+    pub fn reject_draft(&self, draft_id: &str) -> Result<StudyView, String> {
+        self.post_empty(&format!(
+            "/v1/accounts/{}/drafts/{draft_id}/reject",
+            self.account_id
+        ))
     }
 
     /// Fetch the next due review card.
@@ -683,25 +710,6 @@ impl MemoryEngineClient {
     }
 }
 
-/// Create an account against `base_url`, outside any existing `MemoryEngineClient`
-/// (no account id/session token exist yet).
-///
-/// # Errors
-///
-/// Returns an error when the create-account request fails.
-pub fn create_account(base_url: &str, email: &str) -> Result<AccountCreated, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(REQUEST_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent
-        .post(endpoint(base_url, "/v1/accounts"))
-        .send_json(json!({ "email": email }))
-        .map_err(|error| transport_failure("create account", &error))?;
-    read_json(&mut response, "create account")
-}
-
 #[derive(Deserialize)]
 struct ApiError {
     error: String,
@@ -758,20 +766,53 @@ mod tests {
 
     type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
 
-    async fn spawn_local_api() -> (String, tokio::task::JoinHandle<()>) {
+    fn unique_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{millis}-{counter}", std::process::id())
+    }
+
+    /// A local `ApiState` with `email` pre-allowlisted — every test server
+    /// needs credentials provisioned up front now that anonymous account
+    /// creation is deny-by-default (`AuthConfig::default()`).
+    fn provisioned_state(email: &str) -> memory_engine_api::ApiState {
+        let store_root =
+            std::env::temp_dir().join(format!("memory-engine-mcp-client-{}", unique_suffix()));
+        memory_engine_api::ApiState::new(
+            memory_engine_api::AccountRegistry::with_store_root(&store_root).with_auth_config(
+                memory_engine_api::AuthConfig::allow_emails([email.to_owned()])
+                    .with_anonymous_account_creation(true),
+            ),
+        )
+    }
+
+    async fn spawn_local_api(
+        email: &str,
+    ) -> (String, tokio::task::JoinHandle<()>, String, String) {
+        let state = provisioned_state(email);
+        let created = state
+            .create_account(email)
+            .expect("pre-provision test account");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local API listener");
         let address = listener.local_addr().expect("local address");
         let handle = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                memory_engine_api::router(memory_engine_api::ApiState::default()),
-            )
-            .await
-            .expect("serve local API");
+            axum::serve(listener, memory_engine_api::router(state))
+                .await
+                .expect("serve local API");
         });
-        (format!("http://{address}"), handle)
+        (
+            format!("http://{address}"),
+            handle,
+            created.account_id,
+            created.session_token,
+        )
     }
 
     /// Same real local API as `spawn_local_api`, but with its generation-jobs
@@ -780,8 +821,19 @@ mod tests {
     /// crate's client sends it — the evidence behind
     /// `create_deck_enqueues_and_polls_without_ever_requesting_generate`
     /// below, which asserts on the capture instead of scanning source text.
-    async fn spawn_local_api_with_capture() -> (String, tokio::task::JoinHandle<()>, RequestLog) {
-        let state = memory_engine_api::ApiState::default();
+    async fn spawn_local_api_with_capture(
+        email: &str,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        RequestLog,
+        String,
+        String,
+    ) {
+        let state = provisioned_state(email);
+        let created = state
+            .create_account(email)
+            .expect("pre-provision test account");
         state.start_worker();
 
         let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
@@ -798,7 +850,13 @@ mod tests {
                 .await
                 .expect("serve local API");
         });
-        (format!("http://{address}"), handle, requests)
+        (
+            format!("http://{address}"),
+            handle,
+            requests,
+            created.account_id,
+            created.session_token,
+        )
     }
 
     async fn capture_request(State(log): State<RequestLog>, req: Request, next: Next) -> Response {
@@ -809,30 +867,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_legacy_origin_unapproved_draft_can_be_inspected_and_approved() {
-        let (base_url, server) = spawn_local_api().await;
-
-        let created = create_account(&base_url, "mcp-client-recovery-test@example.com")
-            .expect("create account");
+    async fn a_pending_draft_from_the_local_generate_route_can_be_kept() {
+        let (base_url, server, account_id, session_token) =
+            spawn_local_api("mcp-client-recovery-test@example.com").await;
         let client = MemoryEngineClient::new(
             base_url.clone(),
-            created.account_id.clone(),
-            created.session_token.clone(),
+            account_id.clone(),
+            session_token.clone(),
         );
 
-        // Seed an accepted-but-unapproved draft the way a pre-existing or
-        // interrupted lineage would: directly against the legacy synchronous
-        // route, bypassing this crate's own client entirely (this ApiState
-        // has no `MEMORY_ENGINE_POSTGRES_URL`, so the legacy route is not
-        // yet refused with 409 the way every production deployment refuses
-        // it — this fixture only needs a real unapproved draft to exist).
-        let source: serde_json::Value = ureq::post(endpoint(&base_url, &format!(
-            "/v1/accounts/{}/sources",
-            created.account_id
-        )))
-        .header("Authorization", &format!("Bearer {}", created.session_token))
+        // Seed an accepted draft directly against the local (non-production)
+        // synchronous route: this `ApiState` has no
+        // `MEMORY_ENGINE_POSTGRES_URL`, so the route is not yet refused with
+        // HTTP 409 the way every production deployment refuses it — this
+        // fixture only needs a real pending draft to exist.
+        let source: serde_json::Value = ureq::post(endpoint(
+            &base_url,
+            &format!("/v1/accounts/{account_id}/sources"),
+        ))
+        .header("Authorization", &format!("Bearer {session_token}"))
         .send_json(json!({
-            "title": "legacy-origin fixture",
+            "title": "pending-draft fixture",
             "body": "Concept: NATO letter B\nActivity: quiz\nStage: recognition-3\nQuestion: What is the NATO phonetic alphabet word for B?\nAnswer: BRAVO\nDistractors: ALFA, CHARLIE\nReference: The NATO phonetic alphabet word for B is BRAVO.",
         }))
         .expect("create source")
@@ -842,47 +897,32 @@ mod tests {
         let source_id = source["sourceId"].as_str().expect("sourceId").to_owned();
         ureq::post(endpoint(
             &base_url,
-            &format!(
-                "/v1/accounts/{}/sources/{source_id}/generate",
-                created.account_id
-            ),
+            &format!("/v1/accounts/{account_id}/sources/{source_id}/generate"),
         ))
-        .header(
-            "Authorization",
-            &format!("Bearer {}", created.session_token),
-        )
+        .header("Authorization", &format!("Bearer {session_token}"))
         .send_empty()
-        .expect("legacy generate");
+        .expect("local generate");
 
         let pending = client.pending_drafts().expect("pending drafts");
-        assert_eq!(
-            pending.len(),
-            1,
-            "the legacy route must leave its draft unapproved"
-        );
+        assert_eq!(pending.len(), 1, "generation must leave its draft pending");
         assert!(!pending[0].approved);
+        assert!(pending[0].learner_decision.is_none());
         assert_eq!(pending[0].validation_status, "accepted");
 
-        let due_before = client.next_review().expect("study view before approval");
-        assert_eq!(
-            due_before.due_count, 0,
-            "an unapproved draft must not be due"
-        );
+        let due_before = client.next_review().expect("study view before decision");
+        assert_eq!(due_before.due_count, 0, "a pending draft must not be due");
 
-        let approved_view = client
-            .approve_draft(&pending[0].id)
-            .expect("approve the pending draft");
-        assert_eq!(
-            approved_view.due_count, 1,
-            "approval must schedule the card"
-        );
+        let kept_view = client
+            .keep_draft(&pending[0].id)
+            .expect("keep the pending draft");
+        assert_eq!(kept_view.due_count, 1, "keeping must schedule the card");
 
         let remaining = client
             .pending_drafts()
-            .expect("pending drafts after approval");
+            .expect("pending drafts after keeping");
         assert!(
             remaining.is_empty(),
-            "the approved draft must no longer be pending"
+            "the kept draft must no longer be pending"
         );
 
         server.abort();
@@ -890,13 +930,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn errors_surface_the_servers_safe_message_not_a_bare_status_code() {
-        let (base_url, server) = spawn_local_api().await;
-        let created = create_account(&base_url, "mcp-client-safe-error-test@example.com")
-            .expect("create account");
-        let client = MemoryEngineClient::new(base_url, created.account_id, created.session_token);
+        let (base_url, server, account_id, session_token) =
+            spawn_local_api("mcp-client-safe-error-test@example.com").await;
+        let client = MemoryEngineClient::new(base_url, account_id, session_token);
 
         let error = client
-            .approve_draft("draft-does-not-exist")
+            .keep_draft("draft-does-not-exist")
             .expect_err("an unknown draft id must fail");
         assert!(
             error.contains("Unknown generated prompt draft: draft-does-not-exist"),
@@ -908,15 +947,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_deck_enqueues_and_polls_without_ever_requesting_generate() {
-        let (base_url, server, requests) = spawn_local_api_with_capture().await;
-
-        let created = create_account(&base_url, "mcp-client-generate-guard-test@example.com")
-            .expect("create account");
-        let client = MemoryEngineClient::new(
-            base_url,
-            created.account_id.clone(),
-            created.session_token.clone(),
-        );
+        let (base_url, server, requests, account_id, session_token) =
+            spawn_local_api_with_capture("mcp-client-generate-guard-test@example.com").await;
+        let client = MemoryEngineClient::new(base_url, account_id, session_token);
 
         let deck_body = "Concept: NATO letter A\nActivity: quiz\nStage: recognition-3\n\
             Question: What is the NATO phonetic alphabet word for A?\nAnswer: ALFA\n\
@@ -926,9 +959,19 @@ mod tests {
         let (_deck, outcome) = client
             .create_deck("nato-onboarding", "NATO letter A fixture", deck_body, None)
             .expect("create_deck reaches a terminal outcome against a real worker");
-        assert!(
-            matches!(outcome, GenerationOutcome::Succeeded { .. }),
-            "the job must reach succeeded against a real running worker, not time out: {outcome:?}"
+        let GenerationOutcome::Succeeded { job, drafts, .. } = &outcome else {
+            panic!(
+                "the job must reach succeeded against a real running worker, not time out: {outcome:?}"
+            );
+        };
+        assert_eq!(
+            job.card_count, 0,
+            "generation never auto-schedules a card: {outcome:?}"
+        );
+        assert_eq!(
+            drafts.len(),
+            1,
+            "the fixture body must yield exactly one pending draft: {outcome:?}"
         );
 
         server.abort();

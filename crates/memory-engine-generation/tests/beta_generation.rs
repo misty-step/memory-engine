@@ -50,6 +50,7 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -112,11 +113,8 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
     );
 
     let review_unit = store
-        .approve_generated_prompt_draft(
-            "run-nato-draft-src-nato-2-nato-cat-composition",
-            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
-        )
-        .expect("approve");
+        .keep_generated_prompt_draft("run-nato-draft-src-nato-2-nato-cat-composition", 0)
+        .expect("keep");
     let queue =
         memory_engine_service::MemoryServiceStore::list_queue_candidates(&store).expect("queue");
 
@@ -125,6 +123,100 @@ fn generates_accepted_quiz_and_exercise_drafts_with_provenance() {
         Some("run-nato-draft-src-nato-2-nato-cat-composition")
     );
     assert_eq!(queue[0].review_unit_id, review_unit.review_unit_id);
+}
+
+#[test]
+fn short_enumerable_entries_are_promoted_with_substantive_evidence() {
+    let directory = TempDirectory::new("short-enumerable-evidence");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-short-list".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Ordered terms".to_owned(),
+            project_key: None,
+            body: Some("1. Alpha\n2. Beta\n3. Gamma".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        BetaGenerationRequest {
+            run_id: "run-short-list".to_owned(),
+            source_document_ids: vec!["src-short-list".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+            pending: false,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 3);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+    let snapshot = store.snapshot();
+    assert!(snapshot.generated_prompt_drafts.iter().all(|draft| {
+        draft.validation.status == GeneratedPromptValidationStatus::Accepted
+            && !draft.reference_span_ids.is_empty()
+    }));
+}
+
+#[test]
+fn short_verbatim_units_are_promoted_with_substantive_evidence() {
+    let directory = TempDirectory::new("short-verbatim-evidence");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("store");
+    store
+        .save_source_document(SourceDocument {
+            id: "src-short-verse".to_owned(),
+            kind: SourceDocumentKind::Text,
+            title: "Short verse".to_owned(),
+            project_key: None,
+            body: Some("Rise.\nShine bright.\nMove onward.".to_owned()),
+            uri: None,
+            permission: SourcePermission::ModelEligible,
+            freshness: Some(NOW),
+            ttl_expires_at: None,
+            created_at: NOW,
+            archived_at: None,
+        })
+        .expect("source");
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &FakeModelProvider,
+        BetaGenerationRequest {
+            run_id: "run-short-verse".to_owned(),
+            source_document_ids: vec!["src-short-verse".to_owned()],
+            parent_review_unit_id: None,
+            started_at: NOW,
+            completed_at: Some(NOW + 1_000),
+            default_due: NOW - 60_000,
+            model: None,
+            pending: false,
+        },
+    )
+    .expect("generation");
+
+    assert_eq!(result.accepted_draft_ids.len(), 3);
+    assert!(result.rejected_draft_ids.is_empty());
+    assert!(result.validation_failures.is_empty());
+    let snapshot = store.snapshot();
+    assert!(snapshot.generated_prompt_drafts.iter().all(|draft| {
+        draft.validation.status == GeneratedPromptValidationStatus::Accepted
+            && !draft.reference_span_ids.is_empty()
+    }));
 }
 
 #[test]
@@ -158,6 +250,7 @@ fn browser_form_line_endings_preserve_multiple_structured_blocks() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -229,6 +322,7 @@ fn structured_generation_preserves_same_stage_variants_for_one_concept() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -325,6 +419,7 @@ fn persists_rejected_unsupported_and_duplicate_drafts() {
             completed_at: None,
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -381,6 +476,7 @@ fn model_provider_is_not_called_for_local_only_source() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect_err("local-only source must fail closed before provider invocation");
@@ -422,6 +518,7 @@ fn model_provider_is_not_called_for_archived_source() {
             completed_at: Some(1),
             default_due: 0,
             model: None,
+            pending: false,
         },
     )
     .expect_err("archived source must fail before provider invocation");
@@ -442,6 +539,7 @@ fn model_provider_is_not_called_for_archived_source() {
             completed_at: Some(1),
             default_due: 0,
             model: None,
+            pending: false,
         },
     )
     .expect_err("archived source must fail before the deterministic provider too");
@@ -499,6 +597,7 @@ fn rejects_near_duplicate_questions_before_persistence_acceptance() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -548,6 +647,7 @@ fn repairs_zero_accepted_source_once_and_counts_repair_usage() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -614,6 +714,7 @@ fn repairs_rejected_candidates_even_when_source_has_accepted_drafts() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -673,6 +774,7 @@ fn repair_feedback_is_capped_before_provider_retry() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -757,14 +859,12 @@ fn arbitrary_bridge_provider_is_denied_before_local_only_source_context_is_sent(
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
     let parent = store
-        .approve_generated_prompt_draft(
-            &generated.accepted_draft_ids[0],
-            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
-        )
+        .keep_generated_prompt_draft(&generated.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
     let mut source = store.snapshot().source_documents[0].clone();
@@ -822,14 +922,12 @@ fn missing_bridge_source_fails_before_provider_invocation() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("parent generation");
     let parent = store
-        .approve_generated_prompt_draft(
-            &generated.accepted_draft_ids[0],
-            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
-        )
+        .keep_generated_prompt_draft(&generated.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
 
@@ -990,10 +1088,7 @@ fn bridge_descendants_preserve_full_provenance_and_fail_closed_once_provider_is_
     )
     .expect("child generation");
     let child_review_unit_id = store
-        .approve_generated_prompt_draft(
-            &child_generation.accepted_draft_ids[0],
-            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
-        )
+        .keep_generated_prompt_draft(&child_generation.accepted_draft_ids[0], 0)
         .expect("child")
         .review_unit_id;
     let child_snapshot = store.snapshot();
@@ -1080,14 +1175,12 @@ fn seed_bridge_descendants_provenance_fixture() -> (TempDirectory, PathBuf, Revi
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("parent generation");
     let parent_review_unit_id = store
-        .approve_generated_prompt_draft(
-            &parent_generation.accepted_draft_ids[0],
-            memory_engine_persistence::ApproveGeneratedPromptDraftOptions::default(),
-        )
+        .keep_generated_prompt_draft(&parent_generation.accepted_draft_ids[0], 0)
         .expect("parent")
         .review_unit_id;
 
@@ -1148,6 +1241,7 @@ fn authored_block_without_a_reference_is_a_world_knowledge_card() {
             completed_at: None,
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -1272,6 +1366,7 @@ fn world_knowledge_card_without_a_quote_is_accepted_and_seeded() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -1337,6 +1432,7 @@ fn fabricated_source_quote_is_rejected() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW - 60_000,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -1399,6 +1495,7 @@ fn flagged_unsupported_card_is_rejected_even_without_a_quote() {
             completed_at: None,
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -1447,6 +1544,7 @@ fn generation_preserves_retrieval_depth_progression_tiers() {
             completed_at: Some(NOW + 1_000),
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect("generation");
@@ -1502,6 +1600,7 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
             completed_at: None,
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect_err("missing source");
@@ -1535,6 +1634,7 @@ fn reports_unknown_and_empty_sources_before_starting_generation() {
             completed_at: None,
             default_due: NOW,
             model: None,
+            pending: false,
         },
     )
     .expect_err("empty source");

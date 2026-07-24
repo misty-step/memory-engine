@@ -14,12 +14,21 @@
 
 use std::fmt::Write as _;
 
+use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, SourcePermission};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
     SubmitReviewTimings,
 };
+
+#[cfg(test)]
+fn render_test_state(email: &str) -> ApiState {
+    use memory_engine_api_state::{AccountRegistry, AuthConfig};
+    ApiState::new(AccountRegistry::default().with_auth_config(
+        AuthConfig::allow_emails([email.to_owned()]).with_anonymous_account_creation(true),
+    ))
+}
 
 pub struct ContentFeedbackRecovery<'a> {
     pub review_unit_id: &'a str,
@@ -383,11 +392,7 @@ pub fn render_analytics_page(
     options: AnalyticsViewOptions,
 ) -> String {
     let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -425,6 +430,28 @@ pub fn render_waitlist_joined() -> String {
 <p><a class="ae-accent" href="/">Back to start</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_waitlist_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Waitlist</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<section class="ae-group me-capture-hero">
+<form action="/app/waitlist" method="post">
+<label class="ae-label" for="me-waitlist-recovery-email">Your email</label>
+<input class="ae-input me-hero-email" id="me-waitlist-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
+<div class="me-actions"><button class="ae-button" type="submit">Try again</button></div>
+</form>
+</section>
+<p><a class="ae-accent" href="/">Back to start</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
 
 #[must_use]
@@ -492,6 +519,21 @@ pub fn render_return_notification_disabled() -> String {
 <p><a class="ae-accent" href="/">Back to Scry</a></p>
 </div>"#;
     document(&screen_centered("", view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_return_notification_recovery(title: &str, message: &str) -> String {
+    let view = format!(
+        r#"<div class="me-cover">
+<p class="me-kicker">Return gently</p>
+<h1 class="me-display">{}</h1>
+<p class="ae-lede ae-dim me-support">{}</p>
+<p><a class="ae-accent" href="/">Back to Scry</a></p>
+</div>"#,
+        escape_html(title),
+        escape_html(message),
+    );
+    document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
 
 /// Wrap a `.ae-screen` body in the full document, linking the design system.
@@ -619,7 +661,11 @@ fn render_signed_in(
         SignedInSurface::ReviewComplete => render_review_complete(),
         SignedInSurface::Workspace => view.and_then(|view| view.current.as_ref()).map_or_else(
             || render_workspace(account, sources, view, jobs),
-            |current| render_current_review(account, current),
+            |current| {
+                let mut review = render_current_review(account, current);
+                review.push_str(&render_pending_drafts(account, view));
+                review
+            },
         ),
     };
     render_signed_in_body(account, due, notice, jobs, &body)
@@ -633,11 +679,7 @@ fn render_signed_in_body(
     body: &str,
 ) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = format!(
-        r#"<span class="ae-dim">Signed in</span>
-<form class="me-foot-form" action="/app/logout" method="post">{}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>"#,
-        hidden_csrf_input(account)
-    );
+    let footer = signed_in_footer(account);
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
 }
@@ -679,10 +721,8 @@ fn render_workspace(
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
 ) -> String {
-    // Generation is non-blocking: capture is the persistent action, the activity
-    // log shows jobs running in the background (live over SSE, but also correct
-    // on every full load), and review is always one tap away. No keep gate —
-    // successful jobs are already scheduled.
+    // Generation is non-blocking. Accepted drafts stay pending until the learner
+    // inspects their evidence and explicitly keeps, edits, or rejects them.
     let mut html = String::new();
     if let Some(view) = view {
         html.push_str(&render_review_status(account, view));
@@ -695,6 +735,7 @@ fn render_workspace(
     html.push_str(&render_capture(account));
     html.push_str(&render_return_notifications(account));
     html.push_str(&render_jobs(account, jobs));
+    html.push_str(&render_pending_drafts(account, view));
     html.push_str(&render_sources(account, sources, jobs));
     if let Some(view) = view {
         html.push_str(&render_concept_progress(&view.concept_progress));
@@ -790,6 +831,80 @@ fn render_capture(account: &AppAccount) -> String {
 </section>"#,
         csrf = hidden_csrf_input(account),
     )
+}
+
+fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>) -> String {
+    let Some(view) = view else {
+        return String::new();
+    };
+    let pending = view.drafts.iter().filter(|draft| {
+        !draft.approved
+            && draft.learner_decision.is_none()
+            && draft.validation_status == GeneratedPromptValidationStatus::Accepted
+    });
+    let mut rows = String::new();
+    for draft in pending {
+        let spans = if draft.source_spans.is_empty() {
+            String::new()
+        } else {
+            let mut rendered = String::from("<ul class=\"me-provenance-spans\">");
+            for span in &draft.source_spans {
+                let _ = write!(
+                    rendered,
+                    "<li><strong>{}</strong> · {} <span class=\"ae-dim\">{}</span></li>",
+                    escape_html(&span.label),
+                    escape_html(&span.text),
+                    escape_html(&span.locator)
+                );
+            }
+            rendered.push_str("</ul>");
+            rendered
+        };
+        let provenance = draft.provenance.as_ref().map_or_else(String::new, |p| {
+            format!(
+                "<p class=\"ae-dim me-draft-provenance\">Provider: {} · Model: {}{}</p>",
+                escape_html(&p.provider),
+                escape_html(&p.model),
+                p.prompt_version
+                    .as_deref()
+                    .map_or_else(String::new, |v| format!(" · Prompt {}", escape_html(v)))
+            )
+        });
+        let _ = write!(
+            rows,
+            r#"<article class="me-pending-draft">
+<p class="me-kicker">Pending draft</p>
+<h3 class="ae-h">{}</h3>
+<p class="me-prompt">{}</p>
+<p class="ae-dim">Expected answer: <span class="ae-item">{}</span></p>
+{}
+{}
+<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
+<div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
+</article>"#,
+            escape_html(&draft.concept_label),
+            escape_html(&draft.prompt),
+            escape_html(&draft.answer),
+            provenance,
+            spans,
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.prompt),
+            escape_html(&draft.id),
+            escape_html(&draft.id),
+            escape_html(&draft.answer),
+            hidden_csrf_input(account),
+            escape_html(&draft.id),
+            hidden_csrf_input(account),
+            escape_html(&draft.id)
+        );
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
 }
 
 fn render_sources(
@@ -940,11 +1055,9 @@ fn job_meta(job: &GenerationJob) -> String {
         JobStatus::Queued => "Queued…".to_owned(),
         JobStatus::Running => "Generating cards…".to_owned(),
         JobStatus::Retry => "Retrying after a temporary failure…".to_owned(),
-        JobStatus::Succeeded => format!(
-            "{} {} · scheduled for review",
-            job.card_count,
-            plural(job.card_count, "card", "cards")
-        ),
+        JobStatus::Succeeded => {
+            "Generation succeeded; accepted drafts are pending your review.".to_owned()
+        }
         JobStatus::Failed => escape_html(
             job.error
                 .as_deref()
@@ -1697,6 +1810,20 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     )
 }
 
+/// Shared "Signed in" footer for the account and workspace screens: sign
+/// out this browser session, or sign out every browser session for the
+/// account via `/app/logout-all`. Machine/service-session credentials are
+/// an independent scope and are unaffected; there is no PWA control for
+/// those today.
+fn signed_in_footer(account: &AppAccount) -> String {
+    let csrf = hidden_csrf_input(account);
+    format!(
+        r#"<span class="ae-dim">Signed in</span>
+<form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
+    )
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1732,7 +1859,7 @@ const ICON_PLUS: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden=
 mod source_loading_tests {
     use std::cell::Cell;
 
-    use memory_engine_api_state::{ApiState, CreateSourceRequest, EnqueueOutcome};
+    use memory_engine_api_state::{CreateSourceRequest, EnqueueOutcome};
     use memory_engine_persistence::SourcePermission;
 
     use super::{render_account_page_with_loaders, render_capture};
@@ -1752,7 +1879,7 @@ mod source_loading_tests {
 
     #[test]
     fn active_review_loads_only_data_used_by_the_rendered_branch() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-loader-active@example.com");
         let created = state
             .create_account("render-loader-active@example.com")
             .unwrap();
@@ -1772,8 +1899,14 @@ mod source_loading_tests {
             EnqueueOutcome::Started(_)
         ));
         state.run_pending_jobs_blocking();
-        let active_view = state.next_app_review(&account).unwrap();
-
+        let pending_view = state.next_app_review(&account).unwrap();
+        let active_view = state
+            .keep_draft(
+                account.account_id(),
+                account.session_token(),
+                &pending_view.drafts[0].id,
+            )
+            .unwrap();
         let active_source_loads = Cell::new(0);
         let active_job_loads = Cell::new(0);
         render_account_page_with_loaders(
@@ -1792,7 +1925,6 @@ mod source_loading_tests {
         );
         assert_eq!(active_source_loads.get(), 0);
         assert_eq!(active_job_loads.get(), 0);
-
         render_account_page_with_loaders(
             &state,
             &account,
@@ -1809,7 +1941,6 @@ mod source_loading_tests {
             1,
             "a generation notice still needs live jobs to suppress stale UI"
         );
-
         let notice_page = render_account_page_with_loaders(
             &state,
             &account,
@@ -1827,8 +1958,11 @@ mod source_loading_tests {
             "an unconditional notice does not require job history"
         );
         assert!(notice_page.contains("That job can't be retried."));
+        assert_workspace_render_loads_all();
+    }
 
-        let workspace_state = ApiState::default();
+    fn assert_workspace_render_loads_all() {
+        let workspace_state = super::render_test_state("render-loader-workspace@example.com");
         let workspace_created = workspace_state
             .create_account("render-loader-workspace@example.com")
             .unwrap();
@@ -1857,7 +1991,7 @@ mod source_loading_tests {
 
     #[test]
     fn capture_form_exposes_an_accessible_permission_choice_and_default() {
-        let state = ApiState::default();
+        let state = super::render_test_state("render-permission@example.com");
         let account = state
             .create_account("render-permission@example.com")
             .and_then(|account| state.create_browser_session(&account))
@@ -2014,7 +2148,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_is_a_complete_document_with_one_asset_contract() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-document@example.com");
         let created = state
             .create_account("analytics-document@example.com")
             .expect("account");
@@ -2083,7 +2217,7 @@ mod analytics_tests {
 
     #[test]
     fn analytics_page_applies_untried_filter_to_a_study_view_response() {
-        let state = memory_engine_api_state::ApiState::default();
+        let state = super::render_test_state("analytics-untried@example.com");
         let created = state
             .create_account("analytics-untried@example.com")
             .expect("account");

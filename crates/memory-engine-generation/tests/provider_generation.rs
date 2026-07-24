@@ -1,6 +1,6 @@
 use std::{cell::Cell, fs, path::PathBuf};
 
-use memory_engine_core::{ExactPromptKind, Prompt};
+use memory_engine_core::{ExactPromptKind, GradeContext, Grader, Prompt, Verdict};
 use memory_engine_generation::{
     classify_learning_intent, run_beta_generation_with_provider, BetaGenerationRequest,
     DraftCandidate, DraftProvider, DraftRejection, FakeModelProvider, FallbackProvider,
@@ -18,6 +18,33 @@ const PROSE: &str = "Mitochondria are organelles that generate most of the cell'
 adenosine triphosphate. The number of mitochondria in a cell varies widely by organism and \
 tissue type. They are sometimes called the powerhouse of the cell because they produce usable \
 chemical energy.";
+
+#[test]
+fn title_only_verbatim_cue_does_not_activate_exhaustive_policy() {
+    let source = SourceDocument {
+        id: "src-title-only-verbatim".to_owned(),
+        kind: SourceDocumentKind::Text,
+        title: "Apostles' Creed verbatim sequence".to_owned(),
+        project_key: None,
+        body: Some(String::new()),
+        uri: None,
+        permission: SourcePermission::ModelEligible,
+        freshness: Some(NOW),
+        ttl_expires_at: None,
+        created_at: NOW,
+        archived_at: None,
+    };
+
+    let classification = classify_learning_intent(&source);
+    assert!(
+        !matches!(
+            classification.intent,
+            LearningIntent::EnumerableSet | LearningIntent::VerbatimMemorization
+        ),
+        "title-only prose must not activate exhaustive enumerable/verbatim policy: {:?}",
+        classification.intent
+    );
+}
 
 #[test]
 fn fallback_provider_rejects_local_only_source_before_forwarding() {
@@ -162,8 +189,8 @@ fn fake_model_provider_branches_draft_shapes_by_learning_intent() {
     );
     let fact = source_document(
         "src-fact",
-        "NATO letters",
-        "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+        "Cell facts",
+        "ATP means cellular energy. DNA means genetic material. RNA means messenger material.",
     );
     let process = source_document(
         "src-process",
@@ -242,6 +269,362 @@ fn fake_model_provider_branches_draft_shapes_by_learning_intent() {
 }
 
 #[test]
+fn enumerable_sources_emit_every_mapping_in_the_non_derivable_direction() {
+    let source = source_document(
+        "src-enumerable",
+        "NATO phonetic alphabet",
+        "A is Alfa. B is Bravo. C is Charlie. D is Delta.",
+    );
+
+    let classification = classify_learning_intent(&source);
+    assert_eq!(classification.intent, LearningIntent::EnumerableSet);
+    assert_eq!(
+        LearningIntent::from_label("enumerable_set"),
+        Some(LearningIntent::EnumerableSet)
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("enumerable generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 4);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["Alfa", "Bravo", "Charlie", "Delta"]
+    );
+    assert!(drafts.candidates.iter().all(|candidate| {
+        candidate.distractors.is_empty()
+            && candidate.question.contains("letter")
+            && candidate.activity_stage == "production-recall"
+            && candidate.evidence.is_some()
+    }));
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("which letter")));
+}
+
+#[test]
+fn enumerable_numbered_lists_preserve_order_and_source_evidence() {
+    let source = source_document("src-list", "Ordered terms", "1. Alpha\n2. Beta\n3. Gamma");
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("numbered list generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta", "Gamma"]
+    );
+    assert_eq!(drafts.candidates[0].index, 1);
+    assert_eq!(drafts.candidates[2].index, 3);
+    assert_eq!(
+        drafts.candidates[1].evidence.as_deref(),
+        Some("1. Alpha\n2. Beta\n3. Gamma")
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("letter")));
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.index)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+}
+
+#[test]
+fn numbered_procedures_keep_process_semantics_instead_of_set_cards() {
+    let source = source_document(
+        "src-procedure-list",
+        "Three-step recipe",
+        "1. Mix flour and water.\n2. Knead the dough.\n3. Bake the loaf.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.question.contains("entry for number")));
+    assert!(drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage == "procedure-composition"));
+}
+
+#[test]
+fn numbered_imperative_procedures_keep_process_semantics_without_metadata() {
+    let source = source_document(
+        "src-imperative-procedure",
+        "Fried eggs",
+        "1. Heat the pan\n2. Add the oil\n3. Cook the eggs",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("imperative procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .any(|candidate| candidate.activity_stage == "procedure-composition"));
+}
+
+#[test]
+fn non_list_process_prose_stays_bounded_instead_of_one_card_per_sentence() {
+    // Regression guard for a real PR46 defect: the non-list ProcedureProcess
+    // fallback was rewritten to emit one candidate per `split_sentences()`
+    // sentence, silently reintroducing exhaustive-coverage behavior into
+    // ordinary prose (e.g. the `spacing-effect` bench fixture grew from 2
+    // accepted drafts to 11, blowing through its declared `max_drafts: 8`).
+    // Conceptual/procedure prose must stay on a small, bounded fewer-better
+    // fallback regardless of source length; only numbered lists (handled by
+    // the list_entries branch above) and verbatim/enumerable sources get
+    // exhaustive per-unit coverage.
+    let source = source_document(
+        "src-spacing-effect-like",
+        "Spaced review process",
+        "Spaced practice is a process that improves retention over many separate study \
+         sessions. Each review session should be spaced further apart as recall becomes more \
+         reliable. First you study the material once. Then you wait a day and try to recall it \
+         without notes. If you succeed, the next review interval doubles. If you fail, the \
+         interval resets to the beginning. Always review right before you would otherwise \
+         forget, not before or after. This process continues indefinitely as long as the \
+         material stays relevant. Finally, keep track of your review history so you can audit \
+         the schedule.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ProcedureProcess
+    );
+
+    let sentence_count = source
+        .body
+        .as_deref()
+        .unwrap_or_default()
+        .split(['.', '?', '!'])
+        .filter(|sentence| sentence.split_whitespace().count() >= 3)
+        .count();
+    assert!(
+        sentence_count > 3,
+        "fixture must outnumber the fewer-better cap to be a meaningful regression guard: \
+         {sentence_count} sentences"
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("non-list procedure generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::ProcedureProcess)
+    );
+    assert!(
+        drafts.candidates.len() <= 3,
+        "non-list process prose must stay bounded by the fewer-better fallback cap, not scale \
+         with sentence count: got {} candidates from {sentence_count} sentences",
+        drafts.candidates.len()
+    );
+    assert!(
+        drafts.candidates.len() < sentence_count,
+        "candidate count must not track one-per-sentence: {} candidates for {sentence_count} \
+         sentences",
+        drafts.candidates.len()
+    );
+}
+
+#[test]
+fn explicit_poem_intent_outranks_generic_list_shape() {
+    let source = source_document(
+        "src-oath-list",
+        "Recite this oath",
+        "- We stand together.\n- We keep our word.\n- We serve with care.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::VerbatimMemorization
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("oath generation");
+    assert_eq!(
+        drafts.learning_intent,
+        Some(LearningIntent::VerbatimMemorization)
+    );
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "- We stand together.",
+            "- We keep our word.",
+            "- We serve with care."
+        ]
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_kind == GeneratedLearningActivityKind::Exercise));
+}
+
+#[test]
+fn finite_sets_with_weak_process_words_keep_enumerable_semantics() {
+    let source = source_document(
+        "src-planets",
+        "The first three planets",
+        "1. Mercury\n2. Venus\n3. Earth",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::EnumerableSet
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("finite-set generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 3);
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_stage == "production-recall"));
+}
+
+#[test]
+fn two_entry_finite_mappings_receive_exhaustive_enumerable_coverage() {
+    let source = source_document(
+        "src-binary-toggle",
+        "Binary toggle states",
+        "0 is off. 1 is on.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::EnumerableSet,
+        "a two-entry key-to-value mapping is still a finite, non-derivable set"
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("two-entry mapping generation");
+    assert_eq!(drafts.learning_intent, Some(LearningIntent::EnumerableSet));
+    assert_eq!(drafts.candidates.len(), 2);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        ["off", "on"]
+    );
+}
+
+#[test]
+fn conceptual_prose_with_collision_substrings_is_not_misclassified_as_verbatim() {
+    // "universe" and "diverse" contain "verse"; "quoted" contains "quote".
+    // A naive substring check on the verbatim keyword gate would wrongly
+    // force recitation cards onto this ordinary conceptual paragraph.
+    let source = source_document(
+        "src-universe-concept",
+        "Diverse views of the universe",
+        "The universe contains diverse galaxies. Philosophers argue that quoted prose about \
+         physics helps students grasp the underlying principle without needing memorization.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::ConceptUnderstanding,
+        "substrings like universe/diverse/quoted must not trip the verbatim keyword gate"
+    );
+
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("conceptual generation");
+    assert_ne!(
+        drafts.learning_intent,
+        Some(LearningIntent::VerbatimMemorization)
+    );
+    assert!(drafts
+        .candidates
+        .iter()
+        .all(|candidate| candidate.activity_kind != GeneratedLearningActivityKind::Exercise));
+}
+
+#[test]
+fn sequential_sources_emit_one_verbatim_card_per_sentence() {
+    let source = source_document(
+        "src-sequence",
+        "A quoted oath excerpt",
+        "First faithful line. Second faithful line. Third faithful line.",
+    );
+
+    assert_eq!(
+        classify_learning_intent(&source).intent,
+        LearningIntent::VerbatimMemorization
+    );
+    let drafts = FakeModelProvider
+        .generate_drafts(&source)
+        .expect("sequential generation");
+
+    assert_eq!(drafts.candidates.len(), 3);
+    assert_eq!(
+        drafts
+            .candidates
+            .iter()
+            .map(|candidate| candidate.answer.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "First faithful line.",
+            "Second faithful line.",
+            "Third faithful line."
+        ]
+    );
+    assert!(drafts.candidates.iter().all(|candidate| {
+        candidate.activity_kind == GeneratedLearningActivityKind::Exercise
+            && candidate.worked_solution.is_some()
+            && candidate.evidence.as_deref()
+                == Some("First faithful line. Second faithful line. Third faithful line.")
+    }));
+    assert_eq!(drafts.candidates[0].activity_stage, "free-recall");
+    assert!(drafts.candidates[1..]
+        .iter()
+        .all(|candidate| candidate.activity_stage == "cued-recall"));
+    assert!(drafts.candidates[1]
+        .question
+        .contains("First faithful line."));
+}
+
+#[test]
 fn verbatim_intent_persists_recitation_prompt_ladder() {
     let directory = TempDirectory::new("verbatim-recitation");
     let path = directory.path().join("store.json");
@@ -287,6 +670,41 @@ fn verbatim_intent_persists_recitation_prompt_ladder() {
         "verbatim sources must not become MC trivia: {:?}",
         snapshot.generated_prompt_drafts
     );
+
+    let free_recall = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.activity_stage == "free-recall")
+        .expect("free-recall draft");
+    let exact_prompt = match &free_recall.prompt {
+        Prompt::Exact(prompt) => prompt,
+        other => panic!("unexpected verbatim prompt: {other:?}"),
+    };
+    let accepted_answer = exact_prompt.accepted_answers[0].clone();
+    let grader = Grader::new();
+    let context = GradeContext {
+        response_time_ms: 5_100,
+        prior_reps: 0,
+    };
+    assert_eq!(
+        grader
+            .grade(&free_recall.prompt, &accepted_answer, context)
+            .verdict,
+        Verdict::Correct
+    );
+    for (label, submission) in [
+        ("case", accepted_answer.to_lowercase()),
+        ("punctuation", format!("{accepted_answer}!")),
+        ("word", accepted_answer.replacen("thing", "things", 1)),
+    ] {
+        assert_ne!(
+            grader
+                .grade(&free_recall.prompt, &submission, context)
+                .verdict,
+            Verdict::Correct,
+            "{label} deviation must not be correct"
+        );
+    }
 }
 
 #[test]
@@ -580,6 +998,110 @@ fn prose_repair_stays_with_the_model_fallback() {
 }
 
 #[test]
+fn verbatim_repair_reapplies_policy_and_recitation_intent() {
+    struct RepairingVerbatim {
+        repaired: Cell<bool>,
+    }
+
+    impl DraftProvider for RepairingVerbatim {
+        fn model(&self) -> GeneratedPromptModel {
+            test_model("repairing-verbatim")
+        }
+
+        fn generate_drafts(
+            &self,
+            _source: &SourceDocument,
+        ) -> Result<ProviderDrafts, ProviderFailure> {
+            Ok(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: "wrong provider shape".to_owned(),
+                    question: "What should be repaired?".to_owned(),
+                    answer: "the exact source".to_owned(),
+                    evidence: Some("fabricated evidence".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition".to_owned(),
+                    unsupported: false,
+                }],
+                failures: Vec::new(),
+                usage: None,
+            })
+        }
+
+        fn repair_drafts(
+            &self,
+            _source: &SourceDocument,
+            _rejections: &[DraftRejection],
+        ) -> Result<Option<ProviderDrafts>, ProviderFailure> {
+            self.repaired.set(true);
+            Ok(Some(ProviderDrafts {
+                model: self.model(),
+                learning_intent: None,
+                candidates: vec![DraftCandidate {
+                    index: 1,
+                    concept: "repair shape".to_owned(),
+                    question: "Recite the repaired line exactly.".to_owned(),
+                    answer: "Alpha line.".to_owned(),
+                    evidence: Some("Alpha line.".to_owned()),
+                    distractors: Vec::new(),
+                    worked_solution: Some("The exact source line is: Alpha line.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "free-recall".to_owned(),
+                    unsupported: false,
+                }],
+                failures: Vec::new(),
+                usage: None,
+            }))
+        }
+    }
+
+    let directory = TempDirectory::new("verbatim-repair-policy");
+    let mut store = BetaPersistenceStore::open(directory.path().join("store.json")).expect("store");
+    store
+        .save_source_document(source_document(
+            "src-verbatim-repair",
+            "Source text verbatim",
+            "Alpha line.\nBeta line.\nGamma line.",
+        ))
+        .expect("source");
+    let provider = RepairingVerbatim {
+        repaired: Cell::new(false),
+    };
+
+    let result = run_beta_generation_with_provider(
+        &mut store,
+        &provider,
+        request("run-verbatim-repair", "src-verbatim-repair"),
+    )
+    .expect("generation");
+
+    assert!(
+        provider.repaired.get(),
+        "verbatim rejection must enter repair"
+    );
+    assert_eq!(result.accepted_draft_ids.len(), 2);
+    let drafts = store.snapshot().generated_prompt_drafts;
+    assert_eq!(
+        drafts.len(),
+        4,
+        "three policy drafts plus one repaired draft"
+    );
+    assert!(
+        drafts.iter().all(|draft| {
+            matches!(
+                &draft.prompt,
+                Prompt::Exact(exact) if exact.kind == ExactPromptKind::Recitation
+            )
+        }),
+        "initial and repaired verbatim drafts must retain Recitation intent"
+    );
+}
+
+#[test]
 fn fallback_stamps_drafts_with_the_provider_that_actually_ran() {
     let directory = TempDirectory::new("fallback-attribution");
     let mut store = open_store_with_prose(&directory);
@@ -650,6 +1172,7 @@ fn request(run_id: &str, source_id: &str) -> BetaGenerationRequest {
         completed_at: Some(NOW + 1_000),
         default_due: NOW - 60_000,
         model: None,
+        pending: false,
     }
 }
 

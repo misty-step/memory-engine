@@ -4,16 +4,13 @@
 //! for the env var names, on-disk format, and default file path, so
 //! `memory-engine-review login` and this server agree on one account without
 //! manual copying. There is no interactive `login` subcommand: stdin is the
-//! JSON-RPC channel, not a terminal. A brand-new local server bootstraps its
-//! own account non-interactively from `MEMORY_ENGINE_MCP_EMAIL` instead.
-//! There is no silent in-memory fallback — if none of the three paths below
-//! resolve, the server fails loudly at startup rather than guessing.
+//! JSON-RPC channel, not a terminal, and there is no anonymous bootstrap —
+//! credentials must be provisioned through invite or operator
+//! service-session flows. There is no silent in-memory fallback either — if
+//! none of the credential paths below resolve, the server fails loudly at
+//! startup rather than guessing or minting an account.
 
-use memory_engine_credentials::{
-    env_session, read_credentials, write_credentials, StoredCredentials, DEFAULT_BASE_URL,
-};
-
-use crate::client;
+use memory_engine_credentials::{env_session, read_credentials, DEFAULT_BASE_URL};
 
 pub use memory_engine_credentials::{Session, OPERATOR_ORIGIN_FALLBACK_BASE_URL};
 
@@ -21,18 +18,17 @@ pub use memory_engine_credentials::{Session, OPERATOR_ORIGIN_FALLBACK_BASE_URL};
 /// `MEMORY_ENGINE_SESSION_TOKEN` env vars, then the shared credentials file
 /// (migrating a legacy per-client file into it first if the shared file is
 /// missing — see
-/// `memory_engine_credentials::resolve_default_credentials_path`), then a
-/// fresh account created from `MEMORY_ENGINE_MCP_EMAIL` (persisted to the
-/// shared file for reuse across restarts). The shared path is resolved
-/// lazily, after the env-var check: a caller relying on
-/// `MEMORY_ENGINE_ACCOUNT_ID`/`MEMORY_ENGINE_SESSION_TOKEN` never touches
-/// (or migrates) any file on disk.
+/// `memory_engine_credentials::resolve_default_credentials_path`). The
+/// shared path is resolved lazily, after the env-var check: a caller relying
+/// on `MEMORY_ENGINE_ACCOUNT_ID`/`MEMORY_ENGINE_SESSION_TOKEN` never touches
+/// (or migrates) any file on disk. Credentials must be pre-provisioned
+/// through an invite or operator service-session flow; there is no
+/// anonymous bootstrap.
 ///
 /// # Errors
 ///
 /// Returns an error describing every path that was tried when none
-/// resolves, when a legacy migration conflict is found, or when account
-/// creation fails.
+/// resolves, or when a legacy migration conflict is found.
 pub fn resolve() -> Result<Session, String> {
     let base_url_override = memory_engine_credentials::non_empty_env("MEMORY_ENGINE_MCP_BASE_URL");
 
@@ -50,31 +46,12 @@ pub fn resolve() -> Result<Session, String> {
         });
     }
 
-    if let Some(email) = memory_engine_credentials::non_empty_env("MEMORY_ENGINE_MCP_EMAIL") {
-        let base_url = base_url_override.unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-        let created = client::create_account(&base_url, &email)?;
-        write_credentials(
-            &credentials_path,
-            &StoredCredentials {
-                base_url: base_url.clone(),
-                account_id: created.account_id.clone(),
-                session_token: created.session_token.clone(),
-            },
-        )?;
-        return Ok(Session {
-            base_url,
-            account_id: created.account_id,
-            session_token: created.session_token,
-        });
-    }
-
     Err(format!(
-        "no memory-engine credentials found. Set MEMORY_ENGINE_ACCOUNT_ID and \
-         MEMORY_ENGINE_SESSION_TOKEN (see docs/runbook.md), or a credentials file at {} \
-         (written by this server or `memory-engine-review login` — one shared file, no manual \
-         copying between clients), or MEMORY_ENGINE_MCP_EMAIL to bootstrap a fresh account. \
-         There is no in-memory fallback: a stdio MCP server that silently created and discarded \
-         an account would leave an agent believing its study state persisted when it did not.",
+        "no pre-provisioned memory-engine credentials found. Set MEMORY_ENGINE_ACCOUNT_ID and \
+         MEMORY_ENGINE_SESSION_TOKEN (see docs/runbook.md), or provide a credentials file at {} \
+         (written by `memory-engine-review login` or an operator-managed provisioning step — \
+         one shared file, no manual copying between clients). Anonymous account creation is \
+         disabled; there is no in-memory fallback.",
         credentials_path.display()
     ))
 }
@@ -84,6 +61,8 @@ pub use memory_engine_credentials::default_credentials_path;
 #[cfg(test)]
 mod tests {
     use std::{env, fs, path::PathBuf, sync::Mutex};
+
+    use memory_engine_credentials::{write_credentials, StoredCredentials};
 
     use super::*;
 
@@ -123,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fails_loudly_with_no_credentials_and_no_bootstrap_email() {
+    fn resolve_fails_loudly_with_no_preprovisioned_credentials() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -132,22 +111,22 @@ mod tests {
 
         env::remove_var("MEMORY_ENGINE_ACCOUNT_ID");
         env::remove_var("MEMORY_ENGINE_SESSION_TOKEN");
-        env::remove_var("MEMORY_ENGINE_MCP_EMAIL");
 
         let error = resolve().expect_err("must fail without any credential path");
         env::remove_var("MEMORY_ENGINE_HOME");
-        assert!(error.contains("no memory-engine credentials found"));
+        assert!(error.contains("no pre-provisioned memory-engine credentials found"));
     }
 
     #[test]
-    fn resolve_migrates_a_legacy_mcp_credentials_file_before_falling_back_to_email_bootstrap() {
-        // The sharper regression this closes: an MCP host upgraded with
-        // MEMORY_ENGINE_MCP_EMAIL still set (the documented setup) and a
-        // pre-existing legacy `mcp/credentials.json` must keep resolving to
-        // that same account, not silently bootstrap a brand-new one and
-        // make the agent's prior study state appear to vanish. A garbage
-        // base url guards against ever reaching a real network call if
-        // migration regresses and bootstrap is (wrongly) attempted.
+    fn resolve_migrates_a_legacy_mcp_credentials_file_before_any_other_resolution() {
+        // The regression this closes: an MCP host with a stale
+        // MEMORY_ENGINE_MCP_EMAIL still set from before anonymous account
+        // creation was removed, and a pre-existing legacy
+        // `mcp/credentials.json`, must keep resolving to that migrated
+        // account rather than treating the leftover env var as meaningful.
+        // A garbage base url guards against ever reaching a real network
+        // call if migration regresses and some future code path started
+        // consulting MEMORY_ENGINE_MCP_EMAIL again.
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

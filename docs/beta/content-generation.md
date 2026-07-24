@@ -35,7 +35,7 @@ QA spine that real provider calls must satisfy later.
 7. Save generated drafts with source ids and/or concept reference note keys,
    reference span ids when source evidence exists, activity kind, activity
    stage, validation status, critique notes, and optional worked solution.
-8. Approve only accepted drafts into review units consumed by the existing
+8. Keep or edit accepted drafts into review units consumed by the existing
    service, queue, and scheduling path.
 9. For review escape hatches, cache provider-written `ConceptReferenceNote`
    records by concept key. Source-backed reference views use `ReferenceSpan`

@@ -30,20 +30,19 @@ use memory_engine_api_render::{
     render_auth_recovery, render_content_feedback_recovery_html,
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
-    LEDGER_CSS,
+    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
+    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
+    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
-    client_rate_limit_key, csrf_token, html_with_browser_session,
-    html_with_cleared_browser_session, normalize_email, read_session_token,
-    report_submit_browser_performance, report_submit_server_performance, AccountCreated,
-    ApiFailure, ApiState, AppAccount, ContentFeedbackRequest, CreateAccountRequest,
-    CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
-    InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
-    ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
-    StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
-    SubmitViewport, WaitlistEntry,
+    csrf_token, html_with_browser_session, html_with_cleared_browser_session, normalize_email,
+    read_session_token, report_submit_browser_performance, report_submit_server_performance,
+    AccountCreated, ApiFailure, ApiState, AppAccount, BrowserSubmitReceipt, ContentFeedbackRequest,
+    CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome,
+    GenerationJob, HealthResponse, InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord,
+    ReadinessResponse, ScheduledReturnNotificationReport, SourceList, SourcePermission,
+    SourceRecord, StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest,
+    SubmitReviewTimings, SubmitViewport, WaitlistEntry,
 };
 
 #[cfg(test)]
@@ -53,11 +52,23 @@ pub(crate) struct V1ContractOperation {
     pub(crate) path: &'static str,
 }
 
+#[cfg(test)]
+macro_rules! single_operation {
+    ($method:literal, $path:expr) => {
+        &[V1ContractOperation {
+            method: $method,
+            path: $path,
+        }]
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum V1Route {
     OpenApi,
     Accounts,
     ServiceSessions,
+    ApiSessionRevoke,
+    ApiSessionsRevokeAll,
     Sources,
     Source,
     ProjectDecks,
@@ -66,7 +77,9 @@ enum V1Route {
     Generate,
     GenerationJobs,
     GenerationJob,
-    Approve,
+    Keep,
+    EditDraft,
+    RejectDraft,
     Next,
     Reveal,
     Reference,
@@ -81,6 +94,8 @@ const V1_OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.v1.json");
 const V1_OPENAPI_PATH: &str = "/v1/openapi.json";
 const V1_ACCOUNTS_PATH: &str = "/v1/accounts";
 const V1_SERVICE_SESSIONS_PATH: &str = "/v1/service-sessions";
+const V1_API_SESSION_REVOKE_PATH: &str = "/v1/accounts/{account_id}/service-sessions/current";
+const V1_API_SESSIONS_REVOKE_ALL_PATH: &str = "/v1/accounts/{account_id}/service-sessions/all";
 const V1_SOURCES_PATH: &str = "/v1/accounts/{account_id}/sources";
 const V1_SOURCE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}";
 const V1_PROJECT_DECKS_PATH: &str = "/v1/accounts/{account_id}/project-decks";
@@ -90,7 +105,9 @@ const V1_GENERATE_PATH: &str = "/v1/accounts/{account_id}/sources/{source_id}/ge
 const V1_GENERATION_JOBS_PATH: &str =
     "/v1/accounts/{account_id}/sources/{source_id}/generation-jobs";
 const V1_GENERATION_JOB_PATH: &str = "/v1/accounts/{account_id}/generation-jobs/{job_id}";
-const V1_APPROVE_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/approve";
+const V1_KEEP_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/keep";
+const V1_EDIT_DRAFT_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/edit";
+const V1_REJECT_DRAFT_PATH: &str = "/v1/accounts/{account_id}/drafts/{draft_id}/reject";
 const V1_NEXT_PATH: &str = "/v1/accounts/{account_id}/review/next";
 const V1_REVEAL_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reveal";
 const V1_REFERENCE_PATH: &str = "/v1/accounts/{account_id}/review/{review_unit_id}/reference";
@@ -107,6 +124,8 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::OpenApi,
     V1Route::Accounts,
     V1Route::ServiceSessions,
+    V1Route::ApiSessionRevoke,
+    V1Route::ApiSessionsRevokeAll,
     V1Route::Sources,
     V1Route::Source,
     V1Route::ProjectDecks,
@@ -114,7 +133,9 @@ const V1_ROUTES: &[V1Route] = &[
     V1Route::Generate,
     V1Route::GenerationJobs,
     V1Route::GenerationJob,
-    V1Route::Approve,
+    V1Route::Keep,
+    V1Route::EditDraft,
+    V1Route::RejectDraft,
     V1Route::Next,
     V1Route::Reveal,
     V1Route::Reference,
@@ -166,6 +187,13 @@ struct EnqueuedGenerationJobResource {
     coalesced: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditDraftRequest {
+    prompt: String,
+    expected_answer: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AnalyticsQuery {
     filter: Option<String>,
@@ -202,6 +230,13 @@ impl V1Route {
             Self::ServiceSessions => {
                 router.route(V1_SERVICE_SESSIONS_PATH, post(issue_service_session))
             }
+            Self::ApiSessionRevoke => {
+                router.route(V1_API_SESSION_REVOKE_PATH, delete(revoke_api_session))
+            }
+            Self::ApiSessionsRevokeAll => router.route(
+                V1_API_SESSIONS_REVOKE_ALL_PATH,
+                delete(revoke_all_api_sessions),
+            ),
             Self::Sources => router.route(V1_SOURCES_PATH, get(list_sources).post(create_source)),
             Self::Source => router.route(
                 V1_SOURCE_PATH,
@@ -217,7 +252,9 @@ impl V1Route {
                 router.route(V1_GENERATION_JOBS_PATH, post(enqueue_generation_job))
             }
             Self::GenerationJob => router.route(V1_GENERATION_JOB_PATH, get(get_generation_job)),
-            Self::Approve => router.route(V1_APPROVE_PATH, post(approve_draft)),
+            Self::Keep => router.route(V1_KEEP_PATH, post(keep_draft)),
+            Self::EditDraft => router.route(V1_EDIT_DRAFT_PATH, post(edit_draft)),
+            Self::RejectDraft => router.route(V1_REJECT_DRAFT_PATH, post(reject_draft)),
             Self::Next => router.route(V1_NEXT_PATH, post(next_review)),
             Self::Reveal => router.route(V1_REVEAL_PATH, post(reveal_review)),
             Self::Reference => router.route(V1_REFERENCE_PATH, post(reference_review)),
@@ -233,20 +270,16 @@ impl V1Route {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
     fn operations(self) -> &'static [V1ContractOperation] {
         match self {
-            Self::OpenApi => &[V1ContractOperation {
-                method: "GET",
-                path: V1_OPENAPI_PATH,
-            }],
-            Self::Accounts => &[V1ContractOperation {
-                method: "POST",
-                path: V1_ACCOUNTS_PATH,
-            }],
-            Self::ServiceSessions => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SERVICE_SESSIONS_PATH,
-            }],
+            Self::OpenApi => single_operation!("GET", V1_OPENAPI_PATH),
+            Self::Accounts => single_operation!("POST", V1_ACCOUNTS_PATH),
+            Self::ServiceSessions => single_operation!("POST", V1_SERVICE_SESSIONS_PATH),
+            Self::ApiSessionRevoke => single_operation!("DELETE", V1_API_SESSION_REVOKE_PATH),
+            Self::ApiSessionsRevokeAll => {
+                single_operation!("DELETE", V1_API_SESSIONS_REVOKE_ALL_PATH)
+            }
             Self::Sources => &[
                 V1ContractOperation {
                     method: "GET",
@@ -267,66 +300,25 @@ impl V1Route {
                     path: V1_SOURCE_PATH,
                 },
             ],
-            Self::ProjectDecks => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECKS_PATH,
-            }],
-            Self::ProjectDeckInvalidate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_PROJECT_DECK_INVALIDATE_PATH,
-            }],
-            Self::Generate => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATE_PATH,
-            }],
-            Self::GenerationJobs => &[V1ContractOperation {
-                method: "POST",
-                path: V1_GENERATION_JOBS_PATH,
-            }],
-            Self::GenerationJob => &[V1ContractOperation {
-                method: "GET",
-                path: V1_GENERATION_JOB_PATH,
-            }],
-            Self::Approve => &[V1ContractOperation {
-                method: "POST",
-                path: V1_APPROVE_PATH,
-            }],
-            Self::Next => &[V1ContractOperation {
-                method: "POST",
-                path: V1_NEXT_PATH,
-            }],
-            Self::Reveal => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REVEAL_PATH,
-            }],
-            Self::Reference => &[V1ContractOperation {
-                method: "POST",
-                path: V1_REFERENCE_PATH,
-            }],
-            Self::Skip => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SKIP_PATH,
-            }],
-            Self::Snooze => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_PATH,
-            }],
-            Self::SnoozeConcept => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SNOOZE_CONCEPT_PATH,
-            }],
-            Self::Bridge => &[V1ContractOperation {
-                method: "POST",
-                path: V1_BRIDGE_PATH,
-            }],
-            Self::Submit => &[V1ContractOperation {
-                method: "POST",
-                path: V1_SUBMIT_PATH,
-            }],
-            Self::ContentFeedback => &[V1ContractOperation {
-                method: "POST",
-                path: V1_CONTENT_FEEDBACK_PATH,
-            }],
+            Self::ProjectDecks => single_operation!("POST", V1_PROJECT_DECKS_PATH),
+            Self::ProjectDeckInvalidate => {
+                single_operation!("POST", V1_PROJECT_DECK_INVALIDATE_PATH)
+            }
+            Self::Generate => single_operation!("POST", V1_GENERATE_PATH),
+            Self::GenerationJobs => single_operation!("POST", V1_GENERATION_JOBS_PATH),
+            Self::GenerationJob => single_operation!("GET", V1_GENERATION_JOB_PATH),
+            Self::Keep => single_operation!("POST", V1_KEEP_PATH),
+            Self::EditDraft => single_operation!("POST", V1_EDIT_DRAFT_PATH),
+            Self::RejectDraft => single_operation!("POST", V1_REJECT_DRAFT_PATH),
+            Self::Next => single_operation!("POST", V1_NEXT_PATH),
+            Self::Reveal => single_operation!("POST", V1_REVEAL_PATH),
+            Self::Reference => single_operation!("POST", V1_REFERENCE_PATH),
+            Self::Skip => single_operation!("POST", V1_SKIP_PATH),
+            Self::Snooze => single_operation!("POST", V1_SNOOZE_PATH),
+            Self::SnoozeConcept => single_operation!("POST", V1_SNOOZE_CONCEPT_PATH),
+            Self::Bridge => single_operation!("POST", V1_BRIDGE_PATH),
+            Self::Submit => single_operation!("POST", V1_SUBMIT_PATH),
+            Self::ContentFeedback => single_operation!("POST", V1_CONTENT_FEEDBACK_PATH),
         }
     }
 }
@@ -377,6 +369,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
+        .route("/app/logout-all", post(logout_all_app_sessions))
         .route(
             "/app/return-notifications",
             get(return_notification_page).post(update_return_notifications),
@@ -390,6 +383,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/jobs/events", get(app_jobs_events))
         .route("/app/jobs/retry", post(retry_app_job))
         .route("/app/next", post(next_app_review))
+        .route("/app/draft/keep", post(keep_app_draft))
+        .route("/app/draft/edit", post(edit_app_draft))
+        .route("/app/draft/reject", post(reject_app_draft))
         .route("/app/reveal", post(reveal_app_review))
         .route("/app/reference", post(reference_app_review))
         .route("/app/skip", post(skip_app_review))
@@ -418,8 +414,16 @@ pub fn router(state: ApiState) -> Router {
             post(generate_source),
         )
         .route(
-            "/accounts/{account_id}/drafts/{draft_id}/approve",
-            post(approve_draft),
+            "/accounts/{account_id}/drafts/{draft_id}/keep",
+            post(keep_draft),
+        )
+        .route(
+            "/accounts/{account_id}/drafts/{draft_id}/edit",
+            post(edit_draft),
+        )
+        .route(
+            "/accounts/{account_id}/drafts/{draft_id}/reject",
+            post(reject_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
     mount_review_routes(router).with_state(state)
@@ -585,18 +589,24 @@ async fn app_analytics(
 
 async fn create_account(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountCreated>), ApiFailure> {
     let email = normalize_email(&request.email)
         .ok_or_else(|| ApiFailure::bad_request("Account email must contain one @ and a domain."))?;
-    let account = state.create_account(&email)?;
+    let account = if state.anonymous_account_creation_allowed() {
+        state.create_account(&email)?
+    } else {
+        let admin_token = admin_token_from_headers(&headers);
+        state.issue_service_session(admin_token, &email)?
+    };
 
     Ok((StatusCode::CREATED, Json(account)))
 }
 
-/// Issue (or rotate) an account-scoped service-session credential for a
-/// machine consumer. Gated by the operator admin token; reissue revokes the
-/// prior credential immediately.
+/// Issue an independent account-scoped service-session credential for a
+/// machine consumer. Gated by the operator admin token; callers can revoke one
+/// credential or all credentials through the explicit DELETE routes.
 ///
 /// The admin token is verified before the body is deserialized, so an
 /// unauthorized caller can never exercise the JSON parser on this
@@ -616,6 +626,26 @@ async fn issue_service_session(
     let account = state.issue_service_session(admin_token, &request.email)?;
 
     Ok((StatusCode::CREATED, Json(account)))
+}
+
+async fn revoke_api_session(
+    State(state): State<ApiState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.revoke_api_session(&account_id, session_token)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_all_api_sessions(
+    State(state): State<ApiState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    state.revoke_all_api_sessions(&account_id, session_token)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_source(
@@ -747,14 +777,42 @@ async fn update_source_permission(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn approve_draft(
+async fn keep_draft(
     State(state): State<ApiState>,
     Path((account_id, draft_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<StudyViewResponse>, ApiFailure> {
     let session_token = read_session_token(&headers)?;
+    Ok(Json(state.keep_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+    )?))
+}
 
-    Ok(Json(state.approve_draft(
+async fn edit_draft(
+    State(state): State<ApiState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<EditDraftRequest>,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    Ok(Json(state.edit_pending_draft(
+        &account_id,
+        session_token,
+        &draft_id,
+        &request.prompt,
+        &request.expected_answer,
+    )?))
+}
+
+async fn reject_draft(
+    State(state): State<ApiState>,
+    Path((account_id, draft_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<StudyViewResponse>, ApiFailure> {
+    let session_token = read_session_token(&headers)?;
+    Ok(Json(state.reject_pending_draft(
         &account_id,
         session_token,
         &draft_id,
@@ -961,6 +1019,22 @@ struct AppJobActionForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
+struct AppDraftActionForm {
+    csrf_token: Option<String>,
+    draft_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppDraftEditForm {
+    csrf_token: Option<String>,
+    draft_id: String,
+    prompt: String,
+    expected_answer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 struct AppReviewActionForm {
     csrf_token: Option<String>,
     review_unit_id: String,
@@ -1036,7 +1110,7 @@ async fn create_app_account(
 
     no_store_response(match result {
         Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
-        Err(error) => app_failure_response(error),
+        Err(error) => app_failure_response(&error),
     })
 }
 
@@ -1049,8 +1123,33 @@ async fn create_app_waitlist(
 
     no_store_response(match result {
         Ok(()) => Html(render_waitlist_joined()).into_response(),
-        Err(error) => app_failure_response(error),
+        Err(error) => waitlist_failure_response(&error),
     })
+}
+
+fn waitlist_failure_response(error: &ApiFailure) -> Response {
+    let status = match error.status() {
+        StatusCode::BAD_REQUEST => StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let (title, message) = match status {
+        StatusCode::BAD_REQUEST => (
+            "Check the email address",
+            "That email address is not valid. Check it and try again.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Please try again later",
+            "We’re taking a short break from new joins. Please wait a little while, then try again.",
+        ),
+        _ => (
+            "We couldn’t save that",
+            "We couldn’t save your request right now. Please try again shortly.",
+        ),
+    };
+    let mut response = Html(render_waitlist_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    response
 }
 
 fn admin_token_from_headers(headers: &HeaderMap) -> &str {
@@ -1158,9 +1257,10 @@ async fn delete_waitlist(
 
 async fn verify_app_login(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<AppLoginVerifyQuery>,
 ) -> Response {
-    match state.verify_magic_link(&query.token) {
+    match state.verify_magic_link_for_client(&query.token, &client_rate_limit_key(&headers)) {
         Ok(account) => {
             let view = state.app_study_view(&account).ok();
             no_store_response(html_with_browser_session(
@@ -1178,7 +1278,7 @@ async fn verify_app_login(
             *response.status_mut() = status;
             no_store_response(response)
         }
-        Err(error) => no_store_response(app_failure_response(error)),
+        Err(error) => no_store_response(app_failure_response(&error)),
     }
 }
 
@@ -1203,7 +1303,7 @@ async fn return_notification_page(
     Query(query): Query<AppReturnNotificationQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> Result<Response, ApiFailure> {
         if let Some(token) = query.token.as_deref() {
             state.validate_return_notification_token(token)?;
             return Ok(no_store_response(
@@ -1218,11 +1318,30 @@ async fn return_notification_page(
     .await;
     match result {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => no_store_response(app_failure_response(error)),
-        Err(error) => no_store_response(app_failure_response(ApiFailure::internal(format!(
+        Ok(Err(error)) if error.is_return_notification_link_invalid() => {
+            return_notification_token_recovery_response(&error)
+        }
+        Ok(Err(error)) => no_store_response(app_failure_response(&error)),
+        Err(error) => no_store_response(app_failure_response(&ApiFailure::internal(format!(
             "notification page worker join failed: {error}"
         )))),
     }
+}
+
+/// Style a return-notification (due-count reminder) token failure as a
+/// direct recovery page instead of the raw JSON `app_failure_response`
+/// would otherwise render. This route is reached straight from an emailed
+/// link, never through the authenticated app shell, so there is no session
+/// to recover — the only safe next action is back to the study space.
+fn return_notification_token_recovery_response(error: &ApiFailure) -> Response {
+    let status = error.status();
+    let mut response = Html(render_return_notification_recovery(
+        "That reminder link needs a refresh",
+        &error.message,
+    ))
+    .into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
 }
 
 async fn update_return_notifications(
@@ -1244,13 +1363,16 @@ async fn update_return_notifications(
             .and_then(|result| result);
         return no_store_response(match result {
             Ok(()) => Html(render_return_notification_disabled()).into_response(),
-            Err(error) => app_failure_response(error),
+            Err(error) if error.is_return_notification_link_invalid() => {
+                return_notification_token_recovery_response(&error)
+            }
+            Err(error) => app_failure_response(&error),
         });
     }
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return no_store_response(app_failure_response(error)),
+            Err(error) => return no_store_response(app_failure_response(&error)),
         };
     let enabled = form.enabled.as_deref() == Some("on");
     let reminder_email = form.reminder_email.clone();
@@ -1292,7 +1414,18 @@ async fn logout_app_session(
 ) -> Response {
     match state.revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
         Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
-        Err(error) => app_failure_response(error),
+        Err(error) => app_failure_response(&error),
+    }
+}
+
+async fn logout_all_app_sessions(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppAccountActionForm>,
+) -> Response {
+    match state.revoke_all_browser_sessions(&headers, csrf_token(form.csrf_token.as_ref())) {
+        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
+        Err(error) => app_failure_response(&error),
     }
 }
 
@@ -1304,7 +1437,7 @@ async fn save_app_account(
     let source_account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let source_view = state.app_study_view(&source_account).ok();
     let result = normalize_email(&form.email)
@@ -1315,7 +1448,7 @@ async fn save_app_account(
         Ok(account) => {
             let account = match state.create_browser_session(&account) {
                 Ok(account) => account,
-                Err(error) => return app_failure_response(error),
+                Err(error) => return app_failure_response(&error),
             };
             let view = state.app_study_view(&account).ok().or(source_view);
             html_with_browser_session(
@@ -1337,8 +1470,16 @@ async fn start_app_study(
     State(state): State<ApiState>,
     Form(form): Form<AppStartForm>,
 ) -> Response {
-    let email = format!("guest-{:032x}@memory-engine.local", rand::random::<u128>());
-    let account = match state.create_account(&email) {
+    if !state.anonymous_account_creation_allowed() {
+        let mut response = Html(render_auth_recovery(
+            "Sign-in required",
+            "Guest study spaces are disabled here. Request an invite link to continue.",
+        ))
+        .into_response();
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return no_store_response(response);
+    }
+    let account = match state.create_guest_account() {
         Ok(account) => account,
         Err(error) => {
             return Html(render_app_shell(None, &[], None, &[], Some(&error.message)))
@@ -1347,7 +1488,7 @@ async fn start_app_study(
     };
     let account = match state.create_browser_session(&account) {
         Ok(account) => account,
-        Err(error) => return app_failure_response(error),
+        Err(error) => return app_failure_response(&error),
     };
     let result = state.save_app_source(
         &account,
@@ -1368,7 +1509,7 @@ async fn create_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.save_app_source(
         &account,
@@ -1395,7 +1536,7 @@ async fn capture_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let request = capture_request(form.title, form.body, form.capture, form.permission);
     let notice = match state.save_app_source(&account, &request) {
@@ -1470,7 +1611,7 @@ async fn generate_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let title = state
         .list_app_sources(&account)
@@ -1499,7 +1640,7 @@ async fn archive_app_source(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.archive_app_source(&account, &form.source_id);
 
@@ -1537,7 +1678,7 @@ async fn update_app_source_permission(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     match state.update_app_source_permission(&account, &form.source_id, form.permission) {
         Ok(()) => Html(render_account_page(
@@ -1567,7 +1708,7 @@ async fn retry_app_job(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let notice = if state.retry_generation_job(&account, &form.job_id) {
         "Retrying. Generating again in the background."
@@ -1584,7 +1725,7 @@ async fn retry_app_job(
 async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
-        Err(error) => return app_failure_response(error),
+        Err(error) => return app_failure_response(&error),
     };
     let account_id = account.account_id().to_owned();
     // `tokio_stream::StreamExt::filter_map` is synchronous: the closure returns
@@ -1621,6 +1762,92 @@ async fn static_app_js() -> impl IntoResponse {
     )
 }
 
+async fn keep_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(&error),
+        };
+    let result = state.keep_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn edit_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftEditForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(&error),
+        };
+    let result = state.edit_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+        &form.prompt,
+        &form.expected_answer,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn reject_app_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Form(form): Form<AppDraftActionForm>,
+) -> Response {
+    let account =
+        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
+            Ok(account) => account,
+            Err(error) => return app_failure_response(&error),
+        };
+    let result = state.reject_pending_draft(
+        account.account_id(),
+        account.session_token(),
+        &form.draft_id,
+    );
+    match result {
+        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Err(error) => {
+            let status = error.status();
+            (
+                status,
+                Html(render_action_result_html(&state, &account, Err(error))),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn next_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1629,25 +1856,51 @@ async fn next_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.next_app_review(&account);
 
     Html(render_action_result_html(&state, &account, result)).into_response()
 }
 
-fn app_failure_response(error: ApiFailure) -> Response {
-    if error.is_session_expired() {
-        let status = error.status();
-        let mut response = Html(render_auth_recovery(
+fn client_rate_limit_key(headers: &HeaderMap) -> String {
+    // DigitalOcean's edge overwrites this header from the accepted client's address before forwarding the request. Generic forwarding headers remain
+    // untrusted and are intentionally ignored. Missing edge identity is one
+    // deterministic bucket rather than an attacker-controlled bypass.
+    headers
+        .get("do-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| "unknown".to_owned(), str::to_owned)
+}
+
+fn app_failure_response(error: &ApiFailure) -> Response {
+    let status = error.status();
+    let (title, message) = if error.is_session_expired() {
+        (
             "Your session expired",
             "Your study data is safe. Sign in again to continue where you left off.",
-        ))
-        .into_response();
-        *response.status_mut() = status;
-        return no_store_response(response);
-    }
-    error.into_response()
+        )
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        (
+            "Please try again later",
+            "We’re taking a short break from sign-in attempts. Wait a little while, then request a fresh link.",
+        )
+    } else if error.is_magic_link_recovery() {
+        (
+            "Sign-in link expired",
+            "That link is no longer valid. Request a fresh link and return to your study space.",
+        )
+    } else {
+        (
+            "We couldn’t complete sign-in",
+            "We couldn’t complete that request. Request a fresh sign-in link and try again.",
+        )
+    };
+    let mut response = Html(render_auth_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
 }
 fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> Response {
     let mut response = Html(render_submit_recovery(title, message)).into_response();
@@ -1655,7 +1908,7 @@ fn submit_recovery_response(status: StatusCode, title: &str, message: &str) -> R
     no_store_response(response)
 }
 
-fn submit_failure_response(error: ApiFailure) -> Response {
+fn submit_failure_response(error: &ApiFailure) -> Response {
     if error.is_session_expired() {
         return app_failure_response(error);
     }
@@ -1684,7 +1937,7 @@ async fn reveal_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.reveal_app_review(&account, &form.review_unit_id);
 
@@ -1699,7 +1952,7 @@ async fn reference_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.learn_more_app_review(&account, &form.review_unit_id);
 
@@ -1714,7 +1967,7 @@ async fn skip_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
 
@@ -1729,7 +1982,7 @@ async fn delete_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.delete_app_review(&account, &form.review_unit_id);
 
@@ -1744,7 +1997,7 @@ async fn edit_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let view = match state.next_app_review(&account) {
         Ok(view) => view,
@@ -1768,7 +2021,7 @@ async fn save_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.edit_app_review(
         &account,
@@ -1798,7 +2051,7 @@ async fn snooze_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
 
@@ -1813,7 +2066,7 @@ async fn snooze_concept_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
@@ -1838,7 +2091,7 @@ async fn bridge_app_review(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let result = state.bridge_app_review(&account, &form.review_unit_id);
 
@@ -1877,8 +2130,8 @@ async fn submit_app_review(
     let form = match form {
         Ok(Form(form)) => form,
         Err(rejection) => {
-            let render_started = Instant::now();
             let status = rejection.into_response().status();
+            let render_started = Instant::now();
             let response = submit_recovery_response(
                 status,
                 "Review not submitted",
@@ -1924,6 +2177,7 @@ async fn submit_app_review(
                 Err(error) => submit_outcome(error.status()),
             };
             let render_started = Instant::now();
+            let postgres_before_render = postgres;
             let response = Html(render_submit_action_result_html(
                 &state,
                 &account,
@@ -1933,12 +2187,13 @@ async fn submit_app_review(
                 &mut postgres,
             ))
             .into_response();
-            (response, bounded_request_ms(render_started), outcome)
+            let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
+            (response, render_ms, outcome)
         }
         Err(error) => {
             let outcome = submit_outcome(error.status());
             let render_started = Instant::now();
-            let response = submit_failure_response(error);
+            let response = submit_failure_response(&error);
             (response, bounded_request_ms(render_started), outcome)
         }
     };
@@ -1996,36 +2251,37 @@ fn submit_response_headers(
     (response, total_ms)
 }
 
+/// Postgres connect/operation and render are measured as disjoint,
+/// sequential phases; each is independently clamped to at least 1ms
+/// (`bounded_request_ms`), so their raw values are never rescaled or
+/// otherwise fabricated here. A request whose wall-clock `total_ms` came in
+/// under that floor-clamped phase sum (only possible on extremely fast
+/// requests where every phase rounds up to the 1ms floor) has its `total_ms`
+/// raised to the true phase sum instead: the reported total must always
+/// honestly bound its own parts, and raising the coarser aggregate is honest
+/// where shrinking the measured parts to fit would not be. Deliberately no
+/// upper cap is applied after the raise: each phase is already independently
+/// clamped to at most `60_000ms` by `bounded_request_ms`/`bounded_elapsed_ms`,
+/// so a request-wide `.min(60_000)` here could put `total_ms` back *below*
+/// `phase_sum` on a genuinely slow request (e.g. connect + operation + render
+/// each near the 60s ceiling) — reintroducing the exact fabrication this
+/// function exists to prevent.
 fn normalize_submit_durations(
     total_ms: u64,
     postgres: SubmitReviewTimings,
     render_ms: u64,
 ) -> (u64, Option<u64>, Option<u64>, u64) {
-    let mut phases = [
+    let phases = [
         postgres.postgres_connect_ms(),
         postgres.postgres_operation_ms(),
         Some(render_ms),
     ];
-    let phase_count = u64::try_from(phases.iter().flatten().count()).unwrap_or(u64::MAX);
-    let total_ms = total_ms.max(phase_count).min(60_000);
     let phase_sum = phases
         .iter()
         .flatten()
         .copied()
         .fold(0_u64, u64::saturating_add);
-    if phase_sum > total_ms {
-        let flexible_total = total_ms.saturating_sub(phase_count);
-        let flexible_sum = phase_sum.saturating_sub(phase_count);
-        for duration in phases.iter_mut().flatten() {
-            let scaled = if flexible_sum == 0 {
-                0
-            } else {
-                let numerator = u128::from(duration.saturating_sub(1)) * u128::from(flexible_total);
-                u64::try_from(numerator / u128::from(flexible_sum)).unwrap_or(u64::MAX)
-            };
-            *duration = 1_u64.saturating_add(scaled);
-        }
-    }
+    let total_ms = total_ms.max(phase_sum);
 
     (total_ms, phases[0], phases[1], phases[2].unwrap_or(1))
 }
@@ -2042,6 +2298,45 @@ fn bounded_request_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis())
         .unwrap_or(u64::MAX)
         .clamp(1, 60_000)
+}
+
+/// Wall-clock render duration with any Postgres time recorded *during* the
+/// render call subtracted out.
+///
+/// `render_submit_action_result_html` (via `render_submit_account_page`)
+/// performs timed reads — `app_study_view_with_timings`,
+/// `list_app_sources_with_timings`, `jobs_for_app_account_with_timings` — on
+/// the error/empty-queue path, inside this same wall-clock window, while
+/// accumulating their milliseconds into the shared `SubmitReviewTimings`.
+/// Without subtracting that nested time back out, `normalize_submit_durations`
+/// would count it twice: once as `pgconnect`/`pgop`, once folded into
+/// `render`. `before`/`after` MUST be snapshots of the same accumulating
+/// timings taken immediately before and after the render call; both counters
+/// only ever grow, so the delta can never underflow.
+fn render_only_ms(
+    render_started: Instant,
+    before: SubmitReviewTimings,
+    after: SubmitReviewTimings,
+) -> u64 {
+    bounded_request_ms(render_started)
+        .saturating_sub(nested_postgres_delta_ms(before, after))
+        .max(1)
+}
+
+/// Postgres connect+operation milliseconds recorded strictly after `before`
+/// was captured, given both are snapshots of the same monotonically
+/// accumulating [`SubmitReviewTimings`].
+fn nested_postgres_delta_ms(before: SubmitReviewTimings, after: SubmitReviewTimings) -> u64 {
+    after
+        .postgres_connect_ms()
+        .unwrap_or_default()
+        .saturating_sub(before.postgres_connect_ms().unwrap_or_default())
+        .saturating_add(
+            after
+                .postgres_operation_ms()
+                .unwrap_or_default()
+                .saturating_sub(before.postgres_operation_ms().unwrap_or_default()),
+        )
 }
 
 fn submit_outcome(status: StatusCode) -> SubmitPerformanceOutcome {
@@ -2076,7 +2371,16 @@ async fn record_submit_browser_performance(
         BrowserSubmitViewport::Tablet => SubmitViewport::Tablet,
         BrowserSubmitViewport::Desktop => SubmitViewport::Desktop,
     };
-    report_submit_browser_performance(event.tap_to_ack_ms, event.graded_visible_ms, viewport);
+    report_submit_browser_performance(BrowserSubmitReceipt {
+        request_id: &event.request_id,
+        trace_id: &event.trace_id,
+        tap_to_ack_ms: event.tap_to_ack_ms,
+        request_to_response_ms: event.request_to_response_ms,
+        transfer_ms: event.transfer_ms,
+        navigation_ms: event.navigation_ms,
+        graded_visible_ms: event.graded_visible_ms,
+        viewport,
+    });
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2113,7 +2417,7 @@ fn render_content_feedback_follow_up_failure(
     error: ApiFailure,
 ) -> Response {
     if error.is_session_expired() {
-        return app_failure_response(error);
+        return app_failure_response(&error);
     }
     let status = error.status();
     let message = error.message;
@@ -2171,7 +2475,7 @@ pub(crate) fn render_content_feedback_persistence_failure(
     error: ApiFailure,
 ) -> Response {
     if error.is_session_expired() {
-        return app_failure_response(error);
+        return app_failure_response(&error);
     }
     let mut status = error.status();
     let mut message = error.message;
@@ -2234,7 +2538,7 @@ async fn record_app_content_feedback(
     let account =
         match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
             Ok(account) => account,
-            Err(error) => return app_failure_response(error),
+            Err(error) => return app_failure_response(&error),
         };
     let request = ContentFeedbackRequest {
         verdict: form.verdict,

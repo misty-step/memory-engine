@@ -12,7 +12,6 @@ fn refuses_to_start_without_any_credential_path() {
     let output = Command::new(binary)
         .env_remove("MEMORY_ENGINE_ACCOUNT_ID")
         .env_remove("MEMORY_ENGINE_SESSION_TOKEN")
-        .env_remove("MEMORY_ENGINE_MCP_EMAIL")
         .env("MEMORY_ENGINE_HOME", unique_missing_home())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -26,7 +25,7 @@ fn refuses_to_start_without_any_credential_path() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("MEMORY_ENGINE_ACCOUNT_ID") && stderr.contains("MEMORY_ENGINE_MCP_EMAIL"),
+        stderr.contains("MEMORY_ENGINE_ACCOUNT_ID") && stderr.contains("pre-provisioned"),
         "error must name the credential paths tried: {stderr}"
     );
     assert!(

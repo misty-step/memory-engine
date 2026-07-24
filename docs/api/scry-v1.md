@@ -1,7 +1,7 @@
 # Scry v1 API handoff
 
-`memory-engine` owns memory science: source ingestion, draft generation,
-review-unit approval, due queue selection, answer reveal, grading, scheduling,
+`memory-engine` owns memory science: source ingestion, draft generation, learner keep/edit/reject decisions,
+due queue selection, answer reveal, grading, scheduling,
 and source archival. Scry owns the product experience: account UI, study
 layout, navigation, copy, reminders, and client-side state.
 
@@ -12,8 +12,9 @@ HTML forms are not part of this contract. Token clients authenticate with:
 Authorization: Bearer <sessionToken>
 ```
 
-The session token comes from `POST /v1/accounts` or from a pre-provisioned
-account session. The token is secret; receipts and demos must never print it.
+The session token comes from an invite magic-link or an operator-issued
+pre-provisioned account session. The token is secret; receipts and demos must
+never print it. Anonymous account creation is not part of this contract.
 
 ## Contract Files
 
@@ -30,17 +31,20 @@ account session. The token is secret; receipts and demos must never print it.
 
 ## Consumer Demo
 
-Create a disposable local or staging account where the email is allowlisted:
+Provision a disposable local or staging account through the invite magic-link
+or operator service-session flow. Then run the contract against that account
+without printing the session token:
 
 ```sh
+MEMORY_ENGINE_ACCOUNT_ID=acct_... \
+MEMORY_ENGINE_SESSION_TOKEN="$SESSION_TOKEN" \
 cargo run -p memory-engine-contract -- \
-  --base-url http://127.0.0.1:18080 \
-  --email scry-contract-local@example.com
+  --base-url http://127.0.0.1:18080
 ```
 
-Production account creation is allowlist-gated. The production demo must reuse
-a pre-provisioned account without printing the session token. The runner's
-default base URL is the branded production origin `https://scry.study`; pass
+The production demo uses the same pre-provisioned account contract. Production
+account creation is allowlist-gated. The runner's default base URL is the
+branded production origin `https://scry.study`; pass
 `--base-url https://memory-engine-api-i2xcr.ondigitalocean.app` explicitly
 only as a labeled operator-origin fallback (e.g. while DNS for the branded
 domain is degraded):
@@ -54,10 +58,10 @@ cargo run -p memory-engine-contract
 The runner creates a disposable source, enqueues its generation job on the
 durable production queue and polls it to a bounded terminal state (never the
 legacy synchronous `/generate` route, refused with HTTP 409 once
-`MEMORY_ENGINE_POSTGRES_URL` is set — every production deployment), selects
-the next review, reveals the answer, submits that answer, archives the
-source, lists active sources, and emits a JSON receipt with the source
-absent from the active list.
+`MEMORY_ENGINE_POSTGRES_URL` is set — every production deployment), keeps the
+first pending draft explicitly, selects the next review, reveals the answer,
+submits that answer, archives the source, lists active sources, and emits a
+JSON receipt with the source absent from the active list.
 
 ## Scry Integration Notes
 
@@ -66,6 +70,10 @@ phrasing, or scheduling meaning from IDs. The client can keep its own view
 state, but the current due item, projected multiple-choice choices, revealed
 answer, grade, attempt count, post-answer feedback, item history, concept
 health rollup, and schedule result come from the engine response.
+
+Generated drafts expose source spans and provider/model/prompt-version
+provenance before a keep or edit decision. Rejected drafts remain in the
+exported decision receipt but never enter the due queue.
 
 After a submit, `current.feedback` carries human-language result text, the
 expected answer, this item's attempt history (`lastSeen` plus

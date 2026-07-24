@@ -32,12 +32,13 @@ connection.
 | Save source | `POST /v1/accounts/{account_id}/sources` | 201 | 1.135 s |
 | Review next ×5 | `POST /v1/accounts/{account_id}/review/next` | 200 ×5 | 0.684–0.840 s |
 | List sources | `GET /v1/accounts/{account_id}/sources` | 200 | 0.681 s |
-| Rotate (reissue) | `POST /v1/service-sessions` | 201, same `accountId` | 0.419 s |
-| Prior token after rotation | `POST /v1/accounts/{account_id}/review/next` | **403** `Session token does not match account.` | immediate |
-| Fresh token | `POST /v1/accounts/{account_id}/review/next` | 200 | 0.794 s |
+| Reissue independent credential | `POST /v1/service-sessions` | 201, same `accountId`; prior session remains independent | 0.419 s |
+| Revoke one current API session | `DELETE /v1/accounts/{account_id}/service-sessions/current` | route-owned explicit revoke | — |
+| Logout all API sessions | `DELETE /v1/accounts/{account_id}/service-sessions/all` | route-owned explicit revoke-all | — |
 
-Rotation-as-revocation is proven live: the pre-rotation token failed on the
-very next request with 403.
+Session lifecycle is explicit: issuing a new credential does not rotate or revoke
+other sessions. Callers use the one-session or all-session revoke route when they
+intend logout semantics.
 
 ## Isolation
 

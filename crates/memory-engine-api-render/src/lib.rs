@@ -14,6 +14,7 @@ pub use render::{
     render_auth_recovery, render_content_feedback_recovery_html,
     render_content_feedback_result_html, render_edit_review_html, render_login_requested,
     render_return_notification_confirmation, render_return_notification_disabled,
-    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
+    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
+    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
+    AnalyticsViewOptions, ContentFeedbackRecovery,
 };
