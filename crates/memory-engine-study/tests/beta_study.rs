@@ -12,13 +12,14 @@ use memory_engine_generation::{
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, GeneratedLearningActivityKind,
     GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
-    GeneratedPromptValidationStatus, PersistedQueueCandidate, SourceDocument, SourceDocumentKind,
-    SourcePermission,
+    GeneratedPromptValidationStatus, PersistedQueueCandidate, RemediationPackStatus,
+    SourceDocument, SourceDocumentKind, SourcePermission,
 };
 use memory_engine_service::{MemoryServiceStore, ServiceAttemptRecord};
 use memory_engine_study::{
     infer_capture_title, BetaStudyOptions, BetaStudySession, BetaStudySourceInput, BetaStudyStatus,
-    DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_SKIP_DEFER_MS, DEFAULT_SNOOZE_DEFER_MS,
+    DEFAULT_BRIDGE_PARENT_DEFER_MS, DEFAULT_REMEDIATION_PACK_TTL_MS, DEFAULT_SKIP_DEFER_MS,
+    DEFAULT_SNOOZE_DEFER_MS,
 };
 use serde_json::json;
 
@@ -1153,6 +1154,232 @@ fn bridge_material_creates_easier_due_items_before_the_parent() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn wrong_answer_triggers_remediation_pack_before_parent_returns() {
+    let directory = TempDirectory::new("remediation-pack");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    let graded = study
+        .submit_answer("wrong answer", 1_800)
+        .expect("wrong submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Wrong
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("remediation pack");
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+    assert_eq!(pack.review_unit_ids.len(), 2);
+    // Accepted pack members remain pending drafts -- not yet review units --
+    // until the learner explicitly decides them, exactly like every other
+    // generated draft.
+    let pack_draft_ids = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| pack.review_unit_ids.contains(&draft.review_unit_id))
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(pack_draft_ids.len(), pack.review_unit_ids.len());
+    for member_id in &pack.review_unit_ids {
+        let member = snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|draft| draft.review_unit_id == *member_id)
+            .expect("pack member draft");
+        assert!(
+            member.learner_decision.is_none(),
+            "pack members must stay pending until the learner decides"
+        );
+        let progression = member
+            .queue
+            .progression
+            .as_ref()
+            .expect("pack member progression");
+        assert!(
+            !progression.supersedes.contains(&parent_id),
+            "remediation packs must never supersede the parent"
+        );
+    }
+    let parent_row = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == parent_id)
+        .expect("parent row");
+    assert!(
+        parent_row.snoozed_until.is_some_and(|until| until > NOW),
+        "the failed parent must be deferred while the pack is active"
+    );
+
+    for draft_id in &pack_draft_ids {
+        study.keep_draft(draft_id).expect("keep pack member");
+    }
+    for _ in 0..pack.review_unit_ids.len() {
+        let advanced = study.advance().expect("advance");
+        let current = advanced.current.expect("pack member current");
+        assert!(
+            pack.review_unit_ids.contains(&current.review_unit_id),
+            "queue must surface pack members before the deferred parent: {:?}",
+            current.review_unit_id
+        );
+        assert_ne!(current.review_unit_id, parent_id);
+        study
+            .submit_answer("pack-member-answer", 1_000)
+            .expect("submit pack member");
+    }
+
+    let mut resumed_after_pack =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_relearn))
+            .expect("resume after relearn")
+            .with_remediation_packs_enabled(true);
+    let after_pack = resumed_after_pack
+        .start()
+        .expect("start after pack completion");
+    let returned = after_pack.current.expect("parent returns");
+    assert_eq!(
+        returned.review_unit_id, parent_id,
+        "the parent must return as soon as its own schedule allows, not wait out the remediation TTL"
+    );
+
+    let resolved = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let resolved_pack = resolved
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect("resolved pack");
+    assert_eq!(resolved_pack.status, RemediationPackStatus::Completed);
+    let parent_row = resolved
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == parent_id)
+        .expect("parent row");
+    assert!(
+        parent_row.snoozed_until.is_some_and(|until| until <= NOW),
+        "the parent's schedule history must return immediately, not stay buried"
+    );
+}
+
+#[test]
+fn remediation_pack_generation_with_zero_accepted_drafts_leaves_parent_current() {
+    let directory = TempDirectory::new("remediation-pack-rejected");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
+
+    // Bridge the quiz once via the explicit escape hatch: the resulting
+    // bridge item sits at the lowest progression stage (0). A later wrong
+    // answer against that bridge item can never generate an "easier"
+    // remediation candidate, so every candidate the fixture provider
+    // proposes is rejected — the zero-accepted-drafts path.
+    let bridged = study.generate_bridge_material().expect("bridge");
+    let bridge_draft_id = bridged
+        .drafts
+        .iter()
+        .find(|draft| draft.review_unit_id.as_str().starts_with("bridge-"))
+        .expect("bridge draft")
+        .id
+        .clone();
+    let kept = study.keep_draft(&bridge_draft_id).expect("keep bridge");
+    let bridge_id = kept.current.expect("bridge current").review_unit_id;
+    assert!(bridge_id.as_str().starts_with("bridge-"));
+
+    let graded = study
+        .submit_answer("wrong answer", 1_800)
+        .expect("wrong submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Wrong
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == bridge_id)
+        .expect("a rejected pack is still recorded, not silently dropped");
+    assert_eq!(pack.status, RemediationPackStatus::Rejected);
+    assert!(pack.review_unit_ids.is_empty());
+
+    let bridge_row = snapshot
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == bridge_id)
+        .expect("bridge row");
+    assert!(
+        bridge_row.snoozed_until.is_none(),
+        "a rejected pack must never defer or bury its parent"
+    );
+
+    let view = study.view().expect("view");
+    assert_eq!(
+        view.current.expect("current").review_unit_id,
+        bridge_id,
+        "with no accepted remediation drafts the parent stays current"
+    );
+}
+
+#[test]
+fn correct_answer_never_triggers_a_remediation_pack() {
+    let directory = TempDirectory::new("remediation-pack-correct");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
+
+    let graded = study.submit_answer("ALFA", 1_800).expect("correct submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Correct
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot.remediation_packs.is_empty(),
+        "a correct attempt must never trigger a remediation pack"
+    );
+}
+
+#[test]
 fn bridge_descendants_keep_local_only_provenance_and_block_provider_calls() {
     let directory = TempDirectory::new("bridge-local-only-descendant");
     let path = directory.path().join("study.json");
@@ -1203,6 +1430,502 @@ fn bridge_descendants_keep_local_only_provenance_and_block_provider_calls() {
             .expect("current")
             .review_unit_id,
         bridged.current.expect("bridge current").review_unit_id
+    );
+}
+
+#[test]
+fn remediation_packs_stay_off_until_a_session_opts_in() {
+    let directory = TempDirectory::new("remediation-pack-opt-out");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    assert!(!study.remediation_packs_enabled());
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep quiz");
+
+    study.submit_answer("BRAVO", 1_800).expect("wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot.remediation_packs.is_empty(),
+        "existing sessions that never opt in must keep today's behavior"
+    );
+}
+
+#[test]
+fn stale_remediation_pack_expires_and_returns_the_parent() {
+    let directory = TempDirectory::new("remediation-pack-expiry");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study
+        .submit_answer("wrong answer", 1_800)
+        .expect("wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("remediation pack");
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+
+    // Reopen well past the pack's TTL without ever finishing its members:
+    // expiry must return the parent on its own, exactly like completion
+    // does, instead of stranding it behind an abandoned pack forever.
+    let mut resumed =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_pack_ttl))
+            .expect("resume past ttl")
+            .with_remediation_packs_enabled(true);
+    let after_ttl = resumed.start().expect("start past ttl");
+    let returned = after_ttl.current.expect("parent returns after expiry");
+    assert_eq!(returned.review_unit_id, parent_id);
+
+    let resolved = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let resolved_pack = resolved
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect("resolved pack");
+    assert_eq!(resolved_pack.status, RemediationPackStatus::Expired);
+    let parent_row = resolved
+        .review_units
+        .iter()
+        .find(|unit| unit.review_unit_id == parent_id)
+        .expect("parent row");
+    assert!(parent_row
+        .snoozed_until
+        .is_some_and(|until| until <= after_pack_ttl()));
+}
+
+#[test]
+fn remediation_pack_state_survives_session_restart() {
+    let directory = TempDirectory::new("remediation-pack-restart");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study
+        .submit_answer("wrong answer", 1_800)
+        .expect("wrong submit");
+
+    let before_restart = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack_before = before_restart
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("pack before restart");
+    assert_eq!(pack_before.status, RemediationPackStatus::Active);
+    assert_eq!(pack_before.review_unit_ids.len(), 2);
+
+    // Simulate a process restart: open a brand-new session over the same
+    // persisted file instead of reusing `study`.
+    let mut restarted = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("restart")
+        .with_remediation_packs_enabled(true);
+    let resumed = restarted.start().expect("start after restart");
+    let pack_member_drafts = resumed
+        .drafts
+        .iter()
+        .filter(|draft| pack_before.review_unit_ids.contains(&draft.review_unit_id))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pack_member_drafts.len(),
+        pack_before.review_unit_ids.len(),
+        "the restarted session must still surface the durable pack member drafts"
+    );
+    assert!(
+        pack_member_drafts
+            .iter()
+            .all(|draft| draft.learner_decision.is_none()),
+        "restart must not silently decide pending pack members"
+    );
+
+    let after_restart = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert_eq!(
+        after_restart
+            .remediation_packs
+            .iter()
+            .filter(|pack| pack.parent_review_unit_id == parent_id)
+            .count(),
+        1,
+        "restart must never duplicate the remediation pack"
+    );
+    let pack_after = after_restart
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect("pack after restart");
+    assert_eq!(pack_after.id, pack_before.id);
+    assert_eq!(pack_after.review_unit_ids, pack_before.review_unit_ids);
+    assert_eq!(
+        after_restart.generation_runs.len(),
+        before_restart.generation_runs.len(),
+        "resuming must not regenerate remediation content"
+    );
+}
+
+#[test]
+fn close_answer_triggers_remediation_pack() {
+    let directory = TempDirectory::new("remediation-pack-close");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    // One character off "CHARLIE ALFA TANGO" — within the near-miss edit
+    // distance, so the deterministic grader calls it Close, not Wrong.
+    let graded = study
+        .submit_answer("CHARLIE ALFA TANGP", 1_800)
+        .expect("close submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Close
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect("a close attempt must trigger a remediation pack");
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+    assert_eq!(pack.review_unit_ids.len(), 2);
+}
+
+#[test]
+fn revealed_then_submitted_answer_triggers_remediation_pack() {
+    let directory = TempDirectory::new("remediation-pack-revealed");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study.reveal().expect("reveal");
+    // The deterministic grader has no way to tell a copied reveal from
+    // genuine recall, so text-matching the just-revealed answer still
+    // grades Correct — the remediation trigger must not depend on that.
+    let graded = study
+        .submit_answer("CHARLIE ALFA TANGO", 1_800)
+        .expect("revealed submit");
+    assert_eq!(
+        graded
+            .current
+            .expect("graded current")
+            .grade
+            .expect("grade")
+            .verdict,
+        Verdict::Correct
+    );
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .expect(
+            "an attempt submitted after a reveal must trigger a remediation pack \
+             even though the copied answer grades correct",
+        );
+    assert_eq!(pack.status, RemediationPackStatus::Active);
+    assert_eq!(pack.review_unit_ids.len(), 2);
+}
+
+#[test]
+fn correct_answer_without_a_reveal_still_never_triggers_a_pack() {
+    let directory = TempDirectory::new("remediation-pack-correct-no-reveal");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+
+    study
+        .submit_answer("CHARLIE ALFA TANGO", 1_800)
+        .expect("correct submit without reveal");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot.remediation_packs.is_empty(),
+        "a correct attempt with no prior reveal must never trigger a remediation pack"
+    );
+}
+
+#[test]
+fn distinct_later_attempt_creates_a_new_useful_pack_via_injected_provider() {
+    let directory = TempDirectory::new("remediation-pack-distinct-attempt");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    study
+        .submit_answer("wrong answer", 1_800)
+        .expect("first wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let first_pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("first remediation pack");
+    assert_eq!(first_pack.status, RemediationPackStatus::Active);
+
+    // Complete the first pack's members so it resolves to Completed and the
+    // parent returns on its own schedule, exactly like
+    // `wrong_answer_triggers_remediation_pack_before_parent_returns` proves.
+    // Accepted pack members are pending drafts until kept, like every other
+    // generated draft.
+    let first_pack_draft_ids = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| first_pack.review_unit_ids.contains(&draft.review_unit_id))
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(first_pack_draft_ids.len(), first_pack.review_unit_ids.len());
+    for draft_id in &first_pack_draft_ids {
+        study.keep_draft(draft_id).expect("keep first pack member");
+    }
+    for _ in 0..first_pack.review_unit_ids.len() {
+        let advanced = study.advance().expect("advance");
+        let current = advanced.current.expect("pack member current");
+        assert!(first_pack.review_unit_ids.contains(&current.review_unit_id));
+        study
+            .submit_answer("pack-member-answer", 1_000)
+            .expect("submit pack member");
+    }
+
+    // Reopen past the relearn interval with a real provider injected
+    // through the production-safe seam, so the parent can fail again on a
+    // genuinely later, distinct attempt.
+    let mut second_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_relearn))
+            .expect("reopen for second attempt")
+            .with_remediation_provider(Box::new(SecondAttemptRemediationProvider));
+    assert!(second_session.remediation_packs_enabled());
+    let resumed = second_session.start().expect("resume for second attempt");
+    assert_eq!(
+        resumed.current.expect("parent returns").review_unit_id,
+        parent_id
+    );
+    second_session
+        .submit_answer("still wrong", 1_800)
+        .expect("second wrong submit");
+
+    let second_snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let second_pack = second_snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id && pack.id != first_pack.id)
+        .expect("a distinct later attempt must produce a new, useful pack");
+    assert_eq!(second_pack.status, RemediationPackStatus::Active);
+    assert_eq!(second_pack.review_unit_ids.len(), 2);
+    assert!(
+        second_pack
+            .review_unit_ids
+            .iter()
+            .all(|id| !first_pack.review_unit_ids.contains(id)),
+        "the second pack's members must be genuinely new, not collide with the first pack's"
+    );
+
+    // Prove the injected provider's content — not the deterministic
+    // fixture the first pack used — actually produced these members. The
+    // second pack's members are still pending drafts, not review units, so
+    // read the prompt straight off the draft.
+    for member_id in &second_pack.review_unit_ids {
+        let member = second_snapshot
+            .generated_prompt_drafts
+            .iter()
+            .find(|draft| draft.review_unit_id == *member_id)
+            .expect("second pack member draft");
+        match &member.prompt {
+            Prompt::Exact(exact) => assert!(
+                exact.prompt.contains("Second attempt"),
+                "member prompt must come from the injected provider, not the fixture: {}",
+                exact.prompt
+            ),
+            other => panic!("expected an Exact prompt from the injected provider: {other:?}"),
+        }
+    }
+}
+
+/// Why remediation attempt identity can safely be the grade idempotency key.
+///
+/// That key is answer-derived by default
+/// (`beta-study:{review_unit_id}:{prompt_id}:{answer}`), which looks like it
+/// could collapse a learner who fails the same parent twice with the *same*
+/// wrong answer into one attempt and silently deny them a second pack. It
+/// cannot: the store rejects the repeated key outright, before remediation is
+/// ever consulted, so any attempt that reaches the pack guard necessarily
+/// carries a distinct key.
+///
+/// This pins that reasoning. If duplicate-review rejection is ever relaxed, this
+/// test fails and the attempt-identity derivation must be revisited.
+#[test]
+fn repeat_identical_answer_is_rejected_before_remediation_is_reached() {
+    let directory = TempDirectory::new("remediation-identical-repeat");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    let repeated_answer = "wrong answer";
+    study
+        .submit_answer(repeated_answer, 1_800)
+        .expect("first wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let first_pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("first remediation pack");
+    assert_eq!(first_pack.status, RemediationPackStatus::Active);
+
+    // Resolve the first pack so the parent returns and the Active-pack guard is
+    // no longer what stops a second pack.
+    let first_pack_draft_ids = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| first_pack.review_unit_ids.contains(&draft.review_unit_id))
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>();
+    for draft_id in &first_pack_draft_ids {
+        study.keep_draft(draft_id).expect("keep first pack member");
+    }
+    for _ in 0..first_pack.review_unit_ids.len() {
+        study.advance().expect("advance");
+        study
+            .submit_answer("pack-member-answer", 1_000)
+            .expect("submit pack member");
+    }
+
+    let mut second_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_relearn))
+            .expect("reopen for second attempt")
+            .with_remediation_provider(Box::new(SecondAttemptRemediationProvider));
+    let resumed = second_session.start().expect("resume for second attempt");
+    assert_eq!(
+        resumed.current.expect("parent returns").review_unit_id,
+        parent_id
+    );
+
+    // The identical answer never reaches remediation: the store refuses to
+    // apply the same review twice.
+    let repeated = second_session
+        .submit_answer(repeated_answer, 1_800)
+        .expect_err("an identical repeat answer must be refused as a duplicate review");
+    let message = format!("{repeated:?}");
+    assert!(
+        message.contains("DuplicateAppliedReview"),
+        "the repeat must be refused by duplicate-review detection, not silently \
+         accepted with no pack: {message}"
+    );
+
+    // And no second pack was fabricated for a review that never applied.
+    let second_snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert_eq!(
+        second_snapshot
+            .remediation_packs
+            .iter()
+            .filter(|pack| pack.parent_review_unit_id == parent_id)
+            .count(),
+        1,
+        "a refused duplicate review must not create a pack"
+    );
+}
+
+/// A remediation failure must never discard an already-committed grade.
+#[test]
+fn remediation_failure_never_discards_the_committed_grade() {
+    let directory = TempDirectory::new("remediation-failure-keeps-grade");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_provider(Box::new(FailingRemediationProvider));
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    // The submission must succeed: the grade and schedule are applied before
+    // remediation runs, so a remediation failure cannot be allowed to turn a
+    // committed submission into an error.
+    let view = study
+        .submit_answer("wrong answer", 1_800)
+        .expect("a remediation failure must not fail the submission");
+
+    assert_eq!(view.status, BetaStudyStatus::Graded);
+    let graded = view
+        .current
+        .expect("the graded card must still be returned");
+    assert_eq!(graded.grade.expect("the grade").verdict, Verdict::Wrong);
+
+    // And the attempt is durably recorded, not rolled back.
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot
+            .attempts
+            .iter()
+            .any(|attempt| attempt.review_unit_id == parent_id && attempt.grade.is_some()),
+        "the graded attempt must be durably recorded even when remediation fails"
     );
 }
 
@@ -1724,6 +2447,7 @@ fn seed_spanless_review(path: &std::path::Path) {
                 reasons: Vec::new(),
             },
             critique_notes: Vec::new(),
+            remediation_pack_id: None,
             created_at: NOW,
         })
         .expect("draft");
@@ -1751,6 +2475,7 @@ fn seed_spanless_review(path: &std::path::Path) {
             generated_prompt_draft_id: Some("spanless-draft".to_owned()),
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         })
         .expect("review unit");
@@ -1861,6 +2586,80 @@ impl BridgeMaterialProvider for RejectedBridgeProvider {
     }
 }
 
+/// A model-style provider that generates distinguishable remediation
+/// content, proxying how a real model varies phrasing between calls. Used
+/// to prove `with_remediation_provider` actually wires production content
+/// and that a genuinely later attempt can still mint a useful pack after an
+/// earlier attempt's pack resolved.
+struct SecondAttemptRemediationProvider;
+
+impl ReferenceNoteProvider for SecondAttemptRemediationProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "second-attempt-remediation".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Ok(ReferenceNoteDraft {
+            title: format!("Second-attempt reference: {}", request.concept_label),
+            body: "An independently generated remediation note for a later attempt.".to_owned(),
+        })
+    }
+}
+
+impl BridgeMaterialProvider for SecondAttemptRemediationProvider {
+    fn generate_bridge_material(
+        &self,
+        request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Ok(BridgeMaterial {
+            model: ReferenceNoteProvider::model(self),
+            reference_note: self.explain_concept(&ReferenceNoteRequest::new(
+                request.concept_key.clone(),
+                request.concept_label.clone(),
+                request.parent_prompt.clone(),
+                request.parent_expected_answer.clone(),
+                request.recent_performance.clone(),
+                request.authorization().clone(),
+            ))?,
+            candidates: vec![
+                DraftCandidate {
+                    index: 1,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: which letters open the target word?".to_owned(),
+                    answer: "second-attempt-cue".to_owned(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: None,
+                    activity_kind: GeneratedLearningActivityKind::Quiz,
+                    activity_stage: "recognition-bridge".to_owned(),
+                    unsupported: false,
+                },
+                DraftCandidate {
+                    index: 2,
+                    concept: request.concept_label.clone(),
+                    question: "Second attempt: recall the full composition after the retry cue."
+                        .to_owned(),
+                    answer: request.parent_expected_answer.clone(),
+                    evidence: None,
+                    distractors: Vec::new(),
+                    worked_solution: Some("Second attempt worked solution.".to_owned()),
+                    activity_kind: GeneratedLearningActivityKind::Exercise,
+                    activity_stage: "cued-recall-bridge".to_owned(),
+                    unsupported: false,
+                },
+            ],
+            usage: None,
+        })
+    }
+}
+
 impl ReferenceNoteProvider for CountingBridgeProvider {
     fn model(&self) -> GeneratedPromptModel {
         GeneratedPromptModel {
@@ -1905,6 +2704,20 @@ fn after_snooze() -> i64 {
     NOW + DEFAULT_SNOOZE_DEFER_MS + 1
 }
 
+/// Past the fixed first-learning-step relearn interval (1 minute) a wrong
+/// answer schedules, but well short of the remediation-pack TTL — proves
+/// pack completion returns the parent on its own short relearn schedule
+/// instead of waiting out the full defer window.
+fn after_relearn() -> i64 {
+    NOW + 5 * 60_000
+}
+
+/// Past the remediation-pack TTL — proves an abandoned pack expires and
+/// returns the parent on its own, rather than staying active forever.
+fn after_pack_ttl() -> i64 {
+    NOW + DEFAULT_REMEDIATION_PACK_TTL_MS + 1
+}
+
 trait ToStringForTest {
     fn to_string_for_test(&self) -> String;
 }
@@ -1941,5 +2754,39 @@ impl TempDirectory {
 impl Drop for TempDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A remediation provider that always fails, to prove a remediation failure
+/// never discards a committed grade.
+struct FailingRemediationProvider;
+
+impl ReferenceNoteProvider for FailingRemediationProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "failing-remediation".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Err(ProviderFailure::transient(
+            "the remediation provider is unavailable",
+        ))
+    }
+}
+
+impl BridgeMaterialProvider for FailingRemediationProvider {
+    fn generate_bridge_material(
+        &self,
+        _request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Err(ProviderFailure::transient(
+            "the remediation provider is unavailable",
+        ))
     }
 }

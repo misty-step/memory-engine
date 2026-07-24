@@ -31,8 +31,9 @@ use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
     GeneratedPromptModel, GeneratedPromptValidation, GeneratedPromptValidationStatus,
-    GenerationRun, GenerationRunUsage, PersistedQueueCandidate, ReferenceSpan, SourceDocument,
-    SourceDocumentKind, SourcePermission, SourcePermissionReceipt,
+    GenerationRun, GenerationRunUsage, PersistedQueueCandidate, ReferenceSpan,
+    RemediationPackRecord, RemediationPackStatus, SourceDocument, SourceDocumentKind,
+    SourcePermission, SourcePermissionReceipt,
 };
 
 /// The text a world-knowledge card grounds in: the captured input itself. A
@@ -90,6 +91,38 @@ pub struct BridgeGenerationResult {
     pub run_id: String,
     pub concept_key: String,
     pub reference_note_created: bool,
+    pub accepted_draft_ids: Vec<String>,
+    pub rejected_draft_ids: Vec<String>,
+    pub validation_failures: Vec<String>,
+}
+
+/// Request to generate one automatic remediation pack for a failed parent
+/// review unit's exact attempt.
+///
+/// Distinct from [`BridgeGenerationRequest`] (the explicit, pre-answer
+/// learner escape hatch): remediation packs are triggered by the boundary
+/// after a wrong, close, or revealed answer, are keyed by `attempt_id` for
+/// idempotency, and never supersede the parent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemediationPackGenerationRequest {
+    pub run_id: String,
+    pub parent_review_unit_id: ReviewUnitId,
+    pub attempt_id: String,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub default_due: i64,
+    pub model: Option<GeneratedPromptModel>,
+}
+
+/// Outcome of one remediation pack generation attempt.
+///
+/// `pack.status` is [`RemediationPackStatus::Active`] when at least one
+/// draft was accepted, or [`RemediationPackStatus::Rejected`] when provider
+/// output produced none — a data outcome, not an error, so a caller can
+/// grade the learner's answer without the parent ever being buried.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemediationPackGenerationResult {
+    pub pack: RemediationPackRecord,
     pub accepted_draft_ids: Vec<String>,
     pub rejected_draft_ids: Vec<String>,
     pub validation_failures: Vec<String>,
@@ -200,6 +233,16 @@ pub trait BetaGenerationStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error>;
 
+    /// Save or replace a boundary-owned remediation pack record.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when the pack cannot be persisted.
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error>;
+
     /// Remove pending output when a durable worker lease loses its commit fence.
     ///
     /// # Errors
@@ -255,6 +298,13 @@ impl BetaGenerationStore for BetaPersistenceStore {
         draft: GeneratedPromptDraft,
     ) -> Result<GeneratedPromptDraft, Self::Error> {
         BetaPersistenceStore::save_generated_prompt_draft(self, draft)
+    }
+
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error> {
+        BetaPersistenceStore::save_remediation_pack(self, pack)
     }
 
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
@@ -736,23 +786,12 @@ where
 {
     let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
     let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
-    let source_documents =
-        parent_source_documents::<S::Error>(&snapshot, &context.parent, enforce_source_permission)?;
-    let source_document_ids = source_documents
-        .iter()
-        .map(|source| source.id.clone())
-        .collect::<Vec<_>>();
-    let source_permissions = source_permission_receipts(&source_documents);
-    let authorization = SourceAuthorizationContext::from_sources(&source_documents).map_err(
-        |error| match error {
-            SourceAuthorizationError::ArchivedSourceDocument(id) => {
-                BetaGenerationError::ArchivedSourceDocument(id)
-            }
-        },
-    )?;
-    if enforce_source_permission {
-        ensure_model_eligible_receipts(&source_permissions)?;
-    }
+    let (source_document_ids, source_permissions, authorization) =
+        source_authorization_for_parent::<S::Error>(
+            &snapshot,
+            &context.parent,
+            enforce_source_permission,
+        )?;
     let provider_request = bridge_material_request(&snapshot, &context, authorization);
     let material = provider
         .generate_bridge_material(&provider_request)
@@ -791,6 +830,9 @@ where
             parent_review_unit_id: &context.parent.review_unit_id,
             parent_progression: context.parent.queue.progression.as_ref(),
             parent_stage_order: context.parent_stage_order,
+            domain_key: "bridge",
+            supersede_parent: true,
+            remediation_pack_id: None,
             source_document_ids: &source_document_ids,
             source_key: context.parent.queue.source_key.as_ref(),
         },
@@ -826,12 +868,201 @@ where
     })
 }
 
+/// Generate one automatic remediation pack for a failed parent review
+/// unit's exact attempt.
+///
+/// Idempotent by `request.attempt_id`: a duplicate request, retry, or
+/// process restart naming the same attempt returns the existing pack
+/// instead of generating a second one. Reuses the same provider boundary,
+/// concept-note caching, duplicate detection, and draft-ladder enforcement
+/// as [`run_bridge_generation_with_provider`] (the explicit, pre-answer
+/// learner escape hatch), but never supersedes the parent — deferring and
+/// returning it is the caller's job via `snooze_review_unit_until`, so
+/// mastery can never bury it.
+///
+/// Zero accepted drafts is a data outcome, not an error: the returned pack
+/// carries [`RemediationPackStatus::Rejected`] and the caller must not
+/// defer the parent.
+///
+/// # Errors
+///
+/// Returns [`BetaGenerationError`] when the parent is unknown or store
+/// reads or writes fail.
+pub fn run_remediation_pack_generation_with_provider<S>(
+    store: &mut S,
+    provider: &dyn BridgeMaterialProvider,
+    request: &RemediationPackGenerationRequest,
+) -> Result<RemediationPackGenerationResult, BetaGenerationError<S::Error>>
+where
+    S: BetaGenerationStore,
+{
+    let snapshot = store.snapshot().map_err(BetaGenerationError::Store)?;
+    if let Some(existing) = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.attempt_id == request.attempt_id)
+    {
+        return Ok(RemediationPackGenerationResult {
+            pack: existing.clone(),
+            accepted_draft_ids: Vec::new(),
+            rejected_draft_ids: Vec::new(),
+            validation_failures: Vec::new(),
+        });
+    }
+
+    let pack_id = format!("remediation-pack:{}", request.attempt_id);
+    let context = bridge_generation_context::<S::Error>(&snapshot, &request.parent_review_unit_id)?;
+    let (source_document_ids, source_permissions, authorization) =
+        source_authorization_for_parent::<S::Error>(&snapshot, &context.parent, true)?;
+    let provider_request = bridge_material_request(&snapshot, &context, authorization);
+    let material = provider
+        .generate_bridge_material(&provider_request)
+        .map_err(|failure| BetaGenerationError::ProviderFailure(failure.to_string()))?;
+    let model = request
+        .model
+        .clone()
+        .unwrap_or_else(|| material.model.clone());
+    let (note, note_body, _) =
+        bridge_reference_note(&context, &material, &model, request.started_at);
+
+    let run_request = remediation_pack_run_request(request, &source_document_ids);
+    store
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Started,
+            source_permissions.clone(),
+        ))
+        .map_err(BetaGenerationError::Store)?;
+    store
+        .save_concept_reference_note(note)
+        .map_err(BetaGenerationError::Store)?;
+
+    let pack_drafts = save_bridge_drafts(
+        store,
+        &snapshot,
+        material.candidates,
+        &BridgeDraftBaseContext {
+            run_id: &request.run_id,
+            concept_key: &context.concept_key,
+            reference_note_body: &note_body,
+            model: &model,
+            due: request.default_due,
+            created_at: request.started_at,
+            parent_review_unit_id: &context.parent.review_unit_id,
+            parent_progression: context.parent.queue.progression.as_ref(),
+            parent_stage_order: context.parent_stage_order,
+            domain_key: "remediation",
+            supersede_parent: false,
+            remediation_pack_id: Some(&pack_id),
+            source_document_ids: &source_document_ids,
+            source_key: context.parent.queue.source_key.as_ref(),
+        },
+    )?;
+
+    store
+        .save_generation_run(run_receipt(
+            &run_request,
+            &model,
+            RunProgress::Completed {
+                draft_ids: pack_drafts.draft_ids,
+                validation_failures: pack_drafts.validation_failures.clone(),
+                usage: material.usage.as_ref().map(provider_usage_to_run_usage),
+            },
+            source_permissions,
+        ))
+        .map_err(BetaGenerationError::Store)?;
+
+    let status = if pack_drafts.accepted_draft_ids.is_empty() {
+        RemediationPackStatus::Rejected
+    } else {
+        RemediationPackStatus::Active
+    };
+    let pack = store
+        .save_remediation_pack(RemediationPackRecord {
+            id: pack_id,
+            parent_review_unit_id: request.parent_review_unit_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            concept_key: context.concept_key.clone(),
+            review_unit_ids: pack_drafts.accepted_review_unit_ids.clone(),
+            status,
+            created_at: request.started_at,
+            resolved_at: if status == RemediationPackStatus::Rejected {
+                Some(request.started_at)
+            } else {
+                None
+            },
+        })
+        .map_err(BetaGenerationError::Store)?;
+
+    Ok(RemediationPackGenerationResult {
+        pack,
+        accepted_draft_ids: pack_drafts.accepted_draft_ids,
+        rejected_draft_ids: pack_drafts.rejected_draft_ids,
+        validation_failures: pack_drafts.validation_failures,
+    })
+}
+
+fn remediation_pack_run_request(
+    request: &RemediationPackGenerationRequest,
+    source_document_ids: &[String],
+) -> BetaGenerationRequest {
+    BetaGenerationRequest {
+        run_id: request.run_id.clone(),
+        source_document_ids: source_document_ids.to_vec(),
+        parent_review_unit_id: Some(request.parent_review_unit_id.clone()),
+        started_at: request.started_at,
+        completed_at: request.completed_at,
+        default_due: request.default_due,
+        model: request.model.clone(),
+        pending: false,
+    }
+}
+
 struct BridgeGenerationContext {
     parent: BetaReviewUnitRecord,
     concept_key: String,
     concept_label: String,
     cached_note: Option<ConceptReferenceNote>,
     parent_stage_order: u32,
+}
+
+/// Resolve a parent review unit's source documents into the trio every
+/// bridge/remediation generation path needs: the source ids to stamp on the
+/// generated run, their permission receipts, and the [`SourceAuthorizationContext`]
+/// an arbitrary model provider must respect. `enforce` gates both requiring
+/// provenance to exist and rejecting a `LocalOnly` source before any provider
+/// call, matching the `_with_provider` (production) path; the deterministic
+/// local path passes `false`.
+fn source_authorization_for_parent<E>(
+    snapshot: &BetaStoreSnapshot,
+    parent: &BetaReviewUnitRecord,
+    enforce: bool,
+) -> Result<
+    (
+        Vec<String>,
+        Vec<SourcePermissionReceipt>,
+        SourceAuthorizationContext,
+    ),
+    BetaGenerationError<E>,
+> {
+    let source_documents = parent_source_documents::<E>(snapshot, parent, enforce)?;
+    let source_document_ids = source_documents
+        .iter()
+        .map(|source| source.id.clone())
+        .collect::<Vec<_>>();
+    let source_permissions = source_permission_receipts(&source_documents);
+    let authorization = SourceAuthorizationContext::from_sources(&source_documents).map_err(
+        |error| match error {
+            SourceAuthorizationError::ArchivedSourceDocument(id) => {
+                BetaGenerationError::ArchivedSourceDocument(id)
+            }
+        },
+    )?;
+    if enforce {
+        ensure_model_eligible_receipts(&source_permissions)?;
+    }
+    Ok((source_document_ids, source_permissions, authorization))
 }
 
 fn bridge_generation_context<E>(
@@ -928,6 +1159,9 @@ struct BridgeDraftBaseContext<'a> {
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
     parent_stage_order: u32,
+    domain_key: &'a str,
+    supersede_parent: bool,
+    remediation_pack_id: Option<&'a str>,
     source_document_ids: &'a [String],
     source_key: Option<&'a String>,
 }
@@ -935,6 +1169,7 @@ struct BridgeDraftBaseContext<'a> {
 struct BridgeDraftPersistence {
     draft_ids: Vec<String>,
     accepted_draft_ids: Vec<String>,
+    accepted_review_unit_ids: Vec<ReviewUnitId>,
     rejected_draft_ids: Vec<String>,
     validation_failures: Vec<String>,
 }
@@ -951,6 +1186,7 @@ where
     let mut result = BridgeDraftPersistence {
         draft_ids: Vec::new(),
         accepted_draft_ids: Vec::new(),
+        accepted_review_unit_ids: Vec::new(),
         rejected_draft_ids: Vec::new(),
         validation_failures: Vec::new(),
     };
@@ -977,6 +1213,9 @@ where
                 easier,
                 parent_review_unit_id: base.parent_review_unit_id,
                 parent_progression: base.parent_progression,
+                domain_key: base.domain_key,
+                supersede_parent: base.supersede_parent,
+                remediation_pack_id: base.remediation_pack_id,
                 source_document_ids: base.source_document_ids,
                 source_key: base.source_key,
             },
@@ -1027,6 +1266,9 @@ fn enforce_bridge_pack_ladder(drafts: &mut [GeneratedPromptDraft]) {
 fn record_bridge_draft(result: &mut BridgeDraftPersistence, draft: &GeneratedPromptDraft) {
     if draft.validation.status == GeneratedPromptValidationStatus::Accepted {
         result.accepted_draft_ids.push(draft.id.clone());
+        result
+            .accepted_review_unit_ids
+            .push(draft.review_unit_id.clone());
     } else {
         result
             .validation_failures
@@ -1446,6 +1688,7 @@ fn build_draft(
         model: context.model.clone(),
         validation: GeneratedPromptValidation { status, reasons },
         critique_notes,
+        remediation_pack_id: None,
         created_at: context.created_at,
     }
 }
@@ -1461,6 +1704,9 @@ struct BridgeDraftContext<'a> {
     easier: bool,
     parent_review_unit_id: &'a ReviewUnitId,
     parent_progression: Option<&'a ProgressionMetadata>,
+    domain_key: &'a str,
+    supersede_parent: bool,
+    remediation_pack_id: Option<&'a str>,
     source_document_ids: &'a [String],
     source_key: Option<&'a String>,
 }
@@ -1469,8 +1715,14 @@ fn bridge_draft(
     candidate: &DraftCandidate,
     context: &BridgeDraftContext<'_>,
 ) -> GeneratedPromptDraft {
+    // Remediation members are scoped by pack lineage (`remediation-pack:{attempt_id}`),
+    // not the constant "remediation" domain key, so a later distinct failed
+    // attempt against the same parent mints genuinely new review-unit ids
+    // instead of colliding with an earlier, already-resolved pack's members.
+    // Bridge material (no pack id) keeps its original domain-scoped id.
+    let unit_id_prefix = context.remediation_pack_id.unwrap_or(context.domain_key);
     let unit_id = ReviewUnitId::new(bridge_generated_id(
-        "bridge",
+        unit_id_prefix,
         activity_kind_slug(&candidate.activity_kind),
         context.parent_review_unit_id,
         candidate,
@@ -1524,14 +1776,18 @@ fn bridge_draft(
                 progression_group: Some(parent_group),
                 stage_order,
                 requires: Vec::new(),
-                supersedes: vec![context.parent_review_unit_id.clone()],
+                supersedes: if context.supersede_parent {
+                    vec![context.parent_review_unit_id.clone()]
+                } else {
+                    Vec::new()
+                },
             }),
             concept_key: Some(context.concept_key.to_owned()),
             source_key: context
                 .source_key
                 .cloned()
                 .or_else(|| context.source_document_ids.first().cloned()),
-            domain_key: Some("bridge".to_owned()),
+            domain_key: Some(context.domain_key.to_owned()),
         },
         activity_kind: candidate.activity_kind.clone(),
         activity_stage: candidate.activity_stage.clone(),
@@ -1539,6 +1795,7 @@ fn bridge_draft(
         model: context.model.clone(),
         validation: GeneratedPromptValidation { status, reasons },
         critique_notes,
+        remediation_pack_id: context.remediation_pack_id.map(str::to_owned),
         created_at: context.created_at,
     }
 }

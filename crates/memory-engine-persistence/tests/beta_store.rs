@@ -1211,6 +1211,7 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
         content_feedback: Vec::new(),
         concept_reference_notes: Vec::new(),
         applied_reviews: Vec::new(),
+        remediation_packs: Vec::new(),
     };
     let encoded = serde_json::to_value(snapshot).expect("snapshot json");
 
@@ -1218,6 +1219,10 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
     assert!(encoded.get("conceptReferenceNotes").is_some());
     assert!(encoded.get("source_documents").is_none());
     assert!(encoded.get("concept_reference_notes").is_none());
+    assert!(encoded.get("remediationPacks").is_some());
+    assert!(encoded.get("remediation_packs").is_none());
+    assert!(encoded.get("appliedReviews").is_some());
+    assert!(encoded.get("applied_reviews").is_none());
     assert_eq!(encoded["sourceDocuments"][0]["createdAt"], NOW);
     assert_eq!(
         encoded["sourceDocuments"][0]["permission"],
@@ -1513,6 +1518,7 @@ fn accepted_draft(
             reasons: Vec::new(),
         },
         critique_notes: vec!["Grounded in the cited source span.".to_owned()],
+        remediation_pack_id: None,
         created_at: NOW,
     }
 }
@@ -1560,6 +1566,7 @@ fn review_unit(
         generated_prompt_draft_id: None,
         archived_at: None,
         snoozed_until: None,
+        remediation_pack_id: None,
         created_at: NOW,
     }
 }

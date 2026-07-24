@@ -23,8 +23,8 @@ use memory_engine_generation::BetaGenerationStore;
 use memory_engine_persistence::{
     parse_strict_boolean_answer, AppliedReviewReceipt, BetaReviewUnitRecord, BetaStoreSnapshot,
     ConceptReferenceNote, GeneratedPromptDraft, GeneratedPromptValidationStatus, GenerationRun,
-    LearnerDraftDecision, LearnerDraftDecisionExport, ReferenceSpan, ScheduleRecord,
-    SourceDocument, SourcePermission,
+    LearnerDraftDecision, LearnerDraftDecisionExport, ReferenceSpan, RemediationPackRecord,
+    ScheduleRecord, SourceDocument, SourcePermission,
 };
 use memory_engine_service::{
     content_feedback_replay_matches, ContentFeedback, ContentFeedbackStore, MemoryServiceStore,
@@ -445,6 +445,20 @@ ALTER TABLE memory_engine_generation_job_attempts
     ADD COLUMN IF NOT EXISTS generation_run_id TEXT;
 ";
 
+const REMEDIATION_PACKS_MIGRATION_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS memory_engine_remediation_packs (
+    account_id TEXT NOT NULL REFERENCES memory_engine_accounts(account_id) ON DELETE CASCADE,
+    pack_id TEXT NOT NULL,
+    pack JSONB NOT NULL,
+    attempt_id TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (account_id, pack_id)
+);
+
+CREATE INDEX IF NOT EXISTS memory_engine_remediation_packs_attempt_idx
+    ON memory_engine_remediation_packs(account_id, attempt_id);
+";
+
 /// Production waitlist storage: one row per normalized email plus an
 /// append-only audit log of every join/invite/delete transition. The
 /// audit log is intentionally separate from the operational row so a
@@ -481,6 +495,7 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         GENERATION_JOB_ATTEMPTS_MIGRATION_SQL,
         WAITLIST_MIGRATION_SQL,
         SESSION_SCHEMA_MIGRATION_SQL,
+        REMEDIATION_PACKS_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -508,6 +523,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, GENERATION_JOB_ATTEMPTS_MIGRATION_SQL),
     (5, WAITLIST_MIGRATION_SQL),
     (6, SESSION_SCHEMA_MIGRATION_SQL),
+    (7, REMEDIATION_PACKS_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -2894,6 +2910,9 @@ impl AccountStudyStore<'_> {
                 UNION ALL
                 SELECT 'concept_reference_note', updated_at_ms, concept_key::text, note
                 FROM memory_engine_concept_reference_notes WHERE account_id = $1
+                UNION ALL
+                SELECT 'remediation_pack', created_at_ms, pack_id::text, pack
+                FROM memory_engine_remediation_packs WHERE account_id = $1
              ) AS snapshot_rows
              ORDER BY kind, sort_at, sort_id",
             &[&self.scope.account_id],
@@ -2906,53 +2925,7 @@ impl AccountStudyStore<'_> {
         for row in rows {
             let kind: &str = row.get(0);
             let value: serde_json::Value = row.get(1);
-            match kind {
-                "source_document" => {
-                    snapshot
-                        .source_documents
-                        .push(serde_json::from_value(value)?);
-                }
-                "reference_span" => {
-                    snapshot
-                        .reference_spans
-                        .push(serde_json::from_value(value)?);
-                }
-                "generated_prompt_draft" => {
-                    snapshot
-                        .generated_prompt_drafts
-                        .push(serde_json::from_value(value)?);
-                }
-                "review_unit" => {
-                    snapshot.review_units.push(serde_json::from_value(value)?);
-                }
-                "schedule" => {
-                    snapshot.schedules.push(serde_json::from_value(value)?);
-                }
-                "attempt" => {
-                    snapshot.attempts.push(serde_json::from_value(value)?);
-                }
-                "generation_run" => {
-                    snapshot
-                        .generation_runs
-                        .push(serde_json::from_value(value)?);
-                }
-                "content_feedback" => {
-                    snapshot
-                        .content_feedback
-                        .push(serde_json::from_value(value)?);
-                }
-                "applied_review" => {
-                    snapshot
-                        .applied_reviews
-                        .push(serde_json::from_value(value)?);
-                }
-                "concept_reference_note" => {
-                    snapshot
-                        .concept_reference_notes
-                        .push(serde_json::from_value(value)?);
-                }
-                _ => unreachable!("snapshot query returned an unknown row kind"),
-            }
+            hydrate_snapshot_row(&mut snapshot, kind, value)?;
         }
         Ok(snapshot)
     }
@@ -3262,6 +3235,7 @@ impl AccountStudyStore<'_> {
                 generated_prompt_draft_id: Some(draft.id.clone()),
                 archived_at: None,
                 snoozed_until: None,
+                remediation_pack_id: draft.remediation_pack_id.clone(),
                 created_at: draft.created_at,
             };
             let value = serde_json::to_value(&review_unit)?;
@@ -3638,6 +3612,36 @@ impl AccountStudyStore<'_> {
                  SET note = EXCLUDED.note,
                      updated_at_ms = EXCLUDED.updated_at_ms",
                 &[&account_id, &note.concept_key, &value, &note.updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Save or replace a boundary-owned remediation pack record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when serialization or persistence fails.
+    pub fn save_remediation_pack(
+        &mut self,
+        pack: &RemediationPackRecord,
+    ) -> Result<(), PostgresStoreError> {
+        let value = serde_json::to_value(pack)?;
+        let account_id = self.scope.account_id.clone();
+        self.with_account_transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO memory_engine_remediation_packs
+                    (account_id, pack_id, pack, attempt_id, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (account_id, pack_id) DO UPDATE
+                 SET pack = EXCLUDED.pack",
+                &[
+                    &account_id,
+                    &pack.id,
+                    &value,
+                    &pack.attempt_id,
+                    &pack.created_at,
+                ],
             )?;
             Ok(())
         })
@@ -4291,6 +4295,15 @@ impl BetaGenerationStore for AccountStudyStore<'_> {
         Ok(draft)
     }
 
+    fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, Self::Error> {
+        AccountStudyStore::save_remediation_pack(self, &pack)?;
+
+        Ok(pack)
+    }
+
     fn discard_generation_run(&mut self, run_id: &str) -> Result<(), Self::Error> {
         AccountStudyStore::discard_generation_run(self, run_id)
     }
@@ -4446,6 +4459,44 @@ fn assert_known_review_unit_in_transaction(
         .ok_or_else(|| PostgresStoreError::UnknownReviewUnit(review_unit_id.clone()))
 }
 
+fn hydrate_snapshot_row(
+    snapshot: &mut BetaStoreSnapshot,
+    kind: &str,
+    value: serde_json::Value,
+) -> Result<(), PostgresStoreError> {
+    match kind {
+        "source_document" => snapshot
+            .source_documents
+            .push(serde_json::from_value(value)?),
+        "reference_span" => snapshot
+            .reference_spans
+            .push(serde_json::from_value(value)?),
+        "generated_prompt_draft" => snapshot
+            .generated_prompt_drafts
+            .push(serde_json::from_value(value)?),
+        "review_unit" => snapshot.review_units.push(serde_json::from_value(value)?),
+        "schedule" => snapshot.schedules.push(serde_json::from_value(value)?),
+        "attempt" => snapshot.attempts.push(serde_json::from_value(value)?),
+        "generation_run" => snapshot
+            .generation_runs
+            .push(serde_json::from_value(value)?),
+        "content_feedback" => snapshot
+            .content_feedback
+            .push(serde_json::from_value(value)?),
+        "applied_review" => snapshot
+            .applied_reviews
+            .push(serde_json::from_value(value)?),
+        "concept_reference_note" => snapshot
+            .concept_reference_notes
+            .push(serde_json::from_value(value)?),
+        "remediation_pack" => snapshot
+            .remediation_packs
+            .push(serde_json::from_value(value)?),
+        _ => unreachable!("snapshot query returned an unknown row kind"),
+    }
+    Ok(())
+}
+
 fn review_unit_from_transaction(
     transaction: &mut CountingTransaction<'_>,
     account_id: &str,
@@ -4565,6 +4616,7 @@ fn current_review_unit_matches(
         content_feedback: Vec::new(),
         applied_reviews: Vec::new(),
         concept_reference_notes: Vec::new(),
+        remediation_packs: Vec::new(),
     };
 
     Ok(select_current_review_unit(&snapshot, &candidates, now)
@@ -5238,8 +5290,8 @@ mod tests {
         BetaReviewUnitRecord, BetaStoreSnapshot, GeneratedLearningActivityKind,
         GeneratedPromptDraft, GeneratedPromptModel, GeneratedPromptValidation,
         GeneratedPromptValidationStatus, GenerationRun, GenerationRunUsage,
-        PersistedQueueCandidate, ReferenceSpan, SourceDocument, SourceDocumentKind,
-        SourcePermission, SourcePermissionReceipt,
+        PersistedQueueCandidate, ReferenceSpan, RemediationPackRecord, RemediationPackStatus,
+        SourceDocument, SourceDocumentKind, SourcePermission, SourcePermissionReceipt,
     };
     use memory_engine_service::{
         record_content_feedback, ContentFeedbackError, ContentFeedbackVerdict,
@@ -5315,6 +5367,56 @@ mod tests {
         assert!(jobs_sql.contains("memory_engine_generation_jobs"));
         assert!(jobs_sql.contains("lease_expires_at_ms"));
         assert!(jobs_sql.contains("status IN ('queued', 'running', 'retry')"));
+    }
+
+    /// A shipped migration version must never be rebound to different SQL.
+    ///
+    /// [`PostgresStudyStore::migrate`] records applied migrations by number in
+    /// `memory_engine_schema_migrations` and skips any version already present.
+    /// Renumbering therefore produces a silent production no-op: the new SQL is
+    /// bound to a number the database already recorded, so it never executes.
+    /// It cannot be caught by the suite or by hosted CI either, because both
+    /// start from an empty database where every version applies in order and
+    /// the schema looks correct.
+    ///
+    /// Each entry below pins a substring that appears in exactly one migration.
+    /// A new migration must append the next unused version; it must never take
+    /// a number that has already shipped.
+    #[test]
+    fn shipped_migration_versions_are_never_rebound() {
+        const PINNED: &[(i32, &str)] = &[
+            (1, "memory_engine_rate_limits"),
+            (
+                2,
+                "CREATE TABLE IF NOT EXISTS memory_engine_generation_jobs",
+            ),
+            (3, "ADD COLUMN IF NOT EXISTS lease_token"),
+            (4, "memory_engine_generation_job_attempts"),
+            (5, "memory_engine_waitlist_entries"),
+            (6, "memory_engine_api_sessions"),
+            (7, "memory_engine_remediation_packs"),
+        ];
+
+        for (version, marker) in PINNED {
+            let (_, sql) = super::MIGRATIONS
+                .iter()
+                .find(|(candidate, _)| candidate == version)
+                .unwrap_or_else(|| {
+                    panic!("migration {version} disappeared; shipped versions are permanent")
+                });
+            assert!(
+                sql.contains(marker),
+                "migration {version} no longer contains {marker:?}. A shipped version was \
+                 rebound to different SQL, which will never run on any database that already \
+                 recorded version {version}. Append the next unused version instead."
+            );
+        }
+
+        assert_eq!(
+            super::MIGRATIONS.len(),
+            PINNED.len(),
+            "a migration was added or removed without pinning its version above"
+        );
     }
 
     #[test]
@@ -7436,6 +7538,7 @@ mod tests {
         run_low_level_postgres_store_contract(&mut store)?;
         run_postgres_study_session_contract(&mut store)?;
         run_postgres_concept_snooze_contract(&mut store)?;
+        run_postgres_remediation_pack_contract(&mut store)?;
 
         Ok(())
     }
@@ -8008,6 +8111,50 @@ mod tests {
         Ok(())
     }
 
+    /// Save+snapshot-readback coverage for remediation packs: an Active
+    /// pack round-trips through the JSONB store intact, and resolving it
+    /// (Active -> Completed) upserts by `pack_id` — the row count never
+    /// grows, matching `save_remediation_pack`'s `ON CONFLICT` contract.
+    fn run_postgres_remediation_pack_contract(
+        store: &mut PostgresStudyStore,
+    ) -> Result<(), PostgresStoreError> {
+        let parent_review_unit_id = ReviewUnitId::new("unit-live-remediation-parent");
+        let member_a = ReviewUnitId::new("unit-live-remediation-member-a");
+        let member_b = ReviewUnitId::new("unit-live-remediation-member-b");
+        let mut account = store.for_account(AccountScope::new("acct_live_remediation")?);
+        account.ensure_account(NOW)?;
+
+        let active_pack = RemediationPackRecord {
+            id: "remediation-pack:live-attempt-1".to_owned(),
+            parent_review_unit_id: parent_review_unit_id.clone(),
+            attempt_id: "live-attempt-1".to_owned(),
+            concept_key: "live-remediation-concept".to_owned(),
+            review_unit_ids: vec![member_a.clone(), member_b.clone()],
+            status: RemediationPackStatus::Active,
+            created_at: NOW,
+            resolved_at: None,
+        };
+        account.save_remediation_pack(&active_pack)?;
+
+        let snapshot = account.snapshot()?;
+        assert_eq!(snapshot.remediation_packs, vec![active_pack.clone()]);
+
+        let mut resolved_pack = active_pack.clone();
+        resolved_pack.status = RemediationPackStatus::Completed;
+        resolved_pack.resolved_at = Some(NOW + 1_000);
+        account.save_remediation_pack(&resolved_pack)?;
+
+        let resolved_snapshot = account.snapshot()?;
+        assert_eq!(
+            resolved_snapshot.remediation_packs.len(),
+            1,
+            "resolving a pack must upsert by pack_id, never duplicate the row"
+        );
+        assert_eq!(resolved_snapshot.remediation_packs[0], resolved_pack);
+
+        Ok(())
+    }
+
     fn source_document(id: &str) -> SourceDocument {
         SourceDocument {
             id: id.to_owned(),
@@ -8131,6 +8278,7 @@ mod tests {
                 reasons: Vec::new(),
             },
             critique_notes: vec!["Grounded in live Postgres source span.".to_owned()],
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }
@@ -8146,6 +8294,7 @@ mod tests {
             generated_prompt_draft_id: Some(draft.id.clone()),
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }
@@ -8172,6 +8321,7 @@ mod tests {
             generated_prompt_draft_id: None,
             archived_at: None,
             snoozed_until: None,
+            remediation_pack_id: None,
             created_at: NOW,
         }
     }

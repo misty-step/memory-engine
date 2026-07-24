@@ -22,18 +22,20 @@ use memory_engine_core::{
 };
 use memory_engine_generation::{
     run_beta_generation, run_beta_generation_with_provider, run_bridge_generation,
-    run_bridge_generation_with_provider, BetaGenerationError, BetaGenerationRequest,
-    BetaGenerationStore, BridgeGenerationRequest, BridgeMaterialProvider, DraftProvider,
-    FakeModelProvider, ReferenceNoteProvider, ReferenceNoteRequest, SourceAuthorizationContext,
+    run_bridge_generation_with_provider, run_remediation_pack_generation_with_provider,
+    BetaGenerationError, BetaGenerationRequest, BetaGenerationStore, BridgeGenerationRequest,
+    BridgeMaterialProvider, DraftProvider, FakeModelProvider, ReferenceNoteProvider,
+    ReferenceNoteRequest, RemediationPackGenerationRequest, SourceAuthorizationContext,
     SourceAuthorizationError,
 };
 use memory_engine_persistence::{
     BetaPersistenceStore, BetaReviewUnitRecord, BetaStoreError, BetaStoreSnapshot,
     ConceptReferenceNote, GeneratedLearningActivityKind, GeneratedPromptDraft,
-    GeneratedPromptValidationStatus, LearnerDraftDecision, SourceDocument, SourceDocumentKind,
+    GeneratedPromptValidationStatus, LearnerDraftDecision, RemediationPackRecord,
+    RemediationPackStatus, SourceDocument, SourceDocumentKind,
 };
 use memory_engine_service::{
-    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ServiceError,
+    GradeApplyReviewCommand, MemoryService, MemoryServiceStore, ReviewAppliedResult, ServiceError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +45,7 @@ pub const DEFAULT_BETA_STUDY_NOW: i64 = 1_779_465_600_000;
 pub const DEFAULT_SKIP_DEFER_MS: i64 = 15 * 60 * 1_000;
 pub const DEFAULT_SNOOZE_DEFER_MS: i64 = 86_400_000;
 pub const DEFAULT_BRIDGE_PARENT_DEFER_MS: i64 = 60 * 60 * 1_000;
+pub const DEFAULT_REMEDIATION_PACK_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 pub struct BetaStudyOptions {
@@ -616,6 +619,13 @@ pub struct BetaStudySession<S = BetaPersistenceStore> {
     reference_text: Option<String>,
     grade: Option<BetaStudyGrade>,
     schedule_change: Option<ScheduleChange>,
+    remediation_packs_enabled: bool,
+    remediation_provider: Option<Box<dyn BridgeMaterialProvider>>,
+    /// Set when remediation generation failed *after* a grade was already
+    /// durably applied. Surfaced as a learner-facing notice instead of failing
+    /// the submission: remediation is an enhancement on top of grading and must
+    /// never discard a committed grade.
+    remediation_notice: Option<String>,
 }
 
 impl BetaStudySession<BetaPersistenceStore> {
@@ -643,6 +653,9 @@ impl BetaStudySession<BetaPersistenceStore> {
             reference_text: None,
             grade: None,
             schedule_change: None,
+            remediation_packs_enabled: false,
+            remediation_provider: None,
+            remediation_notice: None,
         })
     }
 }
@@ -669,7 +682,49 @@ where
             reference_text: None,
             grade: None,
             schedule_change: None,
+            remediation_packs_enabled: false,
+            remediation_provider: None,
+            remediation_notice: None,
         }
+    }
+
+    /// Opt this session into automatic remediation-pack generation using the
+    /// deterministic, CI-safe `FakeModelProvider` fixture.
+    ///
+    /// Defaults to `false` so every existing caller (API, MCP, CLI, web
+    /// shell, other tests) keeps today's behavior unchanged until it
+    /// deliberately opts in. This is a test/dev-only entry point: it never
+    /// wires a real model, so it must never back a production face. Live
+    /// callers must use [`Self::with_remediation_provider`] instead, which
+    /// enables packs and injects a real provider in the same call.
+    #[must_use]
+    pub fn with_remediation_packs_enabled(mut self, enabled: bool) -> Self {
+        self.remediation_packs_enabled = enabled;
+        self
+    }
+
+    /// Opt this session into automatic remediation-pack generation backed by
+    /// a real model provider, mirroring
+    /// [`Self::generate_bridge_material_with_provider`]'s explicit
+    /// injection seam.
+    ///
+    /// Enables packs and wires the supplied provider together in one call,
+    /// so a production face can never end up with packs enabled while
+    /// silently falling back to the deterministic fixture content
+    /// `with_remediation_packs_enabled` uses. This is the only
+    /// production-safe entry point for automatic remediation generation.
+    #[must_use]
+    pub fn with_remediation_provider(mut self, provider: Box<dyn BridgeMaterialProvider>) -> Self {
+        self.remediation_provider = Some(provider);
+        self.remediation_packs_enabled = true;
+        self
+    }
+
+    /// Whether this session automatically generates remediation packs after
+    /// wrong, close, or revealed answers.
+    #[must_use]
+    pub fn remediation_packs_enabled(&self) -> bool {
+        self.remediation_packs_enabled
     }
 
     /// Start or resume the session by selecting the next review unit.
@@ -1481,6 +1536,210 @@ where
         self.view()
     }
 
+    /// Reconcile boundary-owned remediation-pack state after a graded
+    /// attempt.
+    ///
+    /// A pack member's grade only checks for pack completion; it never
+    /// spawns a nested pack (remediation stays a small, bounded ladder, not
+    /// a recursive DAG). A non-member's wrong or close grade may trigger a
+    /// new pack; so does any grade recorded after the learner revealed the
+    /// answer first (`was_revealed`), since the deterministic grader has no
+    /// way to distinguish a copied reveal from genuine recall; a correct
+    /// grade without a prior reveal never does.
+    fn reconcile_remediation_after_grade(
+        &mut self,
+        review_unit_id: &ReviewUnitId,
+        review: &ReviewAppliedResult,
+        was_revealed: bool,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let now = (self.now)();
+        let snapshot = self.snapshot()?;
+
+        if let Some(pack) = snapshot
+            .remediation_packs
+            .iter()
+            .find(|pack| {
+                pack.status == RemediationPackStatus::Active
+                    && pack.review_unit_ids.contains(review_unit_id)
+            })
+            .cloned()
+        {
+            let all_attempted = pack.review_unit_ids.iter().all(|id| {
+                snapshot
+                    .attempts
+                    .iter()
+                    .any(|attempt| &attempt.review_unit_id == id)
+            });
+            if all_attempted {
+                self.resolve_remediation_pack(&pack, RemediationPackStatus::Completed, now)?;
+            }
+            return Ok(());
+        }
+
+        if !was_revealed && !matches!(review.grade.verdict, Verdict::Wrong | Verdict::Close) {
+            return Ok(());
+        }
+        if snapshot.remediation_packs.iter().any(|pack| {
+            pack.status == RemediationPackStatus::Active
+                && pack.parent_review_unit_id == *review_unit_id
+        }) {
+            return Ok(());
+        }
+        // The grade idempotency key is the attempt's identity here. It is
+        // answer-derived by default
+        // (`beta-study:{review_unit_id}:{prompt_id}:{answer}`), which cannot
+        // collapse two genuinely distinct attempts: the store rejects a repeat
+        // of the same key outright with `DuplicateAppliedReview`, so a second
+        // attempt that reaches this point always carries a different key. See
+        // `repeat_identical_answer_is_rejected_before_remediation_is_reached`.
+        let attempt_id = review.attempt.idempotency_key.clone().unwrap_or_else(|| {
+            format!(
+                "remediation-attempt:{review_unit_id}:{}",
+                review.attempt.occurred_at
+            )
+        });
+        if snapshot
+            .remediation_packs
+            .iter()
+            .any(|pack| pack.attempt_id == attempt_id)
+        {
+            return Ok(());
+        }
+
+        self.trigger_remediation_pack(review_unit_id, &attempt_id, &snapshot, now)
+    }
+
+    /// Generate and activate one remediation pack for a freshly failed
+    /// parent, deferring the parent until the pack resolves.
+    ///
+    /// Zero accepted drafts leaves the parent current and undeferred — a
+    /// generation shortfall never buries it.
+    fn trigger_remediation_pack(
+        &mut self,
+        parent_review_unit_id: &ReviewUnitId,
+        attempt_id: &str,
+        snapshot: &BetaStoreSnapshot,
+        now: i64,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let parent_due = snapshot
+            .review_units
+            .iter()
+            .find(|unit| &unit.review_unit_id == parent_review_unit_id)
+            .map_or(now, |unit| unit.queue.due);
+        let pack_due = parent_due.saturating_sub(1_000);
+        self.invalidate_snapshot();
+        // Production callers must inject a real provider via
+        // `with_remediation_provider`; only test/dev sessions left on the
+        // default fall through to the deterministic fixture.
+        let provider: &dyn BridgeMaterialProvider = self
+            .remediation_provider
+            .as_deref()
+            .unwrap_or(&FakeModelProvider);
+        let outcome = run_remediation_pack_generation_with_provider(
+            &mut self.store,
+            provider,
+            &RemediationPackGenerationRequest {
+                run_id: format!("remediation-run-{attempt_id}"),
+                parent_review_unit_id: parent_review_unit_id.clone(),
+                attempt_id: attempt_id.to_owned(),
+                started_at: now,
+                completed_at: Some(now),
+                default_due: pack_due,
+                model: None,
+            },
+        )?;
+        // Accepted remediation drafts remain pending for an explicit learner
+        // decision (keep/edit/reject) — the boundary never auto-schedules
+        // generated material, remediation packs included.
+        if outcome.pack.status == RemediationPackStatus::Active {
+            self.store
+                .snooze_review_unit_until(
+                    parent_review_unit_id,
+                    now + DEFAULT_REMEDIATION_PACK_TTL_MS,
+                )
+                .map_err(BetaStudyError::Store)?;
+        }
+        self.invalidate_snapshot();
+        Ok(())
+    }
+
+    /// Resolve one remediation pack and immediately return its deferred
+    /// parent, with the parent's FSRS schedule history untouched —
+    /// `snooze_review_unit_until` only ever moves boundary-owned queue
+    /// availability, never the schedule record.
+    fn resolve_remediation_pack(
+        &mut self,
+        pack: &RemediationPackRecord,
+        status: RemediationPackStatus,
+        now: i64,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let mut resolved = pack.clone();
+        resolved.status = status;
+        resolved.resolved_at = Some(now);
+        self.store
+            .save_remediation_pack(resolved)
+            .map_err(BetaStudyError::Store)?;
+        self.store
+            .snooze_review_unit_until(&pack.parent_review_unit_id, now)
+            .map_err(BetaStudyError::Store)?;
+        self.invalidate_snapshot();
+        Ok(())
+    }
+
+    /// Expire any remediation pack that has stayed active past its TTL,
+    /// returning its parent even if the pack was never completed.
+    fn expire_stale_remediation_packs(
+        &mut self,
+    ) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let now = (self.now)();
+        let snapshot = self.snapshot()?;
+        let stale = snapshot
+            .remediation_packs
+            .iter()
+            .filter(|pack| {
+                pack.status == RemediationPackStatus::Active
+                    && now.saturating_sub(pack.created_at) >= DEFAULT_REMEDIATION_PACK_TTL_MS
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for pack in stale {
+            self.resolve_remediation_pack(&pack, RemediationPackStatus::Expired, now)?;
+        }
+        Ok(())
+    }
+
+    /// Explicitly exit the active remediation pack tied to the current
+    /// review unit (if any), returning its failed parent immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when persistence fails.
+    pub fn exit_remediation_pack(
+        &mut self,
+    ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let now = (self.now)();
+        let snapshot = self.snapshot()?;
+        let active_review_unit_id = self
+            .current
+            .as_ref()
+            .map(|draft| draft.review_unit_id.clone());
+        if let Some(active_review_unit_id) = active_review_unit_id {
+            let pack = snapshot
+                .remediation_packs
+                .iter()
+                .find(|pack| {
+                    pack.status == RemediationPackStatus::Active
+                        && pack.review_unit_ids.contains(&active_review_unit_id)
+                })
+                .cloned();
+            if let Some(pack) = pack {
+                self.resolve_remediation_pack(&pack, RemediationPackStatus::Exited, now)?;
+                self.select_next()?;
+            }
+        }
+        self.view()
+    }
+
     /// Reveal the expected answer for the active review unit.
     ///
     /// # Errors
@@ -1531,6 +1790,7 @@ where
         if self.status == BetaStudyStatus::Graded {
             return self.view();
         }
+        let was_revealed = self.status == BetaStudyStatus::Revealed;
         let active = self
             .current
             .clone()
@@ -1569,6 +1829,22 @@ where
             after: project_required_schedule(&review.schedule_state),
         });
         self.status = BetaStudyStatus::Graded;
+        self.remediation_notice = None;
+        if self.remediation_packs_enabled {
+            // The grade and schedule above are already durably applied. A
+            // provider outage or store error inside remediation must not turn a
+            // committed submission into an error, so it becomes a notice.
+            if self
+                .reconcile_remediation_after_grade(&active.review_unit_id, &review, was_revealed)
+                .is_err()
+            {
+                self.remediation_notice = Some(
+                    "Practice material for this miss could not be generated. Your answer was \
+                     still recorded and this card is scheduled."
+                        .to_owned(),
+                );
+            }
+        }
         self.view()
     }
 
@@ -1678,7 +1954,10 @@ where
                 next_review_unit_id,
             },
             api_pressure: api_pressure(),
-            generation_notices: generation_notices(&snapshot),
+            generation_notices: generation_notices(&snapshot)
+                .into_iter()
+                .chain(self.remediation_notice.clone())
+                .collect(),
             library,
         })
     }
@@ -1724,6 +2003,9 @@ where
     }
 
     fn select_next(&mut self) -> Result<(), BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        if self.remediation_packs_enabled {
+            self.expire_stale_remediation_packs()?;
+        }
         let snapshot = self.snapshot()?;
         let candidates = self
             .store

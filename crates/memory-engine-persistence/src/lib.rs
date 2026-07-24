@@ -155,6 +155,8 @@ pub struct GeneratedPromptDraft {
     pub model: GeneratedPromptModel,
     pub validation: GeneratedPromptValidation,
     pub critique_notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_pack_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -216,6 +218,43 @@ pub struct ConceptReferenceNote {
     pub updated_at: i64,
 }
 
+/// Lifecycle of one boundary-owned remediation pack.
+///
+/// A pack is created when a learner answers a review unit wrong, close, or
+/// revealed; its members are easier prerequisite quizzes shown ahead of the
+/// deferred parent. Remediation packs never use `supersedes` — the parent is
+/// only deferred (via `snoozed_until`), never hidden by mastery, so it always
+/// comes back.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemediationPackStatus {
+    Active,
+    Completed,
+    Rejected,
+    Expired,
+    Exited,
+}
+
+/// Boundary-owned lineage connecting a remediation pack to its exact failed
+/// attempt and parent review unit.
+///
+/// `attempt_id` is the grading attempt's idempotency key, reused (not
+/// reinvented) so duplicate requests, retries, and process restarts resolve
+/// to the same pack instead of generating a second one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemediationPackRecord {
+    pub id: String,
+    pub parent_review_unit_id: ReviewUnitId,
+    pub attempt_id: String,
+    pub concept_key: String,
+    pub review_unit_ids: Vec<ReviewUnitId>,
+    pub status: RemediationPackStatus,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BetaReviewUnitRecord {
@@ -231,6 +270,8 @@ pub struct BetaReviewUnitRecord {
     pub archived_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_pack_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -360,6 +401,8 @@ pub struct BetaStoreSnapshot {
     pub applied_reviews: Vec<AppliedReviewReceipt>,
     #[serde(default)]
     pub concept_reference_notes: Vec<ConceptReferenceNote>,
+    #[serde(default)]
+    pub remediation_packs: Vec<RemediationPackRecord>,
 }
 
 impl Default for BetaStoreSnapshot {
@@ -376,6 +419,7 @@ impl Default for BetaStoreSnapshot {
             content_feedback: Vec::new(),
             applied_reviews: Vec::new(),
             concept_reference_notes: Vec::new(),
+            remediation_packs: Vec::new(),
         }
     }
 }
@@ -905,6 +949,24 @@ impl BetaPersistenceStore {
         self.transact(|snapshot| {
             upsert_concept_reference_note(&mut snapshot.concept_reference_notes, note.clone());
             Ok(note)
+        })
+    }
+
+    /// Save or replace a boundary-owned remediation pack record.
+    ///
+    /// Upserts by `id`, so resolving a pack's status (Completed, Rejected,
+    /// Expired, Exited) is the same call as creating it: fetch, mutate, save.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStoreError`] for commit failures.
+    pub fn save_remediation_pack(
+        &mut self,
+        pack: RemediationPackRecord,
+    ) -> Result<RemediationPackRecord, BetaStoreError> {
+        self.transact(|snapshot| {
+            upsert_by_id(&mut snapshot.remediation_packs, pack.clone());
+            Ok(pack)
         })
     }
 
@@ -1853,7 +1915,14 @@ fn assert_draft_contract(
     assert_non_blank(&draft.model.version, "Generated prompt draft model version")?;
     let cites_concept_note = draft.concept_reference_note_key.is_some();
     let provider_generated = draft.generation_run_id.is_some();
-    let bridge_draft = draft.queue.domain_key.as_deref() == Some("bridge");
+    // Bridge and remediation drafts are concept-backed derivatives: they
+    // inherit `source_document_ids` from their parent purely for provenance
+    // display, grounded by the cited concept note rather than a fresh
+    // reference span of their own.
+    let bridge_draft = matches!(
+        draft.queue.domain_key.as_deref(),
+        Some("bridge" | "remediation")
+    );
     if provider_generated && draft.source_document_ids.is_empty() && !cites_concept_note {
         return Err(BetaStoreError::GeneratedPromptDraftRequiresSource);
     }
@@ -2039,6 +2108,7 @@ fn promote_generated_prompt_draft(
         generated_prompt_draft_id: Some(draft.id.clone()),
         archived_at: None,
         snoozed_until: None,
+        remediation_pack_id: draft.remediation_pack_id.clone(),
         created_at: draft.created_at,
     };
     snapshot.review_units.push(review_unit.clone());
@@ -2117,6 +2187,12 @@ impl HasId for GeneratedPromptDraft {
 }
 
 impl HasId for GenerationRun {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for RemediationPackRecord {
     fn id(&self) -> &str {
         &self.id
     }
