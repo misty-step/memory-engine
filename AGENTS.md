@@ -30,7 +30,12 @@ product contract.
 - Boundary crates own service orchestration, persistence, generation, study
   sessions, local app hosts, dogfood receipts, benchmarks, and QA.
 - `.dagger/src/index.ts` is the only TypeScript surface retained after the
-  Rust cutover because it owns the Dagger CI module.
+  Rust cutover because it owns the Dagger CI module. Browser-delivered JS
+  assets under `crates/memory-engine-api/assets/` — the PWA service worker
+  and the page bootstrap — are a separate and permitted exception: a browser
+  executes only JS, so these cannot move to Rust. They ship as plain `.js`
+  with no build step, and their behavior is gated by Rust route/render tests
+  plus the `app.js` contract test.
 
 Runtime code in `crates/memory-engine-core` must stay framework-free and
 persistence-free. No Convex, React, Hono, Node/Bun APIs, filesystem, network
@@ -146,8 +151,10 @@ oracle.
 - **Style:** `cargo fmt --all --check`; `cargo clippy --workspace
   --all-targets -- -D warnings`.
 - **Docs:** `cargo doc --workspace --no-deps` must pass.
-- **No non-Dagger TypeScript runtime.** The QA crate has a regression test
-  for this (see Known Debt for cutover completion status).
+- **No non-Dagger TypeScript runtime.** `crates/memory-engine-qa` enforces
+  this by file extension (`ts`, `tsx`, `mts`, `cts`) everywhere outside
+  `.dagger/`. Plain `.js` browser assets are deliberately outside that scope;
+  see Stack & Boundaries for why the service worker and bootstrap stay JS.
 
 ## Work Lifecycle
 
