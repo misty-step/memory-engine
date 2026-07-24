@@ -3379,7 +3379,11 @@ async fn service_worker_serves_versioned_safe_shell_and_offline_fallback() {
 
 #[tokio::test]
 async fn dynamic_html_and_api_responses_are_not_http_cacheable() {
-    let app = router(ApiState::default());
+    let store_root = temp_store_root("pwa-no-store");
+    let app = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    ));
     let home = app
         .clone()
         .oneshot(
