@@ -1,3 +1,12 @@
+// Register the server-rendered shell as a PWA without persisting page state.
+(function () {
+  "use strict";
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("/sw.js", { scope: "/", updateViaCache: "none" }).catch(function () {});
+  });
+})();
+
 // One state machine for review-submit forms: response timing, immediate
 // acknowledgment, and the cross-document performance handoff stay together.
 // The native form navigation remains the source of truth, so JavaScript off is
