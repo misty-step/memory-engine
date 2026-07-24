@@ -33,8 +33,8 @@ connection.
 | Review next ×5 | `POST /v1/accounts/{account_id}/review/next` | 200 ×5 | 0.684–0.840 s |
 | List sources | `GET /v1/accounts/{account_id}/sources` | 200 | 0.681 s |
 | Reissue independent credential | `POST /v1/service-sessions` | 201, same `accountId`; prior session remains independent | 0.419 s |
-| Revoke one current API session | `POST /v1/accounts/{account_id}/service-sessions/current` | route-owned explicit revoke | — |
-| Logout all API sessions | `POST /v1/accounts/{account_id}/service-sessions/all` | route-owned explicit revoke-all | — |
+| Revoke one current API session | `DELETE /v1/accounts/{account_id}/service-sessions/current` | route-owned explicit revoke | — |
+| Logout all API sessions | `DELETE /v1/accounts/{account_id}/service-sessions/all` | route-owned explicit revoke-all | — |
 
 Session lifecycle is explicit: issuing a new credential does not rotate or revoke
 other sessions. Callers use the one-session or all-session revoke route when they

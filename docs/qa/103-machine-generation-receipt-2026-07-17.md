@@ -29,7 +29,7 @@ used. This closes the open full-loop criterion from the
 | Select next review | `POST /v1/accounts/{account_id}/review/next` | 200; `generated-quiz-src-1a8cd4c00482e36f-1-nato-phonetic-alphabet` | 0.854 s |
 | Submit `ALFA` | `POST /v1/accounts/{account_id}/review/{review_unit_id}/submit` | 200; verdict `correct`, attempt count 1 | 1.640 s |
 | Archive proof source | `DELETE /v1/accounts/{account_id}/sources/{source_id}` | 204 | 1.942 s |
-| Revoke one API session | `POST /v1/accounts/{account_id}/service-sessions/current` | explicit session revoke | — |
+| Revoke one API session | `DELETE /v1/accounts/{account_id}/service-sessions/current` | explicit session revoke | — |
 
 The source used the deterministic structured-block contract:
 

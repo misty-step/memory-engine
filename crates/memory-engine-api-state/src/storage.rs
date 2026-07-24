@@ -1277,6 +1277,12 @@ impl StudyStorageAdapter for FileStudyStorage {
         let preserved = self.browser_backed_session_hashes_for_account(account_id)?;
         let _lock =
             crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
+        // A pre-hash-migration account may still carry a raw legacy token
+        // (see `migrate_legacy_account_session`). Left alone, presenting it
+        // later would lazily migrate a "revoked" session back to life, so
+        // clear it here too, under the same `_api_sessions.lock` used by
+        // that lazy migration.
+        let _ = fs::remove_file(self.store_root.join(account_id).join("session.token"));
         let root = self.store_root.join("_api_sessions");
         let Ok(entries) = fs::read_dir(root) else {
             return Ok(());
@@ -1376,6 +1382,8 @@ impl StudyStorageAdapter for FileStudyStorage {
 
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
         let Ok(saved) = fs::read_to_string(&path) else {
             return Ok(());
         };
@@ -1392,11 +1400,18 @@ impl StudyStorageAdapter for FileStudyStorage {
             .map_err(|error| ApiFailure::internal(error.to_string()))
     }
 
+    /// Guards against the same race [`Self::migrate_legacy_browser_session_token`]
+    /// guards against: an unlocked read-modify-write here could silently
+    /// drop a concurrent revocation or lazy-migration update to the same
+    /// session file. Reuses the entry's own `path` for the write instead of
+    /// rebuilding it from the entry name.
     fn revoke_browser_sessions_for_account(
         &self,
         account_id: &str,
         now_ms: i64,
     ) -> Result<(), ApiFailure> {
+        let _lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
         let root = self.store_root.join("_browser_sessions");
         let Ok(entries) = fs::read_dir(root) else {
             return Ok(());
@@ -1408,12 +1423,6 @@ impl StudyStorageAdapter for FileStudyStorage {
                 continue;
             };
             if saved.lines().next() == Some(account_id) {
-                let session_id_hash = entry.file_name().to_string_lossy().into_owned();
-                let session_path = self
-                    .store_root
-                    .join("_browser_sessions")
-                    .join(session_id_hash)
-                    .join("session");
                 let mut lines = saved.lines().map(str::to_owned).collect::<Vec<_>>();
                 while lines.len() < 5 {
                     lines.push(String::new());
@@ -1423,7 +1432,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                 } else {
                     lines[5] = now_ms.to_string();
                 }
-                write_atomic(&session_path, format!("{}\n", lines.join("\n")).as_bytes())
+                write_atomic(&path, format!("{}\n", lines.join("\n")).as_bytes())
                     .map_err(|error| ApiFailure::internal(error.to_string()))?;
             }
         }
@@ -3328,6 +3337,160 @@ mod tests {
         let persisted = fs::read_to_string(hash_path).expect("hashed session");
         assert!(persisted.starts_with(account_id));
         assert!(!persisted.contains("legacy-wire-token"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_account_sessions_for_account_also_clears_the_legacy_raw_token() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-revoke-legacy-session-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_legacy_revoke";
+        let legacy_path = root.join(account_id).join("session.token");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, "legacy-revoke-token\n").expect("legacy token");
+        let storage = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+
+        storage
+            .revoke_account_sessions_for_account(account_id, test_now())
+            .expect("revoke all sessions");
+
+        assert!(
+            !legacy_path.exists(),
+            "legacy raw token must not survive a bulk revocation"
+        );
+        // Without the fix, presenting the raw legacy token here would
+        // lazily migrate it back into a fresh, valid session.
+        assert!(!storage
+            .account_session_matches(account_id, "legacy-revoke-token")
+            .expect("session check"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_browser_session_waits_for_the_browser_sessions_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-browser-revoke-one-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let session_id = "session-under-lock-one";
+        let session_path = browser_session_path(&root, session_id);
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &session_path,
+            format!(
+                "acct_browser_revoke_one\nsession-token-hash\ncsrf-hash\n{}\n{}\n\n",
+                test_now() + 1_000_000,
+                test_now()
+            ),
+        )
+        .expect("browser session fixture");
+
+        let held = crate::file_lock::acquire(&root.join("_browser_sessions.lock"))
+            .expect("hold browser sessions lock");
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        let session_id_owned = session_id.to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let revoke = thread::spawn(move || {
+            started_tx.send(()).expect("signal revoke start");
+            result_tx
+                .send(contender.revoke_browser_session(&session_id_owned, test_now()))
+                .expect("send revoke result");
+        });
+        started_rx.recv().expect("revoke started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "revoke_browser_session must wait while _browser_sessions.lock is held"
+        );
+        drop(held);
+        let result = early.unwrap_or_else(|_| result_rx.recv().expect("revoke after lock release"));
+        result.expect("revoke browser session");
+        revoke.join().expect("revoke thread");
+
+        let saved = fs::read_to_string(&session_path).expect("session file after revoke");
+        assert!(
+            saved
+                .lines()
+                .nth(5)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some(),
+            "session must be marked revoked with a timestamp once the lock is released"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn revoke_browser_sessions_for_account_waits_for_the_browser_sessions_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-browser-revoke-all-lock-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let account_id = "acct_browser_revoke_lock";
+        let session_path = browser_session_path(&root, "session-under-lock-all");
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &session_path,
+            format!(
+                "{account_id}\nsession-token-hash\ncsrf-hash\n{}\n{}\n\n",
+                test_now() + 1_000_000,
+                test_now()
+            ),
+        )
+        .expect("browser session fixture");
+
+        let held = crate::file_lock::acquire(&root.join("_browser_sessions.lock"))
+            .expect("hold browser sessions lock");
+        let contender = FileStudyStorage {
+            store_root: root.clone(),
+            now: test_now,
+            generation_provider_config: None,
+        };
+        let account_id_owned = account_id.to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let revoke = thread::spawn(move || {
+            started_tx.send(()).expect("signal revoke start");
+            result_tx
+                .send(contender.revoke_browser_sessions_for_account(&account_id_owned, test_now()))
+                .expect("send revoke result");
+        });
+        started_rx.recv().expect("revoke started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            early.is_err(),
+            "revoke_browser_sessions_for_account must wait while _browser_sessions.lock is held"
+        );
+        drop(held);
+        let result = early.unwrap_or_else(|_| result_rx.recv().expect("revoke after lock release"));
+        result.expect("revoke browser sessions for account");
+        revoke.join().expect("revoke thread");
+
+        let saved = fs::read_to_string(&session_path).expect("session file after revoke");
+        assert!(
+            saved
+                .lines()
+                .nth(5)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some(),
+            "session must be marked revoked with a timestamp once the lock is released"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

@@ -289,23 +289,33 @@ The file adapter performs the equivalent one-time migration for legacy
 session.token and browser-session rows on first read; raw values are not
 retained after the rewrite.
 
-Before applying migration 6, take a provider snapshot or Neon branch and retain
-the migration receipt. Roll forward by running the API with the versioned
-Postgres migrator, then verify row counts, non-empty 64-character hashes,
-expiry timestamps, and absence of the legacy columns/tables. Run the migrator
-twice: the second run must be a no-op and must leave the same row counts. Do
-not roll back only the binary after migration 6: the hashed-session schema is
-not compatible with a pre-migration binary.
-
-For a deterministic Postgres rollback, stop API writes and capture the exact
-commit/schema pair, then restore the provider snapshot before migration 6:
+Before applying migration 6, stop writes and capture a provider snapshot,
+Neon branch, or `pg_dump` archive of the pre-migration database, and retain
+the migration receipt:
 
 ```sh
 export DATABASE_URL='postgres://...'
-export SNAPSHOT_FILE="/secure/backup/memory-engine-pre-auth-v6-$(date -u +%Y%m%dT%H%M%SZ).dump"
-pg_dump --format=custom --no-owner --file="$SNAPSHOT_FILE" "$DATABASE_URL"
+export PRE_V6_SNAPSHOT_FILE="/secure/backup/memory-engine-pre-auth-v6-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump --format=custom --no-owner --file="$PRE_V6_SNAPSHOT_FILE" "$DATABASE_URL"
+```
+
+Roll forward by running the API with the versioned Postgres migrator, then
+verify row counts, non-empty 64-character hashes, expiry timestamps, and
+absence of the legacy columns/tables. Run the migrator twice: the second run
+must be a no-op and must leave the same row counts. Do not roll back only
+the binary after migration 6: the hashed-session schema is not compatible
+with a pre-migration binary.
+
+For a deterministic Postgres rollback, stop API writes and restore the
+snapshot captured *before* migration 6 — never a dump taken during rollback,
+which would only capture the already-migrated state and restore a no-op:
+
+```sh
+export DATABASE_URL='postgres://...'
+# The exact file captured in the pre-migration step above, not a fresh dump.
+test -r "$PRE_V6_SNAPSHOT_FILE"
 # Roll back only while writes are stopped.
-pg_restore --clean --if-exists --no-owner --dbname="$DATABASE_URL" "$SNAPSHOT_FILE"
+pg_restore --clean --if-exists --no-owner --dbname="$DATABASE_URL" "$PRE_V6_SNAPSHOT_FILE"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c   "SELECT version FROM memory_engine_schema_migrations ORDER BY version DESC LIMIT 1;"
 ```
 
