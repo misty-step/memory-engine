@@ -228,6 +228,7 @@ fn view(
         summary: summary(),
         due_count,
         generation_notices,
+        library: Vec::new(),
     }
 }
 
@@ -587,20 +588,101 @@ fn conformance_generating_notice_only_shows_while_a_job_is_actually_in_flight() 
 /// Operator dogfood finding (memory-engine-081): too much explainer text on
 /// the workspace. The welcome lede and capture hint are each one short line —
 /// no second sentence restating the product pitch.
+/// memory-engine-087: the workspace is now split into focused views — the
+/// welcome lede lives on Home, the capture hint on Create.
 #[test]
-fn conformance_workspace_copy_trims_to_one_line_each() {
-    let acct = account();
-    let empty_workspace = render_app_shell(Some(&acct), &[], None, &[], None);
+fn conformance_view_copy_trims_to_one_line_each() {
+    let state = memory_engine_api_state::ApiState::new(
+        memory_engine_api_state::AccountRegistry::default().with_auth_config(
+            memory_engine_api_state::AuthConfig::allow_emails(["copy@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
+    let created = state.create_account("copy@example.com").expect("account");
+    let acct = state.create_browser_session(&created).expect("session");
+    let home = render_app_shell(Some(&acct), &[], None, &[], None);
     assert!(
-        empty_workspace.contains(
+        home.contains(
             r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#
         ),
-        "the welcome lede must be a single short line: {empty_workspace}"
+        "the welcome lede must be a single short line on Home: {home}"
     );
+    let create = crate::render_create_page(&state, &acct, None);
     assert!(
-        empty_workspace.contains(
+        create.contains(
             r#"<span class="ae-dim me-hint me-live-hint">Generates in the background.</span>"#
         ),
-        "the capture hint must be a single short line: {empty_workspace}"
+        "the capture hint must be a single short line on Create: {create}"
+    );
+}
+
+/// memory-engine-087: persistent one-tap navigation is present on every
+/// standing view (Home, Create, Library, Analytics) with `aria-current`
+/// marking the active view, and absent from the full-bleed review.
+#[test]
+fn conformance_nav_present_on_standing_views_absent_on_review() {
+    let state = memory_engine_api_state::ApiState::new(
+        memory_engine_api_state::AccountRegistry::default().with_auth_config(
+            memory_engine_api_state::AuthConfig::allow_emails(["nav@example.com".to_owned()])
+                .with_anonymous_account_creation(true),
+        ),
+    );
+    let created = state.create_account("nav@example.com").expect("account");
+    let acct = state.create_browser_session(&created).expect("session");
+
+    // Home (no active review) has nav with Home current.
+    let home = render_app_shell(Some(&acct), &[], None, &[], None);
+    assert!(
+        home.contains(r#"<nav class="me-nav" aria-label="Views">"#),
+        "Home must carry persistent nav: {home}"
+    );
+    assert!(
+        home.contains(r#"href="/" aria-current="page">Home</a>"#),
+        "Home nav must mark itself current: {home}"
+    );
+
+    // Create has nav with Create current.
+    let create = crate::render_create_page(&state, &acct, None);
+    assert!(
+        create.contains(r#"<nav class="me-nav" aria-label="Views">"#),
+        "Create must carry persistent nav: {create}"
+    );
+    assert!(
+        create.contains(r#"href="/app/create" aria-current="page">Create</a>"#),
+        "Create nav must mark itself current: {create}"
+    );
+
+    // Library has nav with Library current.
+    let library = crate::render_library_page(&state, &acct, None, None);
+    assert!(
+        library.contains(r#"<nav class="me-nav" aria-label="Views">"#),
+        "Library must carry persistent nav: {library}"
+    );
+    assert!(
+        library.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
+        "Library nav must mark itself current: {library}"
+    );
+
+    // Analytics has nav with Analytics current.
+    let view = view(vec![], None, vec![], 0, vec![]);
+    let analytics =
+        crate::render_analytics_page(&acct, &view, crate::AnalyticsViewOptions::default());
+    assert!(
+        analytics.contains(r#"<nav class="me-nav" aria-label="Views">"#),
+        "Analytics must carry persistent nav: {analytics}"
+    );
+    assert!(
+        analytics.contains(r#"href="/app/analytics" aria-current="page">Analytics</a>"#),
+        "Analytics nav must mark itself current: {analytics}"
+    );
+
+    // Review is full-bleed: no nav.
+    let pages = pages();
+    let Some((_, review)) = pages.iter().find(|(name, _)| *name == "06-review-open") else {
+        panic!("review-open preview state missing");
+    };
+    assert!(
+        !review.contains(r#"<nav class="me-nav""#),
+        "review must not carry nav (full-bleed): {review}"
     );
 }

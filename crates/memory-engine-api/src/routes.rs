@@ -5,11 +5,12 @@ use std::{
 };
 
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Form, Path, Query, Request, State},
     http::{
         header::{CACHE_CONTROL, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode,
     },
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
@@ -28,11 +29,12 @@ use memory_engine_study::infer_capture_title;
 use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
     render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_edit_review_html, render_login_requested,
-    render_return_notification_confirmation, render_return_notification_disabled,
-    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
-    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
-    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS,
+    render_content_feedback_result_html, render_create_page, render_edit_review_html,
+    render_library_page, render_login_requested, render_return_notification_confirmation,
+    render_return_notification_disabled, render_return_notification_recovery,
+    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
+    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions,
+    ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
     csrf_token, html_with_browser_session, html_with_cleared_browser_session, normalize_email,
@@ -347,6 +349,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(app_home))
         .route("/static/ledger.css", get(static_ledger_css))
         .route("/static/app.js", get(static_app_js))
+        .route("/sw.js", get(static_service_worker))
+        .route("/offline.html", get(static_offline_html))
         .route("/manifest.webmanifest", get(static_manifest))
         .route("/favicon.png", get(static_favicon))
         .route("/icon-192.png", get(static_icon_192))
@@ -365,6 +369,8 @@ pub fn router(state: ApiState) -> Router {
     let router = mount_v1_routes(router)
         .route("/app/start", post(start_app_study))
         .route("/app/analytics", get(app_analytics))
+        .route("/app/create", get(app_create))
+        .route("/app/library", get(app_library))
         .route("/app/account", post(create_app_account))
         .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
@@ -426,7 +432,9 @@ pub fn router(state: ApiState) -> Router {
             post(reject_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
-    mount_review_routes(router).with_state(state)
+    mount_review_routes(router)
+        .layer(middleware::from_fn(no_store_dynamic_responses))
+        .with_state(state)
 }
 
 /// The review "escape hatch" routes: reveal, cross-reference, skip, snooze,
@@ -467,6 +475,27 @@ fn mount_review_routes(router: Router<ApiState>) -> Router<ApiState> {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
+}
+
+async fn no_store_dynamic_responses(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    if matches!(
+        path.as_str(),
+        "/static/ledger.css"
+            | "/static/app.js"
+            | "/sw.js"
+            | "/offline.html"
+            | "/manifest.webmanifest"
+            | "/favicon.png"
+            | "/icon-192.png"
+            | "/icon-512.png"
+            | "/apple-touch-icon.png"
+    ) {
+        response
+    } else {
+        no_store_response(response)
+    }
 }
 
 async fn healthz(State(state): State<ApiState>) -> Json<HealthResponse> {
@@ -514,6 +543,28 @@ async fn static_ledger_css() -> impl IntoResponse {
             (CACHE_CONTROL, "public, max-age=3600"),
         ],
         LEDGER_CSS,
+    )
+}
+
+async fn static_service_worker() -> impl IntoResponse {
+    const WORKER: &str = include_str!("../assets/service-worker.js");
+    (
+        [
+            (CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (CACHE_CONTROL, "no-cache"),
+        ],
+        WORKER,
+    )
+}
+
+async fn static_offline_html() -> impl IntoResponse {
+    const OFFLINE: &str = include_str!("../assets/offline.html");
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        OFFLINE,
     )
 }
 
@@ -583,6 +634,20 @@ async fn app_analytics(
                 Some(&error.message),
             )),
         },
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
+}
+
+async fn app_create(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+    match state.require_browser_session_readonly(&headers) {
+        Ok(account) => Html(render_create_page(&state, &account, None)),
+        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    }
+}
+
+async fn app_library(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+    match state.require_browser_session_readonly(&headers) {
+        Ok(account) => Html(render_library_page(&state, &account, None, None)),
         Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
     }
 }
@@ -1554,17 +1619,11 @@ async fn capture_app_source(
             }
         }
         Err(error) => {
-            return Html(render_account_page(
-                &state,
-                &account,
-                None,
-                Some(&error.message),
-            ))
-            .into_response()
+            return Html(render_create_page(&state, &account, Some(&error.message))).into_response()
         }
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_create_page(&state, &account, Some(&notice))).into_response()
 }
 
 fn render_save_result_html(
@@ -1573,13 +1632,13 @@ fn render_save_result_html(
     result: Result<(), ApiFailure>,
 ) -> String {
     match result {
-        Ok(()) => render_account_page(
+        Ok(()) => render_library_page(
             state,
             account,
             None,
             Some("Capture saved. Create review when you are ready."),
         ),
-        Err(error) => render_account_page(state, account, None, Some(&error.message)),
+        Err(error) => render_library_page(state, account, None, Some(&error.message)),
     }
 }
 
@@ -1629,7 +1688,7 @@ async fn generate_app_source(
         EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
     };
 
-    Html(render_account_page(&state, &account, None, Some(&notice))).into_response()
+    Html(render_library_page(&state, &account, None, Some(&notice))).into_response()
 }
 
 async fn archive_app_source(
@@ -1652,7 +1711,7 @@ async fn archive_app_source(
             // run. Name the actual count instead.
             let cards = if archived_count == 1 { "card" } else { "cards" };
             let notice = format!("Source removed. {archived_count} {cards} retired.");
-            Html(render_account_page(
+            Html(render_library_page(
                 &state,
                 &account,
                 Some(&view),
@@ -1660,7 +1719,7 @@ async fn archive_app_source(
             ))
             .into_response()
         }
-        Err(error) => Html(render_account_page(
+        Err(error) => Html(render_library_page(
             &state,
             &account,
             None,
@@ -1681,14 +1740,14 @@ async fn update_app_source_permission(
             Err(error) => return app_failure_response(&error),
         };
     match state.update_app_source_permission(&account, &form.source_id, form.permission) {
-        Ok(()) => Html(render_account_page(
+        Ok(()) => Html(render_library_page(
             &state,
             &account,
             None,
             Some("Source permission updated."),
         ))
         .into_response(),
-        Err(error) => Html(render_account_page(
+        Err(error) => Html(render_library_page(
             &state,
             &account,
             None,
@@ -1716,7 +1775,7 @@ async fn retry_app_job(
         "That job can't be retried."
     };
 
-    Html(render_account_page(&state, &account, None, Some(notice))).into_response()
+    Html(render_library_page(&state, &account, None, Some(notice))).into_response()
 }
 
 /// Live job-status stream (SSE). Pushes this account's job updates as they

@@ -104,6 +104,34 @@ footer.ae-bar { border-top: 1px solid var(--lg-line); margin-top: auto; justify-
   text-decoration: none;
 }
 .me-due { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* Persistent view navigation (memory-engine-087). Replaces the plain
+   sign-out footer on standing views; review keeps the plain footer
+   (full-bleed, no nav). */
+.me-nav {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  width: 100%;
+}
+.me-nav-item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  font: 600 11px/1 var(--lg-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--lg-ink-2);
+  text-decoration: none;
+  transition: color 190ms var(--lg-ease);
+}
+.me-nav-item[aria-current="page"] {
+  color: var(--lg-accent);
+}
+.me-nav-item:hover { color: var(--lg-ink); }
+.me-nav-signout { margin-left: auto; }
 .ae-stage { flex: 1; display: grid; place-items: center; width: 100%; min-width: 0; }
 .ae-stage-scroll { display: block; width: 100%; min-width: 0; }
 .ae-view {

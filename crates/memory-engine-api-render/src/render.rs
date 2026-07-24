@@ -15,7 +15,9 @@
 use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
-use memory_engine_study::{BetaStudyConceptProgress, BetaStudyCurrent, SourcePermission};
+use memory_engine_study::{
+    BetaStudyConceptProgress, BetaStudyCurrent, LibrarySourceRow, SourcePermission,
+};
 
 use memory_engine_api_state::{
     ApiFailure, ApiState, AppAccount, GenerationJob, JobStatus, SourceRecord, StudyViewResponse,
@@ -119,6 +121,7 @@ pub fn render_content_feedback_recovery_html(
         Some(recovery.message),
         &[],
         &body,
+        None,
     ))
 }
 
@@ -343,17 +346,60 @@ fn render_app_shell_with_head(
     head: &str,
 ) -> String {
     let inner = match account {
-        Some(account) => render_signed_in(
-            account,
-            sources,
-            view,
-            jobs,
-            notice,
-            SignedInSurface::Workspace,
-        ),
+        Some(account) => {
+            render_signed_in(account, sources, view, jobs, notice, SignedInSurface::Home)
+        }
         None => render_signed_out(notice),
     };
     document_with_head(&inner, head)
+}
+
+/// The Create view: the capture form alone, with persistent nav
+/// (memory-engine-087). Capture is one job-to-be-done — it never shares a
+/// scroll with source management or analytics.
+#[must_use]
+pub fn render_create_page(state: &ApiState, account: &AppAccount, notice: Option<&str>) -> String {
+    let view = state.app_study_view(account).ok();
+    let jobs = state.jobs_for_app_account(account);
+    let inner = render_signed_in(
+        account,
+        &[],
+        view.as_ref(),
+        &jobs,
+        notice,
+        SignedInSurface::Create,
+    );
+    document(&inner)
+}
+
+/// The Library view: saved material with per-source active-card counts and
+/// concept drilldown, plus the generation activity log (memory-engine-087).
+/// Source management is one job-to-be-done — it never shares a scroll with
+/// capture or analytics.
+#[must_use]
+pub fn render_library_page(
+    state: &ApiState,
+    account: &AppAccount,
+    view: Option<&StudyViewResponse>,
+    notice: Option<&str>,
+) -> String {
+    let fetched = if view.is_none() {
+        state.app_study_view(account).ok()
+    } else {
+        None
+    };
+    let resolved_view = view.or(fetched.as_ref());
+    let sources = state.list_app_sources(account).unwrap_or_default();
+    let jobs = state.jobs_for_app_account(account);
+    let inner = render_signed_in(
+        account,
+        &sources,
+        resolved_view,
+        &jobs,
+        notice,
+        SignedInSurface::Library,
+    );
+    document(&inner)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -391,8 +437,9 @@ pub fn render_analytics_page(
     view: &StudyViewResponse,
     options: AnalyticsViewOptions,
 ) -> String {
-    let header_right = r#"<a class="ae-button-quiet ae-button-compact" href="/">Workspace</a>"#;
-    let footer = signed_in_footer(account);
+    let due = view.due_count;
+    let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
+    let footer = render_nav("analytics", account);
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -402,7 +449,7 @@ pub fn render_analytics_page(
 </section>"#,
         surface = render_concept_health_surface(&view.concept_progress, options),
     );
-    document(&screen(header_right, &body, &footer))
+    document(&screen(&header_right, &body, &footer))
 }
 
 #[must_use]
@@ -639,7 +686,9 @@ fn render_signed_out(notice: Option<&str>) -> String {
 
 #[derive(Clone, Copy)]
 enum SignedInSurface {
-    Workspace,
+    Home,
+    Create,
+    Library,
     Edit,
     ReviewComplete,
 }
@@ -653,22 +702,40 @@ fn render_signed_in(
     surface: SignedInSurface,
 ) -> String {
     let due = view.map_or(0, |view| view.due_count);
-    let body = match surface {
-        SignedInSurface::Edit => view.and_then(|view| view.current.as_ref()).map_or_else(
-            || render_workspace(account, sources, view, jobs),
-            |current| render_edit_review(account, current),
-        ),
-        SignedInSurface::ReviewComplete => render_review_complete(),
-        SignedInSurface::Workspace => view.and_then(|view| view.current.as_ref()).map_or_else(
-            || render_workspace(account, sources, view, jobs),
-            |current| {
-                let mut review = render_current_review(account, current);
-                review.push_str(&render_pending_drafts(account, view));
-                review
-            },
-        ),
-    };
-    render_signed_in_body(account, due, notice, jobs, &body)
+    match surface {
+        SignedInSurface::Edit => {
+            let body = view.and_then(|view| view.current.as_ref()).map_or_else(
+                || render_home_body(account, view),
+                |current| render_edit_review(account, current),
+            );
+            render_signed_in_body(account, due, notice, jobs, &body, None)
+        }
+        SignedInSurface::ReviewComplete => {
+            let body = render_review_complete();
+            render_signed_in_body(account, due, notice, jobs, &body, Some("home"))
+        }
+        SignedInSurface::Home => {
+            if let Some(current) = view.and_then(|view| view.current.as_ref()) {
+                // Full-bleed review: no nav. Any drafts newly generated while
+                // the learner reviews still get their keep/edit/reject
+                // decision surfaced right below the card, not hidden away.
+                let mut body = render_current_review(account, current);
+                body.push_str(&render_pending_drafts(account, view));
+                render_signed_in_body(account, due, notice, jobs, &body, None)
+            } else {
+                let body = render_home_body(account, view);
+                render_signed_in_body(account, due, notice, jobs, &body, Some("home"))
+            }
+        }
+        SignedInSurface::Create => {
+            let body = render_capture(account);
+            render_signed_in_body(account, due, notice, jobs, &body, Some("create"))
+        }
+        SignedInSurface::Library => {
+            let body = render_library_body(account, sources, view, jobs);
+            render_signed_in_body(account, due, notice, jobs, &body, Some("library"))
+        }
+    }
 }
 
 fn render_signed_in_body(
@@ -677,11 +744,37 @@ fn render_signed_in_body(
     notice: Option<&str>,
     jobs: &[GenerationJob],
     body: &str,
+    nav_active: Option<&str>,
 ) -> String {
     let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = signed_in_footer(account);
+    let footer = match nav_active {
+        Some(active) => render_nav(active, account),
+        None => signed_in_footer(account),
+    };
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
+}
+
+/// Persistent one-tap navigation across standing views (memory-engine-087).
+/// Each view answers one job-to-be-done; the current view carries
+/// `aria-current="page"`. Sign-out stays one tap away in the same bar.
+fn render_nav(active: &str, account: &AppAccount) -> String {
+    let item = |label: &str, href: &str, key: &str| {
+        let current = if key == active {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
+        format!(r#"<a class="me-nav-item" href="{href}"{current}>{label}</a>"#)
+    };
+    format!(
+        r#"<nav class="me-nav" aria-label="Views">{}{}{}{}{}</nav>"#,
+        item("Home", "/", "home"),
+        item("Create", "/app/create", "create"),
+        item("Library", "/app/library", "library"),
+        item("Analytics", "/app/analytics", "analytics"),
+        signed_in_footer(account),
+    )
 }
 
 fn render_review_complete() -> String {
@@ -715,32 +808,152 @@ fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> Strin
     )
 }
 
-fn render_workspace(
+/// The Home view: due hero, caught-up state, and reminders behind a
+/// disclosure. Nothing else — capture, sources, and analytics each own their
+/// own view (memory-engine-087).
+fn render_home_body(account: &AppAccount, view: Option<&StudyViewResponse>) -> String {
+    let mut html = String::new();
+    if let Some(view) = view {
+        html.push_str(&render_review_status(account, view));
+    }
+    if view.is_none()
+        || view.is_some_and(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0)
+    {
+        html.push_str(
+            r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
+        );
+    }
+    html.push_str(&render_return_notifications(account));
+    // Generation is non-blocking. Accepted drafts stay pending until the
+    // learner inspects their evidence and explicitly keeps, edits, or rejects
+    // them (memory-engine-079); that decision lives on Home alongside review.
+    html.push_str(&render_pending_drafts(account, view));
+    html
+}
+
+/// The Library view: saved material with per-source active-card counts and
+/// concept drilldown, generated drafts pending a keep/edit/reject decision,
+/// and the generation activity log (memory-engine-087). Source management is
+/// one job-to-be-done — it never shares a scroll with capture or analytics —
+/// but a pending decision surfaces here too (alongside the activity log that
+/// produced it) as well as on Home, since a learner may look for it in
+/// either place. Generation is non-blocking: accepted drafts stay pending
+/// until the learner inspects their evidence and explicitly keeps, edits, or
+/// rejects them.
+fn render_library_body(
     account: &AppAccount,
     sources: &[SourceRecord],
     view: Option<&StudyViewResponse>,
     jobs: &[GenerationJob],
 ) -> String {
-    // Generation is non-blocking. Accepted drafts stay pending until the learner
-    // inspects their evidence and explicitly keeps, edits, or rejects them.
+    let library = view.map_or(&[][..], |v| v.library.as_slice());
     let mut html = String::new();
-    if let Some(view) = view {
-        html.push_str(&render_review_status(account, view));
+    html.push_str(&render_library_sources(account, sources, library, jobs));
+    html.push_str(&render_pending_drafts(account, view));
+    html.push_str(&render_jobs(account, jobs));
+    html
+}
+
+/// Saved material with per-source active-card counts and concept drilldown
+/// (memory-engine-087). Replaces the flat source list from the workspace —
+/// each source row shows its card count and a collapsible concept breakdown
+/// so duplicates and gaps are visible at a glance.
+fn render_library_sources(
+    account: &AppAccount,
+    sources: &[SourceRecord],
+    library: &[LibrarySourceRow],
+    jobs: &[GenerationJob],
+) -> String {
+    if sources.is_empty() {
+        return String::new();
     }
-    if sources.is_empty() && jobs.is_empty() {
-        html.push_str(
-            r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
+    let mut rows = String::new();
+    for source in sources {
+        let lib = library.iter().find(|row| row.source_id == source.source_id);
+        let card_count = lib.map_or(0, |row| row.active_card_count);
+        let count_line = format!(
+            r#"<span class="ae-dim me-source-count">{card_count} {cards}</span>"#,
+            cards = plural(card_count, "card", "cards"),
+        );
+        let concept_detail = lib.map_or_else(String::new, |row| {
+            if row.concepts.is_empty() {
+                return String::new();
+            }
+            let items = row.concepts.iter().fold(String::new(), |mut acc, concept| {
+                let _ = write!(
+                    acc,
+                    r#"<li class="me-concept-item"><span>{}</span><span class="me-concept-count">{}</span></li>"#,
+                    escape_html(&concept.concept_label),
+                    concept.card_count,
+                );
+                acc
+            });
+            format!(
+                r#"<details class="me-concepts"><summary class="me-concepts-toggle">{count} {concepts}</summary><ul class="me-concepts-list">{items}</ul></details>"#,
+                count = row.concepts.len(),
+                concepts = plural(row.concepts.len(), "concept", "concepts"),
+            )
+        });
+        let generate = if source_generation_in_progress_or_done(source, jobs) {
+            String::new()
+        } else {
+            format!(
+                r#"<form action="/app/generate" method="post">{csrf_generate}<input type="hidden" name="sourceId" value="{id}"><button class="ae-button ae-button-compact" type="submit" title="Turn this material into review cards.">Generate cards</button></form>"#,
+                csrf_generate = hidden_csrf_input(account),
+                id = escape_html(&source.source_id),
+            )
+        };
+        let permission = match &source.permission {
+            SourcePermission::LocalOnly => {
+                "<span class=\"ae-dim me-source-permission\">Local only · never sent to a model</span>"
+            }
+            SourcePermission::ModelEligible => {
+                "<span class=\"ae-dim me-source-permission\">Model eligible</span>"
+            }
+        };
+        let edit_permission = format!(
+            r#"<form class="me-source-permission" action="/app/source/permission" method="post">{csrf}<input type="hidden" name="sourceId" value="{id}"><label class="ae-label" for="permission-{id_label}">Change permission</label><select class="ae-input" id="permission-{id_label}" name="permission" aria-label="Change permission for {title_attr}"><option value="model-eligible" {model_selected}>Allow model help</option><option value="local-only" {local_selected}>Keep local / Never send to a model</option></select><button class="ae-button-quiet ae-button-compact" type="submit">Save permission</button></form>"#,
+            csrf = hidden_csrf_input(account),
+            id = escape_html(&source.source_id),
+            id_label = escape_html(&source.source_id),
+            title_attr = escape_html(&source.title),
+            model_selected = if source.permission == SourcePermission::ModelEligible {
+                "selected"
+            } else {
+                ""
+            },
+            local_selected = if source.permission == SourcePermission::LocalOnly {
+                "selected"
+            } else {
+                ""
+            },
+        );
+        let _ = write!(
+            rows,
+            r#"<article class="me-source">
+<p class="ae-item">{title}</p>
+{count_line}
+{concept_detail}
+{permission}
+{edit_permission}
+<div class="me-row-actions">
+{generate}
+<details class="me-remove-confirm">
+<summary class="ae-button-quiet ae-button-compact" title="Remove this saved material.">Remove</summary>
+<p class="me-remove-warning">This removes the material and stops every card generated from it, across every generation run, from being reviewed.</p>
+<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit">Remove permanently</button></form>
+</details>
+</div>
+</article>"#,
+            title = escape_html(&source.title),
+            permission = permission,
+            csrf_archive = hidden_csrf_input(account),
+            id_archive = escape_html(&source.source_id),
         );
     }
-    html.push_str(&render_capture(account));
-    html.push_str(&render_return_notifications(account));
-    html.push_str(&render_jobs(account, jobs));
-    html.push_str(&render_pending_drafts(account, view));
-    html.push_str(&render_sources(account, sources, jobs));
-    if let Some(view) = view {
-        html.push_str(&render_concept_progress(&view.concept_progress));
-    }
-    html
+    format!(
+        r#"<section class="ae-group me-material"><h2 class="ae-h">Saved material</h2>{rows}</section>"#
+    )
 }
 
 fn render_return_notifications(account: &AppAccount) -> String {
@@ -822,7 +1035,7 @@ fn render_capture(account: &AppAccount) -> String {
 <form class="me-capture-form" action="/app/capture" method="post">
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
-<textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like “NATO phonetic alphabet”, a list, or pasted notes."></textarea>
+<textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like &ldquo;NATO phonetic alphabet&rdquo;, a list, or pasted notes."></textarea>
 <label class="ae-label" for="me-capture-permission">Permission</label>
 <select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
 <p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
@@ -905,78 +1118,6 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
         return String::new();
     }
     format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
-}
-
-fn render_sources(
-    account: &AppAccount,
-    sources: &[SourceRecord],
-    jobs: &[GenerationJob],
-) -> String {
-    if sources.is_empty() {
-        return String::new();
-    }
-
-    let mut rows = String::new();
-    for source in sources {
-        let generate = if source_generation_in_progress_or_done(source, jobs) {
-            String::new()
-        } else {
-            format!(
-                r#"<form action="/app/generate" method="post">{csrf_generate}<input type="hidden" name="sourceId" value="{id}"><button class="ae-button ae-button-compact" type="submit" title="Turn this material into review cards.">Generate cards</button></form>"#,
-                csrf_generate = hidden_csrf_input(account),
-                id = escape_html(&source.source_id),
-            )
-        };
-        let permission = match &source.permission {
-            SourcePermission::LocalOnly => {
-                "<span class=\"ae-dim me-source-permission\">Local only · never sent to a model</span>"
-            }
-            SourcePermission::ModelEligible => {
-                "<span class=\"ae-dim me-source-permission\">Model eligible</span>"
-            }
-        };
-        let edit_permission = format!(
-            r#"<form class="me-source-permission" action="/app/source/permission" method="post">{csrf}<input type="hidden" name="sourceId" value="{id}"><label class="ae-label" for="permission-{id_label}">Change permission</label><select class="ae-input" id="permission-{id_label}" name="permission" aria-label="Change permission for {title_attr}"><option value="model-eligible" {model_selected}>Allow model help</option><option value="local-only" {local_selected}>Keep local / Never send to a model</option></select><button class="ae-button-quiet ae-button-compact" type="submit">Save permission</button></form>"#,
-            csrf = hidden_csrf_input(account),
-            id = escape_html(&source.source_id),
-            id_label = escape_html(&source.source_id),
-            title_attr = escape_html(&source.title),
-            model_selected = if source.permission == SourcePermission::ModelEligible {
-                "selected"
-            } else {
-                ""
-            },
-            local_selected = if source.permission == SourcePermission::LocalOnly {
-                "selected"
-            } else {
-                ""
-            },
-        );
-        let _ = write!(
-            rows,
-            r#"<article class="me-source">
-<p class="ae-item">{title}</p>
-{permission}
-{edit_permission}
-<div class="me-row-actions">
-{generate}
-<details class="me-remove-confirm">
-<summary class="ae-button-quiet ae-button-compact" title="Remove this saved material.">Remove</summary>
-<p class="me-remove-warning">This removes the material and stops every card generated from it, across every generation run, from being reviewed.</p>
-<form action="/app/source/archive" method="post">{csrf_archive}<input type="hidden" name="sourceId" value="{id_archive}"><button class="ae-button-quiet ae-button-compact" type="submit">Remove permanently</button></form>
-</details>
-</div>
-</article>"#,
-            title = escape_html(&source.title),
-            permission = permission,
-            csrf_archive = hidden_csrf_input(account),
-            id_archive = escape_html(&source.source_id),
-        );
-    }
-
-    format!(
-        r#"<section class="ae-group me-material"><h2 class="ae-h">Saved material</h2>{rows}</section>"#
-    )
 }
 
 /// A source whose generation is already queued, running, or done never
@@ -1370,28 +1511,7 @@ fn render_next(account: &AppAccount, current: &BetaStudyCurrent) -> String {
     )
 }
 
-fn render_concept_progress(concepts: &[BetaStudyConceptProgress]) -> String {
-    if concepts.is_empty() {
-        return String::new();
-    }
-
-    let preview_count = concepts.len().min(WORKSPACE_CONCEPT_PREVIEW_SIZE);
-    let rows = concepts
-        .iter()
-        .take(WORKSPACE_CONCEPT_PREVIEW_SIZE)
-        .map(render_concept_row)
-        .collect::<String>();
-
-    format!(
-        r#"<section class="ae-group me-concepts"><h2 class="ae-h"><span>Concept health</span><a class="me-concepts-link" href="/app/analytics">View analytics {ICON_ARROW}</a></h2><p class="me-concepts-summary ae-dim">Showing {preview_count} of {total} {concepts}; Analytics holds the full ledger.</p>{rows}</section>"#,
-        preview_count = preview_count,
-        total = concepts.len(),
-        concepts = plural(concepts.len(), "concept", "concepts"),
-    )
-}
-
 const ANALYTICS_PAGE_SIZE: usize = 12;
-const WORKSPACE_CONCEPT_PREVIEW_SIZE: usize = 6;
 
 fn render_concept_health_surface(
     concepts: &[BetaStudyConceptProgress],
@@ -2167,6 +2287,7 @@ mod analytics_tests {
             },
             due_count: 0,
             generation_notices: Vec::new(),
+            library: Vec::new(),
         };
 
         let page = super::render_analytics_page(&account, &view, AnalyticsViewOptions::default());
@@ -2177,20 +2298,6 @@ mod analytics_tests {
         assert!(page.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert_eq!(page.matches(r#"href="/static/ledger.css""#).count(), 1);
         assert_eq!(page.matches(r#"src="/static/app.js""#).count(), 1);
-    }
-
-    #[test]
-    fn workspace_concept_health_is_a_bounded_preview_for_large_accounts() {
-        let concepts = (0..20)
-            .map(|index| concept(&format!("Concept {index:02}"), "struggling", 1, 10))
-            .collect::<Vec<_>>();
-
-        let page = super::render_concept_progress(&concepts);
-
-        assert_eq!(page.matches(r#"class="me-concept""#).count(), 6);
-        assert!(page.contains("Showing 6 of 20 concepts"));
-        assert!(page.contains(r#"href="/app/analytics""#));
-        assert!(page.contains("View analytics"));
     }
 
     #[test]
@@ -2239,6 +2346,7 @@ mod analytics_tests {
             },
             due_count: 0,
             generation_notices: Vec::new(),
+            library: Vec::new(),
         };
 
         let page = super::render_analytics_page(
