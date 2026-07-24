@@ -9,6 +9,7 @@ members = [
     "crates/memory-engine-canary",
     "crates/memory-engine-cli",
     "crates/memory-engine-contract",
+    "crates/memory-engine-credentials",
     "crates/memory-engine-core",
     "crates/memory-engine-generation",
     "crates/memory-engine-import",

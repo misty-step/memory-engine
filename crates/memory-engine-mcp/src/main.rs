@@ -12,8 +12,7 @@ use memory_engine_mcp::session;
 use serde_json::Value;
 
 fn main() {
-    let credentials_path = session::default_credentials_path();
-    let session = match session::resolve(&credentials_path) {
+    let session = match session::resolve() {
         Ok(session) => session,
         Err(error) => {
             eprintln!("memory-engine-mcp: {error}");

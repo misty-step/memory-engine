@@ -42,20 +42,26 @@ cargo run -p memory-engine-contract -- \
   --base-url http://127.0.0.1:18080
 ```
 
-The production demo uses the same pre-provisioned account contract:
+The production demo uses the same pre-provisioned account contract. Production
+account creation is allowlist-gated. The runner's default base URL is the
+branded production origin `https://scry.study`; pass
+`--base-url https://memory-engine-api-i2xcr.ondigitalocean.app` explicitly
+only as a labeled operator-origin fallback (e.g. while DNS for the branded
+domain is degraded):
 
 ```sh
 MEMORY_ENGINE_ACCOUNT_ID=acct_... \
 MEMORY_ENGINE_SESSION_TOKEN="$SESSION_TOKEN" \
-cargo run -p memory-engine-contract -- \
-  --base-url https://memory-engine-api-i2xcr.ondigitalocean.app
+cargo run -p memory-engine-contract
 ```
 
-The runner creates a disposable source, generates drafts that remain pending,
-keeps the first draft explicitly, selects the next review, reveals the answer,
-submits that answer,
-archives the source, lists active sources, and emits a JSON receipt with the
-source absent from the active list.
+The runner creates a disposable source, enqueues its generation job on the
+durable production queue and polls it to a bounded terminal state (never the
+legacy synchronous `/generate` route, refused with HTTP 409 once
+`MEMORY_ENGINE_POSTGRES_URL` is set — every production deployment), keeps the
+first pending draft explicitly, selects the next review, reveals the answer,
+submits that answer, archives the source, lists active sources, and emits a
+JSON receipt with the source absent from the active list.
 
 ## Scry Integration Notes
 

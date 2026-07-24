@@ -63,9 +63,14 @@ cargo run -p memory-engine-api
    curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/          # 200
    curl -fsS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18080/app/generate  # expect 4xx
    ```
-2. v1 JSON contract: `POST /v1/accounts` → `.../sources` → `.../sources/{id}/generate`
-   → `POST /v1/accounts/{id}/review/next` (see `crates/memory-engine-api/src/routes.rs`;
-   spec at `/v1/openapi.json`). Inspect response shape, not just status.
+2. v1 JSON contract: `POST /v1/accounts` → `.../sources` → enqueue
+   `POST .../sources/{id}/generation-jobs` → bounded-poll
+   `GET .../generation-jobs/{jobId}` → `POST /v1/accounts/{id}/review/next`
+   (see `crates/memory-engine-api/src/routes.rs`; spec at
+   `/v1/openapi.json`). The legacy synchronous `POST .../generate` route is
+   refused with HTTP 409 once `MEMORY_ENGINE_POSTGRES_URL` is set — every
+   production deployment — so a queued job is the only contract that works
+   there. Inspect response shape, not just status.
 3. Study UI walk: sign in via the debug link, capture a source, generate a review,
    `/app/next` → reveal → submit. Confirm the review actually renders and grades.
 
@@ -91,11 +96,14 @@ cargo run -p memory-engine-qa -- --full     # handoff sweep; ends with bun run c
 
 ## Production smoke (optional)
 
-Live at `https://memory-engine-api-i2xcr.ondigitalocean.app` on DigitalOcean
-App Platform. Mirror the deploy smoke (health/home/anonymous mutation boundary)
-per `docs/runbook.md`; e.g.
-`curl -fsS https://memory-engine-api-i2xcr.ondigitalocean.app/healthz` →
-`{"status":"ok",...}`.
+Branded production origin is `https://scry.study`. Mirror the deploy smoke
+(health/home/anonymous mutation boundary) per `docs/runbook.md`; e.g.
+`curl -fsS https://scry.study/healthz` → `{"status":"ok",...}`. The
+DigitalOcean App Platform origin `https://memory-engine-api-i2xcr.ondigitalocean.app`
+that `scry.study` fronts is still live and still the identity the deploy
+smoke checks directly, but treat it only as a labeled operator-origin
+fallback (e.g. while DNS for the branded domain is degraded), never as the
+default a client advertises.
 
 ## Gotchas
 

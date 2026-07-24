@@ -83,7 +83,34 @@ the pulse; state color applies instantly.
   action in the disclosure carries a leading icon and a tooltip truthful to
   what the route actually does (Skip defers within the session; Snooze
   defers until tomorrow — they must never read as interchangeable).
-- The workspace's first element is the due hero: count + one Start review tap.
+- The Home view's first element is the due hero: count + one Start review tap.
+
+## IA and navigation (memory-engine-087)
+
+The signed-in app is four focused views, each owning one job-to-be-done.
+No view mixes capture + source management + analytics in one scroll.
+
+| view | route | job-to-be-done |
+|---|---|---|
+| Home | `/` | due hero + Start review, caught-up state, reminders behind a disclosure |
+| Create | `/app/create` | capture material |
+| Library | `/app/library` | saved material, per-source card counts, concept drilldown, generation activity, source removal |
+| Analytics | `/app/analytics` | concept health |
+
+Review is not a nav destination — it is a full-bleed loop entered from the
+Home due hero (or the next/submit POST loop) and exited when the queue
+empties. The review card owns the screen; no nav, no workspace sections.
+
+**Nav grammar** (`me-nav`): persistent bottom bar on standing views (Home,
+Create, Library, Analytics). Four equal-width items, mono label register,
+`aria-current="page"` on the active view, accent tint on the current item.
+Sign-out stays one tap away in the same bar. Every item is at least 44px.
+Navigation is one tap between any two standing views.
+
+**POST return targets**: capture → Create; generate, archive, retry,
+permission → Library; reminders → Home. Each POST returns to the view that
+owns the action, so the learner never lands on a scroll of unrelated
+sections after submitting.
 
 ## Post-grade meta ledger
 

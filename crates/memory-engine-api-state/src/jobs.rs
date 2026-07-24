@@ -13,14 +13,10 @@
 //! process can reclaim. Generation writes are replay-safe because draft and
 //! review-unit identities are stable and persisted before the job is terminal.
 
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
-};
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 use memory_engine_persistence_postgres::{
@@ -1070,19 +1066,16 @@ impl JobQueue {
     }
 }
 
+/// Delegates to [`PostgresStudyStore::migrate_once`], which owns the one
+/// process-wide "already migrated" cache shared with the HTTP request
+/// path (`lib.rs`'s `connect_postgres_migrated`) — not a private cache of
+/// its own, so this worker and the request path can never each
+/// independently believe they are the first to see `database_url`.
 fn postgres_store(
     database_url: &str,
 ) -> Result<PostgresStudyStore, memory_engine_persistence_postgres::PostgresStoreError> {
-    static MIGRATED_URLS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let mut store = PostgresStudyStore::connect(database_url)?;
-    let migrated = MIGRATED_URLS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut migrated = migrated
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !migrated.contains(database_url) {
-        store.migrate()?;
-        migrated.insert(database_url.to_owned());
-    }
+    store.migrate_once(database_url)?;
     Ok(store)
 }
 
