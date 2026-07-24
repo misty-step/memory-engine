@@ -621,6 +621,11 @@ pub struct BetaStudySession<S = BetaPersistenceStore> {
     schedule_change: Option<ScheduleChange>,
     remediation_packs_enabled: bool,
     remediation_provider: Option<Box<dyn BridgeMaterialProvider>>,
+    /// Set when remediation generation failed *after* a grade was already
+    /// durably applied. Surfaced as a learner-facing notice instead of failing
+    /// the submission: remediation is an enhancement on top of grading and must
+    /// never discard a committed grade.
+    remediation_notice: Option<String>,
 }
 
 impl BetaStudySession<BetaPersistenceStore> {
@@ -650,6 +655,7 @@ impl BetaStudySession<BetaPersistenceStore> {
             schedule_change: None,
             remediation_packs_enabled: false,
             remediation_provider: None,
+            remediation_notice: None,
         })
     }
 }
@@ -678,6 +684,7 @@ where
             schedule_change: None,
             remediation_packs_enabled: false,
             remediation_provider: None,
+            remediation_notice: None,
         }
     }
 
@@ -1578,6 +1585,13 @@ where
         }) {
             return Ok(());
         }
+        // The grade idempotency key is the attempt's identity here. It is
+        // answer-derived by default
+        // (`beta-study:{review_unit_id}:{prompt_id}:{answer}`), which cannot
+        // collapse two genuinely distinct attempts: the store rejects a repeat
+        // of the same key outright with `DuplicateAppliedReview`, so a second
+        // attempt that reaches this point always carries a different key. See
+        // `repeat_identical_answer_is_rejected_before_remediation_is_reached`.
         let attempt_id = review.attempt.idempotency_key.clone().unwrap_or_else(|| {
             format!(
                 "remediation-attempt:{review_unit_id}:{}",
@@ -1815,8 +1829,21 @@ where
             after: project_required_schedule(&review.schedule_state),
         });
         self.status = BetaStudyStatus::Graded;
+        self.remediation_notice = None;
         if self.remediation_packs_enabled {
-            self.reconcile_remediation_after_grade(&active.review_unit_id, &review, was_revealed)?;
+            // The grade and schedule above are already durably applied. A
+            // provider outage or store error inside remediation must not turn a
+            // committed submission into an error, so it becomes a notice.
+            if self
+                .reconcile_remediation_after_grade(&active.review_unit_id, &review, was_revealed)
+                .is_err()
+            {
+                self.remediation_notice = Some(
+                    "Practice material for this miss could not be generated. Your answer was \
+                     still recorded and this card is scheduled."
+                        .to_owned(),
+                );
+            }
         }
         self.view()
     }
@@ -1927,7 +1954,10 @@ where
                 next_review_unit_id,
             },
             api_pressure: api_pressure(),
-            generation_notices: generation_notices(&snapshot),
+            generation_notices: generation_notices(&snapshot)
+                .into_iter()
+                .chain(self.remediation_notice.clone())
+                .collect(),
             library,
         })
     }

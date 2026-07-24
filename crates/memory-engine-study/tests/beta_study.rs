@@ -1797,6 +1797,138 @@ fn distinct_later_attempt_creates_a_new_useful_pack_via_injected_provider() {
     }
 }
 
+/// Why remediation attempt identity can safely be the grade idempotency key.
+///
+/// That key is answer-derived by default
+/// (`beta-study:{review_unit_id}:{prompt_id}:{answer}`), which looks like it
+/// could collapse a learner who fails the same parent twice with the *same*
+/// wrong answer into one attempt and silently deny them a second pack. It
+/// cannot: the store rejects the repeated key outright, before remediation is
+/// ever consulted, so any attempt that reaches the pack guard necessarily
+/// carries a distinct key.
+///
+/// This pins that reasoning. If duplicate-review rejection is ever relaxed, this
+/// test fails and the attempt-identity derivation must be revisited.
+#[test]
+fn repeat_identical_answer_is_rejected_before_remediation_is_reached() {
+    let directory = TempDirectory::new("remediation-identical-repeat");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_packs_enabled(true);
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    let repeated_answer = "wrong answer";
+    study
+        .submit_answer(repeated_answer, 1_800)
+        .expect("first wrong submit");
+
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    let first_pack = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| pack.parent_review_unit_id == parent_id)
+        .cloned()
+        .expect("first remediation pack");
+    assert_eq!(first_pack.status, RemediationPackStatus::Active);
+
+    // Resolve the first pack so the parent returns and the Active-pack guard is
+    // no longer what stops a second pack.
+    let first_pack_draft_ids = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .filter(|draft| first_pack.review_unit_ids.contains(&draft.review_unit_id))
+        .map(|draft| draft.id.clone())
+        .collect::<Vec<_>>();
+    for draft_id in &first_pack_draft_ids {
+        study.keep_draft(draft_id).expect("keep first pack member");
+    }
+    for _ in 0..first_pack.review_unit_ids.len() {
+        study.advance().expect("advance");
+        study
+            .submit_answer("pack-member-answer", 1_000)
+            .expect("submit pack member");
+    }
+
+    let mut second_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(after_relearn))
+            .expect("reopen for second attempt")
+            .with_remediation_provider(Box::new(SecondAttemptRemediationProvider));
+    let resumed = second_session.start().expect("resume for second attempt");
+    assert_eq!(
+        resumed.current.expect("parent returns").review_unit_id,
+        parent_id
+    );
+
+    // The identical answer never reaches remediation: the store refuses to
+    // apply the same review twice.
+    let repeated = second_session
+        .submit_answer(repeated_answer, 1_800)
+        .expect_err("an identical repeat answer must be refused as a duplicate review");
+    let message = format!("{repeated:?}");
+    assert!(
+        message.contains("DuplicateAppliedReview"),
+        "the repeat must be refused by duplicate-review detection, not silently \
+         accepted with no pack: {message}"
+    );
+
+    // And no second pack was fabricated for a review that never applied.
+    let second_snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert_eq!(
+        second_snapshot
+            .remediation_packs
+            .iter()
+            .filter(|pack| pack.parent_review_unit_id == parent_id)
+            .count(),
+        1,
+        "a refused duplicate review must not create a pack"
+    );
+}
+
+/// A remediation failure must never discard an already-committed grade.
+#[test]
+fn remediation_failure_never_discards_the_committed_grade() {
+    let directory = TempDirectory::new("remediation-failure-keeps-grade");
+    let path = directory.path().join("study.json");
+    let mut study = BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now))
+        .expect("open")
+        .with_remediation_provider(Box::new(FailingRemediationProvider));
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    let approved = study
+        .keep_draft("study-run-1-draft-src-nato-2-nato-cat-composition")
+        .expect("keep exercise");
+    let parent_id = approved.current.expect("parent").review_unit_id;
+
+    // The submission must succeed: the grade and schedule are applied before
+    // remediation runs, so a remediation failure cannot be allowed to turn a
+    // committed submission into an error.
+    let view = study
+        .submit_answer("wrong answer", 1_800)
+        .expect("a remediation failure must not fail the submission");
+
+    assert_eq!(view.status, BetaStudyStatus::Graded);
+    let graded = view
+        .current
+        .expect("the graded card must still be returned");
+    assert_eq!(graded.grade.expect("the grade").verdict, Verdict::Wrong);
+
+    // And the attempt is durably recorded, not rolled back.
+    let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();
+    assert!(
+        snapshot
+            .attempts
+            .iter()
+            .any(|attempt| attempt.review_unit_id == parent_id && attempt.grade.is_some()),
+        "the graded attempt must be durably recorded even when remediation fails"
+    );
+}
+
 #[test]
 fn local_only_source_blocks_model_bridge_generation() {
     let directory = TempDirectory::new("local-only-bridge");
@@ -2622,5 +2754,39 @@ impl TempDirectory {
 impl Drop for TempDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A remediation provider that always fails, to prove a remediation failure
+/// never discards a committed grade.
+struct FailingRemediationProvider;
+
+impl ReferenceNoteProvider for FailingRemediationProvider {
+    fn model(&self) -> GeneratedPromptModel {
+        GeneratedPromptModel {
+            provider: "fixture".to_owned(),
+            name: "failing-remediation".to_owned(),
+            version: "v1".to_owned(),
+        }
+    }
+
+    fn explain_concept(
+        &self,
+        _request: &ReferenceNoteRequest,
+    ) -> Result<ReferenceNoteDraft, ProviderFailure> {
+        Err(ProviderFailure::transient(
+            "the remediation provider is unavailable",
+        ))
+    }
+}
+
+impl BridgeMaterialProvider for FailingRemediationProvider {
+    fn generate_bridge_material(
+        &self,
+        _request: &BridgeMaterialRequest,
+    ) -> Result<BridgeMaterial, ProviderFailure> {
+        Err(ProviderFailure::transient(
+            "the remediation provider is unavailable",
+        ))
     }
 }

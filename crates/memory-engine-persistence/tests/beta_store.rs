@@ -1219,6 +1219,10 @@ fn snapshot_envelope_uses_beta_store_wire_names() {
     assert!(encoded.get("conceptReferenceNotes").is_some());
     assert!(encoded.get("source_documents").is_none());
     assert!(encoded.get("concept_reference_notes").is_none());
+    assert!(encoded.get("remediationPacks").is_some());
+    assert!(encoded.get("remediation_packs").is_none());
+    assert!(encoded.get("appliedReviews").is_some());
+    assert!(encoded.get("applied_reviews").is_none());
     assert_eq!(encoded["sourceDocuments"][0]["createdAt"], NOW);
     assert_eq!(
         encoded["sourceDocuments"][0]["permission"],
