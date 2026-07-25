@@ -45,7 +45,7 @@ MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true \
 MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dev-unsubscribe-secret \
 HOST=127.0.0.1 PORT=18080 \
 cargo run -p memory-engine-api
-# → "Memory Engine API listening on http://127.0.0.1:18080"
+# → "Scry API listening on http://127.0.0.1:18080"
 ```
 
 - Port: the production binary defaults to `8080`; use `18080` locally to avoid clashing.

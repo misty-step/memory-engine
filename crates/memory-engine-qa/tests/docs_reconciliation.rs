@@ -232,7 +232,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
         &landmark,
         &[
             "product:",
-            "name: Memory Engine",
+            "name: Scry",
             "changelog:",
             "source: auto",
             "release:",

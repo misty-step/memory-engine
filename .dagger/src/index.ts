@@ -1,5 +1,5 @@
 /**
- * Memory Engine CI pipeline.
+ * Scry CI pipeline.
  *
  * One canonical place to run browser behavior contracts, Rust formatting,
  * tests, linting, documentation, and secret scanning. Each function mounts
