@@ -6,7 +6,7 @@ Refs-Powder: memory-engine-069
 
 ## Context
 
-Memory Engine's durable review loop is built around forgetting. FSRS answers:
+Scry's durable review loop is built around forgetting. FSRS answers:
 "when should this learner see the card again so recall stays strong?" That is
 the right clock for stable knowledge such as vocabulary, formulae, procedures,
 and conceptual bridges.
@@ -22,7 +22,7 @@ Volatile-knowledge mode gives that material a second clock: obsolescence.
 
 ## Decision
 
-Memory Engine will model two independent scheduling clocks:
+Scry will model two independent scheduling clocks:
 
 - **Forgetting clock:** FSRS schedule state models human memory over time.
 - **Obsolescence clock:** volatile lifecycle metadata models whether the card's

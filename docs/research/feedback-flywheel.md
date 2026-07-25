@@ -36,7 +36,7 @@ duplicates `memory-engine-bench` — not a feedback capture tool. Braintrust /
 LangSmith fail the OSS / consumer-owned-persistence constraint. Helicone is the
 easiest on-ramp (base-URL proxy) but acquired-and-coasting with no native OTLP.
 
-## Why homebrew for memory-engine
+## Why homebrew for Scry
 
 1. **The provenance spine already exists.** Every draft carries
    `GeneratedPromptModel { provider, name, version }` (`version` = the prompt

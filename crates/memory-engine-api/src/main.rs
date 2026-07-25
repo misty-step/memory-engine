@@ -30,7 +30,7 @@ async fn main() {
             .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
     });
 
-    println!("Memory Engine API listening on http://{local_addr}");
+    println!("Scry API listening on http://{local_addr}");
 
     let auth_config = match auth_config_from_env() {
         Ok(auth_config) => auth_config,

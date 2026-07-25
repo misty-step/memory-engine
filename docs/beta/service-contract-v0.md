@@ -1,6 +1,6 @@
 # Service Contract v0 Hardening
 
-This document records the stable, hardened local service contract (`MemoryService`) for the `memory-engine` after incorporating mobile beta interface pressure. It explicitly outlines what is stable, what remains private, and what evidence would justify future extraction or promotion.
+This document records the stable, hardened local service contract (`MemoryService`) for Scry's Rust engine after incorporating mobile beta interface pressure. It explicitly outlines what is stable, what remains private, and what evidence would justify future extraction or promotion.
 
 ## Command Lifecycle
 

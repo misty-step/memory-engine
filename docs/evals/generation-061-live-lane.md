@@ -132,7 +132,7 @@ the racy source path. The provider proxy also bounds each Unix-socket
 request read to 16 MiB and 30 seconds, on top of its global budgets.
 
 An arbitrary fork cannot invoke this workflow because there is no pull-request
-trigger, the job is gated to `misty-step/memory-engine` on `master`, checkout
+trigger, the job is gated to `misty-step/scry` on `master`, checkout
 credentials are disabled, and the submitted SHA must be an exact
 `refs/remotes/origin/master` object. The same-repository target is still
 treated as untrusted benchmark code: it receives only a one-run local proxy
@@ -217,7 +217,7 @@ budget boundaries above.
 ## Master branch protection proof
 
 Read-only verification on 2026-07-15, using
-`gh api repos/misty-step/memory-engine/branches/master/protection`, returned:
+`gh api repos/misty-step/scry/branches/master/protection`, returned:
 
 - strict required status checks: exactly `ci` and `review`;
 - required approving reviews: `0`;

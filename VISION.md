@@ -1,6 +1,6 @@
 # Scry Product Vision
 
-Status: Canonical consumer-product vision. Scry is the product; Memory Engine is the Rust engine beneath it. Revise this file when that product premise, the shared capability boundary, or the proof bar materially changes.
+Status: Canonical consumer-product vision. Scry is the product, and this repository is its Rust engine. Revise this file when that product premise, the shared capability boundary, or the proof bar materially changes.
 
 ## The Product
 
@@ -20,7 +20,7 @@ The near-term bet is a strong quiz loop, not full course generation. More learni
 
 ## Five Faces, One Capability System
 
-One Memory Engine capability boundary serves five faces:
+Scry's capability boundary serves five faces:
 
 - **PWA** — the primary human surface, designed for a fast phone-first study flow.
 - **CLI** — a direct operator and power-user interface.
@@ -48,15 +48,13 @@ Optimistic UI may acknowledge input before slower work completes, but it must no
 
 ## Engine and Boundary Architecture
 
-Memory Engine is the Rust engine beneath Scry. The pure kernel remains framework-free and persistence-free. `crates/memory-engine-core` owns deterministic learning behavior: scheduling, grading, queue selection, progression, difficulty, interleaving, opaque review-unit identity, and domain invariants. It does not know about the filesystem, network, auth, analytics, UI state, logging, model vendors, React, Hono, Node, or Bun.
+Scry's Rust engine keeps the pure kernel framework-free and persistence-free. `crates/memory-engine-core` owns deterministic learning behavior: scheduling, grading, queue selection, progression, difficulty, interleaving, opaque review-unit identity, and domain invariants. It does not know about the filesystem, network, auth, analytics, UI state, logging, model vendors, React, Hono, Node, or Bun.
 
 Boundary crates own orchestration, persistence, source ingestion, generation providers, sessions, identity, API routes, rendering, clients, deployment, and QA. AI may generate, explain, adapt, or grade material through an explicit boundary; deterministic Rust owns policy and state transitions. Keep the boundary explicit instead of moving service complexity into the kernel.
 
-## Current Production Surface and Repository Direction
+## Current Production Surface
 
 The current production proof surface is the Rust `memory-engine-api` application on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the Scry product domain. Its deployment, auth, storage, rollback, and smoke contract live in `docs/runbook.md`. This document describes the product; the runbook and executable QA documents provide operational proof.
-
-Repository consolidation into the Scry repository is an approved direction, but it is explicitly deferred. Do not force-push, archive, repoint production, or change repository identity until active claims drain and the operator gives a later explicit go. Until then, this repository remains the Memory Engine Rust engine and current production workspace.
 
 ## Proof Bar
 
@@ -70,12 +68,11 @@ The first real outcome gate is a 30-day retention proof, not a seeded fixture, a
 - OAuth or public signup before the invite, cost, privacy, reliability, and billing gates are ready.
 - Native-first expansion before the PWA and retention proof justify it.
 - Runtime dependencies in the pure Rust kernel.
-- Repository cutover before active claims drain and the operator's later go.
 
 ## Where the Depth Lives
 
 - `AGENTS.md` is the repository operating contract and kernel boundary map.
-- `README.md` explains the Scry/Memory Engine split, Rust workspace, production surface, and current usage.
+- `README.md` explains Scry's product, Rust workspace, production surface, and current usage.
 - `SPEC.md` and `docs/rust-migration.md` retain technical strategy and cutover context; this vision governs product positioning.
 - `docs/runbook.md`, `docs/qa/system.md`, `docs/dogfood/`, and `docs/beta/` hold operational and executable evidence.
 - Powder is the shaped-work queue, claim ledger, and closure history.

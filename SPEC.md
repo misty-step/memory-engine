@@ -1,12 +1,12 @@
-# Memory Engine Spec
+# Scry Spec
 
 Status: modular API and dogfood shaping
 Date: 2026-05-14
 
 ## Executive Summary
 
-`Memory Engine` is the modular learning API and dogfood workspace for building
-learning and memorization applications.
+Scry's Rust engine is the modular learning API and dogfood workspace for
+building learning and memorization applications.
 
 The original extraction was grounded in four related applications:
 
@@ -287,7 +287,7 @@ Decks, concepts, passages, prayers, mass responses, language drills, and knowled
 
 ## Core Recommendation
 
-Build `Memory Engine` as a **Rust-first modular API** with stable logical
+Build Scry's Rust engine as a **Rust-first modular API** with stable logical
 surfaces:
 
 1. `memory_engine::types`
@@ -820,8 +820,8 @@ Direction confirmed in grooming session:
    receipts (ticket 047), not vibes.
 2. **The interface here is a prototype; Scry is the destination.** Scry
    (`../scry`, currently parked) is the original hypersimplicity vision and
-   the likely resurrected client. Memory-engine prototypes the interface
-   (ticket 048), hardens into a versioned learning-science API/microservice
-   (tickets 049, 050), and Scry consumes it, owning experience and opinion.
+   The Rust engine (then named `memory-engine`) prototypes the interface (ticket
+   048), hardens into a versioned learning-science API/microservice (tickets 049,
+   050), and Scry consumes it, owning experience and opinion.
 3. **Engine owns the science.** Scheduling, grading, and item design trace
    to the cognitive-science literature with citations and evals (ticket 050).

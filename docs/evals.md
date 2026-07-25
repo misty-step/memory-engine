@@ -5,7 +5,7 @@ Refs-Powder: memory-engine-050
 Refs-Powder: memory-engine-051
 Refs-Powder: memory-engine-052
 
-`memory-engine` uses behavior tests as the first eval layer. The goal is to
+Scry's Rust engine uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI
 features build on top of changed behavior.
 

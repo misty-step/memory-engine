@@ -4,10 +4,10 @@ Refs-Powder: memory-engine-023
 
 ## Purpose
 
-`crates/memory-engine-web-shell` is a local interface experiment for the
-memory-engine API. It renders a study loop over the import-probe dogfood
-fixture, then drives answer submission, reveal, review-state visibility, and
-queue transitions through the Rust service boundary.
+`crates/memory-engine-web-shell` is a local interface experiment for Scry's
+Rust API. It renders a study loop over the import-probe dogfood fixture, then
+drives answer submission, reveal, review-state visibility, and queue transitions
+through the Rust service boundary.
 
 The former TypeScript `experiments/web-shell/` runtime oracle was deleted after
 the Rust crate covered session, receipt, and HTTP route parity. The former

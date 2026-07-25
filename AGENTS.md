@@ -1,6 +1,6 @@
 # Agent Operations
 
-Scry is the consumer product. `memory-engine` is its Rust engine and current
+Scry is the consumer product. The Rust workspace is Scry's engine and current
 production workspace. The canonical product promise is **Remember everything.**
 Quiz-driven memorization is the heart of the product; the five faces are PWA, CLI,
 skill, MCP, and API over one capability system. See `VISION.md` for the full
@@ -18,9 +18,10 @@ product contract.
 - The current production proof surface is the Rust `memory-engine-api` application
   on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the
   product domain.
-- Repository consolidation into the Scry repository is approved but deferred. Do
-  not force-push, archive, repoint production, or change repository identity until
-  active claims drain and the operator gives a later explicit go.
+- Crate names, Postgres identifiers, wire and telemetry literals, and
+  `MEMORY_ENGINE_*` environment variables still carry the old name. Renaming
+  each one crosses a storage, network, or deployment boundary, so they are
+  tracked as separate Powder work rather than treated as an oversight.
 
 ## Stack & Boundaries
 
@@ -48,7 +49,7 @@ promotion.
 
 - `VISION.md` is the canonical Scry consumer-product vision: it governs the Remember
   everything promise, quiz-first learning loop, five faces, product bars, Rust
-  engine boundary, production surface, and deferred repository consolidation.
+  engine boundary and production surface.
 - `SPEC.md` is the older strategy document; `docs/rust-migration.md` records
   cutover state. Use them for technical history and boundary context;
   `VISION.md` governs when product positioning conflicts.
@@ -175,11 +176,8 @@ bounded `/reflect`. `/groom` always reconciles Powder before strategy.
 - The largest current simplification pressure is in boundary crates,
   especially local HTTP hosts and persistence. Do not move that complexity
   into `memory-engine-core`.
-- Repository consolidation is a later operation, not current implementation work;
-  preserve the current engine identity and production surface until the explicit
-  operator go described above.
 
 ## Non-goals
 
-General-purpose hosting or auth frameworks, chat tutoring, generalized content
-import, and immediate repository consolidation before its explicit go.
+General-purpose hosting or auth frameworks, chat tutoring, and generalized content
+import.

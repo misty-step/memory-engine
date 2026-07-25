@@ -1,19 +1,19 @@
 ---
-name: memory-engine-qa
+name: scry-qa
 description: |
-  QA memory-engine changes by exercising the real running surface, not just tests.
-  memory-engine is a Rust workspace: a framework-free learning kernel + facade
+  QA Scry changes by exercising the real running surface, not just tests.
+  Scry is a Rust workspace: a framework-free learning kernel + facade
   library, an HTTP API/server-rendered study UI (memory-engine-api, deployed to
   DigitalOcean App Platform), model-backed generation, and dogfood clients.
   "Tests pass" is not QA.
   Use when: "QA this", "verify the feature", "smoke test", "check the app",
-  "test memory-engine". Trigger: /memory-engine-qa.
+  "test Scry". Trigger: /scry-qa.
 argument-hint: "[api|kernel|ui|generation|gate|prod-smoke]"
 ---
 
-# memory-engine-qa
+# scry-qa
 
-QA in memory-engine means exercising the surface that changed against reality.
+QA in Scry means exercising the surface that changed against reality.
 `bun run ci` is the deterministic gate (host Cargo: `cargo fmt --check`,
 `cargo test --workspace`, `cargo clippy -D warnings`, `cargo doc`);
 `bun run ci:full` adds the Dagger + Postgres + Gitleaks parity lane. Both are
@@ -45,7 +45,7 @@ MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true \
 MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dev-unsubscribe-secret \
 HOST=127.0.0.1 PORT=18080 \
 cargo run -p memory-engine-api
-# → "Memory Engine API listening on http://127.0.0.1:18080"
+# → "Scry API listening on http://127.0.0.1:18080"
 ```
 
 - Port: the production binary defaults to `8080`; use `18080` locally to avoid clashing.

@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   compare:
-    if: github.repository == 'misty-step/memory-engine' && github.ref == 'refs/heads/master'
+    if: github.repository == 'misty-step/scry' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

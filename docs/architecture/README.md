@@ -2,7 +2,7 @@
 
 Refs-Powder: memory-engine-016
 
-This folder is the repo-local system visualization workbench for `memory-engine`.
+This folder is the repo-local system visualization workbench for Scry.
 It is intentionally static and diffable:
 
 - `memory-engine.map.json` is the canonical graph model.
