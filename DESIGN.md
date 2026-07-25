@@ -1,4 +1,4 @@
-# Memory Engine Design System — "Ledger"
+# Scry Design System — "Ledger"
 
 Status: the binding visual and interaction contract for every production
 surface rendered by `crates/memory-engine-api-render`. Locked by operator
@@ -8,8 +8,8 @@ the conformance gate in `crates/memory-engine-api-render/src/design_preview.rs`
 enforces the checkable parts.
 
 Provenance note: Ledger deliberately diverges from the vendored Misty Step
-aesthetic kit law (one size, zero radius, status-on-glyph-only). memory-engine
-owns its system; `assets/ledger.css` is the single stylesheet of record.
+aesthetic kit law (one size, zero radius, status-on-glyph-only). Scry owns its
+system; `assets/ledger.css` is the single stylesheet of record.
 
 ## Character
 

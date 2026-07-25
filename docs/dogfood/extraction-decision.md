@@ -31,7 +31,7 @@ There are two separate gates:
 | Web shell | `crates/memory-engine-web-shell` renders a local study loop and exercises answer, reveal, review-state visibility, and queue transitions. | A usable interface needs review-state presentation, reveal policy, persistence, and eventually content generation. One web client is not enough proof to stabilize these as package contracts. |
 | QA harness | `bun run qa` runs Rust facade, kernel, service, persistence, generation, beta study, dogfood clients, benchmarks, rustdoc, and Dagger CI. | Package confidence is strong; product readiness still needs repeated mobile dogfood receipts and graduated activity evidence. |
 
-## What Stays In `memory-engine`
+## What Stays In Scry
 
 - Pure learning-kernel runtime under `crates/memory-engine-core`.
 - Rust facade modules for types, scheduling, grading, progression, queue,

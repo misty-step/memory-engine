@@ -4,7 +4,7 @@ Refs-Powder: memory-engine-071, memory-engine-mcp-production-parity
 
 ## Purpose
 
-`crates/memory-engine-mcp` is the MCP face for `memory-engine`: a stdio
+`crates/memory-engine-mcp` is Scry's MCP face: a stdio
 JSON-RPC server wrapping the deployed `memory-engine-api` v1 contract, so any
 MCP-speaking agent (Claude Code, Codex, etc.) can run a study/review loop and
 manage project decks without shelling out to `memory-engine-review` or
@@ -293,8 +293,8 @@ process), but the entry this server would need — matching the shape
 
 ```yaml
 - id: memory-engine
-  app: Memory Engine
-  source_repo: misty-step/memory-engine
+  app: Scry
+  source_repo: misty-step/scry
   product_skill: memory-engine   # or whatever repo-local skill wraps this product
   status: available
   capabilities:

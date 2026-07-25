@@ -1,4 +1,4 @@
-# Memory Engine QA System
+# Scry QA System
 
 Refs-Powder: memory-engine-025
 Refs-Powder: memory-engine-051
@@ -9,7 +9,7 @@ Refs-Powder: memory-engine-055
 
 ## Purpose
 
-The QA system is the repeatable proof path for `memory-engine`. It is designed
+The QA system is the repeatable proof path for Scry. It is designed
 to answer two questions:
 
 1. Does the public API still execute the learning semantics consumers depend on?

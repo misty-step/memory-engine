@@ -198,7 +198,7 @@ fn current_runtime_contract_has_no_retired_provider_recreation_path() {
         "README.md",
         "VISION.md",
         "docs/runbook.md",
-        ".agents/skills/memory-engine-qa/SKILL.md",
+        ".agents/skills/scry-qa/SKILL.md",
         "docs/api/openapi.v1.json",
         "bin/send-magic-link",
         "crates/memory-engine-api-state/src/lib.rs",
@@ -806,7 +806,7 @@ fn trusted_live_contract_pins_repository_permissions_and_tool_discovery() {
     );
     assert!(
         workflow.contains(
-            "if: github.repository == 'misty-step/memory-engine' && github.ref == 'refs/heads/master'"
+            "if: github.repository == 'misty-step/scry' && github.ref == 'refs/heads/master'"
         ),
         "the trusted job must be gated to the exact repository and master branch"
     );

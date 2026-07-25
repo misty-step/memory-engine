@@ -1,10 +1,10 @@
-# Scry / Memory Engine
+# Scry
 
-[![CI](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/memory-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/misty-step/scry/actions/workflows/ci.yml/badge.svg)](https://github.com/misty-step/scry/actions/workflows/ci.yml)
 
 Scry is the consumer product: **Remember everything.** It helps people learn and
-memorize anything through a quiz-driven review loop. Memory Engine is the Rust
-engine beneath Scry, not a separate product category or a generic agent-memory
+memorize anything through a quiz-driven review loop. This repository contains
+Scry's Rust engine, not a separate product category or a generic agent-memory
 store.
 
 The product has five faces over one capability system:
@@ -23,20 +23,15 @@ and Stripe billing are proven. Fast and smooth are product bars: p95 acknowledge
 below 100 ms, p95 graded-visible feedback below 300 ms, and first quiz visible below
 20 s. See [VISION.md](./VISION.md) for the canonical product contract.
 
-Memory Engine keeps a pure Rust learning kernel and explicit boundary crates. The
-kernel owns deterministic scheduling, grading, progression, queue selection, and
-learning invariants. Boundary crates own persistence, generation, sessions, identity,
-API routes, rendering, deployment, and QA.
+Scry keeps a pure Rust learning kernel and explicit boundary
+crates. The kernel owns deterministic scheduling, grading, progression, queue
+selection, and learning invariants. Boundary crates own persistence, generation,
+sessions, identity, API routes, rendering, deployment, and QA.
 
 The current production proof surface is the Rust `memory-engine-api` application on
 DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the Scry
 product domain. Deployment, environment, auth, storage, rollback, and smoke-test
 details live in [docs/runbook.md](./docs/runbook.md).
-
-Repository consolidation into the Scry repository is an approved later direction,
-but it is not executed here. Do not force-push, archive, repoint production, or
-change repository identity until active claims drain and the operator gives an
-explicit later go.
 
 ## What It Owns
 

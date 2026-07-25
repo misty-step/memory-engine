@@ -21,7 +21,7 @@ adopted here:
 - Generate rationale first to focus the item, return only the final payload.
 
 Key difference: Scry's input is a *topic* (model free to use world
-knowledge); memory-engine's input is a *source document* and every draft must
+knowledge); Scry's engine input is a *source document* and every draft must
 carry provenance quoting that source. Ours is grounded question generation,
 which changes the quality bar from "plausible" to "verifiable".
 

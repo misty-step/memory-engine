@@ -4,10 +4,10 @@ Refs-Powder: memory-engine-026
 
 ## Purpose
 
-`crates/memory-engine-persistence` is the durable persistence proof for the
-memory-engine beta interface. It is intentionally repo-local and outside the
-pure kernel: the beta product needs saved state now, but the published kernel
-should remain pure until repeated clients prove a stable service contract.
+`crates/memory-engine-persistence` is the durable persistence proof for Scry's
+beta interface. It is intentionally repo-local and outside the pure kernel:
+the beta product needs saved state now, but the published kernel should remain
+pure until repeated clients prove a stable service contract.
 
 ## Ownership Boundary
 
@@ -118,8 +118,8 @@ true:
   records prove reusable across multiple beta workflows without importing
   provider, UI, or persistence concepts into `crates/memory-engine-core`.
 
-Until then, `crates/memory-engine-persistence` is a dogfood spine, not the
-memory-engine database.
+Until then, `crates/memory-engine-persistence` is a dogfood spine, not Scry's
+database.
 
 ## Verification
 

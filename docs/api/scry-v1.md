@@ -1,9 +1,9 @@
 # Scry v1 API handoff
 
-`memory-engine` owns memory science: source ingestion, draft generation, learner keep/edit/reject decisions,
-due queue selection, answer reveal, grading, scheduling,
-and source archival. Scry owns the product experience: account UI, study
-layout, navigation, copy, reminders, and client-side state.
+Scry's Rust engine owns memory science: source ingestion, draft generation,
+learner keep/edit/reject decisions, due queue selection, answer reveal, grading,
+scheduling, and source archival. Scry owns the product experience: account UI,
+study layout, navigation, copy, reminders, and client-side state.
 
 External clients use only `/v1/...` JSON routes. Browser-only CSRF fields and
 HTML forms are not part of this contract. Token clients authenticate with:
