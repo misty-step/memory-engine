@@ -219,6 +219,25 @@ async fn mobile_home_is_auth_first_and_hides_the_dead_end_guest_capture() {
     assert!(body.contains("Get started"));
     assert!(body.contains("Scry"));
     assert!(body.contains("Remember everything"));
+    // The primary magic-link form is visible immediately. The separate
+    // waitlist form stays inside a closed native disclosure until requested.
+    let disclosure_start = body
+        .find("<details")
+        .expect("new-visitor waitlist disclosure");
+    let disclosure_end = body[disclosure_start..]
+        .find("</details>")
+        .map(|offset| disclosure_start + offset)
+        .expect("closed new-visitor waitlist disclosure");
+    let disclosure = &body[disclosure_start..disclosure_end];
+    let opening_tag_end = disclosure
+        .find('>')
+        .expect("new-visitor disclosure opening tag");
+    assert!(!disclosure[..opening_tag_end]
+        .split_ascii_whitespace()
+        .any(|attribute| attribute == "open"));
+    assert!(disclosure
+        .contains(r#"<form class="me-waitlist-form" action="/app/waitlist" method="post">"#));
+    assert_eq!(body.matches(r#"type="email""#).count(), 2);
     // Regression: the anonymous home must NOT offer the guest capture form,
     // which dead-ends on the account allowlist ("not allowed to register").
     assert!(!body.contains(r#"action="/app/start""#));
