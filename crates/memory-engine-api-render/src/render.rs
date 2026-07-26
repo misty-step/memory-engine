@@ -652,10 +652,11 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
 fn render_signed_out(notice: Option<&str>) -> String {
     // Onboarding is auth-first. Accounts are required (the magic-link
     // allowlist), so anonymous visitors never see the capture form — they would
-    // only dead-end on it. The display promise leads, then two actions: sign in
-    // with an allowlisted email, or join the invite-beta waitlist below it. Both
-    // forms read identically to a visitor who doesn't know their own allowlist
-    // state, so neither response can be used to probe it.
+    // only dead-end on it. The display promise leads, then one primary action:
+    // sign in with an allowlisted email. New visitors who don't yet have an
+    // account reveal a separate waitlist form below it. Both forms read
+    // identically to a visitor who doesn't know their own allowlist state, so
+    // neither response can be used to probe it.
     let view = format!(
         r#"<div class="me-cover">
 {notice}
@@ -669,15 +670,18 @@ fn render_signed_out(notice: Option<&str>) -> String {
 <div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
 </form>
 </section>
-<section class="ae-group me-capture-hero">
-<p class="me-kicker">New here?</p>
+<details class="me-waitlist">
+<summary class="me-waitlist-toggle">
+<span class="me-kicker">New here?</span>
+<span class="me-waitlist-toggle-label">Join the waitlist</span>
+</summary>
 <form class="me-waitlist-form" action="/app/waitlist" method="post">
 <label class="ae-label" for="me-waitlist-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
 <div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
 <p class="me-waitlist-status ae-dim" aria-live="polite"></p>
 </form>
-</section>
+</details>
 </div>"#,
         notice = render_notice(notice, &[]),
     );
