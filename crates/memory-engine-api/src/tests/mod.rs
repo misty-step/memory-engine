@@ -9711,7 +9711,16 @@ fn session_cookie(response: &axum::response::Response) -> String {
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Path=/"));
-    assert!(set_cookie.contains("Max-Age=7776000"));
+    let max_age = set_cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("Max-Age="))
+        .expect("Max-Age")
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    assert!(
+        max_age > 0 && max_age <= 7_776_000,
+        "session Max-Age must be positive and at most 90 days: {set_cookie}"
+    );
     assert!(!set_cookie.contains("Domain="));
     if host_cookie {
         assert!(
@@ -10769,6 +10778,100 @@ fn browser_session_is_rejected_after_it_expires() {
 }
 
 #[tokio::test]
+async fn public_shell_routes_do_not_reissue_session_cookies() {
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("title", "NATO practice notes"), ("body", &source_body())],
+        ))
+        .await
+        .expect("start");
+    assert_eq!(started.status(), StatusCode::OK);
+    let cookie = session_cookie(&started);
+
+    for path in [
+        "/static/ledger.css",
+        "/static/app.js",
+        "/offline.html",
+        "/manifest.webmanifest",
+        "/favicon.png",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .expect("shell request"),
+            )
+            .await
+            .expect("shell response");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(
+            response.headers().get(SET_COOKIE).is_none(),
+            "{path} must not reissue a session cookie"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_cookie_max_age_tracks_server_expiry_not_a_fresh_ninety_days() {
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let store_root = temp_store_root("cookie-max-age-tracks-server");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests())
+            .with_clock(test_now),
+    );
+    let created = state.create_guest_account().expect("guest");
+    let session = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let issued = memory_engine_api_state::html_with_browser_session(&session, String::new());
+    let mut headers = HeaderMap::new();
+    headers.insert("cookie", issued.headers()[SET_COOKIE].clone());
+
+    // Still above the sliding threshold: server expiry stays put, so Max-Age must
+    // shrink with the remaining lifetime instead of resetting to 90 days.
+    test_clock.fetch_add(10 * 86_400_000, Ordering::SeqCst);
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("cookie", headers.get("cookie").expect("cookie"))
+                .body(Body::empty())
+                .expect("home request"),
+        )
+        .await
+        .expect("home response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let set_cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("refreshed cookie")
+        .to_str()
+        .expect("cookie header");
+    let max_age = set_cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("Max-Age="))
+        .expect("Max-Age")
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    let expected = u64::try_from(super::app_session_max_age_ms() / 1000).unwrap() - (10 * 86_400);
+    assert!(
+        max_age <= expected && max_age + 5 >= expected,
+        "Max-Age {max_age} should track remaining server lifetime near {expected}: {set_cookie}"
+    );
+    assert!(!set_cookie.contains("Max-Age=7776000"));
+}
+
+#[tokio::test]
 async fn browser_session_cookie_attributes_follow_request_scheme() {
     let app = router(local_fixture_state());
     let plain = app
@@ -10794,7 +10897,13 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
     assert!(plain_cookie.contains("HttpOnly"));
     assert!(plain_cookie.contains("SameSite=Lax"));
     assert!(plain_cookie.contains("Path=/"));
-    assert!(plain_cookie.contains("Max-Age=7776000"));
+    let plain_max_age = plain_cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("Max-Age="))
+        .expect("Max-Age")
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    assert!((7_775_999..=7_776_000).contains(&plain_max_age));
     assert!(!plain_cookie.contains("Secure"));
 
     let forwarded = app
@@ -10821,7 +10930,13 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
     assert!(host_cookie.contains("Secure"));
     assert!(host_cookie.contains("SameSite=Lax"));
     assert!(host_cookie.contains("Path=/"));
-    assert!(host_cookie.contains("Max-Age=7776000"));
+    let host_max_age = host_cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("Max-Age="))
+        .expect("Max-Age")
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    assert!((7_775_999..=7_776_000).contains(&host_max_age));
     assert!(!host_cookie.contains("Domain="));
 }
 
@@ -10878,7 +10993,16 @@ async fn sliding_browser_session_refresh_persists_browser_and_api_expiry() {
         .expect("refreshed session cookie")
         .to_str()
         .expect("refreshed session cookie header");
-    assert!(refreshed_cookie.contains("Max-Age=7776000"));
+    let max_age = refreshed_cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("Max-Age="))
+        .expect("Max-Age")
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    assert!(
+        max_age > 7_775_000,
+        "after sliding refresh Max-Age should be near 90 days: {refreshed_cookie}"
+    );
 }
 
 #[tokio::test]

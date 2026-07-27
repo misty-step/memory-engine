@@ -695,6 +695,13 @@ async fn refresh_browser_session_cookie(
     request: Request,
     next: Next,
 ) -> Response {
+    let path = request.uri().path().to_owned();
+    // Never attach session cookies to cacheable shell assets or installability
+    // surfaces. Those responses can be shared; learner identity must not ride
+    // along.
+    if is_public_shell_path(&path) {
+        return next.run(request).await;
+    }
     let headers = request.headers().clone();
     let uri = request.uri().clone();
     let mut response = next.run(request).await;
@@ -710,6 +717,24 @@ async fn refresh_browser_session_cookie(
         response.headers_mut().append(SET_COOKIE, value);
     }
     response
+}
+
+fn is_public_shell_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/static/ledger.css"
+            | "/static/app.js"
+            | "/sw.js"
+            | "/offline.html"
+            | "/manifest.webmanifest"
+            | "/favicon.png"
+            | "/icon-192.png"
+            | "/icon-512.png"
+            | "/apple-touch-icon.png"
+            | "/healthz"
+            | "/readyz"
+            | "/v1/openapi.json"
+    )
 }
 
 async fn create_account(

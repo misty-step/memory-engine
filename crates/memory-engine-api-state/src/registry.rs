@@ -9,13 +9,13 @@ use memory_engine_persistence_postgres::{
 use memory_engine_service::RecordContentFeedbackCommand;
 
 use crate::{
-    account_id_for, app_session_max_age_ms, new_browser_session_id, new_magic_link_token,
-    new_session_token, normalize_email, normalize_required_text, project_deck_id_for,
-    read_browser_session_id, secret_hash, session_csrf_token, source_id_for, AccountCreated,
-    AccountRecord, AccountRegistry, AccountRegistryData, ApiFailure, AppAccount, AuthConfig,
-    AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest, CreateProjectDeckRequest,
-    CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest, ProjectDeckRecord,
-    ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
+    account_id_for, app_session_max_age_ms, cookie_max_age_from_expiry, new_browser_session_id,
+    new_magic_link_token, new_session_token, normalize_email, normalize_required_text,
+    project_deck_id_for, read_browser_session_id, secret_hash, session_csrf_token, source_id_for,
+    AccountCreated, AccountRecord, AccountRegistry, AccountRegistryData, ApiFailure, AppAccount,
+    AuthConfig, AuthLinkDelivery, BrowserSessionRecord, ContentFeedbackRequest,
+    CreateProjectDeckRequest, CreateSourceRequest, InvalidateProjectDeckRequest, MagicLinkRequest,
+    ProjectDeckRecord, ReturnNotificationClaimRequest, ReturnNotificationSchedulerConfig,
     ScheduledReturnNotificationReport, SourceRecord, StudyStorage, StudyViewResponse,
     SubmitReviewRequest, SubmitReviewTimings, WaitlistEntry, APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS,
     APP_ACCOUNT_RATE_LIMIT_WINDOW_MS, AUTH_CHALLENGE_TTL_MS, RETURN_NOTIFICATION_INTERVAL_MS,
@@ -512,6 +512,8 @@ impl AccountRegistry {
                         account_id,
                         session_token: session_token_hash,
                         csrf_token,
+                        expires_at_ms,
+                        cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, expires_at_ms),
                     })
                 }
             };
@@ -1657,6 +1659,7 @@ impl AccountRegistry {
             csrf_token_hash: secret_hash(&csrf_token),
             expires_at_ms: (data.now_fn)().saturating_add(app_session_max_age_ms()),
         };
+        let expires_at_ms = session.expires_at_ms;
         storage.save_browser_session(&browser_session_id, &session)?;
         data.browser_sessions
             .insert(browser_session_id.clone(), session);
@@ -1666,6 +1669,8 @@ impl AccountRegistry {
             account_id: account.account_id.clone(),
             session_token: session_token_hash,
             csrf_token,
+            expires_at_ms,
+            cookie_max_age_seconds: cookie_max_age_from_expiry((data.now_fn)(), expires_at_ms),
         })
     }
 
@@ -1744,6 +1749,8 @@ impl AccountRegistry {
             account_id: session.account_id,
             session_token: session.session_token,
             csrf_token: csrf_token.to_owned(),
+            expires_at_ms: session.expires_at_ms,
+            cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, session.expires_at_ms),
         })
     }
 
@@ -1783,6 +1790,8 @@ impl AccountRegistry {
             account_id: session.account_id,
             session_token: session.session_token,
             csrf_token,
+            expires_at_ms: session.expires_at_ms,
+            cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, session.expires_at_ms),
         })
     }
 

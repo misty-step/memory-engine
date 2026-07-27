@@ -2134,6 +2134,12 @@ pub struct AppAccount {
     account_id: String,
     session_token: String,
     csrf_token: String,
+    /// Absolute browser-session expiry in epoch milliseconds.
+    expires_at_ms: i64,
+    /// Remaining cookie lifetime in seconds, computed with the same clock that
+    /// authored `expires_at_ms` so Set-Cookie Max-Age never drifts ahead of the
+    /// server row.
+    cookie_max_age_seconds: u64,
 }
 
 impl AppAccount {
@@ -2150,6 +2156,16 @@ impl AppAccount {
     #[must_use]
     pub fn csrf_token(&self) -> &str {
         &self.csrf_token
+    }
+
+    #[must_use]
+    pub fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+
+    #[must_use]
+    pub fn cookie_max_age_seconds(&self) -> u64 {
+        self.cookie_max_age_seconds
     }
 }
 
@@ -2637,7 +2653,11 @@ pub fn browser_session_cookie_header_for_request(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> String {
-    session_cookie_header(&account.browser_session_id, request_is_secure(headers, uri))
+    session_cookie_header(
+        &account.browser_session_id,
+        request_is_secure(headers, uri),
+        account.cookie_max_age_seconds(),
+    )
 }
 
 #[must_use]
@@ -2650,6 +2670,7 @@ pub fn html_with_browser_session(account: &AppAccount, html: String) -> Response
     )
 }
 
+#[must_use]
 pub fn html_with_browser_session_for_request(
     account: &AppAccount,
     html: String,
@@ -2673,6 +2694,7 @@ pub fn html_with_cleared_browser_session(html: String) -> Response {
     )
 }
 
+#[must_use]
 pub fn html_with_cleared_browser_session_for_request(
     html: String,
     headers: &HeaderMap,
@@ -2702,7 +2724,16 @@ fn append_set_cookie(response: &mut Response, cookie: &str) {
     }
 }
 
-fn session_cookie_header(session_id: &str, secure: bool) -> String {
+pub(crate) fn cookie_max_age_from_expiry(now_ms: i64, expires_at_ms: i64) -> u64 {
+    expires_at_ms
+        .saturating_sub(now_ms)
+        .max(0)
+        .div_euclid(1_000)
+        .try_into()
+        .unwrap_or(0)
+}
+
+fn session_cookie_header(session_id: &str, secure: bool, max_age_seconds: u64) -> String {
     let name = if secure {
         APP_SESSION_COOKIE_NAME
     } else {
@@ -2710,7 +2741,7 @@ fn session_cookie_header(session_id: &str, secure: bool) -> String {
     };
     let secure_attribute = if secure { " Secure;" } else { "" };
     format!(
-        "{name}={}; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age={APP_SESSION_MAX_AGE_SECONDS}",
+        "{name}={}; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age={max_age_seconds}",
         cookie_value(session_id)
     )
 }
