@@ -81,6 +81,12 @@ pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BrowserSessionValidation {
+    pub(crate) session: BrowserSessionRecord,
+    pub(crate) touched: bool,
+}
+
 fn order_content_feedback_for_copy(
     feedback: Vec<ContentFeedback>,
 ) -> Result<Vec<ContentFeedback>, String> {
@@ -218,30 +224,15 @@ impl StudyStorage {
         self.inner.save_browser_session(session_id, session)
     }
 
-    pub(crate) fn load_browser_session(
+    pub(crate) fn load_and_validate_browser_session(
         &self,
         session_id: &str,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        self.inner.load_browser_session(session_id)
-    }
-    pub(crate) fn load_browser_session_with_timings(
-        &self,
-        session_id: &str,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
-        self.inner
-            .load_browser_session_with_timings(session_id, timings)
-    }
-
-    pub(crate) fn touch_browser_session(
-        &self,
-        session_id: &str,
-        session: &BrowserSessionRecord,
         now_ms: i64,
-        expires_at_ms: i64,
-    ) -> Result<bool, ApiFailure> {
+        csrf_token_hash: Option<&str>,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionValidation>, ApiFailure> {
         self.inner
-            .touch_browser_session(session_id, session, now_ms, expires_at_ms)
+            .load_and_validate_browser_session(session_id, now_ms, csrf_token_hash, timings)
     }
 
     pub(crate) fn revoke_browser_session(
@@ -741,6 +732,50 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         now_ms: i64,
         expires_at_ms: i64,
     ) -> Result<bool, ApiFailure>;
+    fn load_and_validate_browser_session(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: Option<&str>,
+        mut timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionValidation>, ApiFailure> {
+        let Some(mut session) =
+            self.load_browser_session_with_timings(session_id, timings.as_deref_mut())?
+        else {
+            return Ok(None);
+        };
+        if session.expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+        if csrf_token_hash.is_some_and(|expected| expected != session.csrf_token_hash) {
+            return Ok(Some(BrowserSessionValidation {
+                session,
+                touched: false,
+            }));
+        }
+        if !self.account_session_matches_with_timings(
+            &session.account_id,
+            &session.session_token,
+            timings.as_deref_mut(),
+        )? {
+            if self.account_exists_with_timings(&session.account_id, timings)? {
+                return Err(ApiFailure::forbidden_account());
+            }
+            return Err(ApiFailure::unknown_account());
+        }
+
+        let mut touched = false;
+        if session.expires_at_ms.saturating_sub(now_ms) < app_session_max_age_ms() / 2 {
+            let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+            if !self.touch_browser_session(session_id, &session, now_ms, expires_at_ms)? {
+                return Err(ApiFailure::missing_session());
+            }
+            session.expires_at_ms = expires_at_ms;
+            touched = true;
+        }
+        Ok(Some(BrowserSessionValidation { session, touched }))
+    }
+
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
     fn revoke_browser_sessions_for_account(
         &self,
@@ -2526,6 +2561,76 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                 .map_err(postgres_failure)
         })
     }
+    fn load_and_validate_browser_session(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: Option<&str>,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<Option<BrowserSessionValidation>, ApiFailure> {
+        let session_id_hash = secret_hash(session_id);
+        let expected_csrf_hash = csrf_token_hash.map(str::to_owned);
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            let Some(persisted) = store
+                .browser_session(&session_id_hash, now_ms)
+                .map_err(postgres_failure)?
+            else {
+                return Ok(None);
+            };
+            let session = BrowserSessionRecord {
+                account_id: persisted.account_id,
+                session_token: persisted.session_token,
+                csrf_token_hash: persisted.csrf_token_hash,
+                expires_at_ms: persisted.expires_at_ms,
+            };
+            if session.expires_at_ms <= now_ms {
+                return Ok(None);
+            }
+            if expected_csrf_hash
+                .as_deref()
+                .is_some_and(|expected| expected != session.csrf_token_hash)
+            {
+                return Ok(Some(BrowserSessionValidation {
+                    session,
+                    touched: false,
+                }));
+            }
+            if !store
+                .api_session_matches(&session.account_id, &session.session_token, now_ms)
+                .map_err(postgres_failure)?
+            {
+                if store
+                    .account_exists(&session.account_id)
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::forbidden_account());
+                }
+                return Err(ApiFailure::unknown_account());
+            }
+
+            let mut session = session;
+            let mut touched = false;
+            if session.expires_at_ms.saturating_sub(now_ms) < app_session_max_age_ms() / 2 {
+                let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+                if !store
+                    .touch_browser_session(
+                        &session_id_hash,
+                        &session.account_id,
+                        &session.session_token,
+                        now_ms,
+                        expires_at_ms,
+                    )
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::missing_session());
+                }
+                session.expires_at_ms = expires_at_ms;
+                touched = true;
+            }
+            Ok(Some(BrowserSessionValidation { session, touched }))
+        })
+    }
+
     fn touch_browser_session(
         &self,
         session_id: &str,

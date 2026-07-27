@@ -434,12 +434,7 @@ pub fn router(state: ApiState) -> Router {
             post(reject_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
-    let session_cookie_state = state.clone();
     mount_review_routes(router)
-        .layer(middleware::from_fn_with_state(
-            session_cookie_state,
-            refresh_browser_session_cookie,
-        ))
         .layer(middleware::from_fn(no_store_dynamic_responses))
         .with_state(state)
 }
@@ -689,52 +684,21 @@ fn app_home_auth_failure(headers: &HeaderMap, error: &ApiFailure) -> Response {
     }
     app_failure_response(error)
 }
-
-async fn refresh_browser_session_cookie(
-    State(state): State<ApiState>,
-    request: Request,
-    next: Next,
+fn with_browser_session_cookie(
+    mut response: Response,
+    account: &AppAccount,
+    headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response {
-    let path = request.uri().path().to_owned();
-    // Never attach session cookies to cacheable shell assets or installability
-    // surfaces. Those responses can be shared; learner identity must not ride
-    // along.
-    if is_public_shell_path(&path) {
-        return next.run(request).await;
-    }
-    let headers = request.headers().clone();
-    let uri = request.uri().clone();
-    let mut response = next.run(request).await;
-    if response.headers().contains_key(SET_COOKIE) || !browser_session_cookie_present(&headers) {
+    if response.headers().contains_key(SET_COOKIE) {
         return response;
     }
-    let Ok(account) = state.require_browser_session_readonly(&headers) else {
-        return response;
-    };
     if let Ok(value) = HeaderValue::from_str(&browser_session_cookie_header_for_request(
-        &account, &headers, &uri,
+        account, headers, uri,
     )) {
         response.headers_mut().append(SET_COOKIE, value);
     }
     response
-}
-
-fn is_public_shell_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/static/ledger.css"
-            | "/static/app.js"
-            | "/sw.js"
-            | "/offline.html"
-            | "/manifest.webmanifest"
-            | "/favicon.png"
-            | "/icon-192.png"
-            | "/icon-512.png"
-            | "/apple-touch-icon.png"
-            | "/healthz"
-            | "/readyz"
-            | "/v1/openapi.json"
-    )
 }
 
 async fn create_account(
@@ -1455,6 +1419,7 @@ async fn return_notification_page(
     State(state): State<ApiState>,
     Query(query): Query<AppReturnNotificationQuery>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     let result = tokio::task::spawn_blocking(move || -> Result<Response, ApiFailure> {
         if let Some(token) = query.token.as_deref() {
@@ -1464,9 +1429,12 @@ async fn return_notification_page(
             ));
         }
         let account = state.require_browser_session_readonly(&headers)?;
-        Ok(no_store_response(
-            Html(render_account_page(&state, &account, None, None)).into_response(),
-        ))
+        Ok(no_store_response(html_with_browser_session_for_request(
+            &account,
+            render_account_page(&state, &account, None, None),
+            &headers,
+            &uri,
+        )))
     })
     .await;
     match result {
@@ -1500,6 +1468,7 @@ fn return_notification_token_recovery_response(error: &ApiFailure) -> Response {
 async fn update_return_notifications(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReturnNotificationForm>,
 ) -> Response {
     if let Some(token) = form
@@ -1553,11 +1522,22 @@ async fn update_return_notifications(
     let notice = match result {
         Ok(()) if enabled => "Due-count reminders are on. One confirmation was sent; reminders stay to one per day and can be turned off below.",
         Ok(()) => "Due-count reminders are off.",
-        Err(error) => return no_store_response(Html(render_account_page(&state, &account, None, Some(&error.message))).into_response()),
+        Err(error) => {
+            let response =
+                Html(render_account_page(&state, &account, None, Some(&error.message)))
+                    .into_response();
+            return no_store_response(with_browser_session_cookie(
+                response,
+                &account,
+                &headers,
+                &uri,
+            ));
+        }
     };
-    no_store_response(
-        Html(render_account_page(&state, &account, None, Some(notice))).into_response(),
-    )
+    let response = Html(render_account_page(&state, &account, None, Some(notice))).into_response();
+    no_store_response(with_browser_session_cookie(
+        response, &account, &headers, &uri,
+    ))
 }
 async fn logout_app_session(
     State(state): State<ApiState>,
@@ -1676,6 +1656,7 @@ async fn start_app_study(
 async fn create_app_source(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSourceForm>,
 ) -> Response {
     let account =
@@ -1688,12 +1669,17 @@ async fn create_app_source(
         &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
-    Html(render_save_result_html(
-        &state,
+    with_browser_session_cookie(
+        Html(render_save_result_html(
+            &state,
+            &account,
+            result.map(|_| ()),
+        ))
+        .into_response(),
         &account,
-        result.map(|_| ()),
-    ))
-    .into_response()
+        &headers,
+        &uri,
+    )
 }
 
 /// Capture material and enqueue generation. Returns immediately: the source is
@@ -1703,6 +1689,7 @@ async fn create_app_source(
 async fn capture_app_source(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSourceForm>,
 ) -> Response {
     let account =
@@ -1726,11 +1713,21 @@ async fn capture_app_source(
             }
         }
         Err(error) => {
-            return Html(render_create_page(&state, &account, Some(&error.message))).into_response()
+            return with_browser_session_cookie(
+                Html(render_create_page(&state, &account, Some(&error.message))).into_response(),
+                &account,
+                &headers,
+                &uri,
+            );
         }
     };
 
-    Html(render_create_page(&state, &account, Some(&notice))).into_response()
+    with_browser_session_cookie(
+        Html(render_create_page(&state, &account, Some(&notice))).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 fn render_save_result_html(
@@ -1772,6 +1769,7 @@ fn capture_request(
 async fn generate_app_source(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSourceActionForm>,
 ) -> Response {
     let account =
@@ -1795,12 +1793,18 @@ async fn generate_app_source(
         EnqueueOutcome::Rejected(reason) | EnqueueOutcome::Unavailable(reason) => reason,
     };
 
-    Html(render_library_page(&state, &account, None, Some(&notice))).into_response()
+    with_browser_session_cookie(
+        Html(render_library_page(&state, &account, None, Some(&notice))).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn archive_app_source(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSourceActionForm>,
 ) -> Response {
     let account =
@@ -1810,7 +1814,7 @@ async fn archive_app_source(
         };
     let result = state.archive_app_source(&account, &form.source_id);
 
-    match result {
+    let response = match result {
         Ok((view, archived_count)) => {
             // memory-engine-088: the operator dogfood found "Source removed."
             // gave no sense of scope for an action that silently retires
@@ -1833,12 +1837,14 @@ async fn archive_app_source(
             Some(&error.message),
         ))
         .into_response(),
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn update_app_source_permission(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSourcePermissionForm>,
 ) -> Response {
     let account =
@@ -1846,22 +1852,24 @@ async fn update_app_source_permission(
             Ok(account) => account,
             Err(error) => return app_failure_response(&error),
         };
-    match state.update_app_source_permission(&account, &form.source_id, form.permission) {
-        Ok(()) => Html(render_library_page(
-            &state,
-            &account,
-            None,
-            Some("Source permission updated."),
-        ))
-        .into_response(),
-        Err(error) => Html(render_library_page(
-            &state,
-            &account,
-            None,
-            Some(&error.message),
-        ))
-        .into_response(),
-    }
+    let response =
+        match state.update_app_source_permission(&account, &form.source_id, form.permission) {
+            Ok(()) => Html(render_library_page(
+                &state,
+                &account,
+                None,
+                Some("Source permission updated."),
+            ))
+            .into_response(),
+            Err(error) => Html(render_library_page(
+                &state,
+                &account,
+                None,
+                Some(&error.message),
+            ))
+            .into_response(),
+        };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 /// Retry a failed generation job. Re-queues it for the worker and re-renders
@@ -1869,6 +1877,7 @@ async fn update_app_source_permission(
 async fn retry_app_job(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppJobActionForm>,
 ) -> Response {
     let account =
@@ -1882,13 +1891,18 @@ async fn retry_app_job(
         "That job can't be retried."
     };
 
-    Html(render_library_page(&state, &account, None, Some(notice))).into_response()
+    with_browser_session_cookie(
+        Html(render_library_page(&state, &account, None, Some(notice))).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 /// Live job-status stream (SSE). Pushes this account's job updates as they
 /// happen so the activity log updates without a reload. The page is already
 /// server-authoritative, so this is pure progressive enhancement.
-async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap, uri: Uri) -> Response {
     let account = match state.require_browser_session_readonly(&headers) {
         Ok(account) => account,
         Err(error) => return app_failure_response(&error),
@@ -1907,13 +1921,18 @@ async fn app_jobs_events(State(state): State<ApiState>, headers: HeaderMap) -> R
         }
     });
 
-    Sse::new(stream)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("ping"),
-        )
-        .into_response()
+    with_browser_session_cookie(
+        Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(15))
+                    .text("ping"),
+            )
+            .into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 /// Serve the progressive-enhancement client script (vendored, like the CSS).
@@ -1931,6 +1950,7 @@ async fn static_app_js() -> impl IntoResponse {
 async fn keep_app_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppDraftActionForm>,
 ) -> Response {
     let account =
@@ -1943,7 +1963,7 @@ async fn keep_app_draft(
         account.session_token(),
         &form.draft_id,
     );
-    match result {
+    let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
@@ -1953,12 +1973,14 @@ async fn keep_app_draft(
             )
                 .into_response()
         }
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn edit_app_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppDraftEditForm>,
 ) -> Response {
     let account =
@@ -1973,7 +1995,7 @@ async fn edit_app_draft(
         &form.prompt,
         &form.expected_answer,
     );
-    match result {
+    let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
@@ -1983,12 +2005,14 @@ async fn edit_app_draft(
             )
                 .into_response()
         }
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn reject_app_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppDraftActionForm>,
 ) -> Response {
     let account =
@@ -2001,7 +2025,7 @@ async fn reject_app_draft(
         account.session_token(),
         &form.draft_id,
     );
-    match result {
+    let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
@@ -2011,12 +2035,14 @@ async fn reject_app_draft(
             )
                 .into_response()
         }
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn next_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
     let account =
@@ -2026,7 +2052,12 @@ async fn next_app_review(
         };
     let result = state.next_app_review(&account);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 fn client_rate_limit_key(headers: &HeaderMap) -> String {
@@ -2098,6 +2129,7 @@ fn no_store_response(mut response: Response) -> Response {
 async fn reveal_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2107,12 +2139,18 @@ async fn reveal_app_review(
         };
     let result = state.reveal_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn reference_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2122,12 +2160,18 @@ async fn reference_app_review(
         };
     let result = state.learn_more_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn skip_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2137,12 +2181,18 @@ async fn skip_app_review(
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn delete_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2152,12 +2202,18 @@ async fn delete_app_review(
         };
     let result = state.delete_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn edit_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2167,21 +2223,39 @@ async fn edit_app_review(
         };
     let view = match state.next_app_review(&account) {
         Ok(view) => view,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            return with_browser_session_cookie(error.into_response(), &account, &headers, &uri)
+        }
     };
     let Some(current) = view.current.as_ref() else {
-        return ApiFailure::not_found("Review unit not found.").into_response();
+        return with_browser_session_cookie(
+            ApiFailure::not_found("Review unit not found.").into_response(),
+            &account,
+            &headers,
+            &uri,
+        );
     };
     if current.review_unit_id.to_string() != form.review_unit_id {
-        return ApiFailure::not_found("Review unit not found.").into_response();
+        return with_browser_session_cookie(
+            ApiFailure::not_found("Review unit not found.").into_response(),
+            &account,
+            &headers,
+            &uri,
+        );
     }
 
-    Html(render_edit_review_html(&state, &account, &view, None)).into_response()
+    with_browser_session_cookie(
+        Html(render_edit_review_html(&state, &account, &view, None)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn save_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewEditForm>,
 ) -> Response {
     let account =
@@ -2196,7 +2270,7 @@ async fn save_app_review(
         &form.expected_answer,
     );
 
-    match result {
+    let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
@@ -2206,12 +2280,14 @@ async fn save_app_review(
             )
                 .into_response()
         }
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn snooze_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2221,12 +2297,18 @@ async fn snooze_app_review(
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn snooze_concept_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2236,7 +2318,7 @@ async fn snooze_concept_app_review(
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
-    match result {
+    let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
         Err(error) => {
             let status = error.status();
@@ -2246,12 +2328,14 @@ async fn snooze_concept_app_review(
             )
                 .into_response()
         }
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn bridge_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppReviewActionForm>,
 ) -> Response {
     let account =
@@ -2261,7 +2345,12 @@ async fn bridge_app_review(
         };
     let result = state.bridge_app_review(&account, &form.review_unit_id);
 
-    Html(render_action_result_html(&state, &account, result)).into_response()
+    with_browser_session_cookie(
+        Html(render_action_result_html(&state, &account, result)).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 /// Ceiling for a plausible single-answer response time (ten minutes).
@@ -2289,6 +2378,7 @@ pub(crate) fn sanitize_response_time_ms(raw: Option<&str>) -> u32 {
 async fn submit_app_review(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     form: Result<Form<AppReviewSubmitForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     let started = Instant::now();
@@ -2344,15 +2434,20 @@ async fn submit_app_review(
             };
             let render_started = Instant::now();
             let postgres_before_render = postgres;
-            let response = Html(render_submit_action_result_html(
-                &state,
+            let response = with_browser_session_cookie(
+                Html(render_submit_action_result_html(
+                    &state,
+                    &account,
+                    result,
+                    &request_id,
+                    trace_id.as_deref(),
+                    &mut postgres,
+                ))
+                .into_response(),
                 &account,
-                result,
-                &request_id,
-                trace_id.as_deref(),
-                &mut postgres,
-            ))
-            .into_response();
+                &headers,
+                &uri,
+            );
             let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
             (response, render_ms, outcome)
         }
@@ -2516,20 +2611,32 @@ fn submit_outcome(status: StatusCode) -> SubmitPerformanceOutcome {
 async fn record_submit_browser_performance(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Json(raw_event): Json<serde_json::Value>,
 ) -> Response {
     let csrf = raw_event
         .get("csrfToken")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if let Err(error) = state.require_browser_session(&headers, csrf) {
-        return error.into_response();
-    }
+    let account = match state.require_browser_session(&headers, csrf) {
+        Ok(account) => account,
+        Err(error) => return error.into_response(),
+    };
     let Ok(event) = serde_json::from_value::<BrowserSubmitPerformance>(raw_event) else {
-        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
+        return with_browser_session_cookie(
+            ApiFailure::bad_request("Browser performance receipt is invalid.").into_response(),
+            &account,
+            &headers,
+            &uri,
+        );
     };
     if !valid_browser_submit_performance(&event) {
-        return ApiFailure::bad_request("Browser performance receipt is invalid.").into_response();
+        return with_browser_session_cookie(
+            ApiFailure::bad_request("Browser performance receipt is invalid.").into_response(),
+            &account,
+            &headers,
+            &uri,
+        );
     }
 
     let viewport = match event.viewport {
@@ -2547,7 +2654,12 @@ async fn record_submit_browser_performance(
         graded_visible_ms: event.graded_visible_ms,
         viewport,
     });
-    StatusCode::NO_CONTENT.into_response()
+    with_browser_session_cookie(
+        StatusCode::NO_CONTENT.into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 fn valid_browser_submit_performance(event: &BrowserSubmitPerformance) -> bool {
@@ -2699,6 +2811,7 @@ pub(crate) fn render_content_feedback_follow_up(
 async fn record_app_content_feedback(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppContentFeedbackForm>,
 ) -> Response {
     let account =
@@ -2713,7 +2826,7 @@ async fn record_app_content_feedback(
         supersedes_id: form.supersedes_id,
     };
     let result = state.record_app_content_feedback(&account, &form.review_unit_id, &request);
-    match result {
+    let response = match result {
         Ok(_) => {
             render_content_feedback_follow_up(&state, &account, state.next_app_review(&account))
         }
@@ -2724,5 +2837,6 @@ async fn record_app_content_feedback(
             &request,
             error,
         ),
-    }
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
