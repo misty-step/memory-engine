@@ -103,23 +103,67 @@ footer.ae-bar { border-top: 1px solid var(--lg-line); margin-top: auto; justify-
   color: var(--lg-accent-ink);
   text-decoration: none;
 }
-.me-due { margin-left: auto; font-variant-numeric: tabular-nums; }
+.me-due { margin-left: auto; font-variant-numeric: tabular-nums; flex-shrink: 0; }
 
-/* Persistent view navigation (memory-engine-087). Replaces the plain
-   sign-out footer on standing views; review keeps the plain footer
-   (full-bleed, no nav). */
+/* Header account menu: sign-out lives here so the bottom nav stays four
+   equal view tabs with no overflow at phone widths (~390px). */
+.me-account {
+  position: relative;
+  flex-shrink: 0;
+}
+.me-account-summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 4px;
+  color: var(--lg-ink-2);
+  font: 600 11px/1 var(--lg-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.me-account-summary::-webkit-details-marker { display: none; }
+.me-account[open] > .me-account-summary { color: var(--lg-ink); }
+.me-account-sheet {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 11rem;
+  padding: 10px;
+  border: 1px solid var(--lg-line);
+  border-radius: var(--lg-r);
+  background: var(--lg-paper);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--lg-ink) 10%, transparent);
+}
+.me-account-sheet .me-foot-form { display: block; width: 100%; }
+.me-account-sheet .ae-button-quiet {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+/* Persistent view navigation (memory-engine-087). Four equal tabs only;
+   review keeps a tagline footer (full-bleed, no nav). */
 .me-nav {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 0;
   width: 100%;
+  padding-bottom: env(safe-area-inset-bottom, 0);
 }
 .me-nav-item {
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  min-width: 0;
   min-height: 44px;
+  padding: 0 4px;
   font: 600 11px/1 var(--lg-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -131,7 +175,6 @@ footer.ae-bar { border-top: 1px solid var(--lg-line); margin-top: auto; justify-
   color: var(--lg-accent);
 }
 .me-nav-item:hover { color: var(--lg-ink); }
-.me-nav-signout { margin-left: auto; }
 .ae-stage { flex: 1; display: grid; place-items: center; width: 100%; min-width: 0; }
 .ae-stage-scroll { display: block; width: 100%; min-width: 0; }
 .ae-view {
@@ -663,9 +706,59 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-reference p { margin: 0; }
 .me-reference .ae-h { margin-bottom: 6px; }
 
-/* ── footer forms ─────────────────────────────────────────────────── */
+/* ── footer forms / account / reminders ───────────────────────────── */
 
 .me-foot-form { display: inline-flex; }
+
+/* Home reminders: collapsed by default; enable is the only primary CTA
+   inside the disclosure; turn-off stays quiet and full-width on phone. */
+.me-return-channel { margin-top: 8px; }
+.me-return-details { width: 100%; }
+.me-return-summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 0;
+  border-top: 1px solid var(--lg-line);
+  color: var(--lg-ink-2);
+  font: 600 11px/1 var(--lg-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.me-return-summary::-webkit-details-marker { display: none; }
+.me-return-summary::after {
+  content: '';
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform var(--lg-quick) var(--lg-ease);
+}
+.me-return-details[open] > .me-return-summary { color: var(--lg-ink); }
+.me-return-details[open] > .me-return-summary::after {
+  transform: rotate(-135deg);
+  margin-top: 4px;
+}
+.me-return-details .ae-lede { margin-top: 12px; }
+.me-return-enable,
+.me-return-off {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
+}
+.me-return-enable .ae-button,
+.me-return-off .ae-button-quiet {
+  width: 100%;
+}
+.me-return-off { margin-top: 8px; }
 
 /* ── instant acknowledgment (086) ─────────────────────────────────── */
 

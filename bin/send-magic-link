@@ -63,7 +63,7 @@ send_email() {
     subject=$2
     text=$3
     idempotency_key=$4
-    from="${MEMORY_ENGINE_MAIL_FROM:-Memory Engine <onboarding@resend.dev>}"
+    from="${MEMORY_ENGINE_MAIL_FROM:-Scry <onboarding@resend.dev>}"
 
     email_json=$(json_escape_untrusted "$email") || return 1
     from_json=$(json_escape_untrusted "$from") || return 1
@@ -115,9 +115,9 @@ if [ -n "${MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL:-}" ]; then
     email="$MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL"
     due_count="$MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT"
     unsubscribe_url="${base}${MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE}"
-    subject="You have ${due_count} Memory Engine review"
-    [ "$due_count" = "1" ] || subject="You have ${due_count} Memory Engine reviews"
-    text=$(printf 'You have %s review(s) waiting in Memory Engine. Return when it suits you: %s/\n\nTo turn off these reminders, visit: %s' "$due_count" "$base" "$unsubscribe_url")
+    subject="You have ${due_count} Scry review"
+    [ "$due_count" = "1" ] || subject="You have ${due_count} Scry reviews"
+    text=$(printf 'You have %s review(s) waiting in Scry. Return when it suits you: %s/\n\nTo turn off these reminders, visit: %s' "$due_count" "$base" "$unsubscribe_url")
     send_email "$email" "$subject" "$text" "$MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY"
     exit 0
 fi
@@ -126,4 +126,4 @@ fi
 : "${MEMORY_ENGINE_AUTH_LINK:?MEMORY_ENGINE_AUTH_LINK is required}"
 sign_in_url="${base}${MEMORY_ENGINE_AUTH_LINK}"
 text=$(printf 'Sign in: %s\n\nThe link expires shortly. If you did not request it, ignore this email.' "$sign_in_url")
-send_email "$MEMORY_ENGINE_AUTH_EMAIL" 'Your Memory Engine sign-in link' "$text" ''
+send_email "$MEMORY_ENGINE_AUTH_EMAIL" 'Your Scry sign-in link' "$text" ''

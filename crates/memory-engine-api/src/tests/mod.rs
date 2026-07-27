@@ -3721,7 +3721,7 @@ async fn service_worker_serves_versioned_safe_shell_and_offline_fallback() {
     );
     let worker = response_text(worker).await;
     for contract in [
-        "scry-shell-v1",
+        "scry-shell-v2",
         "self.skipWaiting()",
         "self.clients.claim()",
         "request.method !== \"GET\"",
