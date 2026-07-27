@@ -284,7 +284,7 @@ BEGIN
         INSERT INTO memory_engine_api_sessions
             (session_token_hash, account_id, created_at_ms, expires_at_ms, revoked_at_ms)
         SELECT encode(digest(session_token, 'sha256'), 'hex'), account_id,
-               updated_at_ms, updated_at_ms + 1209600000, NULL
+               updated_at_ms, updated_at_ms + 7776000000, NULL
           FROM memory_engine_api_sessions_legacy_v1
         ON CONFLICT (session_token_hash) DO NOTHING;
         DROP TABLE memory_engine_api_sessions_legacy_v1;
@@ -1335,6 +1335,62 @@ impl PostgresStudyStore {
             csrf_token_hash: row.get(2),
             expires_at_ms: row.get(3),
         }))
+    }
+    /// Extend a live browser session and its backing API session together.
+    ///
+    /// The update is conditional on both rows remaining active, so a
+    /// concurrent revoke cannot be overwritten by a refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the transaction.
+    pub fn touch_browser_session(
+        &mut self,
+        session_id_hash: &str,
+        account_id: &str,
+        session_token_hash: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, PostgresStoreError> {
+        let mut client = self.client.borrow_mut();
+        let mut transaction = client.transaction()?;
+        let browser_updated = transaction.execute(
+            "UPDATE memory_engine_browser_sessions
+             SET expires_at_ms = $5
+             WHERE session_id_hash = $1
+               AND account_id = $2
+               AND session_token_hash = $3
+               AND revoked_at_ms IS NULL
+               AND expires_at_ms > $4",
+            &[
+                &session_id_hash,
+                &account_id,
+                &session_token_hash,
+                &now_ms,
+                &expires_at_ms,
+            ],
+        )?;
+        if browser_updated != 1 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+
+        let api_updated = transaction.execute(
+            "UPDATE memory_engine_api_sessions
+             SET expires_at_ms = $4
+             WHERE account_id = $1
+               AND session_token_hash = $2
+               AND revoked_at_ms IS NULL
+               AND expires_at_ms > $3",
+            &[&account_id, &session_token_hash, &now_ms, &expires_at_ms],
+        )?;
+        if api_updated != 1 {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Revoke a browser cookie session server-side.

@@ -233,6 +233,17 @@ impl StudyStorage {
             .load_browser_session_with_timings(session_id, timings)
     }
 
+    pub(crate) fn touch_browser_session(
+        &self,
+        session_id: &str,
+        session: &BrowserSessionRecord,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        self.inner
+            .touch_browser_session(session_id, session, now_ms, expires_at_ms)
+    }
+
     pub(crate) fn revoke_browser_session(
         &self,
         session_id: &str,
@@ -723,6 +734,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
     ) -> Result<Option<BrowserSessionRecord>, ApiFailure> {
         self.load_browser_session(session_id)
     }
+    fn touch_browser_session(
+        &self,
+        session_id: &str,
+        session: &BrowserSessionRecord,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, ApiFailure>;
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure>;
     fn revoke_browser_sessions_for_account(
         &self,
@@ -1379,7 +1397,71 @@ impl StudyStorageAdapter for FileStudyStorage {
             expires_at_ms,
         }))
     }
+    fn touch_browser_session(
+        &self,
+        session_id: &str,
+        session: &BrowserSessionRecord,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        let _browser_lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_browser_sessions.lock"))?;
+        let _api_lock =
+            crate::file_lock::acquire_blocking(&self.store_root.join("_api_sessions.lock"))?;
 
+        let browser_path = browser_session_path(&self.store_root, session_id);
+        let Ok(browser_saved) = fs::read_to_string(&browser_path) else {
+            return Ok(false);
+        };
+        let mut browser_lines = browser_saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        let browser_expires_at_ms = browser_lines
+            .get(3)
+            .and_then(|value| value.parse::<i64>().ok());
+        if browser_lines.first().map(String::as_str) != Some(session.account_id.as_str())
+            || browser_lines.get(1).map(String::as_str) != Some(session.session_token.as_str())
+            || browser_lines
+                .get(5)
+                .is_some_and(|value| !value.trim().is_empty())
+            || browser_expires_at_ms.is_none_or(|expires| expires <= now_ms)
+        {
+            return Ok(false);
+        }
+
+        let api_token_hash = if is_secret_hash(&session.session_token) {
+            session.session_token.clone()
+        } else {
+            secret_hash(&session.session_token)
+        };
+        let api_path = self
+            .store_root
+            .join("_api_sessions")
+            .join(&api_token_hash)
+            .join("session");
+        let Ok(api_saved) = fs::read_to_string(&api_path) else {
+            return Ok(false);
+        };
+        let mut api_lines = api_saved.lines().map(str::to_owned).collect::<Vec<_>>();
+        let api_expires_at_ms = api_lines.get(2).and_then(|value| value.parse::<i64>().ok());
+        if api_lines.first().map(String::as_str) != Some(session.account_id.as_str())
+            || api_lines
+                .get(3)
+                .is_some_and(|value| !value.trim().is_empty())
+            || api_expires_at_ms.is_none_or(|expires| expires <= now_ms)
+        {
+            return Ok(false);
+        }
+
+        api_lines[2] = expires_at_ms.to_string();
+        write_atomic(&api_path, format!("{}\n", api_lines.join("\n")).as_bytes())
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        browser_lines[3] = expires_at_ms.to_string();
+        write_atomic(
+            &browser_path,
+            format!("{}\n", browser_lines.join("\n")).as_bytes(),
+        )
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
     fn revoke_browser_session(&self, session_id: &str, now_ms: i64) -> Result<(), ApiFailure> {
         let path = browser_session_path(&self.store_root, session_id);
         let _lock =
@@ -2441,6 +2523,25 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         expires_at_ms: session.expires_at_ms,
                     })
                 })
+                .map_err(postgres_failure)
+        })
+    }
+    fn touch_browser_session(
+        &self,
+        session_id: &str,
+        session: &BrowserSessionRecord,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, ApiFailure> {
+        with_postgres_store(&self.database_url, |store| {
+            store
+                .touch_browser_session(
+                    &secret_hash(session_id),
+                    &session.account_id,
+                    &session.session_token,
+                    now_ms,
+                    expires_at_ms,
+                )
                 .map_err(postgres_failure)
         })
     }

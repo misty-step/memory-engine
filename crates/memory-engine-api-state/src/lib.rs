@@ -21,7 +21,7 @@ use std::{
 use axum::{
     http::{
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode, Uri,
     },
     response::{Html, IntoResponse, Response},
     Json,
@@ -2134,6 +2134,12 @@ pub struct AppAccount {
     account_id: String,
     session_token: String,
     csrf_token: String,
+    /// Absolute browser-session expiry in epoch milliseconds.
+    expires_at_ms: i64,
+    /// Remaining cookie lifetime in seconds, computed with the same clock that
+    /// authored `expires_at_ms` so Set-Cookie Max-Age never drifts ahead of the
+    /// server row.
+    cookie_max_age_seconds: u64,
 }
 
 impl AppAccount {
@@ -2150,6 +2156,16 @@ impl AppAccount {
     #[must_use]
     pub fn csrf_token(&self) -> &str {
         &self.csrf_token
+    }
+
+    #[must_use]
+    pub fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+
+    #[must_use]
+    pub fn cookie_max_age_seconds(&self) -> u64 {
+        self.cookie_max_age_seconds
     }
 }
 
@@ -2548,52 +2564,191 @@ fn read_bearer_session_token(headers: &HeaderMap) -> Option<&str> {
     None
 }
 
+pub fn browser_session_cookie_present(headers: &HeaderMap) -> bool {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies.split(';').any(|cookie| {
+                cookie.trim().split_once('=').is_some_and(|(name, _)| {
+                    name == APP_SESSION_COOKIE_NAME || name == APP_SESSION_INSECURE_COOKIE_NAME
+                })
+            })
+        })
+}
+
 fn read_browser_session_id(headers: &HeaderMap) -> Result<&str, ApiFailure> {
     headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let (name, value) = cookie.trim().split_once('=')?;
-                (name == APP_SESSION_COOKIE_NAME && !value.trim().is_empty()).then_some(value)
-            })
+            cookie_value_for_name(cookies, APP_SESSION_COOKIE_NAME)
+                .or_else(|| cookie_value_for_name(cookies, APP_SESSION_INSECURE_COOKIE_NAME))
         })
         .ok_or_else(ApiFailure::missing_session)
+}
+
+fn cookie_value_for_name<'a>(cookies: &'a str, expected_name: &str) -> Option<&'a str> {
+    cookies.split(';').find_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        (name == expected_name && !value.trim().is_empty()).then_some(value.trim())
+    })
+}
+
+/// Detect whether a request arrived through HTTPS at the application edge.
+///
+/// Forwarded protocol headers are authoritative when present because a reverse
+/// proxy normally passes an origin-form URI without a scheme. Direct tests and
+/// local absolute-form requests fall back to the URI scheme.
+pub fn request_is_secure(headers: &HeaderMap, uri: &Uri) -> bool {
+    if let Some(proto) = forwarded_proto(headers) {
+        return proto.eq_ignore_ascii_case("https");
+    }
+    if let Some(scheme) = uri.scheme_str() {
+        return scheme.eq_ignore_ascii_case("https");
+    }
+    // Origin-form with no proxy headers: prefer Secure cookies unless this
+    // process is an explicit local/test environment. Production App Platform
+    // sets MEMORY_ENGINE_ENVIRONMENT=production, so a missing forwarded proto
+    // cannot silently downgrade the host cookie.
+    !matches!(
+        std::env::var("MEMORY_ENGINE_ENVIRONMENT")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("development" | "test")
+    )
+}
+
+fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(proto);
+    }
+    headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|parameter| {
+                let (name, value) = parameter.trim().split_once('=')?;
+                name.eq_ignore_ascii_case("proto")
+                    .then_some(value.trim().trim_matches('"'))
+            })
+        })
+        .filter(|value| !value.is_empty())
 }
 
 pub fn csrf_token(value: Option<&String>) -> &str {
     value.map(String::as_str).map(str::trim).unwrap_or_default()
 }
 
+#[must_use]
+pub fn browser_session_cookie_header_for_request(
+    account: &AppAccount,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> String {
+    session_cookie_header(
+        &account.browser_session_id,
+        request_is_secure(headers, uri),
+        account.cookie_max_age_seconds(),
+    )
+}
+
+#[must_use]
 pub fn html_with_browser_session(account: &AppAccount, html: String) -> Response {
+    html_with_browser_session_for_request(
+        account,
+        html,
+        &HeaderMap::new(),
+        &Uri::from_static("https://scry.study/"),
+    )
+}
+
+#[must_use]
+pub fn html_with_browser_session_for_request(
+    account: &AppAccount,
+    html: String,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response {
     let mut response = Html(html).into_response();
-    if let Ok(value) = HeaderValue::from_str(&session_cookie_header(&account.browser_session_id)) {
-        response.headers_mut().insert(SET_COOKIE, value);
+    append_set_cookie(
+        &mut response,
+        &browser_session_cookie_header_for_request(account, headers, uri),
+    );
+    response
+}
+
+#[must_use]
+pub fn html_with_cleared_browser_session(html: String) -> Response {
+    html_with_cleared_browser_session_for_request(
+        html,
+        &HeaderMap::new(),
+        &Uri::from_static("https://scry.study/"),
+    )
+}
+
+#[must_use]
+pub fn html_with_cleared_browser_session_for_request(
+    html: String,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response {
+    let mut response = Html(html).into_response();
+    let secure = request_is_secure(headers, uri);
+    let names = if secure {
+        [APP_SESSION_COOKIE_NAME, APP_SESSION_INSECURE_COOKIE_NAME]
+    } else {
+        [APP_SESSION_INSECURE_COOKIE_NAME, APP_SESSION_COOKIE_NAME]
+    };
+    for name in names {
+        append_set_cookie(
+            &mut response,
+            &clear_session_cookie_header(name, name == APP_SESSION_COOKIE_NAME),
+        );
+    }
+    response
+}
+
+fn append_set_cookie(response: &mut Response, cookie: &str) {
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
     } else {
         report_internal_error("failed to build browser session cookie header");
     }
-    response
 }
 
-pub fn html_with_cleared_browser_session(html: String) -> Response {
-    let mut response = Html(html).into_response();
-    if let Ok(value) = HeaderValue::from_str(&clear_session_cookie_header()) {
-        response.headers_mut().insert(SET_COOKIE, value);
+pub(crate) fn cookie_max_age_from_expiry(now_ms: i64, expires_at_ms: i64) -> u64 {
+    expires_at_ms
+        .saturating_sub(now_ms)
+        .max(0)
+        .div_euclid(1_000)
+        .try_into()
+        .unwrap_or(0)
+}
+
+fn session_cookie_header(session_id: &str, secure: bool, max_age_seconds: u64) -> String {
+    let name = if secure {
+        APP_SESSION_COOKIE_NAME
     } else {
-        report_internal_error("failed to build clear-session cookie header");
-    }
-    response
-}
-
-fn session_cookie_header(session_id: &str) -> String {
+        APP_SESSION_INSECURE_COOKIE_NAME
+    };
+    let secure_attribute = if secure { " Secure;" } else { "" };
     format!(
-        "{APP_SESSION_COOKIE_NAME}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={APP_SESSION_MAX_AGE_SECONDS}",
+        "{name}={}; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age={max_age_seconds}",
         cookie_value(session_id)
     )
 }
 
-fn clear_session_cookie_header() -> String {
-    format!("{APP_SESSION_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
+fn clear_session_cookie_header(name: &str, secure: bool) -> String {
+    let secure_attribute = if secure { " Secure;" } else { "" };
+    format!("{name}=; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age=0")
 }
 
 fn cookie_value(value: &str) -> String {
@@ -2649,7 +2804,8 @@ fn new_magic_link_token() -> String {
 }
 
 pub const APP_SESSION_COOKIE_NAME: &str = "__Host-memory_engine_session";
-const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 14;
+pub const APP_SESSION_INSECURE_COOKIE_NAME: &str = "memory_engine_session";
+pub const APP_SESSION_MAX_AGE_SECONDS: u64 = 60 * 60 * 24 * 90;
 pub const APP_ACCOUNT_RATE_LIMIT_MAX_ATTEMPTS: u32 = 5;
 pub const MAX_SOURCE_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_SOURCE_TITLE_BYTES: usize = 512;
