@@ -7,8 +7,8 @@ use std::{
 use axum::{
     extract::{Form, Path, Query, Request, State},
     http::{
-        header::{CACHE_CONTROL, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE},
+        HeaderMap, HeaderValue, StatusCode, Uri,
     },
     middleware::{self, Next},
     response::{
@@ -37,14 +37,16 @@ use memory_engine_api_render::{
     ContentFeedbackRecovery, LEDGER_CSS,
 };
 use memory_engine_api_state::{
-    csrf_token, html_with_browser_session, html_with_cleared_browser_session, normalize_email,
-    read_session_token, report_submit_browser_performance, report_submit_server_performance,
-    AccountCreated, ApiFailure, ApiState, AppAccount, BrowserSubmitReceipt, ContentFeedbackRequest,
-    CreateAccountRequest, CreateProjectDeckRequest, CreateSourceRequest, EnqueueOutcome,
-    GenerationJob, HealthResponse, InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord,
-    ReadinessResponse, ScheduledReturnNotificationReport, SourceList, SourcePermission,
-    SourceRecord, StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest,
-    SubmitReviewTimings, SubmitViewport, WaitlistEntry,
+    browser_session_cookie_header_for_request, browser_session_cookie_present, csrf_token,
+    html_with_browser_session_for_request, html_with_cleared_browser_session_for_request,
+    normalize_email, read_session_token, report_submit_browser_performance,
+    report_submit_server_performance, AccountCreated, ApiFailure, ApiState, AppAccount,
+    BrowserSubmitReceipt, ContentFeedbackRequest, CreateAccountRequest, CreateProjectDeckRequest,
+    CreateSourceRequest, EnqueueOutcome, GenerationJob, HealthResponse,
+    InvalidateProjectDeckRequest, JobStatus, ProjectDeckRecord, ReadinessResponse,
+    ScheduledReturnNotificationReport, SourceList, SourcePermission, SourceRecord,
+    StudyViewResponse, SubmitPerformanceOutcome, SubmitReviewRequest, SubmitReviewTimings,
+    SubmitViewport, WaitlistEntry,
 };
 
 #[cfg(test)]
@@ -432,7 +434,12 @@ pub fn router(state: ApiState) -> Router {
             post(reject_draft),
         )
         .route("/accounts/{account_id}/review/next", get(next_review));
+    let session_cookie_state = state.clone();
     mount_review_routes(router)
+        .layer(middleware::from_fn_with_state(
+            session_cookie_state,
+            refresh_browser_session_cookie,
+        ))
         .layer(middleware::from_fn(no_store_dynamic_responses))
         .with_state(state)
 }
@@ -608,48 +615,101 @@ async fn v1_openapi() -> impl IntoResponse {
     ([(CONTENT_TYPE, "application/json")], V1_OPENAPI_JSON)
 }
 
-async fn app_home(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
+async fn app_home(State(state): State<ApiState>, request: Request) -> Response {
     // The home is the durable entry point, so it must respect an existing
     // session: a signed-in learner reloading or navigating to "/" lands on their
     // workspace (with the live due count and Start review CTA), not the
     // signed-out cover. Read-only session check — a GET carries no CSRF token.
-    match state.require_browser_session_readonly(&headers) {
-        Ok(account) => Html(render_account_page(&state, &account, None, None)),
-        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    let headers = request.headers();
+    let uri = request.uri();
+    match state.require_browser_session_readonly(headers) {
+        Ok(account) => html_with_browser_session_for_request(
+            &account,
+            render_account_page(&state, &account, None, None),
+            headers,
+            uri,
+        ),
+        Err(error) => app_home_auth_failure(headers, &error),
     }
 }
 
 async fn app_analytics(
     State(state): State<ApiState>,
     Query(query): Query<AnalyticsQuery>,
-    headers: HeaderMap,
-) -> Html<String> {
-    match state.require_browser_session_readonly(&headers) {
-        Ok(account) => match state.app_study_view(&account) {
-            Ok(view) => Html(render_analytics_page(&account, &view, query.options())),
-            Err(error) => Html(render_account_page(
-                &state,
-                &account,
-                None,
-                Some(&error.message),
-            )),
-        },
-        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+    request: Request,
+) -> Response {
+    let headers = request.headers();
+    let uri = request.uri();
+    match state.require_browser_session_readonly(headers) {
+        Ok(account) => {
+            let html = match state.app_study_view(&account) {
+                Ok(view) => render_analytics_page(&account, &view, query.options()),
+                Err(error) => render_account_page(&state, &account, None, Some(&error.message)),
+            };
+            html_with_browser_session_for_request(&account, html, headers, uri)
+        }
+        Err(error) => app_home_auth_failure(headers, &error),
     }
 }
 
-async fn app_create(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
-    match state.require_browser_session_readonly(&headers) {
-        Ok(account) => Html(render_create_page(&state, &account, None)),
-        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+async fn app_create(State(state): State<ApiState>, request: Request) -> Response {
+    let headers = request.headers();
+    let uri = request.uri();
+    match state.require_browser_session_readonly(headers) {
+        Ok(account) => html_with_browser_session_for_request(
+            &account,
+            render_create_page(&state, &account, None),
+            headers,
+            uri,
+        ),
+        Err(error) => app_home_auth_failure(headers, &error),
     }
 }
 
-async fn app_library(State(state): State<ApiState>, headers: HeaderMap) -> Html<String> {
-    match state.require_browser_session_readonly(&headers) {
-        Ok(account) => Html(render_library_page(&state, &account, None, None)),
-        Err(_) => Html(render_app_shell(None, &[], None, &[], None)),
+async fn app_library(State(state): State<ApiState>, request: Request) -> Response {
+    let headers = request.headers();
+    let uri = request.uri();
+    match state.require_browser_session_readonly(headers) {
+        Ok(account) => html_with_browser_session_for_request(
+            &account,
+            render_library_page(&state, &account, None, None),
+            headers,
+            uri,
+        ),
+        Err(error) => app_home_auth_failure(headers, &error),
     }
+}
+
+fn app_home_auth_failure(headers: &HeaderMap, error: &ApiFailure) -> Response {
+    if !browser_session_cookie_present(headers) {
+        return Html(render_app_shell(None, &[], None, &[], None)).into_response();
+    }
+    if error.is_session_expired() || error.status() == StatusCode::FORBIDDEN {
+        return app_failure_response(&ApiFailure::missing_session());
+    }
+    app_failure_response(error)
+}
+
+async fn refresh_browser_session_cookie(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers().clone();
+    let uri = request.uri().clone();
+    let mut response = next.run(request).await;
+    if response.headers().contains_key(SET_COOKIE) || !browser_session_cookie_present(&headers) {
+        return response;
+    }
+    let Ok(account) = state.require_browser_session_readonly(&headers) else {
+        return response;
+    };
+    if let Ok(value) = HeaderValue::from_str(&browser_session_cookie_header_for_request(
+        &account, &headers, &uri,
+    )) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
 }
 
 async fn create_account(
@@ -1324,13 +1384,16 @@ async fn verify_app_login(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<AppLoginVerifyQuery>,
+    uri: Uri,
 ) -> Response {
     match state.verify_magic_link_for_client(&query.token, &client_rate_limit_key(&headers)) {
         Ok(account) => {
             let view = state.app_study_view(&account).ok();
-            no_store_response(html_with_browser_session(
+            no_store_response(html_with_browser_session_for_request(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
+                &headers,
+                &uri,
             ))
         }
         Err(error) if error.is_magic_link_recovery() => {
@@ -1471,14 +1534,18 @@ async fn update_return_notifications(
         Html(render_account_page(&state, &account, None, Some(notice))).into_response(),
     )
 }
-
 async fn logout_app_session(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
     match state.revoke_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
+        Ok(()) => html_with_cleared_browser_session_for_request(
+            render_app_shell(None, &[], None, &[], None),
+            &headers,
+            &uri,
+        ),
         Err(error) => app_failure_response(&error),
     }
 }
@@ -1486,10 +1553,15 @@ async fn logout_app_session(
 async fn logout_all_app_sessions(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
     match state.revoke_all_browser_sessions(&headers, csrf_token(form.csrf_token.as_ref())) {
-        Ok(()) => html_with_cleared_browser_session(render_app_shell(None, &[], None, &[], None)),
+        Ok(()) => html_with_cleared_browser_session_for_request(
+            render_app_shell(None, &[], None, &[], None),
+            &headers,
+            &uri,
+        ),
         Err(error) => app_failure_response(&error),
     }
 }
@@ -1497,6 +1569,7 @@ async fn logout_all_app_sessions(
 async fn save_app_account(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppSaveAccountForm>,
 ) -> Response {
     let source_account =
@@ -1516,23 +1589,30 @@ async fn save_app_account(
                 Err(error) => return app_failure_response(&error),
             };
             let view = state.app_study_view(&account).ok().or(source_view);
-            html_with_browser_session(
+            html_with_browser_session_for_request(
                 &account,
                 render_account_page(&state, &account, view.as_ref(), None),
+                &headers,
+                &uri,
             )
         }
-        Err(error) => Html(render_account_page(
-            &state,
+        Err(error) => html_with_browser_session_for_request(
             &source_account,
-            source_view.as_ref(),
-            Some(&error.message),
-        ))
-        .into_response(),
+            render_account_page(
+                &state,
+                &source_account,
+                source_view.as_ref(),
+                Some(&error.message),
+            ),
+            &headers,
+            &uri,
+        ),
     }
 }
-
 async fn start_app_study(
     State(state): State<ApiState>,
+    headers: HeaderMap,
+    uri: Uri,
     Form(form): Form<AppStartForm>,
 ) -> Response {
     if !state.anonymous_account_creation_allowed() {
@@ -1560,9 +1640,11 @@ async fn start_app_study(
         &capture_request(form.title, form.body, form.capture, form.permission),
     );
 
-    html_with_browser_session(
+    html_with_browser_session_for_request(
         &account,
         render_save_result_html(&state, &account, result.map(|_| ())),
+        &headers,
+        &uri,
     )
 }
 

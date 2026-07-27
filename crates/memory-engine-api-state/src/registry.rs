@@ -1669,6 +1669,31 @@ impl AccountRegistry {
         })
     }
 
+    fn refresh_browser_session_if_needed(
+        &self,
+        session_id: &str,
+        session: &mut BrowserSessionRecord,
+        now_ms: i64,
+    ) -> Result<(), ApiFailure> {
+        let max_age_ms = app_session_max_age_ms();
+        if session.expires_at_ms.saturating_sub(now_ms) >= max_age_ms / 2 {
+            return Ok(());
+        }
+        let expires_at_ms = now_ms.saturating_add(max_age_ms);
+        if !self
+            .storage()
+            .touch_browser_session(session_id, session, now_ms, expires_at_ms)?
+        {
+            return Err(ApiFailure::missing_session());
+        }
+        session.expires_at_ms = expires_at_ms;
+        let mut data = self.lock_data();
+        if let Some(cached) = data.browser_sessions.get_mut(session_id) {
+            cached.expires_at_ms = expires_at_ms;
+        }
+        Ok(())
+    }
+
     /// Runs an API registry operation.
     ///
     /// # Errors
@@ -1690,7 +1715,6 @@ impl AccountRegistry {
     ) -> Result<AppAccount, ApiFailure> {
         self.require_browser_session_inner(headers, csrf_token, Some(timings))
     }
-
     fn require_browser_session_inner(
         &self,
         headers: &HeaderMap,
@@ -1698,11 +1722,12 @@ impl AccountRegistry {
         mut timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let session = self
+        let mut session = self
             .storage()
-            .load_browser_session_with_timings(session_id, timings.as_deref_mut())?;
-        let session = session.ok_or_else(ApiFailure::missing_session)?;
-        if session.expires_at_ms <= self.now() {
+            .load_browser_session_with_timings(session_id, timings.as_deref_mut())?
+            .ok_or_else(ApiFailure::missing_session)?;
+        let now_ms = self.now();
+        if session.expires_at_ms <= now_ms {
             let mut data = self.lock_data();
             data.browser_sessions.remove(session_id);
             drop(data);
@@ -1712,6 +1737,7 @@ impl AccountRegistry {
             return Err(ApiFailure::forbidden("CSRF token does not match session."));
         }
         self.require_account_with_timings(&session.account_id, &session.session_token, timings)?;
+        self.refresh_browser_session_if_needed(session_id, &mut session, now_ms)?;
 
         Ok(AppAccount {
             browser_session_id: session_id.to_owned(),
@@ -1737,15 +1763,19 @@ impl AccountRegistry {
         headers: &HeaderMap,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let session = self.storage().load_browser_session(session_id)?;
-        let session = session.ok_or_else(ApiFailure::missing_session)?;
-        if session.expires_at_ms <= self.now() {
+        let mut session = self
+            .storage()
+            .load_browser_session(session_id)?
+            .ok_or_else(ApiFailure::missing_session)?;
+        let now_ms = self.now();
+        if session.expires_at_ms <= now_ms {
             let mut data = self.lock_data();
             data.browser_sessions.remove(session_id);
             drop(data);
             return Err(ApiFailure::missing_session());
         }
         self.require_account(&session.account_id, &session.session_token)?;
+        self.refresh_browser_session_if_needed(session_id, &mut session, now_ms)?;
 
         let csrf_token = session_csrf_token(&session.session_token);
         Ok(AppAccount {

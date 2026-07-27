@@ -3224,7 +3224,10 @@ async fn auth_magic_link_cross_device_resume() {
     assert!(!verified.contains("Save account email"));
     assert!(!verified.contains(r#"name="email""#));
     assert!(!verified.contains(r#"name="sessionToken""#));
-    assert!(cookie.starts_with("__Host-memory_engine_session="));
+    assert!(
+        cookie.starts_with("memory_engine_session=")
+            || cookie.starts_with("__Host-memory_engine_session=")
+    );
 
     // The magic link lands on the Home view; the saved source title lives on
     // the Library view.
@@ -4791,7 +4794,7 @@ async fn auth_magic_link_writes_configured_outbox() {
         .await
         .expect("verify owner magic link");
     assert_eq!(verified.status(), StatusCode::OK);
-    assert!(session_cookie(&verified).starts_with("__Host-memory_engine_session="));
+    let _cookie = session_cookie(&verified);
 }
 
 #[tokio::test]
@@ -4989,14 +4992,22 @@ async fn app_logout_revokes_the_browser_session() {
         .await
         .expect("logout");
     assert_eq!(logged_out.status(), StatusCode::OK);
-    let set_cookie = logged_out
+    let clear_cookies = logged_out
         .headers()
-        .get(SET_COOKIE)
-        .expect("clear cookie")
-        .to_str()
-        .expect("set-cookie");
-    assert!(set_cookie.contains("__Host-memory_engine_session="));
-    assert!(set_cookie.contains("Max-Age=0"));
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("set-cookie"))
+        .collect::<Vec<_>>();
+    assert_eq!(clear_cookies.len(), 2);
+    assert!(clear_cookies
+        .iter()
+        .any(|cookie| cookie.starts_with("memory_engine_session=")));
+    assert!(clear_cookies
+        .iter()
+        .any(|cookie| cookie.starts_with("__Host-memory_engine_session=")));
+    assert!(clear_cookies
+        .iter()
+        .all(|cookie| cookie.contains("Max-Age=0")));
 
     let restarted_app = router(ApiState::new(
         AccountRegistry::with_store_root(&store_root)
@@ -5091,14 +5102,22 @@ async fn app_logout_all_is_reachable_from_the_rendered_page_and_revokes_the_sess
         .await
         .expect("logout-all");
     assert_eq!(logged_out.status(), StatusCode::OK);
-    let set_cookie = logged_out
+    let clear_cookies = logged_out
         .headers()
-        .get(SET_COOKIE)
-        .expect("clear cookie")
-        .to_str()
-        .expect("set-cookie");
-    assert!(set_cookie.contains("__Host-memory_engine_session="));
-    assert!(set_cookie.contains("Max-Age=0"));
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("set-cookie"))
+        .collect::<Vec<_>>();
+    assert_eq!(clear_cookies.len(), 2);
+    assert!(clear_cookies
+        .iter()
+        .any(|cookie| cookie.starts_with("memory_engine_session=")));
+    assert!(clear_cookies
+        .iter()
+        .any(|cookie| cookie.starts_with("__Host-memory_engine_session=")));
+    assert!(clear_cookies
+        .iter()
+        .all(|cookie| cookie.contains("Max-Age=0")));
 
     let rejected = app
         .oneshot(form_request_with_cookie(
@@ -9683,11 +9702,28 @@ fn session_cookie(response: &axum::response::Response) -> String {
         .expect("session set-cookie")
         .to_str()
         .expect("session cookie header");
+    let host_cookie = set_cookie.starts_with("__Host-memory_engine_session=");
+    let plain_cookie = set_cookie.starts_with("memory_engine_session=");
+    assert!(
+        host_cookie || plain_cookie,
+        "session cookie must use the host or plain local name: {set_cookie}"
+    );
     assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("Secure"));
     assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Path=/"));
+    assert!(set_cookie.contains("Max-Age=7776000"));
     assert!(!set_cookie.contains("Domain="));
+    if host_cookie {
+        assert!(
+            set_cookie.contains("Secure"),
+            "host-only production cookie must be Secure: {set_cookie}"
+        );
+    } else {
+        assert!(
+            !set_cookie.contains("Secure"),
+            "plain local HTTP cookie must omit Secure: {set_cookie}"
+        );
+    }
     set_cookie
         .split(';')
         .next()
@@ -10728,14 +10764,159 @@ fn browser_session_is_rejected_after_it_expires() {
         state
             .require_browser_session(&headers, session.csrf_token())
             .is_err(),
-        "an expired browser session must be rejected server-side"
-    );
-    assert!(
-        state
-            .require_browser_session(&headers, session.csrf_token())
-            .is_err(),
         "an expired session reloaded from storage must also be rejected"
     );
+}
+
+#[tokio::test]
+async fn browser_session_cookie_attributes_follow_request_scheme() {
+    let app = router(local_fixture_state());
+    let plain = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("http://127.0.0.1/app/start")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=local+http+session"))
+                .expect("HTTP session request"),
+        )
+        .await
+        .expect("HTTP session response");
+    assert_eq!(plain.status(), StatusCode::OK);
+    let plain_cookie = plain
+        .headers()
+        .get(SET_COOKIE)
+        .expect("HTTP session cookie")
+        .to_str()
+        .expect("HTTP session cookie header");
+    assert!(plain_cookie.starts_with("memory_engine_session="));
+    assert!(plain_cookie.contains("HttpOnly"));
+    assert!(plain_cookie.contains("SameSite=Lax"));
+    assert!(plain_cookie.contains("Path=/"));
+    assert!(plain_cookie.contains("Max-Age=7776000"));
+    assert!(!plain_cookie.contains("Secure"));
+
+    let forwarded = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=forwarded+https+session"))
+                .expect("HTTPS session request"),
+        )
+        .await
+        .expect("HTTPS session response");
+    assert_eq!(forwarded.status(), StatusCode::OK);
+    let host_cookie = forwarded
+        .headers()
+        .get(SET_COOKIE)
+        .expect("HTTPS session cookie")
+        .to_str()
+        .expect("HTTPS session cookie header");
+    assert!(host_cookie.starts_with("__Host-memory_engine_session="));
+    assert!(host_cookie.contains("HttpOnly"));
+    assert!(host_cookie.contains("Secure"));
+    assert!(host_cookie.contains("SameSite=Lax"));
+    assert!(host_cookie.contains("Path=/"));
+    assert!(host_cookie.contains("Max-Age=7776000"));
+    assert!(!host_cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn sliding_browser_session_refresh_persists_browser_and_api_expiry() {
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let store_root = temp_store_root("sliding-browser-session");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests())
+            .with_clock(test_now),
+    );
+    let created = state.create_guest_account().expect("guest account");
+    let session = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let response = memory_engine_api_state::html_with_browser_session(&session, String::new());
+    let mut headers = HeaderMap::new();
+    headers.insert("cookie", response.headers()[SET_COOKIE].clone());
+
+    let max_age = super::app_session_max_age_ms();
+    test_clock.fetch_add(max_age / 2 + 1, Ordering::SeqCst);
+    state
+        .require_browser_session_readonly(&headers)
+        .expect("session refresh");
+
+    // Cross the original expiry. A fresh registry must still accept both
+    // persisted session rows after the sliding refresh.
+    test_clock.fetch_add(max_age / 2 + 1, Ordering::SeqCst);
+    let reloaded = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests())
+            .with_clock(test_now),
+    );
+    reloaded
+        .require_browser_session(&headers, session.csrf_token())
+        .expect("refreshed browser and API sessions");
+
+    let refreshed_response = router(reloaded)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("cookie", headers.get("cookie").expect("cookie"))
+                .body(Body::empty())
+                .expect("refreshed home request"),
+        )
+        .await
+        .expect("refreshed home response");
+    assert_eq!(refreshed_response.status(), StatusCode::OK);
+    let refreshed_cookie = refreshed_response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("refreshed session cookie")
+        .to_str()
+        .expect("refreshed session cookie header");
+    assert!(refreshed_cookie.contains("Max-Age=7776000"));
+}
+
+#[tokio::test]
+async fn app_home_with_expired_browser_cookie_renders_session_recovery() {
+    let (test_clock, test_now) = isolated_test_clock!(DEFAULT_BETA_STUDY_NOW);
+    let app = router(ApiState::new(
+        AccountRegistry::default()
+            .with_auth_config(AuthConfig::for_local_tests())
+            .with_clock(test_now),
+    ));
+    let started = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/app/start",
+            &[("capture", "session expiry recovery")],
+        ))
+        .await
+        .expect("start session");
+    let cookie = session_cookie(&started);
+    test_clock.fetch_add(super::app_session_max_age_ms() + 1, Ordering::SeqCst);
+
+    let expired = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("expired home request"),
+        )
+        .await
+        .expect("expired home response");
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+    let body = response_text(expired).await;
+    assert!(body.contains("Your session expired"));
+    assert!(body.contains("Your study data is safe"));
+    assert!(!body.contains("Join the waitlist"));
 }
 
 #[test]
@@ -10799,7 +10980,10 @@ fn correct_answer_is_not_due_again_until_real_time_passes() {
         "a correctly answered unit must not be due again at the same moment"
     );
 
-    test_clock.fetch_add(30 * 86_400_000, Ordering::SeqCst);
+    test_clock.fetch_add(
+        super::app_session_max_age_ms().saturating_add(1),
+        Ordering::SeqCst,
+    );
     assert!(
         state
             .next_review(&account.account_id, &account.session_token)
@@ -10942,7 +11126,7 @@ async fn review_form_leaves_response_time_blank_for_honest_measurement() {
 
 /// Sign back in over the rendered magic-link flow and return the fresh
 /// browser session cookie and CSRF token. Maturing a card spans weeks of
-/// simulated clock, which outlives any single 14-day browser session — the
+/// simulated clock, which can outlive the 90-day browser session — the
 /// learner signs back in between review sessions, exactly like the product.
 async fn refresh_login(app: &axum::Router, email: &str) -> (String, String) {
     let requested = app
@@ -11044,8 +11228,8 @@ async fn mature_cat_card_then_submit(
             .expect("maturing submit");
         assert_eq!(graded.status(), StatusCode::OK, "maturing cycle {cycle}");
         // Advance just past the card's next-review horizon so it is due
-        // again, then sign back in: the horizon can outlive the fixed 14-day
-        // browser session.
+        // again, then sign back in: the horizon can outlive the fixed
+        // browser session lifetime.
         advance_clock_past_next_review(clock, &response_text(graded).await);
         (cookie, csrf_token) = refresh_login(app, &email).await;
     }
