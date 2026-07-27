@@ -1674,29 +1674,11 @@ impl AccountRegistry {
         })
     }
 
-    fn refresh_browser_session_if_needed(
-        &self,
-        session_id: &str,
-        session: &mut BrowserSessionRecord,
-        now_ms: i64,
-    ) -> Result<(), ApiFailure> {
-        let max_age_ms = app_session_max_age_ms();
-        if session.expires_at_ms.saturating_sub(now_ms) >= max_age_ms / 2 {
-            return Ok(());
-        }
-        let expires_at_ms = now_ms.saturating_add(max_age_ms);
-        if !self
-            .storage()
-            .touch_browser_session(session_id, session, now_ms, expires_at_ms)?
-        {
-            return Err(ApiFailure::missing_session());
-        }
-        session.expires_at_ms = expires_at_ms;
+    fn update_browser_session_cache(&self, session_id: &str, expires_at_ms: i64) {
         let mut data = self.lock_data();
         if let Some(cached) = data.browser_sessions.get_mut(session_id) {
             cached.expires_at_ms = expires_at_ms;
         }
-        Ok(())
     }
 
     /// Runs an API registry operation.
@@ -1724,25 +1706,28 @@ impl AccountRegistry {
         &self,
         headers: &HeaderMap,
         csrf_token: &str,
-        mut timings: Option<&mut SubmitReviewTimings>,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let mut session = self
-            .storage()
-            .load_browser_session_with_timings(session_id, timings.as_deref_mut())?
-            .ok_or_else(ApiFailure::missing_session)?;
         let now_ms = self.now();
-        if session.expires_at_ms <= now_ms {
-            let mut data = self.lock_data();
-            data.browser_sessions.remove(session_id);
-            drop(data);
+        let csrf_token_hash = secret_hash(csrf_token);
+        let Some(validation) = self.storage().load_and_validate_browser_session(
+            session_id,
+            now_ms,
+            Some(&csrf_token_hash),
+            timings,
+        )?
+        else {
+            self.lock_data().browser_sessions.remove(session_id);
             return Err(ApiFailure::missing_session());
+        };
+        if validation.touched {
+            self.update_browser_session_cache(session_id, validation.session.expires_at_ms);
         }
-        if session.csrf_token_hash != secret_hash(csrf_token) {
+        let session = validation.session;
+        if session.csrf_token_hash != csrf_token_hash {
             return Err(ApiFailure::forbidden("CSRF token does not match session."));
         }
-        self.require_account_with_timings(&session.account_id, &session.session_token, timings)?;
-        self.refresh_browser_session_if_needed(session_id, &mut session, now_ms)?;
 
         Ok(AppAccount {
             browser_session_id: session_id.to_owned(),
@@ -1770,19 +1755,18 @@ impl AccountRegistry {
         headers: &HeaderMap,
     ) -> Result<AppAccount, ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
-        let mut session = self
-            .storage()
-            .load_browser_session(session_id)?
-            .ok_or_else(ApiFailure::missing_session)?;
         let now_ms = self.now();
-        if session.expires_at_ms <= now_ms {
-            let mut data = self.lock_data();
-            data.browser_sessions.remove(session_id);
-            drop(data);
+        let Some(validation) = self
+            .storage()
+            .load_and_validate_browser_session(session_id, now_ms, None, None)?
+        else {
+            self.lock_data().browser_sessions.remove(session_id);
             return Err(ApiFailure::missing_session());
+        };
+        if validation.touched {
+            self.update_browser_session_cache(session_id, validation.session.expires_at_ms);
         }
-        self.require_account(&session.account_id, &session.session_token)?;
-        self.refresh_browser_session_if_needed(session_id, &mut session, now_ms)?;
+        let session = validation.session;
 
         let csrf_token = session_csrf_token(&session.session_token);
         Ok(AppAccount {

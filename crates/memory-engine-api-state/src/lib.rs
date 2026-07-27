@@ -1989,6 +1989,7 @@ pub struct SubmitReviewRequest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SubmitReviewTimings {
     connect_ms: Option<u64>,
+    connect_count: Option<u64>,
     operation_ms: Option<u64>,
     statement_count: Option<u64>,
 }
@@ -1997,6 +1998,10 @@ impl SubmitReviewTimings {
     #[must_use]
     pub const fn postgres_connect_ms(self) -> Option<u64> {
         self.connect_ms
+    }
+    #[must_use]
+    pub const fn postgres_connect_count(self) -> Option<u64> {
+        self.connect_count
     }
 
     #[must_use]
@@ -2015,6 +2020,7 @@ impl SubmitReviewTimings {
                 .unwrap_or_default()
                 .saturating_add(duration_ms),
         );
+        self.connect_count = Some(self.connect_count.unwrap_or_default().saturating_add(1));
     }
 
     pub(crate) fn record_postgres_operation(&mut self, duration_ms: u64) {

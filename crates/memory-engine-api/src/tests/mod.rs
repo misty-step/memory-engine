@@ -6059,6 +6059,40 @@ async fn assert_postgres_edge_rate_limit(state: ApiState, edge: String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_browser_session_auth_uses_one_connect() {
+    let Some(database) = PostgresTestDatabase::new("browser_session_one_connect") else {
+        return;
+    };
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(database.scoped_url.clone())
+            .with_auth_config(AuthConfig::for_local_tests()),
+    );
+    let account = state
+        .create_guest_account()
+        .expect("create Postgres test account");
+    let browser = state
+        .create_browser_session(&account)
+        .expect("create Postgres browser session");
+    let response = memory_engine_api_state::html_with_browser_session(&browser, String::new());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "cookie",
+        HeaderValue::try_from(session_cookie(&response)).expect("browser cookie"),
+    );
+    let mut timings = memory_engine_api_state::SubmitReviewTimings::default();
+
+    state
+        .require_browser_session_with_timings(&headers, browser.csrf_token(), &mut timings)
+        .expect("browser session");
+
+    assert_eq!(
+        timings.postgres_connect_count(),
+        Some(1),
+        "browser session auth must use one Postgres connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_auth_hardening_invite_sessions_and_edge_limits() {
     let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
         eprintln!(
@@ -6907,14 +6941,21 @@ fn assert_postgres_submit_timing(
         Some("no-store")
     );
 }
-
-/// Cross-checks the server's self-reported `total` against wall-clock time
-/// the test measured around the whole in-process request.
-///
-/// `normalize_submit_durations` raises the reported total to at least the
-/// summed phase durations, so a bare `phase_sum <= total` assertion is
-/// tautologically true by construction (`total` is *defined* as
-/// `total.max(phase_sum)`) and can never catch the total itself being
+async fn assert_postgres_submit_receipt(
+    graded: axum::response::Response,
+    expected_statement_count: u64,
+) -> String {
+    assert_eq!(graded.status(), StatusCode::OK);
+    assert_eq!(
+        graded.headers().get_all(SET_COOKIE).iter().count(),
+        1,
+        "authenticated submit response must attach exactly one session cookie"
+    );
+    assert_postgres_submit_timing(&graded, expected_statement_count);
+    let graded = response_text(graded).await;
+    assert!(graded.contains("me-verdict") && graded.contains(">Correct<"));
+    graded
+}
 /// inflated beyond reality. This closes that gap: memory-engine-109 review
 /// finding — Postgres reads nested inside the timed render window on the
 /// empty-queue/error path (`app_study_view_with_timings`,
@@ -6939,17 +6980,6 @@ fn assert_reported_total_is_not_inflated_beyond_measured_wall_clock(
         "reported total {total_ms}ms must not exceed the independently \
          measured wall clock {measured_ms}ms by more than harness slack: {timing}"
     );
-}
-
-async fn assert_postgres_submit_receipt(
-    graded: axum::response::Response,
-    expected_statement_count: u64,
-) -> String {
-    assert_eq!(graded.status(), StatusCode::OK);
-    assert_postgres_submit_timing(&graded, expected_statement_count);
-    let graded = response_text(graded).await;
-    assert!(graded.contains("me-verdict") && graded.contains(">Correct<"));
-    graded
 }
 
 async fn prepare_postgres_browser_review(
