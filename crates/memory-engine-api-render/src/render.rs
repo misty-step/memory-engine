@@ -438,8 +438,11 @@ pub fn render_analytics_page(
     options: AnalyticsViewOptions,
 ) -> String {
     let due = view.due_count;
-    let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
-    let footer = render_nav("analytics", account);
+    let header_right = format!(
+        r#"<span class="me-due">{due} due</span>{account_menu}"#,
+        account_menu = account_menu(account),
+    );
+    let footer = render_nav("analytics");
     let body = format!(
         r#"<section class="me-analytics">
 <p class="me-kicker">Analytics</p>
@@ -750,10 +753,16 @@ fn render_signed_in_body(
     body: &str,
     nav_active: Option<&str>,
 ) -> String {
-    let header_right = format!(r#"<span class="me-due">{due} due</span>"#);
+    // Account menu lives in the header so the bottom nav stays four equal
+    // view tabs. Review (nav_active = None) keeps the same header menu and
+    // a tagline footer — no sign-out jammed into the bottom bar.
+    let header_right = format!(
+        r#"<span class="me-due">{due} due</span>{account_menu}"#,
+        account_menu = account_menu(account),
+    );
     let footer = match nav_active {
-        Some(active) => render_nav(active, account),
-        None => signed_in_footer(account),
+        Some(active) => render_nav(active),
+        None => FOOTER_TAGLINE.to_owned(),
     };
     let view_inner = format!("{}{}", render_notice(notice, jobs), body);
     screen(&header_right, &view_inner, &footer)
@@ -761,8 +770,9 @@ fn render_signed_in_body(
 
 /// Persistent one-tap navigation across standing views (memory-engine-087).
 /// Each view answers one job-to-be-done; the current view carries
-/// `aria-current="page"`. Sign-out stays one tap away in the same bar.
-fn render_nav(active: &str, account: &AppAccount) -> String {
+/// `aria-current="page"`. Sign-out lives in the header account menu so the
+/// bar stays four equal tabs with no overflow on phone widths.
+fn render_nav(active: &str) -> String {
     let item = |label: &str, href: &str, key: &str| {
         let current = if key == active {
             r#" aria-current="page""#
@@ -772,12 +782,11 @@ fn render_nav(active: &str, account: &AppAccount) -> String {
         format!(r#"<a class="me-nav-item" href="{href}"{current}>{label}</a>"#)
     };
     format!(
-        r#"<nav class="me-nav" aria-label="Views">{}{}{}{}{}</nav>"#,
+        r#"<nav class="me-nav" aria-label="Views">{}{}{}{}</nav>"#,
         item("Home", "/", "home"),
         item("Create", "/app/create", "create"),
         item("Library", "/app/library", "library"),
         item("Analytics", "/app/analytics", "analytics"),
-        signed_in_footer(account),
     )
 }
 
@@ -961,20 +970,24 @@ fn render_library_sources(
 }
 
 fn render_return_notifications(account: &AppAccount) -> String {
+    // Collapsed by default so Home stays calm: one due-hero primary action
+    // in the open view, reminders one tap deeper (operator dogfood).
     format!(
         r#"<section class="ae-group me-return-channel">
-<h2 class="ae-h">Return gently</h2>
+<details class="me-return-details">
+<summary class="me-return-summary">Daily reminders</summary>
 <p class="ae-lede">Opt in to one quiet email a day when reviews are waiting. No scores or promotional mail.</p>
-<form action="/app/return-notifications" method="post">
+<form class="me-return-enable" action="/app/return-notifications" method="post">
 {csrf}<label class="ae-label" for="me-reminder-email">Reminder email</label>
 <input class="ae-input" id="me-reminder-email" name="reminderEmail" type="email" autocomplete="email" required placeholder="you@example.com">
 <input type="hidden" name="enabled" value="on">
 <button class="ae-button" type="submit">Enable due-count reminders</button>
 </form>
-<form action="/app/return-notifications" method="post" class="me-return-off">
+<form class="me-return-off" action="/app/return-notifications" method="post">
 {csrf}<input type="hidden" name="enabled" value="off">
 <button class="ae-button-quiet" type="submit">Turn off reminders</button>
 </form>
+</details>
 </section>"#,
         csrf = hidden_csrf_input(account),
     )
@@ -1934,17 +1947,21 @@ fn hidden_csrf_input(account: &AppAccount) -> String {
     )
 }
 
-/// Shared "Signed in" footer for the account and workspace screens: sign
-/// out this browser session, or sign out every browser session for the
-/// account via `/app/logout-all`. Machine/service-session credentials are
-/// an independent scope and are unaffected; there is no PWA control for
-/// those today.
-fn signed_in_footer(account: &AppAccount) -> String {
+/// Header account menu for signed-in views: sign out this browser session,
+/// or sign out every browser session via `/app/logout-all`. Machine/service-
+/// session credentials are an independent scope and are unaffected; there is
+/// no PWA control for those today. Lives in the header so the bottom nav
+/// stays four equal view tabs.
+fn account_menu(account: &AppAccount) -> String {
     let csrf = hidden_csrf_input(account);
     format!(
-        r#"<span class="ae-dim">Signed in</span>
+        r#"<details class="me-account">
+<summary class="me-account-summary">Account</summary>
+<div class="me-account-sheet">
 <form class="me-foot-form" action="/app/logout" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out</button></form>
-<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>"#
+<form class="me-foot-form" action="/app/logout-all" method="post">{csrf}<button class="ae-button-quiet ae-button-compact" type="submit">Sign out everywhere</button></form>
+</div>
+</details>"#
     )
 }
 

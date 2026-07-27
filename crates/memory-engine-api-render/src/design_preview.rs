@@ -616,9 +616,11 @@ fn conformance_view_copy_trims_to_one_line_each() {
     );
 }
 
-/// memory-engine-087: persistent one-tap navigation is present on every
-/// standing view (Home, Create, Library, Analytics) with `aria-current`
-/// marking the active view, and absent from the full-bleed review.
+/// memory-engine-087 + home chrome: persistent one-tap navigation is present
+/// on every standing view (Home, Create, Library, Analytics) with
+/// `aria-current` marking the active view, and absent from the full-bleed
+/// review. The nav holds only the four view links — sign-out lives in the
+/// header account menu. Home reminders stay collapsed by default.
 #[test]
 fn conformance_nav_present_on_standing_views_absent_on_review() {
     let state = memory_engine_api_state::ApiState::new(
@@ -640,6 +642,35 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
         home.contains(r#"href="/" aria-current="page">Home</a>"#),
         "Home nav must mark itself current: {home}"
     );
+    assert_nav_is_four_views_only(&home, "Home");
+    assert_account_menu_logout(&home, "Home");
+    assert!(
+        home.contains(r#"<details class="me-return-details">"#),
+        "Home reminders must collapse behind a details disclosure: {home}"
+    );
+    assert!(
+        home.contains(r#"<summary class="me-return-summary">Daily reminders</summary>"#),
+        "Home reminders summary must read Daily reminders: {home}"
+    );
+    // Default-closed: no open attribute on the reminders details.
+    assert!(
+        !home.contains(r#"<details class="me-return-details" open"#)
+            && !home.contains(r#"<details open class="me-return-details""#),
+        "Home reminders must be collapsed by default: {home}"
+    );
+    // Enable is the only primary CTA inside the disclosure; turn-off is quiet.
+    assert!(
+        home.contains(r#"class="ae-button" type="submit">Enable due-count reminders</button>"#),
+        "Home reminders must keep one primary enable CTA: {home}"
+    );
+    assert!(
+        home.contains(r#"class="ae-button-quiet" type="submit">Turn off reminders</button>"#),
+        "Home turn-off must stay a quiet secondary control: {home}"
+    );
+    assert!(
+        !home.contains(r">Signed in</span>"),
+        "bare Signed in spam must not appear: {home}"
+    );
 
     // Create has nav with Create current.
     let create = crate::render_create_page(&state, &acct, None);
@@ -651,6 +682,8 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
         create.contains(r#"href="/app/create" aria-current="page">Create</a>"#),
         "Create nav must mark itself current: {create}"
     );
+    assert_nav_is_four_views_only(&create, "Create");
+    assert_account_menu_logout(&create, "Create");
 
     // Library has nav with Library current.
     let library = crate::render_library_page(&state, &acct, None, None);
@@ -662,6 +695,8 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
         library.contains(r#"href="/app/library" aria-current="page">Library</a>"#),
         "Library nav must mark itself current: {library}"
     );
+    assert_nav_is_four_views_only(&library, "Library");
+    assert_account_menu_logout(&library, "Library");
 
     // Analytics has nav with Analytics current.
     let view = view(vec![], None, vec![], 0, vec![]);
@@ -675,8 +710,10 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
         analytics.contains(r#"href="/app/analytics" aria-current="page">Analytics</a>"#),
         "Analytics nav must mark itself current: {analytics}"
     );
+    assert_nav_is_four_views_only(&analytics, "Analytics");
+    assert_account_menu_logout(&analytics, "Analytics");
 
-    // Review is full-bleed: no nav.
+    // Review is full-bleed: no nav, but still has the header account menu.
     let pages = pages();
     let Some((_, review)) = pages.iter().find(|(name, _)| *name == "06-review-open") else {
         panic!("review-open preview state missing");
@@ -684,5 +721,71 @@ fn conformance_nav_present_on_standing_views_absent_on_review() {
     assert!(
         !review.contains(r#"<nav class="me-nav""#),
         "review must not carry nav (full-bleed): {review}"
+    );
+    assert_account_menu_logout(review, "review");
+}
+
+/// The bottom nav is only the four standing views — no logout forms inside.
+fn assert_nav_is_four_views_only(html: &str, label: &str) {
+    let start = html
+        .find(r#"<nav class="me-nav" aria-label="Views">"#)
+        .unwrap_or_else(|| panic!("{label}: missing me-nav open tag"));
+    let after = &html[start..];
+    let end_rel = after
+        .find("</nav>")
+        .unwrap_or_else(|| panic!("{label}: missing me-nav close tag"));
+    let nav = &after[..end_rel + "</nav>".len()];
+    assert!(
+        !nav.contains("/app/logout"),
+        "{label}: nav must not contain logout forms: {nav}"
+    );
+    assert!(
+        !nav.contains("Sign out"),
+        "{label}: nav must not contain sign-out controls: {nav}"
+    );
+    for (href, name) in [
+        ("/", "Home"),
+        ("/app/create", "Create"),
+        ("/app/library", "Library"),
+        ("/app/analytics", "Analytics"),
+    ] {
+        assert!(
+            nav.contains(&format!(r#"href="{href}""#)) && nav.contains(name),
+            "{label}: nav must contain {name} link: {nav}"
+        );
+    }
+    let link_count = nav.matches(r#"class="me-nav-item""#).count();
+    assert_eq!(
+        link_count, 4,
+        "{label}: nav must contain exactly four view links, found {link_count}: {nav}"
+    );
+}
+
+/// Sign-out controls live in a header account menu with CSRF forms.
+fn assert_account_menu_logout(html: &str, label: &str) {
+    assert!(
+        html.contains(r#"<details class="me-account">"#),
+        "{label}: must carry header account menu: {html}"
+    );
+    assert!(
+        html.contains(r#"<summary class="me-account-summary">Account</summary>"#),
+        "{label}: account menu summary must read Account: {html}"
+    );
+    assert!(
+        html.contains(r#"action="/app/logout" method="post""#),
+        "{label}: account menu must include logout form: {html}"
+    );
+    assert!(
+        html.contains(r#"action="/app/logout-all" method="post""#),
+        "{label}: account menu must include logout-all form: {html}"
+    );
+    assert!(
+        html.contains(">Sign out</button>") && html.contains(">Sign out everywhere</button>"),
+        "{label}: account menu must label both sign-out actions: {html}"
+    );
+    // CSRF tokens ride the logout forms.
+    assert!(
+        html.contains(r#"name="csrfToken""#),
+        "{label}: logout forms must carry CSRF: {html}"
     );
 }

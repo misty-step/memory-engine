@@ -94,10 +94,7 @@ fn run_mailer_with_inputs(
             "MEMORY_ENGINE_PUBLIC_BASE_URL",
             "https://memory.example.test",
         )
-        .env(
-            "MEMORY_ENGINE_MAIL_FROM",
-            "Memory Engine <test@example.test>",
-        );
+        .env("MEMORY_ENGINE_MAIL_FROM", "Scry <test@example.test>");
     if let Some(reminder_key) = reminder_key {
         command.env(
             "MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY",
@@ -357,4 +354,144 @@ fn bundled_resend_mailer_escapes_json_fields_without_a_subprocess_per_character(
     assert!(output.status.success(), "mailer failed: {output:?}");
     server.join().expect("mock Resend server");
     eprintln!("magic-link send completed in {elapsed:?} (informational only)");
+}
+
+#[test]
+fn bundled_resend_mailer_defaults_use_scry_branding() {
+    let (resend_api_url, server) = start_mock_resend(2);
+
+    // Magic-link path without MAIL_FROM override.
+    let mut magic = Command::new(script_path());
+    let magic_output = magic
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RESEND_API_KEY", "test-resend-key")
+        .env("RESEND_API_URL", &resend_api_url)
+        .env(
+            "MEMORY_ENGINE_PUBLIC_BASE_URL",
+            "https://memory.example.test",
+        )
+        .env("MEMORY_ENGINE_AUTH_EMAIL", "learner@example.test")
+        .env(
+            "MEMORY_ENGINE_AUTH_LINK",
+            "/app/login/verify?token=magic-test",
+        )
+        .output()
+        .expect("run magic-link mailer");
+    assert!(
+        magic_output.status.success(),
+        "magic link failed: {magic_output:?}"
+    );
+
+    // Reminder path without MAIL_FROM override.
+    let mut reminder = Command::new(script_path());
+    let reminder_output = reminder
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RESEND_API_KEY", "test-resend-key")
+        .env("RESEND_API_URL", &resend_api_url)
+        .env(
+            "MEMORY_ENGINE_PUBLIC_BASE_URL",
+            "https://memory.example.test",
+        )
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL",
+            "learner@example.test",
+        )
+        .env("MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT", "3")
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE",
+            "/app/return-notifications?token=unsubscribe-test",
+        )
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY",
+            "return-brand-1",
+        )
+        .output()
+        .expect("run reminder mailer");
+    assert!(
+        reminder_output.status.success(),
+        "reminder failed: {reminder_output:?}"
+    );
+
+    let requests = server.join().expect("mock Resend server");
+    assert_eq!(requests.len(), 2);
+
+    assert!(
+        requests[0].contains(r#""from":"Scry <onboarding@resend.dev>""#),
+        "magic-link from default must be Scry-branded: {}",
+        requests[0]
+    );
+    assert!(
+        requests[0].contains(r#""subject":"Your Scry sign-in link""#),
+        "magic-link subject must say Scry: {}",
+        requests[0]
+    );
+    assert!(
+        !requests[0].contains("Memory Engine"),
+        "magic-link must not say Memory Engine: {}",
+        requests[0]
+    );
+
+    assert!(
+        requests[1].contains(r#""from":"Scry <onboarding@resend.dev>""#),
+        "reminder from default must be Scry-branded: {}",
+        requests[1]
+    );
+    assert!(
+        requests[1].contains(r#""subject":"You have 3 Scry reviews""#),
+        "reminder subject must say Scry: {}",
+        requests[1]
+    );
+    assert!(
+        requests[1].contains("waiting in Scry"),
+        "reminder body must say waiting in Scry: {}",
+        requests[1]
+    );
+    assert!(
+        !requests[1].contains("Memory Engine"),
+        "reminder must not say Memory Engine: {}",
+        requests[1]
+    );
+}
+
+#[test]
+fn bundled_resend_mailer_reminder_singular_subject_uses_scry() {
+    let (resend_api_url, server) = start_mock_resend(1);
+    let mut command = Command::new(script_path());
+    let output = command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("RESEND_API_KEY", "test-resend-key")
+        .env("RESEND_API_URL", &resend_api_url)
+        .env(
+            "MEMORY_ENGINE_PUBLIC_BASE_URL",
+            "https://memory.example.test",
+        )
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_EMAIL",
+            "learner@example.test",
+        )
+        .env("MEMORY_ENGINE_RETURN_NOTIFICATION_DUE_COUNT", "1")
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_UNSUBSCRIBE",
+            "/app/return-notifications?token=unsubscribe-test",
+        )
+        .env(
+            "MEMORY_ENGINE_RETURN_NOTIFICATION_IDEMPOTENCY_KEY",
+            "return-brand-singular",
+        )
+        .output()
+        .expect("run singular reminder mailer");
+    assert!(
+        output.status.success(),
+        "singular reminder failed: {output:?}"
+    );
+    let requests = server.join().expect("mock Resend server");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains(r#""subject":"You have 1 Scry review""#),
+        "singular reminder subject must say Scry review: {}",
+        requests[0]
+    );
 }
