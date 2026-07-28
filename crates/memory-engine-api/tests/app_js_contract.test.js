@@ -69,6 +69,10 @@ function browserHarness(options = {}) {
     idempotencyKey: "review-unit-1-0",
   };
   let nativeSubmitCount = 0;
+  let viewHtml = options.viewHtml ?? '<p class="me-prompt">Q</p>';
+  let dueText = options.dueText ?? "1 due";
+  let footerHtml = options.footerHtml ?? '<nav class="me-nav">Home</nav>';
+  const fallbackFields = [];
   const form = {
     tagName: "FORM",
     classList: classes(options.formClass ?? "me-choices-form"),
@@ -78,18 +82,33 @@ function browserHarness(options = {}) {
       if (selector === 'input[name="responseTimeMs"]') return responseInput;
       if (selector === 'input[name="performanceTraceId"]') return performanceTraceInput;
       if (selector === 'button[type="submit"], button:not([type])') return control;
+      const fallbackMatch = selector.match(
+        /^input\[type="hidden"\]\[name="([^"]+)"\]\[data-scry-fallback="1"\]$/,
+      );
+      if (fallbackMatch) {
+        return fallbackFields.find((field) => field.name === fallbackMatch[1]) ?? null;
+      }
       return null;
     },
     querySelectorAll: (selector) => (selector === ".me-choice" ? [control] : []),
     appendChild: (input) => {
+      if (input && input.name === "performanceTraceId") {
+        performanceTraceInput = input;
+        return;
+      }
+      if (input && input.getAttribute && input.getAttribute("data-scry-fallback") === "1") {
+        fallbackFields.push({
+          name: input.name || input.getAttribute("name"),
+          value: input.value || input.getAttribute("value"),
+        });
+        return;
+      }
       performanceTraceInput = input;
     },
     submit() {
       nativeSubmitCount += 1;
     },
   };
-  let viewHtml = options.viewHtml ?? '<p class="me-prompt">Q</p>';
-  let dueText = options.dueText ?? "1 due";
   const headMetas = new Map(Object.entries(options.metas ?? {}));
   const document = {
     documentElement: {
@@ -137,6 +156,16 @@ function browserHarness(options = {}) {
           },
         };
       }
+      if (selector === "footer.ae-bar") {
+        return {
+          get innerHTML() {
+            return footerHtml;
+          },
+          set innerHTML(value) {
+            footerHtml = String(value);
+          },
+        };
+      }
       const metaMatch = selector.match(/^meta\[name="([^"]+)"\]$/);
       if (metaMatch) {
         const value = headMetas.get(metaMatch[1]);
@@ -175,7 +204,20 @@ function browserHarness(options = {}) {
           },
         };
       }
-      return { setAttribute() {}, value: "" };
+      const el = {
+        name: "",
+        value: "",
+        attrs: {},
+        setAttribute(name, value) {
+          this.attrs[name] = value;
+          if (name === "name") this.name = value;
+          if (name === "value") this.value = value;
+        },
+        getAttribute(name) {
+          return this.attrs[name] ?? null;
+        },
+      };
+      return el;
     },
   };
   const sessionStorage = {
@@ -212,6 +254,7 @@ function browserHarness(options = {}) {
     parseFromString(html) {
       const viewMatch = html.match(/<div class="ae-view">([\s\S]*?)<\/div>/);
       const dueMatch = html.match(/<span class="me-due">([^<]*)<\/span>/);
+      const footerMatch = html.match(/<footer class="ae-bar">([\s\S]*?)<\/footer>/);
       const meta = {};
       for (const match of html.matchAll(
         /<meta name="([^"]+)" content="([^"]*)">/g,
@@ -226,6 +269,9 @@ function browserHarness(options = {}) {
           }
           if (selector === ".me-due" && dueMatch) {
             return { textContent: dueMatch[1] };
+          }
+          if (selector === "footer.ae-bar" && footerMatch) {
+            return { innerHTML: footerMatch[1] };
           }
           const metaMatch = selector.match(/^meta\[name="([^"]+)"\]$/);
           if (metaMatch && meta[metaMatch[1]] !== undefined) {
@@ -315,6 +361,8 @@ function browserHarness(options = {}) {
     controlAttr: (name) => controlAttributes.get(name),
     viewHtml: () => viewHtml,
     dueText: () => dueText,
+    footerHtml: () => footerHtml,
+    fallbackFields: () => fallbackFields.slice(),
     nativeSubmits: () => nativeSubmitCount,
     responseTimeMs: () => responseInput.value,
     meta: (name) => headMetas.get(name) ?? null,
@@ -502,7 +550,9 @@ test("review submit fetches and swaps the graded view without inventing a verdic
 <p class="me-prompt">What is 6*7?</p>
 <p class="me-result"><span class="me-verdict">Correct</span></p>
 <form class="me-next" action="/app/next" method="post"><button type="submit">Continue</button></form>
-</div></body></html>`),
+</div>
+<footer class="ae-bar"><p class="me-tagline">tagline</p></footer>
+</body></html>`),
   });
 
   await flushMicrotasks();
@@ -511,6 +561,7 @@ test("review submit fetches and swaps the graded view without inventing a verdic
   expect(browser.viewHtml()).toContain('class="me-verdict">Correct<');
   expect(browser.viewHtml()).toContain("me-next");
   expect(browser.dueText()).toBe("0 due");
+  expect(browser.footerHtml()).toContain("tagline");
   expect(browser.meta("memory-engine-csrf-token")).toBe("csrf-next");
   expect(browser.nativeSubmits()).toBe(0);
 });
@@ -531,6 +582,7 @@ test("in-place submit falls back to native form submit when fetch fails", async 
   expect(browser.prevented()).toBe(1);
   await flushMicrotasks();
   expect(browser.nativeSubmits()).toBe(1);
+  expect(browser.fallbackFields()).toEqual([{ name: "answer", value: "42" }]);
 });
 
 test("continue uses in-place fetch and does not write a submit handoff", async () => {
@@ -546,7 +598,7 @@ test("continue uses in-place fetch and does not write a submit handoff", async (
         headers: { get: () => "text/html; charset=utf-8" },
         text: () =>
           Promise.resolve(
-            `<div class="ae-screen"><span class="me-due">1 due</span><div class="ae-view"><p class="me-prompt">Next card</p></div></div>`,
+            `<div class="ae-screen"><span class="me-due">1 due</span><div class="ae-view"><p class="me-prompt">Next card</p></div><footer class="ae-bar"><p class="me-tagline">review</p></footer></div>`,
           ),
       });
     },
@@ -558,6 +610,7 @@ test("continue uses in-place fetch and does not write a submit handoff", async (
   expect(browser.handoff()).toBeNull();
   await flushMicrotasks();
   expect(browser.viewHtml()).toContain("Next card");
+  expect(browser.footerHtml()).toContain("review");
   expect(browser.busy()).toBeFalse();
 });
 test("every native form keeps instant acknowledgment and duplicate suppression", () => {

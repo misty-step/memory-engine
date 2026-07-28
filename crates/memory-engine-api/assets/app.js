@@ -385,6 +385,11 @@
     var currentDue = document.querySelector(".me-due");
     var nextDue = doc.querySelector(".me-due");
     if (currentDue && nextDue) currentDue.textContent = nextDue.textContent;
+    // Home uses the four-tab nav footer; review uses the tagline. Crossing
+    // those surfaces without swapping footer leaves the wrong chrome.
+    var currentFooter = document.querySelector("footer.ae-bar");
+    var nextFooter = doc.querySelector("footer.ae-bar");
+    if (currentFooter && nextFooter) currentFooter.innerHTML = nextFooter.innerHTML;
     replaceHeadMeta(doc, "memory-engine-csrf-token");
     replaceHeadMeta(doc, "memory-engine-submit-request");
     replaceHeadMeta(doc, "memory-engine-submit-handoff");
@@ -406,8 +411,43 @@
     return true;
   }
 
-  function nativeSubmit(form) {
-    // HTMLFormElement.submit() does not re-fire the submit event.
+  function nativeSubmit(form, control) {
+    // HTMLFormElement.submit() does not re-fire the submit event and drops
+    // the clicked submitter. For MCQ choices, materialize the answer as a
+    // hidden field so the fallback grades the same choice fetch would have.
+    if (
+      form &&
+      control &&
+      typeof control.getAttribute === "function" &&
+      typeof document.createElement === "function" &&
+      typeof form.appendChild === "function"
+    ) {
+      var name = control.getAttribute("name") || control.name;
+      var value =
+        typeof control.value === "string"
+          ? control.value
+          : control.getAttribute("value");
+      if (typeof name === "string" && name && typeof value === "string") {
+        var existing =
+          typeof form.querySelector === "function"
+            ? form.querySelector(
+                'input[type="hidden"][name="' + name + '"][data-scry-fallback="1"]'
+              )
+            : null;
+        if (!existing) {
+          try {
+            var hidden = document.createElement("input");
+            hidden.setAttribute("type", "hidden");
+            hidden.setAttribute("name", name);
+            hidden.setAttribute("value", value);
+            hidden.setAttribute("data-scry-fallback", "1");
+            form.appendChild(hidden);
+          } catch (error) {
+            // If we cannot materialize the answer, still attempt submit.
+          }
+        }
+      }
+    }
     if (form && typeof form.submit === "function") {
       try {
         form.submit();
@@ -460,7 +500,7 @@
         // Drop any fetch-only handoff before the native navigation path.
         if (requestToken) removeHandoffIfToken(requestToken);
         clearTimeoutIfAny();
-        nativeSubmit(form);
+        nativeSubmit(form, control);
       });
     return true;
   }
