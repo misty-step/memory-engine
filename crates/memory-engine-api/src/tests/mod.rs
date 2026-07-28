@@ -7060,7 +7060,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
         ))
         .await
         .expect("Postgres browser submit");
-    assert_postgres_submit_receipt(graded, 23).await;
+    assert_postgres_submit_receipt(graded, 22).await;
 
     let completed_browser_app = router(ApiState::new(
         AccountRegistry::with_postgres_url(database.scoped_url.clone())
@@ -7101,7 +7101,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
     let workspace_submit_measured_ms =
         u64::try_from(workspace_submit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     assert_eq!(workspace_submit.status(), StatusCode::OK);
-    assert_postgres_submit_timing(&workspace_submit, 16);
+    assert_postgres_submit_timing(&workspace_submit, 11);
     // This is the exact empty-queue/error-render path (missing review unit,
     // no active review) that nests app_study_view_with_timings +
     // list_app_sources_with_timings + jobs_for_app_account_with_timings

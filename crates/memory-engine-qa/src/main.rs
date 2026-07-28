@@ -4,6 +4,8 @@
 //! lanes execute the Rust tools that prove each surface, with Dagger retained as
 //! the full/ship parity handoff.
 
+mod action_latency;
+
 use std::{
     env, fmt,
     process::{Command, Stdio},
@@ -44,7 +46,13 @@ struct LaneReceipt<'a> {
 }
 
 fn main() {
-    let mode = parse_mode(env::args().skip(1));
+    let args = env::args().collect::<Vec<_>>();
+    if matches!(args.get(1).map(String::as_str), Some("latency" | "diff")) {
+        let command = args.get(1).map(String::as_str).unwrap_or_default();
+        std::process::exit(action_latency::run(command, &args[2..]));
+    }
+
+    let mode = parse_mode(args.into_iter().skip(1));
     let selected = selected_lanes(mode);
     let started_at = Instant::now();
     let mut receipts = Vec::new();

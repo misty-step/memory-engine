@@ -21,3 +21,15 @@ jobs:
 
       - name: Run full repo CI gate
         run: bun run ci:full
+
+      - name: Export Postgres action latency receipt
+        run: |
+          mkdir -p "target/perf/action-latency-postgres-${GITHUB_SHA}"
+          dagger call action-latency-postgres --source=. export --path="target/perf/action-latency-postgres-${GITHUB_SHA}"
+
+      - name: Upload Postgres action latency receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: action-latency-postgres-${{ github.sha }}
+          path: target/perf/action-latency-postgres-${{ github.sha }}
+          retention-days: 14

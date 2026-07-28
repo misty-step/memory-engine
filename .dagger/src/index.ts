@@ -23,9 +23,33 @@ const POSTGRES_IMAGE = 'postgres:17-alpine';
 const POSTGRES_TEST_URL = 'postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable';
 const RUST_IMAGE = 'rust:1.94-bookworm';
 const SOURCE_EXCLUDES = ['.git/', '.tmp/', 'target/'];
+const SOURCE_EXCLUDES_WITH_GIT = ['.tmp/', 'target/'];
 
 function ciSource(source: Directory): Directory {
   return source.filter({ gitignore: true, exclude: SOURCE_EXCLUDES });
+}
+
+function rustSource(source: Directory, includeGit = false): Directory {
+  const excludes = includeGit
+    ? SOURCE_EXCLUDES.filter((path) => path !== '.git/')
+    : SOURCE_EXCLUDES;
+  return source.filter({ gitignore: true, exclude: excludes });
+}
+
+function rustContainer(source: Directory, includeGit = false): Container {
+  return dag
+    .container()
+    .from(RUST_IMAGE)
+    .withMountedDirectory('/src', rustSource(source, includeGit))
+    .withMountedCache('/usr/local/cargo/registry', dag.cacheVolume('memory-engine-cargo-registry'))
+    .withMountedCache('/usr/local/cargo/git', dag.cacheVolume('memory-engine-cargo-git'))
+    .withMountedCache('/cargo-target', dag.cacheVolume('memory-engine-cargo-target'), {
+      sharing: CacheSharingMode.Locked,
+    })
+    .withEnvVariable('CARGO_BUILD_JOBS', '2')
+    .withEnvVariable('CARGO_TARGET_DIR', '/cargo-target')
+    .withWorkdir('/src')
+    .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
 }
 
 function postgresService(): Service {
@@ -46,19 +70,7 @@ export class MemoryEngine {
    */
   @func()
   rustBase(@argument({ ignore: SOURCE_EXCLUDES }) source: Directory): Container {
-    return dag
-      .container()
-      .from(RUST_IMAGE)
-      .withMountedDirectory('/src', ciSource(source))
-      .withMountedCache('/usr/local/cargo/registry', dag.cacheVolume('memory-engine-cargo-registry'))
-      .withMountedCache('/usr/local/cargo/git', dag.cacheVolume('memory-engine-cargo-git'))
-      .withMountedCache('/cargo-target', dag.cacheVolume('memory-engine-cargo-target'), {
-        sharing: CacheSharingMode.Locked,
-      })
-      .withEnvVariable('CARGO_BUILD_JOBS', '2')
-      .withEnvVariable('CARGO_TARGET_DIR', '/cargo-target')
-      .withWorkdir('/src')
-      .withExec(['rustup', 'component', 'add', 'rustfmt', 'clippy']);
+    return rustContainer(source);
   }
 
   /**
@@ -100,6 +112,36 @@ export class MemoryEngine {
       ])
       .stdout();
   }
+  /**
+   * Run the in-process browser action latency suite against the CI Postgres service.
+   * The receipt and markdown report are captured under the known
+   * `/tmp/memory-engine-perf` artifact directory.
+   */
+  @func()
+  async actionLatencyPostgres(
+    @argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory,
+  ): Promise<Directory> {
+    return rustContainer(source, true)
+      .withServiceBinding('postgres', postgresService())
+      .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
+      .withEnvVariable(
+        'MEMORY_ENGINE_PERF_GIT_SHA',
+        // Prefer the mounted checkout HEAD; fall back is handled in-process.
+        // Hosted CI also injects GITHUB_SHA into the outer job environment.
+        process.env.GITHUB_SHA ?? '',
+      )
+      .withExec([
+        'bash',
+        '-c',
+        [
+          'for attempt in $(seq 1 20); do (echo >/dev/tcp/postgres/5432) >/dev/null 2>&1 && break; sleep 1; done',
+          'mkdir -p /tmp/memory-engine-perf',
+          'cargo run -p memory-engine-qa -- latency --backend postgres --iterations 3 --out /tmp/memory-engine-perf/action-latency-postgres.json --markdown /tmp/memory-engine-perf/action-latency-postgres.md',
+        ].join(' && '),
+      ])
+      .directory('/tmp/memory-engine-perf');
+  }
+
 
   /**
    * Run `cargo clippy --workspace --all-targets -- -D warnings`.
@@ -138,10 +180,19 @@ export class MemoryEngine {
    * Returns a concatenated log on success.
    */
   @func()
-  async check(@argument({ ignore: SOURCE_EXCLUDES }) source: Directory): Promise<string> {
+  async check(@argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory): Promise<string> {
+    // Keep .git available for action-latency receipts (git_sha). Other gates
+    // re-filter via rustSource/ciSource and drop .git themselves.
     const browserContract = await this.browserContract(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
+    const actionLatencyArtifact = await this.actionLatencyPostgres(source);
+    const actionLatencyReceipt = await actionLatencyArtifact
+      .file('action-latency-postgres.json')
+      .contents();
+    const actionLatencyMarkdown = await actionLatencyArtifact
+      .file('action-latency-postgres.md')
+      .contents();
     const rustClippy = await this.rustClippy(source);
     const rustDoc = await this.rustDoc(source);
     const secrets = await this.secrets(source);
@@ -149,6 +200,7 @@ export class MemoryEngine {
       `=== browser contract ===\n${browserContract}`,
       `=== rust fmt ===\n${rustFmt}`,
       `=== rust test ===\n${rustTest}`,
+      `=== action latency (postgres) ===\n${actionLatencyReceipt}\n${actionLatencyMarkdown}`,
       `=== rust clippy ===\n${rustClippy}`,
       `=== rust doc ===\n${rustDoc}`,
       `=== secrets ===\n${secrets}`,
