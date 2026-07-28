@@ -341,26 +341,38 @@ account until the operator restores the pre-migration store snapshot.
 
 ## Deploy and rollback
 
-DigitalOcean App Platform is git-integrated on `master`, but the app spec
-does NOT set `deploy_on_push`, so **merging to master does not deploy** —
-verified 2026-07-09 when two shipped merges sat undeployed until a manual
-trigger. Until ticket 075 wires an automatic gated deploy, every ship must
-end with the manual deploy below plus the Deployed smoke, and "shipped"
-claims must name the ACTIVE deployment id. The 2026-07-08 cutover removed the
-legacy provider workflow after it was proven to reactivate the old runtime on
-every green push.
+DigitalOcean App Platform is GitHub-integrated on `master` for service `api`
+(`repo: misty-step/scry`, `github.deploy_on_push: true`, verified 2026-07-28).
+A merge to `master` starts a production deployment automatically. The pre-deploy
+gate is branch protection on `master` (required checks `ci` and `review`,
+including administrators), not a second manual release step. A green merge is
+evidence CI passed at that commit; it is not yet evidence the deployment is
+ACTIVE — wait for App Platform to finish, then run Deployed smoke and name the
+ACTIVE deployment id in any "shipped" claim.
 
-Manual deploy:
+The 2026-07-08 cutover removed the legacy provider workflow after it was proven
+to reactivate the old runtime on every green push. Do not restore
+`.github/workflows/deploy.yml` or any Fly path.
+
+Manual deploy (hotfix / redeploy current tip without a new commit):
 
 ```sh
 app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
+# Preferred agent path: mint proxy + secret://memory-engine/digitalocean-app
+# POST /v2/apps/$app_id/deployments
+# Operator laptop with doctl still works when authenticated:
 doctl apps create-deployment "$app_id" --wait
 doctl apps list-deployments "$app_id" --format ID,Phase,Created,Updated
 ```
 
-Code rollback is a normal git revert followed by a new DigitalOcean deployment;
-do not revive a second provider. For an app-spec rollback, retrieve the known
-good deployment's spec, validate it, update the same app, and rerun the smoke:
+Code rollback is a normal git revert (or revert merge) on `master`, which
+triggers a new App Platform deployment via `deploy_on_push`. Do not revive a
+second provider.
+
+App-spec rollback restores a prior deployment's full spec. Specs from before
+2026-07-28 may still carry bare `git` source without `github.deploy_on_push`.
+After applying any known-good spec, force the current auto-deploy source and
+verify it before calling the rollback complete:
 
 ```sh
 app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
@@ -368,8 +380,16 @@ known_good_deployment="${KNOWN_GOOD_DEPLOYMENT_ID:?set deployment id}"
 umask 077
 doctl apps spec get "$app_id" --deployment "$known_good_deployment" \
   > /tmp/memory-engine-known-good.yaml
+# Ensure service api keeps GitHub auto-deploy (edit YAML if the snapshot is old):
+#   github:
+#     repo: misty-step/scry
+#     branch: master
+#     deploy_on_push: true
+# and remove any legacy `git:` block on that service.
 doctl apps spec validate /tmp/memory-engine-known-good.yaml
 doctl apps update "$app_id" --spec /tmp/memory-engine-known-good.yaml --wait
+doctl apps spec get "$app_id" --format json \
+  | jq -e '.services[] | select(.name=="api") | .github.deploy_on_push == true'
 rm -f /tmp/memory-engine-known-good.yaml
 ```
 
