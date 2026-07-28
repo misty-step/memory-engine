@@ -1498,7 +1498,7 @@ async fn assert_submit_recovery_document(
 ) {
     let body = response_text(response).await;
     assert!(
-        body.contains(r#"<script src="/static/app.js" defer></script>"#),
+        body.contains(r#"<script src="/static/app.js?v=inplace-1" defer></script>"#),
         "submit recovery must load the handoff consumer"
     );
     assert!(body.contains(r#"href="/""#));
@@ -3721,7 +3721,7 @@ async fn service_worker_serves_versioned_safe_shell_and_offline_fallback() {
     );
     let worker = response_text(worker).await;
     for contract in [
-        "scry-shell-v2",
+        "scry-shell-v3",
         "self.skipWaiting()",
         "self.clients.claim()",
         "request.method !== \"GET\"",
@@ -12008,6 +12008,10 @@ async fn served_assets_carry_the_instant_acknowledgment_enhancement() {
         "pendingLabelFor",
         "Loading…",
         "Sending…",
+        "fetchInPlace",
+        "applyInPlaceDocument",
+        "scry-inplace",
+        "X-Requested-With",
     ] {
         assert!(js.contains(hook), "app.js must carry {hook}");
     }

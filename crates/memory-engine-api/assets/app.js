@@ -7,10 +7,10 @@
   });
 })();
 
-// One state machine for review-submit forms: response timing, immediate
-// acknowledgment, and the cross-document performance handoff stay together.
-// The native form navigation remains the source of truth, so JavaScript off is
-// unchanged and a failed navigation can recover without a stale global lock.
+// One state machine for review-loop forms: response timing, immediate
+// acknowledgment, in-place fetch swap, and the cross-document performance
+// handoff stay together. Native form navigation remains the JS-off path and
+// the automatic fallback when fetch cannot complete.
 (function () {
   "use strict";
 
@@ -68,6 +68,12 @@
       typeof form.getAttribute === "function" &&
       form.getAttribute("action") === "/app/submit"
     );
+  }
+
+  function isInPlaceActionForm(form) {
+    if (!isNativeForm(form) || typeof form.getAttribute !== "function") return false;
+    var action = form.getAttribute("action") || "";
+    return action === "/app/submit" || action === "/app/next";
   }
 
   function responseClockNow() {
@@ -304,6 +310,161 @@
     }
   }
 
+  function formBody(form, control) {
+    if (typeof window.FormData !== "function") return null;
+    var body;
+    try {
+      body = new window.FormData(form);
+    } catch (error) {
+      return null;
+    }
+    // Clicked submitters (MCQ choices) are not always in FormData(form).
+    if (
+      control &&
+      typeof control.getAttribute === "function" &&
+      typeof body.append === "function"
+    ) {
+      var name = control.getAttribute("name") || control.name;
+      var value =
+        typeof control.value === "string"
+          ? control.value
+          : control.getAttribute("value");
+      if (typeof name === "string" && name && typeof value === "string") {
+        if (typeof body.has !== "function" || !body.has(name)) {
+          body.append(name, value);
+        }
+      }
+    }
+    return body;
+  }
+
+  function viewRoot() {
+    return typeof document.querySelector === "function"
+      ? document.querySelector(".ae-view")
+      : null;
+  }
+
+  function replaceHeadMeta(doc, name) {
+    if (!doc || typeof doc.querySelector !== "function") return;
+    var next = doc.querySelector('meta[name="' + name + '"]');
+    var content =
+      next && typeof next.getAttribute === "function"
+        ? next.getAttribute("content")
+        : null;
+    var current = document.querySelector('meta[name="' + name + '"]');
+    if (typeof content === "string" && content) {
+      if (current) {
+        current.setAttribute("content", content);
+      } else if (document.head && typeof document.createElement === "function") {
+        var meta = document.createElement("meta");
+        meta.setAttribute("name", name);
+        meta.setAttribute("content", content);
+        document.head.appendChild(meta);
+      }
+    } else if (current && current.parentNode) {
+      current.parentNode.removeChild(current);
+    }
+  }
+
+  function applyInPlaceDocument(html) {
+    if (typeof html !== "string" || !html) return false;
+    if (typeof window.DOMParser !== "function") return false;
+    var currentView = viewRoot();
+    if (!currentView) return false;
+    var doc;
+    try {
+      doc = new window.DOMParser().parseFromString(html, "text/html");
+    } catch (error) {
+      return false;
+    }
+    if (!doc || typeof doc.querySelector !== "function") return false;
+    var nextView = doc.querySelector(".ae-view");
+    if (!nextView) return false;
+    currentView.innerHTML = nextView.innerHTML;
+    // Keep header due count honest after a graded submit / continue.
+    var currentDue = document.querySelector(".me-due");
+    var nextDue = doc.querySelector(".me-due");
+    if (currentDue && nextDue) currentDue.textContent = nextDue.textContent;
+    replaceHeadMeta(doc, "memory-engine-csrf-token");
+    replaceHeadMeta(doc, "memory-engine-submit-request");
+    replaceHeadMeta(doc, "memory-engine-submit-handoff");
+    presentedAt = responseClockNow();
+    // In-place landings have no Navigation Timing entry; never emit the
+    // native-nav handoff telemetry for this attempt.
+    removeHandoff();
+    state.landingAttempted = true;
+    var continueButton = currentView.querySelector(
+      'form.me-next button[type="submit"], form.me-next button:not([type])'
+    );
+    if (continueButton && typeof continueButton.focus === "function") {
+      try {
+        continueButton.focus();
+      } catch (error) {
+        // Focus is best-effort; the graded result is already on screen.
+      }
+    }
+    return true;
+  }
+
+  function nativeSubmit(form) {
+    // HTMLFormElement.submit() does not re-fire the submit event.
+    if (form && typeof form.submit === "function") {
+      try {
+        form.submit();
+        return;
+      } catch (error) {
+        // Fall through to unlock UI if the browser refuses the submit.
+      }
+    }
+    resetState();
+  }
+
+  function fetchInPlace(form, control) {
+    if (!window.fetch || typeof window.fetch !== "function") return false;
+    if (typeof window.FormData !== "function") return false;
+    if (typeof window.DOMParser !== "function") return false;
+    var action =
+      (typeof form.getAttribute === "function" && form.getAttribute("action")) ||
+      form.action ||
+      "";
+    if (!action) return false;
+    var body = formBody(form, control);
+    if (!body) return false;
+    var requestToken = state.token;
+    window
+      .fetch(action, {
+        method: "POST",
+        body: body,
+        credentials: "same-origin",
+        headers: {
+          Accept: "text/html",
+          "X-Requested-With": "scry-inplace"
+        },
+        redirect: "follow"
+      })
+      .then(function (response) {
+        if (!response || !response.ok) throw new Error("submit failed");
+        var type = response.headers && response.headers.get
+          ? response.headers.get("content-type") || ""
+          : "";
+        if (type.indexOf("text/html") === -1) throw new Error("not html");
+        return response.text();
+      })
+      .then(function (html) {
+        if (state.form !== form) return;
+        if (!applyInPlaceDocument(html)) throw new Error("swap failed");
+        resetState();
+      })
+      .catch(function () {
+        if (state.form !== form) return;
+        // Drop any fetch-only handoff before the native navigation path.
+        if (requestToken) removeHandoffIfToken(requestToken);
+        clearTimeoutIfAny();
+        nativeSubmit(form);
+      });
+    return true;
+  }
+
   document.addEventListener("submit", function (event) {
     var form = event && event.target;
     if (!isNativeForm(form)) return;
@@ -324,6 +485,14 @@
 
     var control = submitControl(form, event);
     setBusy(form, control);
+
+    if (isInPlaceActionForm(form) && fetchInPlace(form, control)) {
+      // Fetch owns the round trip. Do not write a native-nav handoff: there
+      // will be no Navigation Timing entry for this answer.
+      event.preventDefault();
+      return;
+    }
+
     if (reviewSubmit) {
       var acknowledgedAtMs = absoluteEpochNow();
       storeHandoff(form, startedAtMs, acknowledgedAtMs);

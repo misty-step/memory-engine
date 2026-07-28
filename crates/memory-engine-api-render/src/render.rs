@@ -610,7 +610,7 @@ fn document_with_head(inner: &str, head: &str) -> String {
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap">
 <link rel="stylesheet" href="/static/ledger.css">
 {head}
-<script src="/static/app.js" defer></script>
+<script src="/static/app.js?v=inplace-1" defer></script>
 </head>
 <body>
 {inner}
@@ -2315,7 +2315,7 @@ mod analytics_tests {
             .contains(r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#));
         assert!(page.contains(r#"<meta name="color-scheme" content="light dark">"#));
         assert_eq!(page.matches(r#"href="/static/ledger.css""#).count(), 1);
-        assert_eq!(page.matches(r#"src="/static/app.js""#).count(), 1);
+        assert_eq!(page.matches(r#"src="/static/app.js?v=inplace-1""#).count(), 1);
     }
 
     #[test]
