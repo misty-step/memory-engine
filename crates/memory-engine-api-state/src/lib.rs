@@ -685,6 +685,46 @@ impl ApiState {
             .next_review(account.account_id(), account.session_token())
     }
 
+    /// Browser Continue/Start on one Postgres checkout (session + next card).
+    pub fn next_app_review_with_timings(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+        self.accounts
+            .next_app_review_with_timings(headers, csrf_token, timings)
+    }
+
+    /// Browser submit on one Postgres checkout (session + grade).
+    pub fn submit_app_review_session_with_timings(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+        review_unit_id: &str,
+        request: &SubmitReviewRequest,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+        self.accounts.submit_app_review_with_timings(
+            headers,
+            csrf_token,
+            review_unit_id,
+            request,
+            timings,
+        )
+    }
+
+    /// API next-review with optional timing accounting (single checkout).
+    pub fn next_review_with_timings(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts
+            .next_review_with_timings(account_id, session_token, timings)
+    }
+
     /// Render the current study view.
     ///
     /// # Errors

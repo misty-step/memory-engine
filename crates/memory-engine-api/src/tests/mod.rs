@@ -6093,6 +6093,65 @@ async fn postgres_browser_session_auth_uses_one_connect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_browser_next_review_uses_one_connect() {
+    let Some(database) = PostgresTestDatabase::new("browser_next_one_connect") else {
+        return;
+    };
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(database.scoped_url.clone())
+            .with_auth_config(AuthConfig::for_local_tests()),
+    );
+    let account = state
+        .create_guest_account()
+        .expect("create Postgres test account");
+    let browser = state
+        .create_browser_session(&account)
+        .expect("create Postgres browser session");
+    let response = memory_engine_api_state::html_with_browser_session(&browser, String::new());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "cookie",
+        HeaderValue::try_from(session_cookie(&response)).expect("browser cookie"),
+    );
+    let mut timings = memory_engine_api_state::SubmitReviewTimings::default();
+    let _ = state
+        .next_app_review_with_timings(&headers, browser.csrf_token(), &mut timings)
+        .expect("browser next");
+    assert_eq!(
+        timings.postgres_connect_count(),
+        Some(1),
+        "browser next must authenticate and load the card on one Postgres connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_api_next_review_uses_one_connect() {
+    let Some(database) = PostgresTestDatabase::new("api_next_one_connect") else {
+        return;
+    };
+    let state = ApiState::new(
+        AccountRegistry::with_postgres_url(database.scoped_url.clone())
+            .with_auth_config(AuthConfig::for_local_tests()),
+    );
+    let account = state
+        .create_guest_account()
+        .expect("create Postgres test account");
+    let mut timings = memory_engine_api_state::SubmitReviewTimings::default();
+    let _ = state
+        .next_review_with_timings(
+            &account.account_id,
+            &account.session_token,
+            Some(&mut timings),
+        )
+        .expect("api next");
+    assert_eq!(
+        timings.postgres_connect_count(),
+        Some(1),
+        "API next must authenticate and load the card on one Postgres connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_auth_hardening_invite_sessions_and_edge_limits() {
     let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
         eprintln!(
@@ -6929,6 +6988,17 @@ fn assert_postgres_submit_timing(
         .and_then(|value| value.strip_suffix('"'))
         .and_then(|value| value.parse::<u64>().ok())
         .expect("Postgres statement count");
+    let connect_count = timing
+        .split(',')
+        .map(str::trim)
+        .find_map(|metric| metric.strip_prefix(r#"pgconn;desc=""#))
+        .and_then(|value| value.strip_suffix('"'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("Postgres connect count");
+    assert_eq!(
+        connect_count, 1,
+        "auth + review work must share one pool checkout: {timing}"
+    );
     assert_eq!(
         statement_count, expected_statement_count,
         "cold-cache submit must count auth, review, and render work: {timing}"
