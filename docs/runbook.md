@@ -341,19 +341,26 @@ account until the operator restores the pre-migration store snapshot.
 
 ## Deploy and rollback
 
-DigitalOcean App Platform is git-integrated on `master`, but the app spec
-does NOT set `deploy_on_push`, so **merging to master does not deploy** —
-verified 2026-07-09 when two shipped merges sat undeployed until a manual
-trigger. Until ticket 075 wires an automatic gated deploy, every ship must
-end with the manual deploy below plus the Deployed smoke, and "shipped"
-claims must name the ACTIVE deployment id. The 2026-07-08 cutover removed the
-legacy provider workflow after it was proven to reactivate the old runtime on
-every green push.
+DigitalOcean App Platform is GitHub-integrated on `master` for service `api`
+(`repo: misty-step/scry`, `github.deploy_on_push: true`, verified 2026-07-28).
+A merge to `master` starts a production deployment automatically. The pre-deploy
+gate is branch protection on `master` (required checks `ci` and `review`,
+including administrators), not a second manual release step. A green merge is
+evidence CI passed at that commit; it is not yet evidence the deployment is
+ACTIVE — wait for App Platform to finish, then run Deployed smoke and name the
+ACTIVE deployment id in any "shipped" claim.
 
-Manual deploy:
+The 2026-07-08 cutover removed the legacy provider workflow after it was proven
+to reactivate the old runtime on every green push. Do not restore
+`.github/workflows/deploy.yml` or any Fly path.
+
+Manual deploy (hotfix / redeploy current tip without a new commit):
 
 ```sh
 app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
+# Preferred agent path: mint proxy + secret://memory-engine/digitalocean-app
+# POST /v2/apps/$app_id/deployments
+# Operator laptop with doctl still works when authenticated:
 doctl apps create-deployment "$app_id" --wait
 doctl apps list-deployments "$app_id" --format ID,Phase,Created,Updated
 ```
