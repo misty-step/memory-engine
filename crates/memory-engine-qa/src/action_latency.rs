@@ -465,9 +465,11 @@ async fn run_latency_async(options: &LatencyOptions) -> Result<LatencyReceipt, L
                             "review.submit did not report Postgres connect_count in Server-Timing",
                         )
                     })?;
-                if count > 1 {
+                // Session auth is one borrow; the review write is a second until
+                // the full pool card lands. Middleware must not add a third.
+                if count > 2 {
                     return Err(LatencyError::new(format!(
-                        "{} reported {count} Postgres connections",
+                        "{} reported {count} Postgres connections (budget ≤2: auth+write)",
                         spec.name
                     )));
                 }

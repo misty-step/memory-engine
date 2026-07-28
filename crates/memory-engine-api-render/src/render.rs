@@ -172,18 +172,15 @@ fn render_submit_account_page(
     head: &str,
     timings: &mut SubmitReviewTimings,
 ) -> String {
-    let active_review = view.is_some_and(|view| view.current.is_some());
-    let sources = if active_review {
-        Vec::new()
-    } else {
-        state
-            .list_app_sources_with_timings(account, timings)
-            .unwrap_or_default()
-    };
-    let jobs = if active_review && !notice.is_some_and(is_generating_notice) {
-        Vec::new()
-    } else {
+    // Submit responses only need the graded/home study view already in hand.
+    // Loading the full source catalog here opened an extra Neon connection on
+    // every answer for HTML that never reads sources (Home/Review surfaces).
+    // Jobs are loaded only when a Generating… notice must be validated.
+    let sources = Vec::new();
+    let jobs = if notice.is_some_and(is_generating_notice) {
         state.jobs_for_app_account_with_timings(account, timings)
+    } else {
+        Vec::new()
     };
     render_app_shell_with_head(Some(account), &sources, view, &jobs, notice, head)
 }
