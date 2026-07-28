@@ -455,18 +455,21 @@ async fn run_latency_async(options: &LatencyOptions) -> Result<LatencyReceipt, L
                     spec.name, observation.status
                 )));
             }
-            if spec.kind == ActionKind::ReviewSubmit {
-                if let Some(count) = observation
+            if spec.kind == ActionKind::ReviewSubmit && options.backend == Backend::Postgres {
+                let count = observation
                     .server_timing
                     .as_ref()
                     .and_then(|timing| timing.connect_count)
-                {
-                    if count > 1 {
-                        return Err(LatencyError::new(format!(
-                            "{} reported {count} Postgres connections",
-                            spec.name
-                        )));
-                    }
+                    .ok_or_else(|| {
+                        LatencyError::new(
+                            "review.submit did not report Postgres connect_count in Server-Timing",
+                        )
+                    })?;
+                if count > 1 {
+                    return Err(LatencyError::new(format!(
+                        "{} reported {count} Postgres connections",
+                        spec.name
+                    )));
                 }
             }
             observations.push(observation);
