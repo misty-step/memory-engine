@@ -50,49 +50,241 @@ function browserHarness(options = {}) {
   const control = {
     classList: classes(...(options.controlClasses ?? ["me-choice"])),
     textContent: options.controlLabel ?? "Answer",
+    name: options.controlName ?? "answer",
+    value: options.controlValue ?? options.controlLabel ?? "Answer",
     setAttribute: (name, value) => controlAttributes.set(name, value ?? ""),
-    getAttribute: (name) =>
-      controlAttributes.has(name) ? controlAttributes.get(name) : null,
+    getAttribute: (name) => {
+      if (controlAttributes.has(name)) return controlAttributes.get(name);
+      if (name === "name") return control.name;
+      if (name === "value") return control.value;
+      return null;
+    },
     removeAttribute: (name) => controlAttributes.delete(name),
   };
   const responseInput = { value: "" };
+  const formFields = options.formFields ?? {
+    csrfToken: "csrf-test",
+    reviewUnitId: "unit-1",
+    responseTimeMs: "",
+    idempotencyKey: "review-unit-1-0",
+  };
+  let nativeSubmitCount = 0;
+  let viewHtml = options.viewHtml ?? '<p class="me-prompt">Q</p>';
+  let dueText = options.dueText ?? "1 due";
+  let footerHtml = options.footerHtml ?? '<nav class="me-nav">Home</nav>';
+  const fallbackFields = [];
   const form = {
     tagName: "FORM",
     classList: classes(options.formClass ?? "me-choices-form"),
+    action: options.action ?? "/app/submit",
     getAttribute: (name) => (name === "action" ? options.action ?? "/app/submit" : null),
     querySelector(selector) {
       if (selector === 'input[name="responseTimeMs"]') return responseInput;
       if (selector === 'input[name="performanceTraceId"]') return performanceTraceInput;
       if (selector === 'button[type="submit"], button:not([type])') return control;
+      const fallbackMatch = selector.match(
+        /^input\[type="hidden"\]\[name="([^"]+)"\]\[data-scry-fallback="1"\]$/,
+      );
+      if (fallbackMatch) {
+        return fallbackFields.find((field) => field.name === fallbackMatch[1]) ?? null;
+      }
       return null;
     },
     querySelectorAll: (selector) => (selector === ".me-choice" ? [control] : []),
     appendChild: (input) => {
+      if (input && input.name === "performanceTraceId") {
+        performanceTraceInput = input;
+        return;
+      }
+      if (input && input.getAttribute && input.getAttribute("data-scry-fallback") === "1") {
+        fallbackFields.push({
+          name: input.name || input.getAttribute("name"),
+          value: input.value || input.getAttribute("value"),
+        });
+        return;
+      }
       performanceTraceInput = input;
     },
+    submit() {
+      nativeSubmitCount += 1;
+    },
   };
+  const headMetas = new Map(Object.entries(options.metas ?? {}));
   const document = {
     documentElement: {
       setAttribute: (name) => rootAttributes.add(name),
       removeAttribute: (name) => rootAttributes.delete(name),
       hasAttribute: (name) => rootAttributes.has(name),
     },
+    head: {
+      appendChild(meta) {
+        if (meta && meta.name) headMetas.set(meta.name, meta.content ?? "");
+      },
+    },
     visibilityState: options.visibilityState ?? "visible",
     addEventListener: (name, handler) => addListener(documentEvents, name, handler),
-    querySelector: (selector) => (selector === ".me-verdict" && verdictPresent ? {} : null),
+    querySelector(selector) {
+      if (selector === ".me-verdict" && verdictPresent) return {};
+      if (selector === ".ae-view") {
+        return {
+          get innerHTML() {
+            return viewHtml;
+          },
+          set innerHTML(value) {
+            viewHtml = String(value);
+            verdictPresent = viewHtml.includes("me-verdict");
+          },
+          querySelector(inner) {
+            if (
+              inner ===
+                'form.me-next button[type="submit"], form.me-next button:not([type])' &&
+              viewHtml.includes("me-next")
+            ) {
+              return { focus() {} };
+            }
+            return null;
+          },
+        };
+      }
+      if (selector === ".me-due") {
+        return {
+          get textContent() {
+            return dueText;
+          },
+          set textContent(value) {
+            dueText = String(value);
+          },
+        };
+      }
+      if (selector === "footer.ae-bar") {
+        return {
+          get innerHTML() {
+            return footerHtml;
+          },
+          set innerHTML(value) {
+            footerHtml = String(value);
+          },
+        };
+      }
+      const metaMatch = selector.match(/^meta\[name="([^"]+)"\]$/);
+      if (metaMatch) {
+        const value = headMetas.get(metaMatch[1]);
+        if (value === undefined) return null;
+        return {
+          getAttribute: (name) => (name === "content" ? value : null),
+          setAttribute: (name, next) => {
+            if (name === "content") headMetas.set(metaMatch[1], next);
+          },
+          parentNode: {
+            removeChild() {
+              headMetas.delete(metaMatch[1]);
+            },
+          },
+        };
+      }
+      return null;
+    },
     getElementById: (id) => (id === "me-jobs" ? options.jobsList ?? null : null),
     querySelectorAll(selector) {
       const match = selector.match(/^meta\[name="([^"]+)"\]$/);
-      const value = match ? options.metas?.[match[1]] : undefined;
-      return value === undefined ? [] : [{ getAttribute: () => value }];
+      if (!match) return [];
+      const value = headMetas.get(match[1]);
+      return value === undefined
+        ? []
+        : [{ getAttribute: () => value }];
     },
-    createElement: () => ({ setAttribute() {}, value: "" }),
+    createElement: (tag) => {
+      if (tag === "meta") {
+        return {
+          name: "",
+          content: "",
+          setAttribute(name, value) {
+            if (name === "name") this.name = value;
+            if (name === "content") this.content = value;
+          },
+        };
+      }
+      const el = {
+        name: "",
+        value: "",
+        attrs: {},
+        setAttribute(name, value) {
+          this.attrs[name] = value;
+          if (name === "name") this.name = value;
+          if (name === "value") this.value = value;
+        },
+        getAttribute(name) {
+          return this.attrs[name] ?? null;
+        },
+      };
+      return el;
+    },
   };
   const sessionStorage = {
     getItem: (key) => storage.get(key) ?? null,
     setItem: (key, value) => storage.set(key, value),
     removeItem: (key) => storage.delete(key),
   };
+  const fetchImpl = options.fetchImpl;
+  const enableInPlace = options.inPlace === true;
+  class FakeFormData {
+    constructor(source) {
+      this.map = new Map();
+      if (source === form) {
+        for (const [key, value] of Object.entries(formFields)) {
+          this.map.set(key, value);
+        }
+        if (responseInput.value !== "") this.map.set("responseTimeMs", responseInput.value);
+      }
+    }
+    append(name, value) {
+      this.map.set(name, value);
+    }
+    has(name) {
+      return this.map.has(name);
+    }
+    get(name) {
+      return this.map.has(name) ? this.map.get(name) : null;
+    }
+    entries() {
+      return this.map.entries();
+    }
+  }
+  class FakeDOMParser {
+    parseFromString(html) {
+      const viewMatch = html.match(/<div class="ae-view">([\s\S]*?)<\/div>/);
+      const dueMatch = html.match(/<span class="me-due">([^<]*)<\/span>/);
+      const footerMatch = html.match(/<footer class="ae-bar">([\s\S]*?)<\/footer>/);
+      const meta = {};
+      for (const match of html.matchAll(
+        /<meta name="([^"]+)" content="([^"]*)">/g,
+      )) {
+        meta[match[1]] = match[2];
+      }
+      const viewHtmlNext = viewMatch ? viewMatch[1] : "";
+      return {
+        querySelector(selector) {
+          if (selector === ".ae-view") {
+            return { innerHTML: viewHtmlNext };
+          }
+          if (selector === ".me-due" && dueMatch) {
+            return { textContent: dueMatch[1] };
+          }
+          if (selector === "footer.ae-bar" && footerMatch) {
+            return { innerHTML: footerMatch[1] };
+          }
+          const metaMatch = selector.match(/^meta\[name="([^"]+)"\]$/);
+          if (metaMatch && meta[metaMatch[1]] !== undefined) {
+            return {
+              getAttribute: (name) =>
+                name === "content" ? meta[metaMatch[1]] : null,
+            };
+          }
+          return null;
+        },
+      };
+    }
+  }
   const window = {
     sessionStorage,
     performance: {
@@ -120,7 +312,12 @@ function browserHarness(options = {}) {
     },
     fetch(url, request) {
       fetches.push({ url, request });
-      return { catch() {} };
+      if (typeof fetchImpl === "function") {
+        // Always re-wrap so the VM sees a real thenable even when the
+        // implementation returns a bare value or a foreign-realm Promise.
+        return Promise.resolve().then(() => fetchImpl(url, request));
+      }
+      return Promise.resolve({ catch() {} });
     },
     setTimeout(handler, duration) {
       const id = nextTimerId;
@@ -131,6 +328,10 @@ function browserHarness(options = {}) {
     clearTimeout: (id) => timers.delete(id),
     location: { assign: (url) => navigations.push(url) },
   };
+  if (enableInPlace) {
+    window.FormData = FakeFormData;
+    window.DOMParser = FakeDOMParser;
+  }
   window.window = window;
   if (eventSource) window.EventSource = function EventSource() { return eventSource; };
 
@@ -140,6 +341,9 @@ function browserHarness(options = {}) {
     window,
     EventSource: eventSource ? window.EventSource : undefined,
     URL,
+    Promise,
+    setTimeout,
+    clearTimeout,
   });
 
   return {
@@ -155,6 +359,13 @@ function browserHarness(options = {}) {
     },
     controlLabel: () => control.textContent,
     controlAttr: (name) => controlAttributes.get(name),
+    viewHtml: () => viewHtml,
+    dueText: () => dueText,
+    footerHtml: () => footerHtml,
+    fallbackFields: () => fallbackFields.slice(),
+    nativeSubmits: () => nativeSubmitCount,
+    responseTimeMs: () => responseInput.value,
+    meta: (name) => headMetas.get(name) ?? null,
     dispatchWindow(name, event = {}) {
       for (const handler of windowEvents.get(name) ?? []) handler(event);
     },
@@ -291,6 +502,117 @@ test("next and content-feedback show pending labels without disabling submitter 
   expect(choice.controlLabel()).toBe("42");
 });
 
+async function flushMicrotasks() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+test("review submit fetches and swaps the graded view without inventing a verdict", async () => {
+  let resolveFetch;
+  const fetchPromise = new Promise((resolve) => {
+    resolveFetch = resolve;
+  });
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/submit",
+    controlClasses: ["me-choice"],
+    controlLabel: "42",
+    controlValue: "42",
+    viewHtml: '<p class="me-prompt">What is 6*7?</p><form class="me-choices-form"></form>',
+    fetchImpl() {
+      return fetchPromise;
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  expect(browser.busy()).toBeTrue();
+  expect(browser.handoff()).toBeNull();
+  expect(browser.controlLabel()).toBe("42");
+  expect(browser.fetches).toHaveLength(1);
+  expect(browser.fetches[0].url).toBe("/app/submit");
+  expect(browser.fetches[0].request.headers["X-Requested-With"]).toBe("scry-inplace");
+  const body = browser.fetches[0].request.body;
+  expect(body.get("answer")).toBe("42");
+  expect(Number(body.get("responseTimeMs"))).toBeGreaterThan(0);
+
+  // Server is the only source of the verdict text.
+  resolveFetch({
+    ok: true,
+    headers: { get: () => "text/html; charset=utf-8" },
+    text: () =>
+      Promise.resolve(`<!doctype html><html><head>
+<meta name="memory-engine-csrf-token" content="csrf-next">
+<meta name="memory-engine-submit-request" content="req_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
+</head><body>
+<span class="me-due">0 due</span>
+<div class="ae-view">
+<p class="me-prompt">What is 6*7?</p>
+<p class="me-result"><span class="me-verdict">Correct</span></p>
+<form class="me-next" action="/app/next" method="post"><button type="submit">Continue</button></form>
+</div>
+<footer class="ae-bar"><p class="me-tagline">tagline</p></footer>
+</body></html>`),
+  });
+
+  await flushMicrotasks();
+
+  expect(browser.busy()).toBeFalse();
+  expect(browser.viewHtml()).toContain('class="me-verdict">Correct<');
+  expect(browser.viewHtml()).toContain("me-next");
+  expect(browser.dueText()).toBe("0 due");
+  expect(browser.footerHtml()).toContain("tagline");
+  expect(browser.meta("memory-engine-csrf-token")).toBe("csrf-next");
+  expect(browser.nativeSubmits()).toBe(0);
+});
+
+test("in-place submit falls back to native form submit when fetch fails", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/submit",
+    controlClasses: ["me-choice"],
+    controlLabel: "42",
+    controlValue: "42",
+    fetchImpl() {
+      return Promise.reject(new Error("network down"));
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  await flushMicrotasks();
+  expect(browser.nativeSubmits()).toBe(1);
+  expect(browser.fallbackFields()).toEqual([{ name: "answer", value: "42" }]);
+});
+
+test("continue uses in-place fetch and does not write a submit handoff", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/next",
+    formClass: "me-next",
+    controlClasses: ["ae-button"],
+    controlLabel: "Continue →",
+    fetchImpl() {
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(
+            `<div class="ae-screen"><span class="me-due">1 due</span><div class="ae-view"><p class="me-prompt">Next card</p></div><footer class="ae-bar"><p class="me-tagline">review</p></footer></div>`,
+          ),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  expect(browser.controlLabel()).toBe("Loading…");
+  expect(browser.handoff()).toBeNull();
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Next card");
+  expect(browser.footerHtml()).toContain("review");
+  expect(browser.busy()).toBeFalse();
+});
 test("every native form keeps instant acknowledgment and duplicate suppression", () => {
   const browser = browserHarness({ action: "/app/next" });
   browser.dispatchSubmit();
