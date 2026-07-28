@@ -1498,7 +1498,7 @@ async fn assert_submit_recovery_document(
 ) {
     let body = response_text(response).await;
     assert!(
-        body.contains(r#"<script src="/static/app.js?v=inplace-1" defer></script>"#),
+        body.contains(r#"<script src="/static/app.js" defer></script>"#),
         "submit recovery must load the handoff consumer"
     );
     assert!(body.contains(r#"href="/""#));
