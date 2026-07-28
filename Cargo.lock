@@ -1047,6 +1047,15 @@ dependencies = [
 [[package]]
 name = "memory-engine-qa"
 version = "0.0.0"
+dependencies = [
+ "axum",
+ "memory-engine-api",
+ "memory-engine-performance",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
 
 [[package]]
 name = "memory-engine-review"

@@ -2495,6 +2495,9 @@ fn submit_response_headers(
     if let Some(statement_count) = postgres.postgres_statement_count() {
         let _ = write!(timing, r#", pgstmt;desc="{statement_count}""#);
     }
+    if let Some(connect_count) = postgres.postgres_connect_count() {
+        let _ = write!(timing, r#", pgconn;desc="{connect_count}""#);
+    }
     let _ = write!(timing, ", render;dur={render_ms}");
 
     response.headers_mut().insert(

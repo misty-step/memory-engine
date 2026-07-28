@@ -1,0 +1,16 @@
+{
+  "schema": "memory_engine.action_latency_budgets.v1",
+  "actions": {
+    "auth.app_home": { "p95_ms": { "soft": 50, "hard": 5000 } },
+    "auth.login_request": { "p95_ms": { "soft": 100, "hard": 5000 } },
+    "material.capture": { "p95_ms": { "soft": 200, "hard": 5000 } },
+    "generation.enqueue": { "p95_ms": { "soft": 200, "hard": 5000 } },
+    "review.next": { "p95_ms": { "soft": 50, "hard": 5000 } },
+    "review.submit": { "p95_ms": { "soft": 100, "hard": 5000 } },
+    "review.content_feedback": { "p95_ms": { "soft": 100, "hard": 5000 } },
+    "review.reveal": { "p95_ms": { "soft": 50, "hard": 5000 } },
+    "review.skip": { "p95_ms": { "soft": 50, "hard": 5000 } },
+    "review.snooze": { "p95_ms": { "soft": 50, "hard": 5000 } },
+    "auth.logout": { "p95_ms": { "soft": 50, "hard": 5000 } }
+  }
+}

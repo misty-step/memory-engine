@@ -1,0 +1,191 @@
+{
+  "schema": "memory_engine.action_latency_receipt.v1",
+  "git_sha": "5e75fea24429a0d4d3e11114842ef9e1bad57ce8",
+  "recorded_at_unix_ms": 1785197726312,
+  "backend": "file",
+  "iterations": 5,
+  "actions": [
+    {
+      "action": "auth.app_home",
+      "family": "auth",
+      "samples_ms": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "auth.login_request",
+      "family": "auth",
+      "samples_ms": [
+        10,
+        11,
+        11,
+        11,
+        9
+      ],
+      "p50_ms": 11,
+      "p95_ms": 11,
+      "max_ms": 11,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "material.capture",
+      "family": "material",
+      "samples_ms": [
+        13,
+        13,
+        14,
+        14,
+        13
+      ],
+      "p50_ms": 13,
+      "p95_ms": 14,
+      "max_ms": 14,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "generation.enqueue",
+      "family": "generation",
+      "samples_ms": [
+        6,
+        6,
+        7,
+        5,
+        7
+      ],
+      "p50_ms": 6,
+      "p95_ms": 7,
+      "max_ms": 7,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "review.next",
+      "family": "review",
+      "samples_ms": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "review.submit",
+      "family": "review",
+      "samples_ms": [
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "p50_ms": 1,
+      "p95_ms": 2,
+      "max_ms": 2,
+      "server_timing": {
+        "total_ms": 1,
+        "pgconnect_ms": null,
+        "pgop_ms": null,
+        "render_ms": 1,
+        "connect_count": null
+      },
+      "http_status": 200
+    },
+    {
+      "action": "review.content_feedback",
+      "family": "review",
+      "samples_ms": [
+        1,
+        1,
+        2,
+        2,
+        2
+      ],
+      "p50_ms": 2,
+      "p95_ms": 2,
+      "max_ms": 2,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "review.reveal",
+      "family": "review",
+      "samples_ms": [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "p50_ms": 0,
+      "p95_ms": 1,
+      "max_ms": 1,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "review.skip",
+      "family": "review",
+      "samples_ms": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "p50_ms": 1,
+      "p95_ms": 2,
+      "max_ms": 2,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "review.snooze",
+      "family": "review",
+      "samples_ms": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "p50_ms": 1,
+      "p95_ms": 1,
+      "max_ms": 1,
+      "server_timing": null,
+      "http_status": 200
+    },
+    {
+      "action": "auth.logout",
+      "family": "auth",
+      "samples_ms": [
+        5,
+        11,
+        5,
+        5,
+        5
+      ],
+      "p50_ms": 5,
+      "p95_ms": 11,
+      "max_ms": 11,
+      "server_timing": null,
+      "http_status": 200
+    }
+  ]
+}

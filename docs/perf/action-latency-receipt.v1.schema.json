@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "memory_engine.action_latency_receipt.v1",
+  "title": "Scry core action latency receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "git_sha",
+    "recorded_at_unix_ms",
+    "backend",
+    "iterations",
+    "actions"
+  ],
+  "properties": {
+    "schema": { "const": "memory_engine.action_latency_receipt.v1" },
+    "git_sha": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+    "recorded_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "backend": { "enum": ["file", "postgres"] },
+    "iterations": { "type": "integer", "minimum": 1 },
+    "actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/action" },
+      "minItems": 1
+    }
+  },
+  "$defs": {
+    "server_timing": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "total_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "pgconnect_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "pgop_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "render_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "connect_count": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "family",
+        "samples_ms",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "server_timing",
+        "http_status"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "auth.app_home",
+            "auth.login_request",
+            "material.capture",
+            "generation.enqueue",
+            "review.next",
+            "review.submit",
+            "review.content_feedback",
+            "review.reveal",
+            "review.skip",
+            "review.snooze",
+            "auth.logout"
+          ]
+        },
+        "family": { "enum": ["auth", "material", "review", "generation"] },
+        "samples_ms": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "p50_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "p95_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "max_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "server_timing": { "$ref": "#/$defs/server_timing" },
+        "http_status": { "type": "integer", "minimum": 0, "maximum": 599 },
+        "skip_reason": { "const": "generation fixture unavailable" }
+      }
+    }
+  }
+}

@@ -100,6 +100,30 @@ export class MemoryEngine {
       ])
       .stdout();
   }
+  /**
+   * Run the in-process browser action latency suite against the CI Postgres service.
+   * The receipt and markdown report are captured under the known
+   * `/tmp/memory-engine-perf` artifact directory.
+   */
+  @func()
+  async actionLatencyPostgres(
+    @argument({ ignore: SOURCE_EXCLUDES }) source: Directory,
+  ): Promise<Directory> {
+    return this.rustBase(source)
+      .withServiceBinding('postgres', postgresService())
+      .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
+      .withExec([
+        'bash',
+        '-c',
+        [
+          'for attempt in $(seq 1 20); do (echo >/dev/tcp/postgres/5432) >/dev/null 2>&1 && break; sleep 1; done',
+          'mkdir -p /tmp/memory-engine-perf',
+          'cargo run -p memory-engine-qa -- latency --backend postgres --iterations 3 --out /tmp/memory-engine-perf/action-latency-postgres.json --markdown /tmp/memory-engine-perf/action-latency-postgres.md',
+        ].join(' && '),
+      ])
+      .directory('/tmp/memory-engine-perf');
+  }
+
 
   /**
    * Run `cargo clippy --workspace --all-targets -- -D warnings`.
@@ -142,6 +166,13 @@ export class MemoryEngine {
     const browserContract = await this.browserContract(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
+    const actionLatencyArtifact = await this.actionLatencyPostgres(source);
+    const actionLatencyReceipt = await actionLatencyArtifact
+      .file('action-latency-postgres.json')
+      .contents();
+    const actionLatencyMarkdown = await actionLatencyArtifact
+      .file('action-latency-postgres.md')
+      .contents();
     const rustClippy = await this.rustClippy(source);
     const rustDoc = await this.rustDoc(source);
     const secrets = await this.secrets(source);
@@ -149,6 +180,7 @@ export class MemoryEngine {
       `=== browser contract ===\n${browserContract}`,
       `=== rust fmt ===\n${rustFmt}`,
       `=== rust test ===\n${rustTest}`,
+      `=== action latency (postgres) ===\n${actionLatencyReceipt}\n${actionLatencyMarkdown}`,
       `=== rust clippy ===\n${rustClippy}`,
       `=== rust doc ===\n${rustDoc}`,
       `=== secrets ===\n${secrets}`,
