@@ -163,6 +163,12 @@
     if (state.control) {
       state.control.removeAttribute("data-pressed");
       state.control.removeAttribute("aria-disabled");
+      if (state.control.getAttribute("data-pending-label") === "1") {
+        var original = state.control.getAttribute("data-original-label");
+        if (typeof original === "string") state.control.textContent = original;
+        state.control.removeAttribute("data-pending-label");
+        state.control.removeAttribute("data-original-label");
+      }
     }
     for (var i = 0; i < state.dimmed.length; i++) {
       state.dimmed[i].removeAttribute("data-dim");
@@ -186,6 +192,26 @@
     return form.querySelector('button[type="submit"], button:not([type])');
   }
 
+  // Immediate pending copy only — never a grade. Server still owns verdicts.
+  function pendingLabelFor(form, control) {
+    if (!form || typeof form.getAttribute !== "function") return null;
+    if (control && hasClass(control, "me-choice")) return null;
+    var action = form.getAttribute("action") || "";
+    if (action === "/app/next") {
+      var current = control && typeof control.textContent === "string" ? control.textContent : "";
+      if (current.indexOf("Start") !== -1) return "Starting…";
+      return "Loading…";
+    }
+    if (action === "/app/content-feedback") return "Sending…";
+    if (action === "/app/reveal") return "Revealing…";
+    if (action === "/app/skip") return "Skipping…";
+    if (action === "/app/snooze" || action === "/app/snooze-concept") return "Snoozing…";
+    if (action === "/app/submit" && control && !hasClass(control, "me-choice")) {
+      return "Checking…";
+    }
+    return null;
+  }
+
   function setBusy(form, control) {
     state.busy = true;
     state.form = form;
@@ -194,6 +220,16 @@
     if (control) {
       control.setAttribute("data-pressed", "");
       control.setAttribute("aria-disabled", "true");
+      var pending = pendingLabelFor(form, control);
+      if (
+        pending &&
+        typeof control.textContent === "string" &&
+        control.getAttribute("data-pending-label") !== "1"
+      ) {
+        control.setAttribute("data-pending-label", "1");
+        control.setAttribute("data-original-label", control.textContent);
+        control.textContent = pending;
+      }
       if (hasClass(control, "me-choice") && typeof form.querySelectorAll === "function") {
         var choices = form.querySelectorAll(".me-choice");
         for (var i = 0; i < choices.length; i++) {

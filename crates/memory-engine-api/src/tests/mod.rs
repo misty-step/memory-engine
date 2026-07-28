@@ -12000,7 +12000,15 @@ async fn served_assets_carry_the_instant_acknowledgment_enhancement() {
         .expect("js response");
     assert_eq!(js.status(), StatusCode::OK);
     let js = response_text(js).await;
-    for hook in ["data-busy", "data-pressed", "data-dim", "event.submitter"] {
+    for hook in [
+        "data-busy",
+        "data-pressed",
+        "data-dim",
+        "event.submitter",
+        "pendingLabelFor",
+        "Loading…",
+        "Sending…",
+    ] {
         assert!(js.contains(hook), "app.js must carry {hook}");
     }
     assert!(
@@ -12019,7 +12027,7 @@ async fn served_assets_carry_the_instant_acknowledgment_enhancement() {
         .await
         .expect("css response");
     let css = response_text(css).await;
-    for hook in ["data-pressed", "data-dim", "html[data-busy]"] {
+    for hook in ["data-pressed", "data-dim", "html[data-busy]", "lg-busy"] {
         assert!(css.contains(hook), "ledger.css must style {hook}");
     }
 }
