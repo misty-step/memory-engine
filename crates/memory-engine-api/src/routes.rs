@@ -7,7 +7,7 @@ use std::{
 use axum::{
     extract::{Form, Path, Query, Request, State},
     http::{
-        header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode, Uri,
     },
     middleware::{self, Next},
@@ -436,6 +436,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/accounts/{account_id}/review/next", get(next_review));
     mount_review_routes(router)
         .layer(middleware::from_fn(no_store_dynamic_responses))
+        // Outermost: host canonicalization must run before handlers so www
+        // never establishes a second __Host- session cookie scope.
+        .layer(middleware::from_fn(canonicalize_public_host))
         .with_state(state)
 }
 
@@ -477,6 +480,62 @@ fn mount_review_routes(router: Router<ApiState>) -> Router<ApiState> {
             "/accounts/{account_id}/review/{review_unit_id}/content-feedback",
             post(content_feedback),
         )
+}
+/// Product hosts that must never mint or read a separate `__Host-` session.
+///
+/// Browser sessions use `__Host-memory_engine_session`, which is host-only.
+/// Serving the same app on both `www.scry.study` and `scry.study` without a
+/// redirect makes ordinary leave/return look like a sign-out when the learner
+/// crosses hosts. Health probes stay local so platform checks never follow a
+/// redirect loop.
+const CANONICAL_PUBLIC_HOST: &str = "scry.study";
+
+fn request_public_host(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    Some(raw.split(':').next().unwrap_or(raw))
+}
+
+fn www_alias_redirect_location(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    let path = uri.path();
+    if matches!(path, "/healthz" | "/readyz") {
+        return None;
+    }
+    let host = request_public_host(headers)?;
+    if !host.eq_ignore_ascii_case("www.scry.study") {
+        return None;
+    }
+    let mut location = format!("https://{CANONICAL_PUBLIC_HOST}{path}");
+    if let Some(query) = uri.query() {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
+}
+
+async fn canonicalize_public_host(request: Request, next: Next) -> Response {
+    if let Some(location) = www_alias_redirect_location(request.headers(), request.uri()) {
+        return (
+            StatusCode::PERMANENT_REDIRECT,
+            [(
+                LOCATION,
+                HeaderValue::from_str(&location).expect("ascii location"),
+            )],
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn no_store_dynamic_responses(request: Request, next: Next) -> Response {
