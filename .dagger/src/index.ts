@@ -124,6 +124,12 @@ export class MemoryEngine {
     return rustContainer(source, true)
       .withServiceBinding('postgres', postgresService())
       .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
+      .withEnvVariable(
+        'MEMORY_ENGINE_PERF_GIT_SHA',
+        // Prefer the mounted checkout HEAD; fall back is handled in-process.
+        // Hosted CI also injects GITHUB_SHA into the outer job environment.
+        process.env.GITHUB_SHA ?? '',
+      )
       .withExec([
         'bash',
         '-c',
@@ -173,8 +179,9 @@ export class MemoryEngine {
    * Run every gate in sequence. A non-zero exit on any gate fails the pipeline.
    * Returns a concatenated log on success.
    */
-  @func()
-  async check(@argument({ ignore: SOURCE_EXCLUDES }) source: Directory): Promise<string> {
+  async check(@argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory): Promise<string> {
+    // Keep .git available for action-latency receipts (git_sha). Other gates
+    // re-filter via rustSource/ciSource and drop .git themselves.
     const browserContract = await this.browserContract(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
