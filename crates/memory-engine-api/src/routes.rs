@@ -526,14 +526,9 @@ fn www_alias_redirect_location(headers: &HeaderMap, uri: &Uri) -> Option<String>
 
 async fn canonicalize_public_host(request: Request, next: Next) -> Response {
     if let Some(location) = www_alias_redirect_location(request.headers(), request.uri()) {
-        return (
-            StatusCode::PERMANENT_REDIRECT,
-            [(
-                LOCATION,
-                HeaderValue::from_str(&location).expect("ascii location"),
-            )],
-        )
-            .into_response();
+        if let Ok(value) = HeaderValue::from_str(&location) {
+            return (StatusCode::PERMANENT_REDIRECT, [(LOCATION, value)]).into_response();
+        }
     }
     next.run(request).await
 }
