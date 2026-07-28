@@ -46,20 +46,24 @@ function browserHarness(options = {}) {
     listeners.set(name, handlers);
   };
   const classes = (...names) => ({ contains: (name) => names.includes(name) });
-  const controlAttributes = new Set();
+  const controlAttributes = new Map();
   const control = {
-    classList: classes("me-choice"),
-    setAttribute: (name) => controlAttributes.add(name),
+    classList: classes(...(options.controlClasses ?? ["me-choice"])),
+    textContent: options.controlLabel ?? "Answer",
+    setAttribute: (name, value) => controlAttributes.set(name, value ?? ""),
+    getAttribute: (name) =>
+      controlAttributes.has(name) ? controlAttributes.get(name) : null,
     removeAttribute: (name) => controlAttributes.delete(name),
   };
   const responseInput = { value: "" };
   const form = {
     tagName: "FORM",
-    classList: classes("me-choices-form"),
+    classList: classes(options.formClass ?? "me-choices-form"),
     getAttribute: (name) => (name === "action" ? options.action ?? "/app/submit" : null),
     querySelector(selector) {
       if (selector === 'input[name="responseTimeMs"]') return responseInput;
       if (selector === 'input[name="performanceTraceId"]') return performanceTraceInput;
+      if (selector === 'button[type="submit"], button:not([type])') return control;
       return null;
     },
     querySelectorAll: (selector) => (selector === ".me-choice" ? [control] : []),
@@ -149,6 +153,8 @@ function browserHarness(options = {}) {
       };
       for (const handler of documentEvents.get("submit") ?? []) handler(event);
     },
+    controlLabel: () => control.textContent,
+    controlAttr: (name) => controlAttributes.get(name),
     dispatchWindow(name, event = {}) {
       for (const handler of windowEvents.get(name) ?? []) handler(event);
     },
@@ -252,6 +258,37 @@ test("busy recovery preserves a slow submit handoff until its TTL", () => {
 
   browser.runTimer(65_000);
   expect(browser.handoff()).toBeNull();
+});
+
+test("next and content-feedback show pending labels without disabling submitter value", () => {
+  const next = browserHarness({
+    action: "/app/next",
+    formClass: "me-next",
+    controlClasses: ["ae-button"],
+    controlLabel: "Continue →",
+  });
+  next.dispatchSubmit();
+  expect(next.busy()).toBeTrue();
+  expect(next.controlLabel()).toBe("Loading…");
+  expect(next.controlAttr("data-pending-label")).toBe("1");
+  expect(next.controlAttr("aria-disabled")).toBe("true");
+
+  const feedback = browserHarness({
+    action: "/app/content-feedback",
+    formClass: "me-content-feedback",
+    controlClasses: ["ae-button"],
+    controlLabel: "Good question",
+  });
+  feedback.dispatchSubmit();
+  expect(feedback.controlLabel()).toBe("Sending…");
+
+  const choice = browserHarness({
+    action: "/app/submit",
+    controlClasses: ["me-choice"],
+    controlLabel: "42",
+  });
+  choice.dispatchSubmit();
+  expect(choice.controlLabel()).toBe("42");
 });
 
 test("every native form keeps instant acknowledgment and duplicate suppression", () => {
