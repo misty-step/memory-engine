@@ -445,78 +445,7 @@ impl AccountRegistry {
             .map(|path| crate::file_lock::acquire(&path.with_file_name("auth.lock")))
             .transpose()?;
         if let Some(database_url) = self.postgres_url() {
-            let now_ms = self.now();
-            let email = crate::with_postgres_store(&database_url, |store| {
-                store
-                    .auth_challenge_email(&token_hash, now_ms)
-                    .map_err(crate::postgres_failure)
-            })?
-            .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
-            let configured_allowed = {
-                let data = self.lock_data();
-                data.auth_config.email_allowed(&email)
-            };
-            let account_id = account_id_for(&email);
-            let session_token = new_session_token();
-            let session_token_hash = secret_hash(&session_token);
-            let browser_session_id = new_browser_session_id();
-            let csrf_token = session_csrf_token(&session_token_hash);
-            let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
-            let browser_session_id_hash = secret_hash(&browser_session_id);
-            let csrf_token_hash = secret_hash(&csrf_token);
-            let outcome = crate::with_postgres_store(&database_url, |store| {
-                store
-                    .consume_auth_challenge_and_create_sessions(&AuthChallengeSessionRequest {
-                        challenge_hash: &token_hash,
-                        now_ms,
-                        configured_allowed,
-                        account_id: &account_id,
-                        session_token_hash: &session_token_hash,
-                        browser_session_id_hash: &browser_session_id_hash,
-                        csrf_token_hash: &csrf_token_hash,
-                        expires_at_ms,
-                    })
-                    .map_err(crate::postgres_failure)
-            })?;
-            return match outcome {
-                AuthChallengeSessionOutcome::Invalid => {
-                    Err(ApiFailure::forbidden("Magic link is invalid or expired."))
-                }
-                AuthChallengeSessionOutcome::NotAdmitted => {
-                    Err(ApiFailure::forbidden("This invite is no longer active."))
-                }
-                AuthChallengeSessionOutcome::Created {
-                    email: committed_email,
-                } => {
-                    debug_assert_eq!(committed_email, email);
-                    let storage = self.storage();
-                    let mut data = self.lock_data();
-                    data.accounts
-                        .entry(account_id.clone())
-                        .or_insert_with(|| AccountRecord {
-                            store_path: storage.account_store_path(&account_id),
-                            sources: BTreeMap::new(),
-                            submitted_reviews: BTreeMap::new(),
-                        });
-                    data.browser_sessions.insert(
-                        browser_session_id.clone(),
-                        BrowserSessionRecord {
-                            account_id: account_id.clone(),
-                            session_token: session_token_hash.clone(),
-                            csrf_token_hash,
-                            expires_at_ms,
-                        },
-                    );
-                    Ok(AppAccount {
-                        browser_session_id,
-                        account_id,
-                        session_token: session_token_hash,
-                        csrf_token,
-                        expires_at_ms,
-                        cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, expires_at_ms),
-                    })
-                }
-            };
+            return self.verify_magic_link_postgres(&database_url, &token_hash);
         }
         let email = self
             .storage()
@@ -533,6 +462,105 @@ impl AccountRegistry {
         let mut data = self.lock_data();
         let account = Self::login_account_locked(&mut data, &storage, &email)?;
         Self::create_browser_session_locked(&mut data, &storage, &account)
+    }
+
+    fn verify_magic_link_postgres(
+        &self,
+        database_url: &str,
+        token_hash: &str,
+    ) -> Result<AppAccount, ApiFailure> {
+        let now_ms = self.now();
+        let auth_config = {
+            let data = self.lock_data();
+            data.auth_config.clone()
+        };
+        // Single pool checkout: email probe + session create stay on one
+        // connection so login verify does not pay two Neon handshakes.
+        let (
+            email,
+            account_id,
+            session_token_hash,
+            browser_session_id,
+            csrf_token,
+            expires_at_ms,
+            csrf_token_hash,
+            outcome,
+        ) = crate::with_postgres_store(database_url, |store| {
+            let email = store
+                .auth_challenge_email(token_hash, now_ms)
+                .map_err(crate::postgres_failure)?
+                .ok_or_else(|| ApiFailure::forbidden("Magic link is invalid or expired."))?;
+            let configured_allowed = auth_config.email_allowed(&email);
+            let account_id = account_id_for(&email);
+            let session_token = new_session_token();
+            let session_token_hash = secret_hash(&session_token);
+            let browser_session_id = new_browser_session_id();
+            let csrf_token = session_csrf_token(&session_token_hash);
+            let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+            let browser_session_id_hash = secret_hash(&browser_session_id);
+            let csrf_token_hash = secret_hash(&csrf_token);
+            let outcome = store
+                .consume_auth_challenge_and_create_sessions(&AuthChallengeSessionRequest {
+                    challenge_hash: token_hash,
+                    now_ms,
+                    configured_allowed,
+                    account_id: &account_id,
+                    session_token_hash: &session_token_hash,
+                    browser_session_id_hash: &browser_session_id_hash,
+                    csrf_token_hash: &csrf_token_hash,
+                    expires_at_ms,
+                })
+                .map_err(crate::postgres_failure)?;
+            Ok((
+                email,
+                account_id,
+                session_token_hash,
+                browser_session_id,
+                csrf_token,
+                expires_at_ms,
+                csrf_token_hash,
+                outcome,
+            ))
+        })?;
+        match outcome {
+            AuthChallengeSessionOutcome::Invalid => {
+                Err(ApiFailure::forbidden("Magic link is invalid or expired."))
+            }
+            AuthChallengeSessionOutcome::NotAdmitted => {
+                Err(ApiFailure::forbidden("This invite is no longer active."))
+            }
+            AuthChallengeSessionOutcome::Created {
+                email: committed_email,
+            } => {
+                debug_assert_eq!(committed_email, email);
+                let storage = self.storage();
+                let mut data = self.lock_data();
+                data.accounts
+                    .entry(account_id.clone())
+                    .or_insert_with(|| AccountRecord {
+                        store_path: storage.account_store_path(&account_id),
+                        sources: BTreeMap::new(),
+                        submitted_reviews: BTreeMap::new(),
+                    });
+                data.browser_sessions.insert(
+                    browser_session_id.clone(),
+                    BrowserSessionRecord {
+                        account_id: account_id.clone(),
+                        session_token: session_token_hash.clone(),
+                        csrf_token_hash,
+                        expires_at_ms,
+                    },
+                );
+                Ok(AppAccount {
+                    browser_session_id,
+                    account_id,
+                    session_token: session_token_hash,
+                    csrf_token,
+                    expires_at_ms,
+                    cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, expires_at_ms),
+                })
+            }
+        }
     }
 
     /// Check a caller-supplied token against the configured operator admin

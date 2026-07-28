@@ -1071,14 +1071,6 @@ impl JobQueue {
 /// path (`lib.rs`'s `connect_postgres_migrated`) — not a private cache of
 /// its own, so this worker and the request path can never each
 /// independently believe they are the first to see `database_url`.
-fn postgres_store(
-    database_url: &str,
-) -> Result<PostgresStudyStore, memory_engine_persistence_postgres::PostgresStoreError> {
-    let mut store = PostgresStudyStore::connect(database_url)?;
-    store.migrate_once(database_url)?;
-    Ok(store)
-}
-
 fn claim_worker_start(started: &AtomicBool) -> bool {
     !started.swap(true, Ordering::AcqRel)
 }
@@ -1089,14 +1081,11 @@ fn with_postgres_store<R>(
         &mut PostgresStudyStore,
     ) -> Result<R, memory_engine_persistence_postgres::PostgresStoreError>,
 ) -> Result<R, memory_engine_persistence_postgres::PostgresStoreError> {
+    let run = || memory_engine_persistence_postgres::with_pooled_store(database_url, operation);
     if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| {
-            let mut store = postgres_store(database_url)?;
-            operation(&mut store)
-        })
+        tokio::task::block_in_place(run)
     } else {
-        let mut store = postgres_store(database_url)?;
-        operation(&mut store)
+        run()
     }
 }
 

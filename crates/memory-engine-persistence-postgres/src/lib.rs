@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock, Mutex,
     },
+    time::Duration,
 };
 
 use memory_engine_core::{
@@ -44,6 +45,20 @@ static NEXT_LEASE_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// independently believe they are the first to see a URL.
 static MIGRATED_URLS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// Process-wide r2d2 pools keyed by database URL. Validated on checkout so
+/// Neon-idle disconnects are evicted before a request sees them. Migrations
+/// still run through [`PostgresStudyStore::migrate_once`] on first use of a
+/// URL, under the same advisory lock as before — the pool never opens a
+/// connection "past" an incomplete migrate.
+static CONNECTION_POOLS: LazyLock<Mutex<BTreeMap<String, r2d2::Pool<PostgresConnectionManager>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Max live connections per database URL for the single App Platform instance.
+const POOL_MAX_SIZE: u32 = 8;
+const POOL_MIN_IDLE: u32 = 1;
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
@@ -624,15 +639,36 @@ fn increment_statement_count(counter: &AtomicU64) {
     });
 }
 
+enum ClientHandle {
+    Owned(Client),
+    Pooled(r2d2::PooledConnection<PostgresConnectionManager>),
+}
+
+impl ClientHandle {
+    fn client_mut(&mut self) -> &mut Client {
+        match self {
+            Self::Owned(client) => client,
+            Self::Pooled(client) => &mut *client,
+        }
+    }
+}
+
 struct CountingClient {
-    client: Client,
+    client: ClientHandle,
     statement_count: Arc<AtomicU64>,
 }
 
 impl CountingClient {
     fn new(client: Client) -> Self {
         Self {
-            client,
+            client: ClientHandle::Owned(client),
+            statement_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn from_pooled(client: r2d2::PooledConnection<PostgresConnectionManager>) -> Self {
+        Self {
+            client: ClientHandle::Pooled(client),
             statement_count: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -650,7 +686,7 @@ impl CountingClient {
         T: ?Sized + ToStatement,
     {
         increment_statement_count(&self.statement_count);
-        self.client.query(query, params)
+        self.client.client_mut().query(query, params)
     }
 
     fn query_one<T>(
@@ -662,7 +698,7 @@ impl CountingClient {
         T: ?Sized + ToStatement,
     {
         increment_statement_count(&self.statement_count);
-        self.client.query_one(query, params)
+        self.client.client_mut().query_one(query, params)
     }
 
     fn query_opt<T>(
@@ -674,7 +710,7 @@ impl CountingClient {
         T: ?Sized + ToStatement,
     {
         increment_statement_count(&self.statement_count);
-        self.client.query_opt(query, params)
+        self.client.client_mut().query_opt(query, params)
     }
 
     fn execute<T>(
@@ -686,17 +722,17 @@ impl CountingClient {
         T: ?Sized + ToStatement,
     {
         increment_statement_count(&self.statement_count);
-        self.client.execute(query, params)
+        self.client.client_mut().execute(query, params)
     }
 
     fn batch_execute(&mut self, query: &str) -> Result<(), postgres::Error> {
         increment_statement_count(&self.statement_count);
-        self.client.batch_execute(query)
+        self.client.client_mut().batch_execute(query)
     }
 
     fn transaction(&mut self) -> Result<CountingTransaction<'_>, postgres::Error> {
         increment_statement_count(&self.statement_count);
-        let transaction = self.client.transaction()?;
+        let transaction = self.client.client_mut().transaction()?;
         Ok(CountingTransaction {
             transaction: Some(transaction),
             statement_count: Arc::clone(&self.statement_count),
@@ -935,6 +971,76 @@ pub fn connect_client(url: &str) -> Result<Client, postgres::Error> {
     }
 }
 
+/// r2d2 manager that creates clients through [`connect_client`] (our TLS /
+/// sslmode path) and validates with `SELECT 1` on checkout.
+#[derive(Debug)]
+struct PostgresConnectionManager {
+    url: String,
+}
+
+impl r2d2::ManageConnection for PostgresConnectionManager {
+    type Connection = Client;
+    type Error = postgres::Error;
+
+    fn connect(&self) -> Result<Client, postgres::Error> {
+        connect_client(&self.url)
+    }
+
+    fn is_valid(&self, conn: &mut Client) -> Result<(), postgres::Error> {
+        conn.query_one("SELECT 1", &[]).map(|_| ())
+    }
+
+    fn has_broken(&self, conn: &mut Client) -> bool {
+        conn.is_closed()
+    }
+}
+
+fn pool_for_url(url: &str) -> Result<r2d2::Pool<PostgresConnectionManager>, PostgresStoreError> {
+    let mut pools = CONNECTION_POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pool) = pools.get(url) {
+        return Ok(pool.clone());
+    }
+    let manager = PostgresConnectionManager {
+        url: url.to_owned(),
+    };
+    let pool = r2d2::Pool::builder()
+        .max_size(POOL_MAX_SIZE)
+        .min_idle(Some(POOL_MIN_IDLE))
+        .connection_timeout(POOL_CONNECTION_TIMEOUT)
+        .idle_timeout(Some(POOL_IDLE_TIMEOUT))
+        .test_on_check_out(true)
+        .build(manager)
+        .map_err(|error| PostgresStoreError::Pool(error.to_string()))?;
+    pools.insert(url.to_owned(), pool.clone());
+    Ok(pool)
+}
+
+/// Run `operation` on a pooled, migration-ready [`PostgresStudyStore`].
+///
+/// Checkouts are validated (`SELECT 1`) so idle Neon disconnects are replaced
+/// before the caller runs. The first checkout for a URL still runs
+/// [`PostgresStudyStore::migrate_once`] under the advisory lock.
+///
+/// # Errors
+///
+/// Returns [`PostgresStoreError`] when the pool cannot produce a connection
+/// or when `operation` fails.
+pub fn with_pooled_store<R>(
+    database_url: &str,
+    operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, PostgresStoreError>,
+) -> Result<R, PostgresStoreError> {
+    let pool = pool_for_url(database_url)?;
+    let client = pool
+        .get()
+        .map_err(|error| PostgresStoreError::Pool(error.to_string()))?;
+    let mut store = PostgresStudyStore {
+        client: RefCell::new(CountingClient::from_pooled(client)),
+    };
+    store.migrate_once(database_url)?;
+    operation(&mut store)
+}
 const CONNECT_ATTEMPTS: usize = 3;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -4902,6 +5008,9 @@ pub enum PostgresStoreError {
         supplied_parent: Option<String>,
     },
     StudySession(String),
+    /// Connection pool checkout / build failure (validated idle disconnects,
+    /// capacity, or configuration). Distinct from a live query error.
+    Pool(String),
     Postgres(postgres::Error),
     Json(serde_json::Error),
 }
@@ -4972,6 +5081,7 @@ impl fmt::Display for PostgresStoreError {
                 "Content feedback revision is stale: expected head {expected_head:?}, supplied parent {supplied_parent:?}"
             ),
             Self::StudySession(error) => write!(formatter, "Study session error: {error}"),
+            Self::Pool(error) => write!(formatter, "Postgres pool error: {error}"),
             Self::Postgres(error) => write!(formatter, "Postgres error: {error}"),
             Self::Json(error) => write!(formatter, "JSON error: {error}"),
         }
@@ -5007,7 +5117,8 @@ impl Error for PostgresStoreError {
             | Self::FeedbackSupersedesOtherReviewUnit(_)
             | Self::FeedbackSupersedesOtherAccount(_)
             | Self::FeedbackSupersedesStale { .. }
-            | Self::StudySession(_) => None,
+            | Self::StudySession(_)
+            | Self::Pool(_) => None,
         }
     }
 }
@@ -5199,6 +5310,44 @@ mod tests {
         });
         assert_eq!(result, Err("hard down"));
         assert_eq!(attempts, super::CONNECT_ATTEMPTS);
+    }
+
+    #[test]
+    fn with_pooled_store_reuses_a_live_connection_across_checkouts() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping pool reuse test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        // Two sequential checkouts: second should hit the warm pool (validated
+        // SELECT 1 only), not open a brand-new TCP+TLS session from scratch.
+        let first_ms = {
+            let started = std::time::Instant::now();
+            super::with_pooled_store(&database_url, |store| {
+                store.ping()?;
+                Ok(())
+            })
+            .expect("first pooled checkout");
+            started.elapsed().as_millis()
+        };
+        let second_ms = {
+            let started = std::time::Instant::now();
+            super::with_pooled_store(&database_url, |store| {
+                store.ping()?;
+                Ok(())
+            })
+            .expect("second pooled checkout");
+            started.elapsed().as_millis()
+        };
+        // Warm checkout should be dramatically cheaper than a cold TLS connect
+        // on Neon-like paths; keep a loose bound so local unix sockets still pass.
+        assert!(
+            second_ms <= first_ms.saturating_add(50),
+            "warm pool checkout should not be slower than cold: first={first_ms}ms second={second_ms}ms"
+        );
+        assert!(
+            second_ms < 500,
+            "warm pool checkout should stay well under half a second: {second_ms}ms"
+        );
     }
     #[test]
     fn counting_client_counts_direct_and_transaction_calls_exactly() {
