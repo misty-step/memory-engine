@@ -365,9 +365,14 @@ doctl apps create-deployment "$app_id" --wait
 doctl apps list-deployments "$app_id" --format ID,Phase,Created,Updated
 ```
 
-Code rollback is a normal git revert followed by a new DigitalOcean deployment;
-do not revive a second provider. For an app-spec rollback, retrieve the known
-good deployment's spec, validate it, update the same app, and rerun the smoke:
+Code rollback is a normal git revert (or revert merge) on `master`, which
+triggers a new App Platform deployment via `deploy_on_push`. Do not revive a
+second provider.
+
+App-spec rollback restores a prior deployment's full spec. Specs from before
+2026-07-28 may still carry bare `git` source without `github.deploy_on_push`.
+After applying any known-good spec, force the current auto-deploy source and
+verify it before calling the rollback complete:
 
 ```sh
 app_id="5ab05b73-9265-43c9-a01c-fef53f5f46a4"
@@ -375,8 +380,16 @@ known_good_deployment="${KNOWN_GOOD_DEPLOYMENT_ID:?set deployment id}"
 umask 077
 doctl apps spec get "$app_id" --deployment "$known_good_deployment" \
   > /tmp/memory-engine-known-good.yaml
+# Ensure service api keeps GitHub auto-deploy (edit YAML if the snapshot is old):
+#   github:
+#     repo: misty-step/scry
+#     branch: master
+#     deploy_on_push: true
+# and remove any legacy `git:` block on that service.
 doctl apps spec validate /tmp/memory-engine-known-good.yaml
 doctl apps update "$app_id" --spec /tmp/memory-engine-known-good.yaml --wait
+doctl apps spec get "$app_id" --format json \
+  | jq -e '.services[] | select(.name=="api") | .github.deploy_on_push == true'
 rm -f /tmp/memory-engine-known-good.yaml
 ```
 
