@@ -1303,11 +1303,13 @@ fn compare_receipts(
         let base_p95 = base_action.p95_ms;
         let delta_percent = percent_delta(base_p95, head_p95);
         let hard = head_p95.is_some_and(|value| value > budget.hard);
+        // Soft regressions need both a relative move and a meaningful absolute
+        // delta. Sub-10ms file-store noise otherwise floods CI with false SOFT WARNs.
         let soft = match (base_p95, head_p95) {
-            (Some(base), Some(head)) if base > 0 => {
-                head.saturating_mul(100) > base.saturating_mul(120)
+            (Some(base), Some(head)) => {
+                let absolute = head.saturating_sub(base);
+                absolute >= 25 && (base == 0 || head.saturating_mul(100) > base.saturating_mul(120))
             }
-            (Some(0), Some(head)) => head > 0,
             _ => false,
         };
         hard_fail |= hard;
@@ -1487,6 +1489,16 @@ mod tests {
         assert!(!report.hard_fail);
         assert!(report.rows.iter().all(|row| row.soft_regression));
         assert!(render_diff_markdown(&base, &head, &report).contains("SOFT WARN"));
+    }
+
+    #[test]
+    fn diff_ignores_sub_threshold_absolute_noise() {
+        let base = sample_receipt(2);
+        let head = sample_receipt(6);
+        let budgets = sample_budgets(200);
+        let report = compare_receipts(&base, &head, &budgets).expect("diff");
+        assert!(!report.hard_fail);
+        assert!(report.rows.iter().all(|row| !row.soft_regression));
     }
 
     #[test]
