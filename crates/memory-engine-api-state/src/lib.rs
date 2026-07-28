@@ -3094,12 +3094,12 @@ fn with_postgres_account<R>(
     operation: impl FnOnce(AccountStudyStore<'_>) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
     let run = || {
-        let mut store = connect_postgres_migrated(database_url)?;
-        let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
-        let mut account = store.for_account(scope);
-        account.ensure_account(now_ms).map_err(postgres_failure)?;
-
-        operation(account)
+        run_with_pooled_postgres(database_url, |store| {
+            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
+            let mut account = store.for_account(scope);
+            account.ensure_account(now_ms).map_err(postgres_failure)?;
+            operation(account)
+        })
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -3121,20 +3121,21 @@ fn with_postgres_account_timed<R>(
     };
     let run = || {
         let connect_started = std::time::Instant::now();
-        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
-        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
-        let mut store = connected?;
-
-        let operation_started = std::time::Instant::now();
-        let result = (|| {
-            migrate_postgres_store(database_url, &mut store)?;
-            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
-            let mut account = store.for_account(scope);
-            account.ensure_account(now_ms).map_err(postgres_failure)?;
-            operation(account)
-        })();
-        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
-        timings.record_postgres_statement_count(store.statement_count());
+        let mut statement_count = 0_u64;
+        let result = run_with_pooled_postgres(database_url, |store| {
+            timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
+            let operation_started = std::time::Instant::now();
+            let result = (|| {
+                let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
+                let mut account = store.for_account(scope);
+                account.ensure_account(now_ms).map_err(postgres_failure)?;
+                operation(account)
+            })();
+            timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
+            statement_count = store.statement_count();
+            result
+        });
+        timings.record_postgres_statement_count(statement_count);
         result
     };
 
@@ -3155,11 +3156,7 @@ fn with_postgres_store<R>(
     database_url: &str,
     operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
 ) -> Result<R, ApiFailure> {
-    let run = || {
-        let mut store = connect_postgres_migrated(database_url)?;
-
-        operation(&mut store)
-    };
+    let run = || run_with_pooled_postgres(database_url, operation);
 
     if tokio::runtime::Handle::try_current().is_ok() {
         tokio::task::block_in_place(run)
@@ -3177,17 +3174,17 @@ fn with_postgres_store_timed<R>(
     };
     let run = || {
         let connect_started = std::time::Instant::now();
-        let connected = PostgresStudyStore::connect(database_url).map_err(postgres_failure);
-        timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
-        let mut store = connected?;
-
-        let operation_started = std::time::Instant::now();
-        let result = (|| {
-            migrate_postgres_store(database_url, &mut store)?;
-            operation(&mut store)
-        })();
-        timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
-        timings.record_postgres_statement_count(store.statement_count());
+        // Nested so statement_count is captured after the pooled store drops.
+        let mut statement_count = 0_u64;
+        let result = run_with_pooled_postgres(database_url, |store| {
+            timings.record_postgres_connect(bounded_elapsed_ms(connect_started));
+            let operation_started = std::time::Instant::now();
+            let result = operation(store);
+            timings.record_postgres_operation(bounded_elapsed_ms(operation_started));
+            statement_count = store.statement_count();
+            result
+        });
+        timings.record_postgres_statement_count(statement_count);
         result
     };
 
@@ -3195,6 +3192,26 @@ fn with_postgres_store_timed<R>(
         tokio::task::block_in_place(run)
     } else {
         run()
+    }
+}
+
+fn run_with_pooled_postgres<R>(
+    database_url: &str,
+    operation: impl FnOnce(&mut PostgresStudyStore) -> Result<R, ApiFailure>,
+) -> Result<R, ApiFailure> {
+    // Bridge ApiFailure through the pool helper without forcing a From impl.
+    let bridged =
+        memory_engine_persistence_postgres::with_pooled_store(
+            database_url,
+            |store| match operation(store) {
+                Ok(value) => Ok(Ok(value)),
+                Err(error) => Ok(Err(error)),
+            },
+        );
+    match bridged {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(postgres_failure(error)),
     }
 }
 
@@ -3208,29 +3225,6 @@ fn with_postgres_study<R>(
         let mut study = BetaStudySession::from_store(account, now);
         operation(&mut study)
     })
-}
-
-/// Connect to Postgres, running migrations only the first time this process
-/// sees a given database URL. Previously every request re-ran the DDL
-/// migration batch; at daily-use traffic that is pure overhead and DDL lock
-/// pressure. The set is keyed by URL so tests pointing at scratch databases
-/// still migrate each one.
-fn connect_postgres_migrated(database_url: &str) -> Result<PostgresStudyStore, ApiFailure> {
-    let mut store = PostgresStudyStore::connect(database_url).map_err(postgres_failure)?;
-    migrate_postgres_store(database_url, &mut store)?;
-    Ok(store)
-}
-
-/// Delegates to [`PostgresStudyStore::migrate_once`], which owns the one
-/// process-wide "already migrated" cache shared with the background
-/// generation worker (`jobs.rs`) — not a private cache of its own, so this
-/// call site and the worker's can never each independently believe they
-/// are the first to see `database_url`.
-fn migrate_postgres_store(
-    database_url: &str,
-    store: &mut PostgresStudyStore,
-) -> Result<(), ApiFailure> {
-    store.migrate_once(database_url).map_err(postgres_failure)
 }
 
 trait LearnerDecisionApiError {
