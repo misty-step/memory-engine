@@ -1595,8 +1595,21 @@ impl AccountRegistry {
             ));
         }
         let storage = self.storage();
-        let account =
-            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?;
+        // Browser `/app/submit` already authenticated via
+        // `require_browser_session_with_timings` (one Neon borrow that matched
+        // the durable API session). A second `require_account_with_timings`
+        // only repeated that match on a fresh connect. Timed callers therefore
+        // only need the store path; durable review/idempotency work stays in
+        // `storage.submit_review`. Untimed/API callers still fully re-auth.
+        let account = if timings.is_some() {
+            AccountRecord {
+                store_path: storage.account_store_path(account_id),
+                sources: BTreeMap::new(),
+                submitted_reviews: BTreeMap::new(),
+            }
+        } else {
+            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?
+        };
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
