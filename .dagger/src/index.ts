@@ -179,6 +179,7 @@ export class MemoryEngine {
    * Run every gate in sequence. A non-zero exit on any gate fails the pipeline.
    * Returns a concatenated log on success.
    */
+  @func()
   async check(@argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory): Promise<string> {
     // Keep .git available for action-latency receipts (git_sha). Other gates
     // re-filter via rustSource/ciSource and drop .git themselves.
