@@ -12919,3 +12919,76 @@ async fn waitlist_admin_export_invite_and_delete_require_a_valid_admin_token() {
         );
     }
 }
+
+#[tokio::test]
+async fn www_public_host_permanently_redirects_to_apex() {
+    let app = router(ApiState::default());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app/login/verify?token=magic_deadbeef")
+                .header("host", "www.scry.study")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://scry.study/app/login/verify?token=magic_deadbeef")
+    );
+}
+
+#[tokio::test]
+async fn apex_public_host_and_health_probes_do_not_redirect() {
+    let app = router(ApiState::default());
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("host", "scry.study")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(home.status(), StatusCode::OK);
+    assert!(home.headers().get(axum::http::header::LOCATION).is_none());
+
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .header("host", "www.scry.study")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert!(health.headers().get(axum::http::header::LOCATION).is_none());
+
+    let ready = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .header("host", "www.scry.study")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    // readyz may be 503 without postgres in unit tests, but must not redirect.
+    assert_ne!(ready.status(), StatusCode::PERMANENT_REDIRECT);
+    assert!(ready.headers().get(axum::http::header::LOCATION).is_none());
+}
