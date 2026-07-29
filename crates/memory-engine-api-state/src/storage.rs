@@ -6,6 +6,7 @@ use std::{
 };
 
 use memory_engine_persistence::SourcePermission;
+use memory_engine_persistence_postgres::AccountScope;
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
 };
@@ -80,6 +81,17 @@ impl StudyStorageConfig {
 pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
 }
+
+/// One-checkout browser action result: `None` = missing/expired session,
+/// outer `Err` = auth/CSRF/storage failure, inner `Result` = review work
+/// outcome for a validated session (rendered signed-in on failure).
+pub(crate) type BrowserSessionWorkResult = Result<
+    Option<(
+        BrowserSessionValidation,
+        Result<StudyViewResponse, ApiFailure>,
+    )>,
+    ApiFailure,
+>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BrowserSessionValidation {
@@ -534,12 +546,67 @@ impl StudyStorage {
             .reject_pending_draft(account_id, store_path, draft_id)
     }
 
-    pub(crate) fn next_review(
+    /// Authenticate the API session and start the next review on one Postgres
+    /// checkout. File backends keep the prior multi-step path.
+    pub(crate) fn authenticated_next_review(
         &self,
         account_id: &str,
-        store_path: &FsPath,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner.next_review(account_id, store_path)
+        self.inner
+            .authenticated_next_review(account_id, session_token, timings)
+    }
+
+    /// Validate the browser session (and its durable API session) then start
+    /// the next review without a second pool checkout.
+    pub(crate) fn browser_session_next_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        self.inner
+            .browser_session_next_review(session_id, now_ms, csrf_token_hash, timings)
+    }
+
+    /// Validate the browser session then submit an answer on one checkout.
+    pub(crate) fn browser_session_submit_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        self.inner.browser_session_submit_review(
+            session_id,
+            now_ms,
+            csrf_token_hash,
+            review_unit_id,
+            request,
+            timings,
+        )
+    }
+
+    /// Authenticate the API session and submit on one checkout.
+    pub(crate) fn authenticated_submit_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.inner.authenticated_submit_review(
+            account_id,
+            session_token,
+            review_unit_id,
+            request,
+            timings,
+        )
     }
 
     pub(crate) fn study_view(
@@ -644,18 +711,6 @@ impl StudyStorage {
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner
             .bridge_review(account_id, store_path, review_unit_id)
-    }
-
-    pub(crate) fn submit_review(
-        &self,
-        account_id: &str,
-        store_path: &FsPath,
-        review_unit_id: &str,
-        request: SubmitReviewRequest,
-        timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .submit_review(account_id, store_path, review_unit_id, request, timings)
     }
 
     pub(crate) fn record_content_feedback(
@@ -889,6 +944,108 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         store_path: &FsPath,
         source_id: &str,
     ) -> Result<StudyViewResponse, ApiFailure>;
+
+    fn authenticated_next_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        // Default: preserve prior multi-step behavior for file backends.
+        if !self.account_session_matches_with_timings(account_id, session_token, timings)? {
+            if self.account_exists_with_timings(account_id, None)? {
+                return Err(ApiFailure::forbidden_account());
+            }
+            return Err(ApiFailure::unknown_account());
+        }
+        self.next_review(account_id, &self.account_store_path(account_id))
+    }
+
+    fn browser_session_next_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        let Some(validation) = self.load_and_validate_browser_session(
+            session_id,
+            now_ms,
+            Some(csrf_token_hash),
+            timings,
+        )?
+        else {
+            return Ok(None);
+        };
+        if validation.session.csrf_token_hash != csrf_token_hash {
+            // Match require_browser_session_inner: CSRF mismatch is forbidden,
+            // not a missing session.
+            return Err(ApiFailure::forbidden("CSRF token does not match session."));
+        }
+        let view = self.next_review(
+            &validation.session.account_id,
+            &self.account_store_path(&validation.session.account_id),
+        );
+        Ok(Some((validation, view)))
+    }
+
+    fn authenticated_submit_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        mut timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        if !self.account_session_matches_with_timings(
+            account_id,
+            session_token,
+            timings.as_deref_mut(),
+        )? {
+            if self.account_exists_with_timings(account_id, timings.as_deref_mut())? {
+                return Err(ApiFailure::forbidden_account());
+            }
+            return Err(ApiFailure::unknown_account());
+        }
+        self.submit_review(
+            account_id,
+            &self.account_store_path(account_id),
+            review_unit_id,
+            request,
+            timings,
+        )
+    }
+
+    fn browser_session_submit_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        mut timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        let Some(validation) = self.load_and_validate_browser_session(
+            session_id,
+            now_ms,
+            Some(csrf_token_hash),
+            timings.as_deref_mut(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if validation.session.csrf_token_hash != csrf_token_hash {
+            return Err(ApiFailure::forbidden("CSRF token does not match session."));
+        }
+        let view = self.submit_review(
+            &validation.session.account_id,
+            &self.account_store_path(&validation.session.account_id),
+            review_unit_id,
+            request,
+            timings,
+        );
+        Ok(Some((validation, view)))
+    }
     fn generate_source_with_run_id(
         &self,
         account_id: &str,
@@ -3221,6 +3378,246 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let view = study.start().map_err(study_failure)?;
 
             Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn authenticated_next_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
+        let now_ms = self.now_ms();
+        let now = self.now;
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            if !store
+                .api_session_matches(account_id, &session_token_hash, now_ms)
+                .map_err(postgres_failure)?
+            {
+                if store.account_exists(account_id).map_err(postgres_failure)? {
+                    return Err(ApiFailure::forbidden_account());
+                }
+                return Err(ApiFailure::unknown_account());
+            }
+            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
+            let mut account = store.for_account(scope);
+            account.ensure_account(now_ms).map_err(postgres_failure)?;
+            let mut study = BetaStudySession::from_store(account, now);
+            let view = study.start().map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn browser_session_next_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        let session_id_hash = secret_hash(session_id);
+        let expected_csrf_hash = csrf_token_hash.to_owned();
+        let now = self.now;
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            let Some(persisted) = store
+                .browser_session(&session_id_hash, now_ms)
+                .map_err(postgres_failure)?
+            else {
+                return Ok(None);
+            };
+            let mut session = BrowserSessionRecord {
+                account_id: persisted.account_id,
+                session_token: persisted.session_token,
+                csrf_token_hash: persisted.csrf_token_hash,
+                expires_at_ms: persisted.expires_at_ms,
+            };
+            if session.expires_at_ms <= now_ms {
+                return Ok(None);
+            }
+            if session.csrf_token_hash != expected_csrf_hash {
+                return Err(ApiFailure::forbidden("CSRF token does not match session."));
+            }
+            if !store
+                .api_session_matches(&session.account_id, &session.session_token, now_ms)
+                .map_err(postgres_failure)?
+            {
+                if store
+                    .account_exists(&session.account_id)
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::forbidden_account());
+                }
+                return Err(ApiFailure::unknown_account());
+            }
+            let mut touched = false;
+            if session.expires_at_ms.saturating_sub(now_ms) < app_session_max_age_ms() / 2 {
+                let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+                if store
+                    .touch_browser_session(
+                        &session_id_hash,
+                        &session.account_id,
+                        &session.session_token,
+                        now_ms,
+                        expires_at_ms,
+                    )
+                    .map_err(postgres_failure)?
+                {
+                    session.expires_at_ms = expires_at_ms;
+                    touched = true;
+                }
+            }
+            let work = (|| {
+                let scope =
+                    AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
+                let mut account = store.for_account(scope);
+                account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let mut study = BetaStudySession::from_store(account, now);
+                let view = study.start().map_err(study_failure)?;
+                Ok(StudyViewResponse::from_view(view))
+            })();
+            Ok(Some((BrowserSessionValidation { session, touched }, work)))
+        })
+    }
+
+    fn authenticated_submit_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let session_token_hash = if is_secret_hash(session_token) {
+            session_token.to_owned()
+        } else {
+            secret_hash(session_token)
+        };
+        let now_ms = self.now_ms();
+        let now = self.now;
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            if !store
+                .api_session_matches(account_id, &session_token_hash, now_ms)
+                .map_err(postgres_failure)?
+            {
+                if store.account_exists(account_id).map_err(postgres_failure)? {
+                    return Err(ApiFailure::forbidden_account());
+                }
+                return Err(ApiFailure::unknown_account());
+            }
+            let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
+            let mut account = store.for_account(scope);
+            account.ensure_account(now_ms).map_err(postgres_failure)?;
+            if account
+                .applied_review_idempotency_key_exists(&request.idempotency_key)
+                .map_err(postgres_failure)?
+            {
+                let study = BetaStudySession::from_store(account, now);
+                let view = study.view().map_err(study_failure)?;
+                return Ok(StudyViewResponse::from_view(view));
+            }
+            let mut study = BetaStudySession::from_store(account, now);
+            require_current_review_postgres(&mut study, review_unit_id)?;
+            let view = study
+                .submit_answer_with_idempotency_key(
+                    request.answer,
+                    request.response_time_ms,
+                    Some(request.idempotency_key),
+                )
+                .map_err(study_failure)?;
+            Ok(StudyViewResponse::from_view(view))
+        })
+    }
+
+    fn browser_session_submit_review(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        csrf_token_hash: &str,
+        review_unit_id: &str,
+        request: SubmitReviewRequest,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> BrowserSessionWorkResult {
+        let session_id_hash = secret_hash(session_id);
+        let expected_csrf_hash = csrf_token_hash.to_owned();
+        let now = self.now;
+        with_postgres_store_timed(&self.database_url, timings, |store| {
+            let Some(persisted) = store
+                .browser_session(&session_id_hash, now_ms)
+                .map_err(postgres_failure)?
+            else {
+                return Ok(None);
+            };
+            let mut session = BrowserSessionRecord {
+                account_id: persisted.account_id,
+                session_token: persisted.session_token,
+                csrf_token_hash: persisted.csrf_token_hash,
+                expires_at_ms: persisted.expires_at_ms,
+            };
+            if session.expires_at_ms <= now_ms {
+                return Ok(None);
+            }
+            if session.csrf_token_hash != expected_csrf_hash {
+                return Err(ApiFailure::forbidden("CSRF token does not match session."));
+            }
+            if !store
+                .api_session_matches(&session.account_id, &session.session_token, now_ms)
+                .map_err(postgres_failure)?
+            {
+                if store
+                    .account_exists(&session.account_id)
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::forbidden_account());
+                }
+                return Err(ApiFailure::unknown_account());
+            }
+            let mut touched = false;
+            if session.expires_at_ms.saturating_sub(now_ms) < app_session_max_age_ms() / 2 {
+                let expires_at_ms = now_ms.saturating_add(app_session_max_age_ms());
+                if store
+                    .touch_browser_session(
+                        &session_id_hash,
+                        &session.account_id,
+                        &session.session_token,
+                        now_ms,
+                        expires_at_ms,
+                    )
+                    .map_err(postgres_failure)?
+                {
+                    session.expires_at_ms = expires_at_ms;
+                    touched = true;
+                }
+            }
+            let work = (|| {
+                let scope =
+                    AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
+                let mut account = store.for_account(scope);
+                account.ensure_account(now_ms).map_err(postgres_failure)?;
+                if account
+                    .applied_review_idempotency_key_exists(&request.idempotency_key)
+                    .map_err(postgres_failure)?
+                {
+                    let study = BetaStudySession::from_store(account, now);
+                    let view = study.view().map_err(study_failure)?;
+                    return Ok(StudyViewResponse::from_view(view));
+                }
+                let mut study = BetaStudySession::from_store(account, now);
+                require_current_review_postgres(&mut study, review_unit_id)?;
+                let view = study
+                    .submit_answer_with_idempotency_key(
+                        request.answer,
+                        request.response_time_ms,
+                        Some(request.idempotency_key),
+                    )
+                    .map_err(study_failure)?;
+                Ok(StudyViewResponse::from_view(view))
+            })();
+            Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
     }
 

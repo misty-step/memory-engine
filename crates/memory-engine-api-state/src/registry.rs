@@ -1401,8 +1401,170 @@ impl AccountRegistry {
         account_id: &str,
         session_token: &str,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        let account = self.require_account(account_id, session_token)?;
-        self.storage().next_review(account_id, &account.store_path)
+        self.next_review_with_timings(account_id, session_token, None)
+    }
+
+    pub(crate) fn next_review_with_timings(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        timings: Option<&mut SubmitReviewTimings>,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        // One Postgres checkout: session match + start next review.
+        self.storage()
+            .authenticated_next_review(account_id, session_token, timings)
+    }
+
+    /// Browser Continue/Start: one checkout for session validation + next card.
+    pub(crate) fn next_app_review_with_timings(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
+        let session_id = read_browser_session_id(headers)?;
+        let now_ms = self.now();
+        let csrf_token_hash = secret_hash(csrf_token);
+        let Some((validation, view)) = self.storage().browser_session_next_review(
+            session_id,
+            now_ms,
+            &csrf_token_hash,
+            Some(timings),
+        )?
+        else {
+            self.lock_data().browser_sessions.remove(session_id);
+            return Err(ApiFailure::missing_session());
+        };
+        if validation.touched {
+            self.update_browser_session_cache(session_id, validation.session.expires_at_ms);
+        }
+        let session = validation.session;
+        Ok((
+            AppAccount {
+                browser_session_id: session_id.to_owned(),
+                account_id: session.account_id,
+                session_token: session.session_token,
+                csrf_token: csrf_token.to_owned(),
+                expires_at_ms: session.expires_at_ms,
+                cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, session.expires_at_ms),
+            },
+            view,
+        ))
+    }
+
+    /// Browser submit: one checkout for session validation + grade.
+    pub(crate) fn submit_app_review_with_timings(
+        &self,
+        headers: &HeaderMap,
+        csrf_token: &str,
+        review_unit_id: &str,
+        request: &SubmitReviewRequest,
+        timings: &mut SubmitReviewTimings,
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
+        let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
+        let answer = normalize_required_text(&request.answer, "Review answer")?;
+        if request.response_time_ms == 0 {
+            return Err(ApiFailure::bad_request(
+                "Review response time must be a positive integer.",
+            ));
+        }
+        let session_id = read_browser_session_id(headers)?;
+        let now_ms = self.now();
+        let csrf_token_hash = secret_hash(csrf_token);
+
+        // Prefer the cached account id so concurrent browser submits for the
+        // same learner share the durable store lock before any Postgres work.
+        let cached_account_id = {
+            let data = self.lock_data();
+            data.browser_sessions
+                .get(session_id)
+                .map(|session| session.account_id.clone())
+        };
+        let lock_key = cached_account_id
+            .clone()
+            .unwrap_or_else(|| format!("browser-session:{session_id}"));
+        let store_lock = self.store_lock(&lock_key);
+        let _guard = store_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(account_id) = cached_account_id.as_deref() {
+            let data = self.lock_data();
+            if let Some(response) = data
+                .accounts
+                .get(account_id)
+                .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+            {
+                let session = data
+                    .browser_sessions
+                    .get(session_id)
+                    .cloned()
+                    .ok_or_else(ApiFailure::missing_session)?;
+                return Ok((
+                    AppAccount {
+                        browser_session_id: session_id.to_owned(),
+                        account_id: session.account_id,
+                        session_token: session.session_token,
+                        csrf_token: csrf_token.to_owned(),
+                        expires_at_ms: session.expires_at_ms,
+                        cookie_max_age_seconds: cookie_max_age_from_expiry(
+                            now_ms,
+                            session.expires_at_ms,
+                        ),
+                    },
+                    Ok(response.clone()),
+                ));
+            }
+        }
+
+        let request = SubmitReviewRequest {
+            answer,
+            response_time_ms: request.response_time_ms,
+            idempotency_key: idempotency_key.clone(),
+        };
+        let Some((validation, work)) = self.storage().browser_session_submit_review(
+            session_id,
+            now_ms,
+            &csrf_token_hash,
+            review_unit_id,
+            request,
+            Some(timings),
+        )?
+        else {
+            self.lock_data().browser_sessions.remove(session_id);
+            return Err(ApiFailure::missing_session());
+        };
+        if validation.touched {
+            self.update_browser_session_cache(session_id, validation.session.expires_at_ms);
+        }
+        let session = validation.session;
+        let account_id = session.account_id.clone();
+        if let Ok(view) = &work {
+            // Resolve the store path before locking: storage() takes the data
+            // lock, so calling it inside or_insert_with would self-deadlock.
+            let store_path = self.storage().account_store_path(&account_id);
+            let mut data = self.lock_data();
+            data.accounts
+                .entry(account_id.clone())
+                .or_insert_with(|| AccountRecord {
+                    store_path,
+                    sources: BTreeMap::new(),
+                    submitted_reviews: BTreeMap::new(),
+                })
+                .submitted_reviews
+                .insert(idempotency_key, view.clone());
+        }
+        Ok((
+            AppAccount {
+                browser_session_id: session_id.to_owned(),
+                account_id,
+                session_token: session.session_token,
+                csrf_token: csrf_token.to_owned(),
+                expires_at_ms: session.expires_at_ms,
+                cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, session.expires_at_ms),
+            },
+            work,
+        ))
     }
 
     /// Runs an API registry operation.
@@ -1613,7 +1775,7 @@ impl AccountRegistry {
         session_token: &str,
         review_unit_id: &str,
         request: &SubmitReviewRequest,
-        mut timings: Option<&mut SubmitReviewTimings>,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
         let answer = normalize_required_text(&request.answer, "Review answer")?;
@@ -1622,37 +1784,23 @@ impl AccountRegistry {
                 "Review response time must be a positive integer.",
             ));
         }
-        let storage = self.storage();
-        // Browser `/app/submit` already authenticated via
-        // `require_browser_session_with_timings` (one Neon borrow that matched
-        // the durable API session). A second `require_account_with_timings`
-        // only repeated that match on a fresh connect. Timed callers therefore
-        // only need the store path; durable review/idempotency work stays in
-        // `storage.submit_review`. Untimed/API callers still fully re-auth.
-        let account = if timings.is_some() {
-            AccountRecord {
-                store_path: storage.account_store_path(account_id),
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            }
-        } else {
-            self.require_account_with_timings(account_id, session_token, timings.as_deref_mut())?
-        };
         let store_lock = self.store_lock(account_id);
         let _guard = store_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut data = self.lock_data();
-        if let Some(response) = data
-            .accounts
-            .get(account_id)
-            .and_then(|account| account.submitted_reviews.get(&idempotency_key))
         {
-            return Ok(response.clone());
+            let data = self.lock_data();
+            if let Some(response) = data
+                .accounts
+                .get(account_id)
+                .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+            {
+                return Ok(response.clone());
+            }
         }
-        let response = storage.submit_review(
+        let response = self.storage().authenticated_submit_review(
             account_id,
-            &account.store_path,
+            session_token,
             review_unit_id,
             SubmitReviewRequest {
                 answer,
@@ -1661,14 +1809,19 @@ impl AccountRegistry {
             },
             timings,
         )?;
-        let record = data
-            .accounts
+        // Resolve the store path before locking: storage() takes the data
+        // lock, so calling it inside or_insert_with would self-deadlock.
+        let store_path = self.storage().account_store_path(account_id);
+        let mut data = self.lock_data();
+        data.accounts
             .entry(account_id.to_owned())
-            .or_insert_with(|| account.clone());
-        record
+            .or_insert_with(|| AccountRecord {
+                store_path,
+                sources: BTreeMap::new(),
+                submitted_reviews: BTreeMap::new(),
+            })
             .submitted_reviews
             .insert(idempotency_key, response.clone());
-
         Ok(response)
     }
 

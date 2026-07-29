@@ -2099,19 +2099,41 @@ async fn next_app_review(
     uri: Uri,
     Form(form): Form<AppAccountActionForm>,
 ) -> Response {
-    let account =
-        match state.require_browser_session(&headers, csrf_token(form.csrf_token.as_ref())) {
-            Ok(account) => account,
-            Err(error) => return app_failure_response(&error),
+    let started = Instant::now();
+    let request_id = format!("req_{:032x}", rand::random::<u128>());
+    let mut postgres = SubmitReviewTimings::default();
+    let csrf = csrf_token(form.csrf_token.as_ref());
+    let (response, render_ms) =
+        match state.next_app_review_with_timings(&headers, csrf, &mut postgres) {
+            Ok((account, view)) => {
+                let render_started = Instant::now();
+                let postgres_before_render = postgres;
+                let response = with_browser_session_cookie(
+                    Html(render_action_result_html(&state, &account, view)).into_response(),
+                    &account,
+                    &headers,
+                    &uri,
+                );
+                let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
+                (response, render_ms)
+            }
+            Err(error) => {
+                let render_started = Instant::now();
+                (
+                    app_failure_response(&error),
+                    bounded_request_ms(render_started),
+                )
+            }
         };
-    let result = state.next_app_review(&account);
-
-    with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
-        &account,
-        &headers,
-        &uri,
-    )
+    let (response, _total_ms) = submit_response_headers(
+        response,
+        &request_id,
+        None,
+        bounded_request_ms(started),
+        postgres,
+        render_ms,
+    );
+    no_store_response(response)
 }
 
 fn client_rate_limit_key(headers: &HeaderMap) -> String {
@@ -2466,23 +2488,19 @@ async fn submit_app_review(
         .map(str::to_owned);
     let mut postgres = SubmitReviewTimings::default();
 
-    let (response, render_ms, outcome) = match state.require_browser_session_with_timings(
+    let (response, render_ms, outcome) = match state.submit_app_review_session_with_timings(
         &headers,
         csrf_token(form.csrf_token.as_ref()),
+        &form.review_unit_id,
+        &SubmitReviewRequest {
+            answer: form.answer,
+            response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
+            idempotency_key: form.idempotency_key,
+        },
         &mut postgres,
     ) {
-        Ok(account) => {
-            let result = state.submit_app_review(
-                &account,
-                &form.review_unit_id,
-                &SubmitReviewRequest {
-                    answer: form.answer,
-                    response_time_ms: sanitize_response_time_ms(form.response_time_ms.as_deref()),
-                    idempotency_key: form.idempotency_key,
-                },
-                &mut postgres,
-            );
-            let outcome = match result.as_ref() {
+        Ok((account, result)) => {
+            let outcome = match &result {
                 Ok(_) => SubmitPerformanceOutcome::Succeeded,
                 Err(error) => submit_outcome(error.status()),
             };
