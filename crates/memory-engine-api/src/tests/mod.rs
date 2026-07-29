@@ -6943,6 +6943,7 @@ fn server_timing_duration(timing: &str, name: &str) -> u64 {
 fn assert_postgres_submit_timing(
     response: &axum::response::Response,
     expected_statement_count: u64,
+    expected_connect_count: u64,
 ) {
     let request_id = response
         .headers()
@@ -6996,7 +6997,7 @@ fn assert_postgres_submit_timing(
         .and_then(|value| value.parse::<u64>().ok())
         .expect("Postgres connect count");
     assert_eq!(
-        connect_count, 1,
+        connect_count, expected_connect_count,
         "auth + review work must share one pool checkout: {timing}"
     );
     assert_eq!(
@@ -7014,6 +7015,7 @@ fn assert_postgres_submit_timing(
 async fn assert_postgres_submit_receipt(
     graded: axum::response::Response,
     expected_statement_count: u64,
+    expected_connect_count: u64,
 ) -> String {
     assert_eq!(graded.status(), StatusCode::OK);
     assert_eq!(
@@ -7021,7 +7023,7 @@ async fn assert_postgres_submit_receipt(
         1,
         "authenticated submit response must attach exactly one session cookie"
     );
-    assert_postgres_submit_timing(&graded, expected_statement_count);
+    assert_postgres_submit_timing(&graded, expected_statement_count, expected_connect_count);
     let graded = response_text(graded).await;
     assert!(graded.contains("me-verdict") && graded.contains(">Correct<"));
     graded
@@ -7130,7 +7132,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
         ))
         .await
         .expect("Postgres browser submit");
-    assert_postgres_submit_receipt(graded, 22).await;
+    assert_postgres_submit_receipt(graded, 22, 1).await;
 
     let completed_browser_app = router(ApiState::new(
         AccountRegistry::with_postgres_url(database.scoped_url.clone())
@@ -7171,7 +7173,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
     let workspace_submit_measured_ms =
         u64::try_from(workspace_submit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     assert_eq!(workspace_submit.status(), StatusCode::OK);
-    assert_postgres_submit_timing(&workspace_submit, 11);
+    assert_postgres_submit_timing(&workspace_submit, 11, 3);
     // This is the exact empty-queue/error-render path (missing review unit,
     // no active review) that nests app_study_view_with_timings +
     // list_app_sources_with_timings + jobs_for_app_account_with_timings

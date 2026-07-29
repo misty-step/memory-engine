@@ -1421,7 +1421,7 @@ impl AccountRegistry {
         headers: &HeaderMap,
         csrf_token: &str,
         timings: &mut SubmitReviewTimings,
-    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
         let session_id = read_browser_session_id(headers)?;
         let now_ms = self.now();
         let csrf_token_hash = secret_hash(csrf_token);
@@ -1460,7 +1460,7 @@ impl AccountRegistry {
         review_unit_id: &str,
         request: &SubmitReviewRequest,
         timings: &mut SubmitReviewTimings,
-    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
         let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
         let answer = normalize_required_text(&request.answer, "Review answer")?;
         if request.response_time_ms == 0 {
@@ -1512,7 +1512,7 @@ impl AccountRegistry {
                             session.expires_at_ms,
                         ),
                     },
-                    response.clone(),
+                    Ok(response.clone()),
                 ));
             }
         }
@@ -1522,7 +1522,7 @@ impl AccountRegistry {
             response_time_ms: request.response_time_ms,
             idempotency_key: idempotency_key.clone(),
         };
-        let Some((validation, view)) = self.storage().browser_session_submit_review(
+        let Some((validation, work)) = self.storage().browser_session_submit_review(
             session_id,
             now_ms,
             &csrf_token_hash,
@@ -1539,12 +1539,15 @@ impl AccountRegistry {
         }
         let session = validation.session;
         let account_id = session.account_id.clone();
-        {
+        if let Ok(view) = &work {
+            // Resolve the store path before locking: storage() takes the data
+            // lock, so calling it inside or_insert_with would self-deadlock.
+            let store_path = self.storage().account_store_path(&account_id);
             let mut data = self.lock_data();
             data.accounts
                 .entry(account_id.clone())
                 .or_insert_with(|| AccountRecord {
-                    store_path: self.storage().account_store_path(&account_id),
+                    store_path,
                     sources: BTreeMap::new(),
                     submitted_reviews: BTreeMap::new(),
                 })
@@ -1560,7 +1563,7 @@ impl AccountRegistry {
                 expires_at_ms: session.expires_at_ms,
                 cookie_max_age_seconds: cookie_max_age_from_expiry(now_ms, session.expires_at_ms),
             },
-            view,
+            work,
         ))
     }
 
@@ -1772,7 +1775,7 @@ impl AccountRegistry {
         session_token: &str,
         review_unit_id: &str,
         request: &SubmitReviewRequest,
-        mut timings: Option<&mut SubmitReviewTimings>,
+        timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<StudyViewResponse, ApiFailure> {
         let idempotency_key = normalize_required_text(&request.idempotency_key, "Idempotency key")?;
         let answer = normalize_required_text(&request.answer, "Review answer")?;
@@ -1804,13 +1807,16 @@ impl AccountRegistry {
                 response_time_ms: request.response_time_ms,
                 idempotency_key: idempotency_key.clone(),
             },
-            timings.as_deref_mut(),
+            timings,
         )?;
+        // Resolve the store path before locking: storage() takes the data
+        // lock, so calling it inside or_insert_with would self-deadlock.
+        let store_path = self.storage().account_store_path(account_id);
         let mut data = self.lock_data();
         data.accounts
             .entry(account_id.to_owned())
             .or_insert_with(|| AccountRecord {
-                store_path: self.storage().account_store_path(account_id),
+                store_path,
                 sources: BTreeMap::new(),
                 submitted_reviews: BTreeMap::new(),
             })

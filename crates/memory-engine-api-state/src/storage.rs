@@ -82,6 +82,17 @@ pub struct StudyStorage {
     inner: Arc<dyn StudyStorageAdapter>,
 }
 
+/// One-checkout browser action result: `None` = missing/expired session,
+/// outer `Err` = auth/CSRF/storage failure, inner `Result` = review work
+/// outcome for a validated session (rendered signed-in on failure).
+pub(crate) type BrowserSessionWorkResult = Result<
+    Option<(
+        BrowserSessionValidation,
+        Result<StudyViewResponse, ApiFailure>,
+    )>,
+    ApiFailure,
+>;
+
 #[derive(Clone, Debug)]
 pub(crate) struct BrowserSessionValidation {
     pub(crate) session: BrowserSessionRecord,
@@ -555,7 +566,7 @@ impl StudyStorage {
         now_ms: i64,
         csrf_token_hash: &str,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         self.inner
             .browser_session_next_review(session_id, now_ms, csrf_token_hash, timings)
     }
@@ -569,7 +580,7 @@ impl StudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         self.inner.browser_session_submit_review(
             session_id,
             now_ms,
@@ -956,7 +967,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         now_ms: i64,
         csrf_token_hash: &str,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         let Some(validation) = self.load_and_validate_browser_session(
             session_id,
             now_ms,
@@ -974,7 +985,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         let view = self.next_review(
             &validation.session.account_id,
             &self.account_store_path(&validation.session.account_id),
-        )?;
+        );
         Ok(Some((validation, view)))
     }
 
@@ -1013,7 +1024,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         let Some(validation) = self.load_and_validate_browser_session(
             session_id,
             now_ms,
@@ -1032,7 +1043,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
             review_unit_id,
             request,
             timings,
-        )?;
+        );
         Ok(Some((validation, view)))
     }
     fn generate_source_with_run_id(
@@ -3408,7 +3419,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         now_ms: i64,
         csrf_token_hash: &str,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         let session_id_hash = secret_hash(session_id);
         let expected_csrf_hash = csrf_token_hash.to_owned();
         let now = self.now;
@@ -3460,15 +3471,16 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     touched = true;
                 }
             }
-            let scope = AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
-            let mut account = store.for_account(scope);
-            account.ensure_account(now_ms).map_err(postgres_failure)?;
-            let mut study = BetaStudySession::from_store(account, now);
-            let view = study.start().map_err(study_failure)?;
-            Ok(Some((
-                BrowserSessionValidation { session, touched },
-                StudyViewResponse::from_view(view),
-            )))
+            let work = (|| {
+                let scope =
+                    AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
+                let mut account = store.for_account(scope);
+                account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let mut study = BetaStudySession::from_store(account, now);
+                let view = study.start().map_err(study_failure)?;
+                Ok(StudyViewResponse::from_view(view))
+            })();
+            Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
     }
 
@@ -3529,7 +3541,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<Option<(BrowserSessionValidation, StudyViewResponse)>, ApiFailure> {
+    ) -> BrowserSessionWorkResult {
         let session_id_hash = secret_hash(session_id);
         let expected_csrf_hash = csrf_token_hash.to_owned();
         let now = self.now;
@@ -3581,33 +3593,31 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     touched = true;
                 }
             }
-            let scope = AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
-            let mut account = store.for_account(scope);
-            account.ensure_account(now_ms).map_err(postgres_failure)?;
-            if account
-                .applied_review_idempotency_key_exists(&request.idempotency_key)
-                .map_err(postgres_failure)?
-            {
-                let study = BetaStudySession::from_store(account, now);
-                let view = study.view().map_err(study_failure)?;
-                return Ok(Some((
-                    BrowserSessionValidation { session, touched },
-                    StudyViewResponse::from_view(view),
-                )));
-            }
-            let mut study = BetaStudySession::from_store(account, now);
-            require_current_review_postgres(&mut study, review_unit_id)?;
-            let view = study
-                .submit_answer_with_idempotency_key(
-                    request.answer,
-                    request.response_time_ms,
-                    Some(request.idempotency_key),
-                )
-                .map_err(study_failure)?;
-            Ok(Some((
-                BrowserSessionValidation { session, touched },
-                StudyViewResponse::from_view(view),
-            )))
+            let work = (|| {
+                let scope =
+                    AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
+                let mut account = store.for_account(scope);
+                account.ensure_account(now_ms).map_err(postgres_failure)?;
+                if account
+                    .applied_review_idempotency_key_exists(&request.idempotency_key)
+                    .map_err(postgres_failure)?
+                {
+                    let study = BetaStudySession::from_store(account, now);
+                    let view = study.view().map_err(study_failure)?;
+                    return Ok(StudyViewResponse::from_view(view));
+                }
+                let mut study = BetaStudySession::from_store(account, now);
+                require_current_review_postgres(&mut study, review_unit_id)?;
+                let view = study
+                    .submit_answer_with_idempotency_key(
+                        request.answer,
+                        request.response_time_ms,
+                        Some(request.idempotency_key),
+                    )
+                    .map_err(study_failure)?;
+                Ok(StudyViewResponse::from_view(view))
+            })();
+            Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
     }
 

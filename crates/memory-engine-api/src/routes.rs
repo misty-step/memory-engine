@@ -2109,7 +2109,7 @@ async fn next_app_review(
                 let render_started = Instant::now();
                 let postgres_before_render = postgres;
                 let response = with_browser_session_cookie(
-                    Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+                    Html(render_action_result_html(&state, &account, view)).into_response(),
                     &account,
                     &headers,
                     &uri,
@@ -2499,14 +2499,18 @@ async fn submit_app_review(
         },
         &mut postgres,
     ) {
-        Ok((account, view)) => {
+        Ok((account, result)) => {
+            let outcome = match &result {
+                Ok(_) => SubmitPerformanceOutcome::Succeeded,
+                Err(error) => submit_outcome(error.status()),
+            };
             let render_started = Instant::now();
             let postgres_before_render = postgres;
             let response = with_browser_session_cookie(
                 Html(render_submit_action_result_html(
                     &state,
                     &account,
-                    Ok(view),
+                    result,
                     &request_id,
                     trace_id.as_deref(),
                     &mut postgres,
@@ -2517,7 +2521,7 @@ async fn submit_app_review(
                 &uri,
             );
             let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
-            (response, render_ms, SubmitPerformanceOutcome::Succeeded)
+            (response, render_ms, outcome)
         }
         Err(error) => {
             let outcome = submit_outcome(error.status());

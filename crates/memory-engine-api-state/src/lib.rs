@@ -686,17 +686,32 @@ impl ApiState {
     }
 
     /// Browser Continue/Start on one Postgres checkout (session + next card).
+    ///
+    /// The outer `Err` is an auth/session failure; the inner `Result` carries
+    /// the study work outcome for a validated session so callers can render
+    /// signed-in recovery HTML.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth rejects the request.
     pub fn next_app_review_with_timings(
         &self,
         headers: &HeaderMap,
         csrf_token: &str,
         timings: &mut SubmitReviewTimings,
-    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
         self.accounts
             .next_app_review_with_timings(headers, csrf_token, timings)
     }
 
     /// Browser submit on one Postgres checkout (session + grade).
+    ///
+    /// The outer `Err` is an auth/session/validation failure; the inner
+    /// `Result` carries the grade outcome for a validated session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth or request validation rejects the submit.
     pub fn submit_app_review_session_with_timings(
         &self,
         headers: &HeaderMap,
@@ -704,7 +719,7 @@ impl ApiState {
         review_unit_id: &str,
         request: &SubmitReviewRequest,
         timings: &mut SubmitReviewTimings,
-    ) -> Result<(AppAccount, StudyViewResponse), ApiFailure> {
+    ) -> Result<(AppAccount, Result<StudyViewResponse, ApiFailure>), ApiFailure> {
         self.accounts.submit_app_review_with_timings(
             headers,
             csrf_token,
@@ -715,6 +730,10 @@ impl ApiState {
     }
 
     /// API next-review with optional timing accounting (single checkout).
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth or study state rejects the read.
     pub fn next_review_with_timings(
         &self,
         account_id: &str,
