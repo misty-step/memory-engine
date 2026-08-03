@@ -181,3 +181,5 @@ bounded `/reflect`. `/groom` always reconciles Powder before strategy.
 
 General-purpose hosting or auth frameworks, chat tutoring, and generalized content
 import.
+
+Organization root context: @~/Development/misty-step/AGENTS.md
