@@ -263,7 +263,7 @@ CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
 /// metadata, and drops the raw-token copies only after the replacement insert
 /// succeeds. A failed transaction leaves the legacy schema intact for retry.
 const SESSION_SCHEMA_MIGRATION_SQL: &str = r"
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;
 
 DO $$
 BEGIN
@@ -5524,6 +5524,7 @@ mod tests {
     fn migration_uses_account_scoped_primary_keys_and_durable_receipts() {
         let sql = migration_sql();
         let session_sql = super::SESSION_SCHEMA_MIGRATION_SQL;
+        assert!(session_sql.contains("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;"));
         let jobs_sql = generation_jobs_migration_sql();
 
         assert!(sql.contains("memory_engine_accounts"));
