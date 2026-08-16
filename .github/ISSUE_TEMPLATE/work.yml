@@ -19,6 +19,34 @@ body:
       description: Name the binding product evidence, production observation, or code invariant.
     validations:
       required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: Select the priority label that the groomer must apply.
+      options:
+        - priority:p0
+        - priority:p1
+        - priority:p2
+        - priority:p3
+    validations:
+      required: true
+  - type: dropdown
+    id: work-type
+    attributes:
+      label: Type
+      description: Select the work-type label that the groomer must apply.
+      options:
+        - type:bug
+        - type:feature
+        - type:infrastructure
+        - type:maintenance
+        - type:performance
+        - type:product-proof
+        - type:roadmap
+        - type:security
+    validations:
+      required: true
   - type: textarea
     id: acceptance
     attributes:
