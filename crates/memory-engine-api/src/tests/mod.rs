@@ -5593,9 +5593,7 @@ async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
             .unwrap_or(0)
     };
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while std::fs::read_to_string(&jobs_file)
-            .map(|text| terminal_count(&text))
-            .unwrap_or(0)
+        while std::fs::read_to_string(&jobs_file).map_or(0, |text| terminal_count(&text))
             != source_count
         {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

@@ -1,6 +1,5 @@
 # Extract Beta App Readiness Gate
 
-Refs-Powder: memory-engine-035
 
 ## Decision
 

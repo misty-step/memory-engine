@@ -1,0 +1,54 @@
+name: Shaped work
+description: Define an executable Scry outcome and its proof
+title: ""
+labels:
+  - status:backlog
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the observable result and its owner.
+      placeholder: The learner or operator can...
+    validations:
+      required: true
+  - type: textarea
+    id: why-now
+    attributes:
+      label: Why now
+      description: Name the binding product evidence, production observation, or code invariant.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Use behavior-level checkboxes. Include failure paths and boundaries.
+      placeholder: |
+        - [ ] Observable behavior
+        - [ ] Failure behavior
+        - [ ] Exact proof and gates
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link only hard blockers or state None.
+      placeholder: None.
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: Proof
+      description: Name the real interface, scenario, fixture, artifacts, and required gates.
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: State scope that must not enter this issue.
+    validations:
+      required: true

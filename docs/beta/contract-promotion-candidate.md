@@ -1,6 +1,5 @@
 # Contract Promotion Candidate
 
-Refs-Powder: memory-engine-034
 
 ## Chosen Candidate
 

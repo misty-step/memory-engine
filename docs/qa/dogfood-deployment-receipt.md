@@ -1,6 +1,6 @@
 # QA receipt — persistent dogfood deployment
 
-Date: 2026-06-11. Powder card: `memory-engine-044` (partial; see card for
+Date: 2026-06-11. Legacy work item: `memory-engine-044` (partial; see card for
 remaining scope). Production: `https://memory-engine-api.fly.dev`.
 
 ## Pipeline (first real runs of the gated deploy)

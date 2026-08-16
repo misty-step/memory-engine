@@ -77,6 +77,44 @@ fn agent_docs_match_post_cutover_contract() {
         agents.contains("historical extraction context"),
         "AGENTS.md must identify SLICE docs and exemplars as historical context"
     );
+    assert!(
+        agents.contains("GitHub Issues is authoritative"),
+        "AGENTS.md must name GitHub Issues as the work ledger"
+    );
+    assert!(
+        agents.contains("Refs #") && agents.contains("Closes #"),
+        "AGENTS.md must document issue attribution without premature closure"
+    );
+    assert!(
+        !agents.contains("Powder"),
+        "AGENTS.md must not retain the retired Powder workflow"
+    );
+    for relative in ["README.md", "VISION.md", "docs/fleet-onboarding.md"] {
+        let text = read_repo_file(relative);
+        assert!(
+            text.contains("GitHub Issues"),
+            "{relative} must point at the active GitHub Issues ledger"
+        );
+        assert!(
+            !text.contains("Powder"),
+            "{relative} must not retain the retired Powder workflow"
+        );
+    }
+
+    let issue_template = read_repo_file(".github/ISSUE_TEMPLATE/work.yml");
+    assert_contains_all(
+        ".github/ISSUE_TEMPLATE/work.yml",
+        &issue_template,
+        &[
+            "status:backlog",
+            "Outcome",
+            "Why now",
+            "Acceptance",
+            "Dependencies",
+            "Proof",
+            "Non-goals",
+        ],
+    );
 }
 
 #[test]
@@ -281,7 +319,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "memory-engine.map.json",
             "CANARY_ENDPOINT",
             "memory-engine-api",
-            "Powder",
+            "GitHub Issues",
             "Cerberus",
             "Bitterblossom",
         ],
@@ -296,12 +334,12 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "node.fleet.landmark",
             "node.fleet.cerberus",
             "node.fleet.canary",
-            "node.fleet.powder",
+            "node.fleet.github-issues",
         ],
     );
     assert!(
-        !map.contains("edge.fleet.powder-to-card"),
-        "the Powder fleet node already references memory-engine-067; do not retain a stale historical-card edge"
+        !map.contains("\"kind\": \"powder\""),
+        "the architecture map must not retain Powder as a work-ledger kind"
     );
 }
 

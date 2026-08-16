@@ -9,7 +9,7 @@
 
 External patterns this repo originally lifted or followed. Use them as
 historical explanation for why the Rust kernel looks the way it does; use live
-Rust tests, active Powder cards, and current architecture docs before
+Rust tests, active GitHub Issues, and current architecture docs before
 implementing new work.
 
 ## Deterministic grading (primary exemplar)

@@ -1,6 +1,5 @@
 # Web Shell Dogfood
 
-Refs-Powder: memory-engine-023
 
 ## Purpose
 

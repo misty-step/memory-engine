@@ -58,7 +58,7 @@ static CONNECTION_POOLS: LazyLock<Mutex<BTreeMap<String, r2d2::Pool<PostgresConn
 const POOL_MAX_SIZE: u32 = 8;
 const POOL_MIN_IDLE: u32 = 1;
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT

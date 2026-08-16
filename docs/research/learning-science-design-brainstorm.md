@@ -4,10 +4,6 @@ This brainstorm translates the research reference pack into concrete
 `memory-engine` design pressure. It is intentionally experimental; promote only
 what repeated clients and evals prove.
 
-Refs-Powder: memory-engine-020
-Refs-Powder: memory-engine-021
-Refs-Powder: memory-engine-022
-Refs-Powder: memory-engine-023
 
 ## Design Principles
 
@@ -184,7 +180,7 @@ Measure whole loops rather than only isolated functions:
 - anti-clumping with large recent history
 - rubric normalization over large criterion sets
 
-## Powder Queue Pressure
+## Issue Queue Pressure
 
 Strong candidates for future tickets after the current Slice 5 set:
 

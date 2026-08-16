@@ -826,9 +826,7 @@ fn render_home_body(account: &AppAccount, view: Option<&StudyViewResponse>) -> S
     if let Some(view) = view {
         html.push_str(&render_review_status(account, view));
     }
-    if view.is_none()
-        || view.is_some_and(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0)
-    {
+    if view.is_none_or(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0) {
         html.push_str(
             r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
         );
@@ -1765,11 +1763,12 @@ fn compare_success_rate(
 }
 
 fn render_concept_row(concept: &BetaStudyConceptProgress) -> String {
-    let pct = if concept.attempts > 0 {
-        (concept.correct * 100 / concept.attempts).min(100)
-    } else {
-        0
-    };
+    let pct = concept
+        .correct
+        .saturating_mul(100)
+        .checked_div(concept.attempts)
+        .unwrap_or(0)
+        .min(100);
     format!(
         r#"<article class="me-concept" data-health="{health}">
 <div class="me-concept-head"><div class="me-concept-label"><strong>{label}</strong><span class="me-health-label {fill}">{health}</span></div><span class="me-trend ae-dim">{trend_icon} {trend}</span></div>

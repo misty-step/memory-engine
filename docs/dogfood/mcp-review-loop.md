@@ -1,6 +1,5 @@
 # MCP Review Loop Dogfood
 
-Refs-Powder: memory-engine-071, memory-engine-mcp-production-parity
 
 ## Purpose
 
@@ -27,10 +26,8 @@ schedules a card by itself, a policy shared with every other caller
 
 ## Tool contract
 
-Tools are agent-intent-shaped, not 1:1 REST wrappers — the discipline
-`powder-mcp` established for this fleet (`../../Development/powder/crates/powder-mcp`
-was the reference exemplar for the stdio transport, tool registration, and
-error-handling shape).
+Tools are agent-intent-shaped, not 1:1 REST wrappers. The stdio transport,
+tool registration, and error handling add no server-side learning policy.
 
 | Tool | Composes | Intent |
 |---|---|---|
@@ -79,8 +76,8 @@ terminal.
 There is no in-memory fallback
 (`crates/memory-engine-mcp/tests/no_credentials_fallback.rs` proves the
 server exits non-zero with no stdout before reading any stdin when no
-credential path resolves) — the same lesson `powder-mcp` encoded after an
-ephemeral in-memory mode silently evaporated claims on process exit.
+credential path resolves), so an ephemeral process can never silently discard
+work that the caller believed was durable.
 
 `MEMORY_ENGINE_MCP_BASE_URL` overrides the base URL. The default is the
 branded production origin `https://scry.study`. The DigitalOcean App
@@ -287,9 +284,8 @@ output.
 
 The canonical registry for bootstrapped-agent MCP visibility is
 `~/.harness-kit/factory-mcps.yaml` (Harness Kit, `crates/harness-kit-checks/src/mcp_registry.rs`).
-That file is out of scope for this ticket (a different repo, its own review
-process), but the entry this server would need — matching the shape
-`powder`'s entry already uses — is:
+That file is out of scope for this issue because it belongs to a different
+repository and review process. The entry this server would need is:
 
 ```yaml
 - id: memory-engine

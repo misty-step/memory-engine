@@ -1,6 +1,5 @@
 # Beta Persistence Spine
 
-Refs-Powder: memory-engine-026
 
 ## Purpose
 

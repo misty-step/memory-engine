@@ -1,7 +1,6 @@
 # Ticket 064 child 0 model bakeoff rerun
 
 Date: 2026-07-03
-Refs-Powder: memory-engine-064
 
 ## Verdict
 

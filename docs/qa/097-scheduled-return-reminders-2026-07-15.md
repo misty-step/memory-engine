@@ -62,4 +62,4 @@ start or mutate a send. `GET /healthz` returns `status: "ok"`,
 This is merge-ready but intentionally not merged or marked complete. Production
 scheduled-reminder evidence awaits deployment. Card092 remains open
 for child056 real inbox deliverability; its merged/deployed proof and the
-097 relation are recorded in Powder.
+097 relation was recorded in the legacy ledger.

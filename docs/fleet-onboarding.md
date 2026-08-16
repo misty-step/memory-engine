@@ -9,7 +9,7 @@ authorities.
 | Surface | Current authority | Decision and proof |
 | --- | --- | --- |
 | Canary | `memory-engine-api` runtime and `docs/runbook.md` | Shipped. `CANARY_ENDPOINT` and `CANARY_API_KEY` are documented production variables; API 500s report as `memory-engine-api`. |
-| Powder | Powder board | Shipped. Powder is the sole work ledger under the current `AGENTS.md` contract. This checkout has no `backlog.d/` to import; the historical file-import criterion is superseded rather than recreated. |
+| GitHub Issues | [`misty-step/scry` issues](https://github.com/misty-step/scry/issues) | GitHub Issues is the sole active work ledger under `AGENTS.md`. Labels own priority and workflow state; assignees own active work; issue comments hold proof and closure. |
 | Landmark | `.landmark.yml` plus Landmark CLI | Adopted in manifest-only/synthesis-only mode. The repo has no release-secret authority, so no release-mutating workflow is added. Preview with `landmark setup --repo-root . --dry-run` and `landmark run --provider local --repo-root . --dry-run` from a Landmark checkout. |
 | Project map | `docs/architecture/memory-engine.map.json` and `workbench.html` | This is the live repo-local architecture-map successor for project structure. It is static, diffable, and explicitly separate from Landmark release intelligence. |
 | Cerberus | `.github/workflows/cerberus-review.yml` | CI-native `review-pr` path is wired to Cerberus v0.72.0 with an explicit per-job GitHub token, `container-opencode`, and a capped per-review key minted from `CERBERUS_OPENROUTER_PROVISIONING_KEY`. The job skips visibly when that provisioning key is not provisioned. |

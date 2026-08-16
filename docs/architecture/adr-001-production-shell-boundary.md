@@ -3,7 +3,6 @@
 Status: superseded by the 2026-07-08 DigitalOcean cutover; retained as a
 historical decision record
 Date: 2026-06-06
-Refs-Powder: memory-engine-040
 
 Current runtime authority is `docs/runbook.md`. The provider-specific decision
 and commands below describe the original deployment only and are not an active

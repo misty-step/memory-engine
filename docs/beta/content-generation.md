@@ -1,8 +1,5 @@
 # Beta Content Generation
 
-Refs-Powder: memory-engine-027
-Refs-Powder: memory-engine-051
-Refs-Powder: memory-engine-052
 
 ## Purpose
 

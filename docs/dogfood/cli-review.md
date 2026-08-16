@@ -1,6 +1,5 @@
 # CLI Review Dogfood
 
-Refs-Powder: memory-engine-021
 
 ## Purpose
 

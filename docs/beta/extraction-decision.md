@@ -1,6 +1,5 @@
 # Beta Extraction Decision
 
-Refs-Powder: memory-engine-031
 
 ## Primary Decision
 

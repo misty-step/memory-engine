@@ -1,6 +1,6 @@
 # Generation 055 blocked receipt — 2026-06-13
 
-Powder card memory-engine-055 requires a fresh judged field run that improves both distractor
+Legacy work item memory-engine-055 required a fresh judged field run that improves both distractor
 quality and keep rate over `docs/evals/generation-field-2026-06-11.md`, plus a
 production end-to-end latency receipt.
 
@@ -81,5 +81,5 @@ account. This shell did not have those credentials exported, so no production
 latency receipt was generated.
 
 Current status: blocked. Infrastructure and evidence from this branch may land,
-but do not archive Powder card memory-engine-055 or claim the ticket is shipped until both
+but do not archive legacy work item memory-engine-055 or claim the ticket is shipped until both
 required evidence gates are satisfied.

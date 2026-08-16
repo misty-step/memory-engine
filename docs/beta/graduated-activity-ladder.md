@@ -1,6 +1,5 @@
 # Graduated Activity Ladder
 
-Refs-Powder: memory-engine-032
 
 ## Model
 
