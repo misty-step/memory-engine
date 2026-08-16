@@ -118,6 +118,19 @@ fn agent_docs_match_post_cutover_contract() {
 }
 
 #[test]
+fn hosted_ci_passes_commit_sha_to_every_latency_receipt() {
+    let workflow = read_repo_file(".github/workflows/ci.yml");
+    assert_contains_all(
+        ".github/workflows/ci.yml",
+        &workflow,
+        &[
+            "run: bun run ci:full",
+            "dagger call action-latency-postgres --source=. --git-sha=\"$GITHUB_SHA\" export",
+        ],
+    );
+}
+
+#[test]
 fn historical_shape_packets_are_explicitly_marked() {
     for relative in [
         "SLICE-1-KERNEL.md",
