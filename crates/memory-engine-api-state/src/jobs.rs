@@ -664,7 +664,6 @@ impl JobQueue {
         let fence_account_id = job.account_id.clone();
         let fence_job_id = job.id.clone();
         let fence_token = job.lease_token.clone().unwrap_or_default();
-        let fence_reservation = job.reserved_cost_usd_micros;
         let fence_run_id = run_id.clone();
         let fence_registry = registry.clone();
         let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
@@ -681,13 +680,18 @@ impl JobQueue {
                         let current = store.generation_job(&fence_account_id, &fence_job_id)?;
                         let cost =
                             store.generation_cost_for_run(&fence_account_id, &fence_run_id)?;
+                        // The queue-share reservation is an admission heuristic
+                        // (budget / queue depth), not a per-run ceiling: a
+                        // legitimate run may pay for a draft call plus a repair
+                        // call, so the fence caps each attempt at the full
+                        // account/model budget instead of its reservation.
                         Ok(current.is_some_and(|current| {
                             current.status == "running"
                                 && current.lease_token.as_deref() == Some(fence_token.as_str())
                                 && current
                                     .lease_expires_at
                                     .is_some_and(|expires| expires > fence_registry.now())
-                                && cost <= fence_reservation
+                                && cost <= ACCOUNT_MODEL_BUDGET_USD_MICROS
                         }))
                     })
                     .ok()
@@ -810,7 +814,6 @@ impl JobQueue {
         let fence_account_id = job.account_id.clone();
         let fence_job_id = job.id.clone();
         let fence_token = job.lease_token.clone().unwrap_or_default();
-        let fence_reservation = job.reserved_cost_usd_micros;
         let fence_run_id = run_id.clone();
         let fence_registry = registry.clone();
         let generation_attempt = i32::try_from(job.attempts).unwrap_or(i32::MAX);
@@ -844,13 +847,17 @@ impl JobQueue {
                             let current = store.generation_job(&fence_account_id, &fence_job_id)?;
                             let cost =
                                 store.generation_cost_for_run(&fence_account_id, &fence_run_id)?;
+                            // Same ceiling as `run_claimed_blocking`: the queue-share
+                            // reservation is an admission heuristic, not a per-run
+                            // cap, so the cost fence uses the full account/model
+                            // budget.
                             Ok(current.is_some_and(|current| {
                                 current.status == "running"
                                     && current.lease_token.as_deref() == Some(fence_token.as_str())
                                     && current
                                         .lease_expires_at
                                         .is_some_and(|expires| expires > fence_registry.now())
-                                    && cost <= fence_reservation
+                                    && cost <= ACCOUNT_MODEL_BUDGET_USD_MICROS
                             }))
                         })
                         .ok()
@@ -1784,6 +1791,156 @@ mod tests {
             .expect("drop schema");
         TEST_CLOCK_MS.store(0, std::sync::atomic::Ordering::SeqCst);
         result.expect("live lease expiry fence");
+    }
+
+    fn serve_mock_completions(body: String, max_requests: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let port = listener.local_addr().expect("mock port").port();
+        std::thread::spawn(move || {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn postgres_generation_with_provider_cost_above_queue_share_finalizes() -> Result<(), String> {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres provider-cost regression; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return Ok(());
+        };
+        let completion = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": serde_json::json!({
+                        "learning_intent": "concept_understanding",
+                        "drafts": [
+                            {
+                                "concept": "Mitochondria ATP production",
+                                "question": "What do mitochondria generate most of?",
+                                "answer": "The cell's supply of adenosine triphosphate",
+                                "evidence_quote": "generate most of the cell's supply of adenosine triphosphate",
+                                "distractors": ["Ribosomal RNA", "Chlorophyll"],
+                                "activity_kind": "quiz",
+                                "activity_stage": "free-recall",
+                                "worked_solution": ""
+                            }
+                        ]
+                    }).to_string()
+                }
+            }],
+            // 20 000 micros: one plausible model call, above the 12 500 micros
+            // queue-share reservation the enqueue admission computes for the
+            // default budget (100 000 / 8).
+            "usage": { "prompt_tokens": 850, "completion_tokens": 220, "cost": 0.02 }
+        });
+        let base_url = serve_mock_completions(completion.to_string(), 4);
+        let schema = format!(
+            "memory_engine_test_provider_cost_{}_{}",
+            std::process::id(),
+            crate::wall_clock_ms()
+        );
+        let scoped_url = format!(
+            "{}{}options=-csearch_path%3D{}",
+            database_url,
+            if database_url.contains('?') { '&' } else { '?' },
+            schema
+        );
+        let mut admin = memory_engine_persistence_postgres::connect_client(&database_url)
+            .expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let provider_config = Some(memory_engine_openrouter::OpenRouterConfig {
+            api_key: "test-key".to_owned(),
+            model: "fixture/model".to_owned(),
+            base_url,
+            proxy_socket: None,
+            timeout: std::time::Duration::from_secs(10),
+            prompt: memory_engine_openrouter::PromptVariant::Principled,
+            max_drafts: 8,
+        });
+        let registry = AccountRegistry::with_postgres_url(scoped_url.clone())
+            .with_auth_config(crate::AuthConfig::for_local_tests())
+            .with_generation_provider_config(provider_config);
+        {
+            let mut ledger =
+                memory_engine_persistence_postgres::PostgresStudyStore::connect(&scoped_url)
+                    .map_err(|error| error.to_string())?;
+            ledger.migrate().map_err(|error| error.to_string())?;
+        }
+        let account = registry
+            .create_account("provider-cost@example.com")
+            .map_err(|error| error.message.clone())?;
+        let source = registry
+            .save_source(
+                &account.account_id,
+                &account.session_token,
+                &crate::CreateSourceRequest {
+                    title: "Provider cost source".to_owned(),
+                    body: "Mitochondria are organelles found in most eukaryotic cells. They generate most of the cell's supply of adenosine triphosphate, used as a source of chemical energy."
+                        .to_owned(),
+                    permission: crate::SourcePermission::ModelEligible,
+                },
+            )
+            .map_err(|error| error.message.clone())?;
+        let queue = JobQueue::with_postgres(registry.clone(), scoped_url.clone());
+        let job_id = match queue.enqueue(
+            &account.account_id,
+            &source.source_id,
+            "Provider cost source",
+        ) {
+            EnqueueOutcome::Started(job) => job.id,
+            other => panic!("unexpected enqueue outcome: {other:?}"),
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("worker runtime");
+        runtime.block_on(async {
+            queue.spawn_worker();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            loop {
+                let jobs = queue.jobs_for(&account.account_id);
+                let Some(job) = jobs.iter().find(|job| job.id == job_id) else {
+                    panic!("job missing from account history");
+                };
+                if job.status.is_terminal() {
+                    assert_eq!(
+                        job.status,
+                        JobStatus::Succeeded,
+                        "a provider run above the queue-share reservation must still finalize; error={:?}",
+                        job.error
+                    );
+                    assert_eq!(job.attempts, 1, "one attempt must suffice");
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "job never reached terminal state: {job:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        Ok(())
     }
 
     #[tokio::test]
