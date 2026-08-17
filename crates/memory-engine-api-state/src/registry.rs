@@ -1250,9 +1250,9 @@ impl AccountRegistry {
             generation_attempt,
             lease_token,
         )?;
-        // Evaluate the in-memory cancellation fence first. The durable adapter
-        // then validates the exact Postgres attempt/lease under the same account
-        // advisory transaction lock, or commits the file rollback under its lock.
+        // File-store rollback still consults this in-memory fence. Postgres
+        // publication uses the durable attempt/job lease row; a false
+        // in-memory result must not discard a still-valid run.
         let local_lease_valid = lease_valid();
         let finalized = storage.finalize_generation_run(
             account_id,

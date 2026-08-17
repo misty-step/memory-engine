@@ -4130,13 +4130,16 @@ impl AccountStudyStore<'_> {
         attempt: i32,
         lease_token: &str,
         now_ms: i64,
-        lease_valid: bool,
+        _lease_valid: bool,
     ) -> Result<bool, PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
-            let lease_row = if lease_valid {
-                transaction.query_opt(
-                    "SELECT attempt.job_id
+            // The in-memory worker fence is advisory. A false negative there
+            // (swallowed store error, cost-read glitch) must not delete a run
+            // whose attempt/job lease is still valid. Cleanup only when the
+            // durable lease row is absent.
+            let lease_row = transaction.query_opt(
+                "SELECT attempt.job_id
                          FROM memory_engine_generation_job_attempts attempt
                          JOIN memory_engine_generation_jobs job
                            ON job.account_id = attempt.account_id
@@ -4152,11 +4155,8 @@ impl AccountStudyStore<'_> {
                            AND job.lease_expires_at_ms > $5::BIGINT
                          FOR UPDATE OF attempt, job
                          LIMIT 1",
-                    &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
-                )?
-            } else {
-                None
-            };
+                &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
+            )?;
             if let Some(lease_row) = lease_row {
                 let job_id: String = lease_row.get(0);
                 let updated = transaction.execute(
@@ -6986,6 +6986,96 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop publication schema");
         result.expect("generation publication contract");
+    }
+
+    #[test]
+    fn live_postgres_valid_lease_publishes_when_memory_fence_is_false() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres durable-lease publication; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_durable_fence_{}_{}",
+            std::process::id(),
+            NOW + 5
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect durable fence admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create durable fence schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-durable-fence");
+            let reference = reference_span("reference-generation-durable-fence", &source.id);
+            let unit = ReviewUnitId::new("unit-generation-durable-fence");
+            let draft = accepted_draft(
+                "draft-generation-durable-fence",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-durable-fence"),
+            );
+            let run = generation_run("run-generation-durable-fence", &[&source.id], &[&draft.id]);
+            let (attempt, token) = {
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-durable-fence")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-durable-fence",
+                    "job-generation-durable-fence",
+                    &source.id,
+                    "Durable fence",
+                    "model-durable-fence",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-durable-fence", NOW, 10, 0, 1, 3)?
+                    .expect("durable fence claim");
+                let token = claimed.lease_token.clone().expect("durable fence token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-durable-fence",
+                    "job-generation-durable-fence",
+                    claimed.attempts,
+                    &token,
+                    &run.id,
+                )?);
+                (
+                    i32::try_from(claimed.attempts).expect("attempt fits i32"),
+                    token,
+                )
+            };
+            let mut publisher = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut account =
+                publisher.for_account(AccountScope::new("acct-generation-durable-fence")?);
+            assert!(
+                account.finalize_generation_run(&run.id, attempt, &token, NOW + 1, false)?,
+                "a still-valid durable lease must publish even when the in-memory fence is false"
+            );
+            let snapshot = account.snapshot()?;
+            assert_eq!(snapshot.generation_runs.len(), 1);
+            assert_eq!(snapshot.generation_runs[0].completed_at, Some(NOW + 1));
+            assert_eq!(snapshot.generated_prompt_drafts.len(), 1);
+            assert_eq!(snapshot.generated_prompt_drafts[0].id, draft.id);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop durable fence schema");
+        result.expect("durable lease publication contract");
     }
 
     #[test]
