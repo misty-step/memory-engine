@@ -868,6 +868,7 @@ impl JobQueue {
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(
             u64::try_from((JOB_LEASE_MS / 3).max(1)).unwrap_or(1),
         ));
+        heartbeat.tick().await;
         let outcome = loop {
             tokio::select! {
                 result = &mut generation => {
@@ -1783,5 +1784,17 @@ mod tests {
             .expect("drop schema");
         TEST_CLOCK_MS.store(0, std::sync::atomic::Ordering::SeqCst);
         result.expect("live lease expiry fence");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_interval_skips_initial_tick_at_t_zero() {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        interval.tick().await;
+        let start = std::time::Instant::now();
+        interval.tick().await;
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(35),
+            "second tick must wait for the interval duration, not complete immediately"
+        );
     }
 }
