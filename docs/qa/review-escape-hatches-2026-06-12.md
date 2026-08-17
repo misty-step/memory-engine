@@ -1,6 +1,5 @@
 # Review escape hatches QA receipt
 
-Refs-Powder: memory-engine-052
 
 Date: 2026-06-12
 

@@ -1,9 +1,5 @@
 # Evals And Benchmarks
 
-Refs-Powder: memory-engine-020
-Refs-Powder: memory-engine-050
-Refs-Powder: memory-engine-051
-Refs-Powder: memory-engine-052
 
 Scry's Rust engine uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI

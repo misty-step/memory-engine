@@ -217,13 +217,11 @@ impl AccountRegistry {
         let Some(store_path) = self.waitlist_store_path() else {
             return false;
         };
-        crate::waitlist::list(&store_path)
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .any(|entry| entry.email == email && entry.invited_at_ms.is_some())
-            })
-            .unwrap_or(false)
+        crate::waitlist::list(&store_path).is_ok_and(|entries| {
+            entries
+                .into_iter()
+                .any(|entry| entry.email == email && entry.invited_at_ms.is_some())
+        })
     }
 
     /// Join the invite-beta waitlist.

@@ -1,6 +1,5 @@
 # Anti-question Memorization QA
 
-Refs-Powder: memory-engine-054
 
 ## Scope
 

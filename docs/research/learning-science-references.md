@@ -4,15 +4,6 @@ This note captures research inputs for `memory-engine` API and dogfood-client
 design. It is a local reference pack, not a literature review claim of
 exhaustiveness.
 
-Refs-Powder: memory-engine-020
-Refs-Powder: memory-engine-021
-Refs-Powder: memory-engine-022
-Refs-Powder: memory-engine-023
-Refs-Powder: memory-engine-026
-Refs-Powder: memory-engine-027
-Refs-Powder: memory-engine-028
-Refs-Powder: memory-engine-029
-Refs-Powder: memory-engine-031
 
 ## Core Findings
 
@@ -131,7 +122,7 @@ queue behavior.
 
 ## Evidence Matrix
 
-This matrix is the durable design context for Powder shaping. It does not make
+This matrix is the durable design context for GitHub issue shaping. It does not make
 every finding a kernel feature. It records what the product should test before
 promoting new API surface.
 

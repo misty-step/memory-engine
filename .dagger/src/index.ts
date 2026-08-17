@@ -23,24 +23,16 @@ const POSTGRES_IMAGE = 'postgres:17-alpine';
 const POSTGRES_TEST_URL = 'postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable';
 const RUST_IMAGE = 'rust:1.94-bookworm';
 const SOURCE_EXCLUDES = ['.git/', '.tmp/', 'target/'];
-const SOURCE_EXCLUDES_WITH_GIT = ['.tmp/', 'target/'];
 
 function ciSource(source: Directory): Directory {
   return source.filter({ gitignore: true, exclude: SOURCE_EXCLUDES });
 }
 
-function rustSource(source: Directory, includeGit = false): Directory {
-  const excludes = includeGit
-    ? SOURCE_EXCLUDES.filter((path) => path !== '.git/')
-    : SOURCE_EXCLUDES;
-  return source.filter({ gitignore: true, exclude: excludes });
-}
-
-function rustContainer(source: Directory, includeGit = false): Container {
+function rustContainer(source: Directory): Container {
   return dag
     .container()
     .from(RUST_IMAGE)
-    .withMountedDirectory('/src', rustSource(source, includeGit))
+    .withMountedDirectory('/src', ciSource(source))
     .withMountedCache('/usr/local/cargo/registry', dag.cacheVolume('memory-engine-cargo-registry'))
     .withMountedCache('/usr/local/cargo/git', dag.cacheVolume('memory-engine-cargo-git'))
     .withMountedCache('/cargo-target', dag.cacheVolume('memory-engine-cargo-target'), {
@@ -119,17 +111,13 @@ export class MemoryEngine {
    */
   @func()
   async actionLatencyPostgres(
-    @argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory,
+    @argument({ ignore: SOURCE_EXCLUDES }) source: Directory,
+    gitSha: string,
   ): Promise<Directory> {
-    return rustContainer(source, true)
+    return rustContainer(source)
       .withServiceBinding('postgres', postgresService())
       .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
-      .withEnvVariable(
-        'MEMORY_ENGINE_PERF_GIT_SHA',
-        // Prefer the mounted checkout HEAD; fall back is handled in-process.
-        // Hosted CI also injects GITHUB_SHA into the outer job environment.
-        process.env.GITHUB_SHA ?? '',
-      )
+      .withEnvVariable('MEMORY_ENGINE_PERF_GIT_SHA', gitSha)
       .withExec([
         'bash',
         '-c',
@@ -180,13 +168,14 @@ export class MemoryEngine {
    * Returns a concatenated log on success.
    */
   @func()
-  async check(@argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory): Promise<string> {
-    // Keep .git available for action-latency receipts (git_sha). Other gates
-    // re-filter via rustSource/ciSource and drop .git themselves.
+  async check(
+    @argument({ ignore: SOURCE_EXCLUDES }) source: Directory,
+    gitSha: string,
+  ): Promise<string> {
     const browserContract = await this.browserContract(source);
     const rustFmt = await this.rustFmt(source);
     const rustTest = await this.rustTest(source);
-    const actionLatencyArtifact = await this.actionLatencyPostgres(source);
+    const actionLatencyArtifact = await this.actionLatencyPostgres(source, gitSha);
     const actionLatencyReceipt = await actionLatencyArtifact
       .file('action-latency-postgres.json')
       .contents();

@@ -1,7 +1,5 @@
 # Architecture Workbench
 
-Refs-Powder: memory-engine-016
-
 This folder is the repo-local system visualization workbench for Scry.
 It is intentionally static and diffable:
 
@@ -22,7 +20,7 @@ limits are recorded in [`../fleet-onboarding.md`](../fleet-onboarding.md).
 3. For every node/edge change, update all of:
    - `viewTags` for relevant views;
    - `summary` text that describes invariant intent;
-   - `refs` pointing to concrete source/test/doc/Powder evidence.
+   - `refs` pointing to concrete source, test, documentation, or GitHub Issue evidence.
 4. Run a local parse/smoke check:
    - `python3 -m json.tool docs/architecture/memory-engine.map.json >/dev/null`
    - `test -f docs/architecture/workbench.html`

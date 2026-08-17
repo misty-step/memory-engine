@@ -1,6 +1,5 @@
 # Learning Science Doctrine
 
-Refs-Powder: memory-engine-050
 
 This is the living bibliography for decisions that belong in
 `memory-engine` rather than in one client experiment. A principle is adopted

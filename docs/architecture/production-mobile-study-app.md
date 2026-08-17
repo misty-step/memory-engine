@@ -262,7 +262,7 @@ from this repo alone without the session transcript.
 
 ## Oracle (Definition of Done)
 
-- [x] Powder card `memory-engine-040` records the production-app acceptance
+- [x] Legacy work item `memory-engine-040` records the production-app acceptance
   oracle.
 - [x] ADR records Fly Machines + managed Postgres as the chosen production
   shell and rejects Vercel as the backend.
@@ -283,7 +283,7 @@ from this repo alone without the session transcript.
 
 - Output: production mobile study app boundary, deploy config, QA evidence, and
   updated docs.
-- Acceptance oracle: context packet plus Powder card plus executable tests,
+- Acceptance oracle: context packet plus shaped issue plus executable tests,
   staging deployment smoke, and full CI.
 - Evidence artifacts: test output, Dagger output, staging URL, screenshots,
   `/state` or API receipts, and deploy command output.
@@ -306,7 +306,7 @@ from this repo alone without the session transcript.
 
 - Acceptance source: this context packet, `SPEC.md`,
   `docs/beta/extract-beta-app-readiness.md`, `docs/beta/mobile-study.md`,
-  `docs/qa/quality-register.md`, and the future Powder card.
+  `docs/qa/quality-register.md`, and a future GitHub issue.
 - Evidence that proves it: implementation tests, browser/mobile screenshots,
   deployed smoke, and Dagger output.
 - Exact command/path/route exercised:

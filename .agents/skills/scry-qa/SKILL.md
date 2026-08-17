@@ -3,8 +3,8 @@ name: scry-qa
 description: |
   QA Scry changes by exercising the real running surface, not just tests.
   Scry is a Rust workspace: a framework-free learning kernel + facade
-  library, an HTTP API/server-rendered study UI (memory-engine-api, deployed to
-  DigitalOcean App Platform), model-backed generation, and dogfood clients.
+  library, a native Rust `memory-engine-api` process on the isolated public
+  application host, model-backed generation, and dogfood clients.
   "Tests pass" is not QA.
   Use when: "QA this", "verify the feature", "smoke test", "check the app",
   "test Scry". Trigger: /scry-qa.
@@ -97,13 +97,12 @@ cargo run -p memory-engine-qa -- --full     # handoff sweep; ends with bun run c
 ## Production smoke (optional)
 
 Branded production origin is `https://scry.study`. Mirror the deploy smoke
-(health/home/anonymous mutation boundary) per `docs/runbook.md`; e.g.
-`curl -fsS https://scry.study/healthz` → `{"status":"ok",...}`. The
-DigitalOcean App Platform origin `https://memory-engine-api-i2xcr.ondigitalocean.app`
-that `scry.study` fronts is still live and still the identity the deploy
-smoke checks directly, but treat it only as a labeled operator-origin
-fallback (e.g. while DNS for the branded domain is degraded), never as the
-default a client advertises.
+(health, readiness, home, and anonymous mutation boundary) from
+`docs/runbook.md`; for example,
+`curl -fsS https://scry.study/readyz` must report `{"status":"ready",...}`.
+There is no provider-origin fallback. A successful production check must use
+the branded origin and confirm the native `scry.service` process is active on
+the public application host.
 
 ## Gotchas
 
@@ -124,4 +123,4 @@ default a client advertises.
 Return: **verdict** (PASS / FAIL / UNVERIFIED) · exact commands run · surfaces
 exercised (machinery vs live API/UI vs generation brain) · artifacts inspected ·
 what was NOT covered (e.g. "fixtures only — no live generation") and whether a
-post-ship signal (DigitalOcean smoke, Canary) exists.
+post-ship signal (public-host smoke, Canary) exists.

@@ -1,6 +1,5 @@
 # Service Prototype Notes
 
-Refs-Powder: memory-engine-015
 
 ## Current Shape
 

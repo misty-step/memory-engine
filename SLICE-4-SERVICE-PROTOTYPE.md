@@ -42,5 +42,5 @@ dependencies, storage clients, logging, auth, or deployment concerns into
 - service contract tests pin the first command surface
 - persistence-boundary tests prove storage is outside the kernel
 - README and SPEC describe the new direction
-- Powder card `memory-engine-015` names extraction criteria and non-goals
+- Legacy work item `memory-engine-015` named extraction criteria and non-goals
 - `bun run ci` remains green

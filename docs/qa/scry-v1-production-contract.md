@@ -1,6 +1,6 @@
 # QA receipt - Scry v1 production contract
 
-Date: 2026-06-12. Powder card: memory-engine-049.
+Date: 2026-06-12. Legacy work item: memory-engine-049.
 Production: `https://memory-engine-api.fly.dev`.
 
 ## Live Verification

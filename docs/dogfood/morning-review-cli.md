@@ -1,6 +1,5 @@
 # Morning Review CLI Dogfood
 
-Refs-Powder: memory-engine-070
 
 ## Purpose
 

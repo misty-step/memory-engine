@@ -1647,8 +1647,7 @@ fn nonzero_timestamp(value: i64) -> Option<i64> {
 
 fn scheduler_enabled() -> bool {
     std::env::var("MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_ENABLED")
-        .map(|value| value.trim() != "false")
-        .unwrap_or(true)
+        .map_or(true, |value| value.trim() != "false")
 }
 
 fn scheduler_interval_ms() -> u64 {
@@ -2522,7 +2521,7 @@ pub fn start_health_reporting_loop() {
     std::thread::Builder::new()
         .name("canary-health".to_owned())
         .spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_mins(1));
             report_health_check_in();
         })
         .ok();
@@ -3772,11 +3771,10 @@ mod tests {
             .read_dir()
             .expect("api session rows")
             .flatten()
-            .all(
-                |entry| std::fs::read_to_string(entry.path().join("session"))
-                    .map(|body| !body.contains(&first.session_token))
-                    .unwrap_or(true)
-            ));
+            .all(|entry| {
+                std::fs::read_to_string(entry.path().join("session"))
+                    .map_or(true, |body| !body.contains(&first.session_token))
+            }));
         NOW.store(
             now() + app_session_max_age_ms() + 1,
             std::sync::atomic::Ordering::SeqCst,

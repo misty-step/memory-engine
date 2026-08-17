@@ -75,11 +75,10 @@ fn concept(
     trend: &str,
     summary_text: &str,
 ) -> BetaStudyConceptProgress {
-    let pct = if attempts > 0 {
-        correct * 100 / attempts
-    } else {
-        0
-    };
+    let pct = correct
+        .saturating_mul(100)
+        .checked_div(attempts)
+        .unwrap_or(0);
     BetaStudyConceptProgress {
         concept_key: label.to_lowercase().replace([' ', ':'], "-"),
         concept_label: label.to_owned(),

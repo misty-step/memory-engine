@@ -1,6 +1,5 @@
 # Boundary Reshape Trigger Check
 
-Refs-Powder: memory-engine-036
 
 ## Purpose
 

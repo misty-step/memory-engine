@@ -58,7 +58,7 @@ static CONNECTION_POOLS: LazyLock<Mutex<BTreeMap<String, r2d2::Pool<PostgresConn
 const POOL_MAX_SIZE: u32 = 8;
 const POOL_MIN_IDLE: u32 = 1;
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
@@ -263,7 +263,7 @@ CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
 /// metadata, and drops the raw-token copies only after the replacement insert
 /// succeeds. A failed transaction leaves the legacy schema intact for retry.
 const SESSION_SCHEMA_MIGRATION_SQL: &str = r"
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;
 
 DO $$
 BEGIN
@@ -5524,6 +5524,7 @@ mod tests {
     fn migration_uses_account_scoped_primary_keys_and_durable_receipts() {
         let sql = migration_sql();
         let session_sql = super::SESSION_SCHEMA_MIGRATION_SQL;
+        assert!(session_sql.contains("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;"));
         let jobs_sql = generation_jobs_migration_sql();
 
         assert!(sql.contains("memory_engine_accounts"));

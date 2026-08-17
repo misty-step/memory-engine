@@ -1,7 +1,6 @@
 use std::process::{Command, Stdio};
 
-/// Mirrors `powder-mcp`'s `refuses_to_start_without_a_persistence_mode`: a
-/// stdio MCP server that silently picked an account, or silently ran against
+/// A stdio MCP server that silently picked an account, or silently ran against
 /// nothing, would leave an agent believing its study state persisted when it
 /// did not. Prove instead that running the binary with no credential path
 /// configured fails loudly before reading any stdin.

@@ -43,11 +43,12 @@ original 403/401 status and `text/html` content type.
 
 ## Not covered here
 
-This is a local receipt, not a production deployment. Production DNS/SPF/DKIM/
-DMARC verification and first-contact inbox placement remain the explicit human
-gate owned by card `memory-engine-056`; no claim is made for those criteria.
+This historical local receipt is not production proof. Current production
+DNS/SPF/DKIM/DMARC verification and first-contact inbox placement belong to
+GitHub issue [#98](https://github.com/misty-step/scry/issues/98); this receipt
+makes no claim for those criteria.
 
-A read-only probe of the current production deployment confirmed `/healthz` and
-`/` at 200, while the new manifest and icon paths are still 404. That is
-expected before this branch is merged and deployed; it is recorded so the
-production phone receipt is not misrepresented as complete.
+At capture time, a read-only production probe returned `200` for `/healthz` and
+`/`, while the then-new manifest and icon paths still returned `404`. That
+observation predates the corresponding deployment and is retained only to keep
+this phone receipt honest.

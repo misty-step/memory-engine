@@ -27,34 +27,10 @@
     {
       "id": "fleet-integration",
       "label": "Fleet Integration",
-      "description": "Current repo-owned evidence for Canary, Powder, Landmark, the project map, and Cerberus review."
+      "description": "Current repo-owned evidence for Canary, GitHub Issues, Landmark, the project map, and Cerberus review."
     }
   ],
   "nodes": [
-    {
-      "id": "node.powder.016",
-      "label": "Ticket 16 Workbench",
-      "kind": "powder",
-      "summary": "Defines this architecture workbench scope and acceptance criteria.",
-      "viewTags": ["architecture-boundary", "extraction-decision-map"],
-      "layout": {
-        "architecture-boundary": {
-          "x": 70,
-          "y": 60
-        },
-        "extraction-decision-map": {
-          "x": 70,
-          "y": 60
-        }
-      },
-      "refs": [
-        {
-          "kind": "powder",
-          "path": "memory-engine-016",
-          "label": "Powder card memory-engine-016"
-        }
-      ]
-    },
     {
       "id": "node.docs.architecture.workbench",
       "label": "Workbench Artifacts",
@@ -675,11 +651,6 @@
           "kind": "doc",
           "path": "docs/dogfood/extraction-decision.md",
           "label": "docs/dogfood/extraction-decision.md"
-        },
-        {
-          "kind": "powder",
-          "path": "memory-engine-024",
-          "label": "Powder card memory-engine-024 closure"
         }
       ]
     },
@@ -744,15 +715,15 @@
       ]
     },
     {
-      "id": "node.fleet.powder",
-      "label": "Powder Work Ledger",
-      "kind": "powder",
-      "summary": "Powder is the sole durable work ledger; no retired backlog.d importer is kept here.",
+      "id": "node.fleet.github-issues",
+      "label": "GitHub Issues Work Ledger",
+      "kind": "issue",
+      "summary": "GitHub Issues is the sole active work ledger; no repository-local backlog or second tracker is kept.",
       "viewTags": ["fleet-integration"],
       "layout": {"fleet-integration": {"x": 280, "y": 360}},
       "refs": [
         {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
-        {"kind": "powder", "path": "memory-engine-067", "label": "onboarding card"}
+        {"kind": "issue", "path": "https://github.com/misty-step/scry/issues", "label": "active issue queue"}
       ]
     },
     {
@@ -769,22 +740,6 @@
     }
   ],
   "edges": [
-    {
-      "id": "edge.backlog16.owns.workbench",
-      "from": "node.powder.016",
-      "to": "node.docs.architecture.workbench",
-      "label": "Defines artifact scope",
-      "kind": "defines",
-      "summary": "Ticket acceptance explicitly requires map JSON and interactive HTML workbench.",
-      "viewTags": ["architecture-boundary", "extraction-decision-map"],
-      "refs": [
-        {
-          "kind": "powder",
-          "path": "memory-engine-016",
-          "label": "Powder card memory-engine-016 oracle"
-        }
-      ]
-    },
     {
       "id": "edge.exports.publish.kernel",
       "from": "node.package.exports",
@@ -1329,14 +1284,7 @@
       "label": "Decision aid",
       "kind": "supports",
       "summary": "Workbench visualizes boundaries and evidence used during extraction decisions.",
-      "viewTags": ["extraction-decision-map"],
-      "refs": [
-        {
-          "kind": "powder",
-          "path": "memory-engine-016",
-          "label": "Powder card memory-engine-016"
-        }
-      ]
+      "viewTags": ["extraction-decision-map"]
     },
     {
       "id": "edge.fleet.landmark-to-map",

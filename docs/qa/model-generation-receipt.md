@@ -1,6 +1,6 @@
 # QA receipt — model-backed generation on arbitrary prose
 
-Date: 2026-06-11. Powder card: memory-engine-043.
+Date: 2026-06-11. Legacy work item: memory-engine-043.
 
 Live walk of the running `memory-engine-api` binary (file store) with
 `OPENROUTER_API_KEY` set, default model `google/gemini-3.5-flash`.

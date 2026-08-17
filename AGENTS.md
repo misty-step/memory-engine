@@ -15,13 +15,13 @@ product contract.
   only; there is no OAuth path. Machine faces use operator-gated service sessions.
   Subscription is intended; public signup waits for bounded costs, privacy,
   reliability, and Stripe proof.
-- The current production proof surface is the Rust `memory-engine-api` application
-  on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the
-  product domain.
+- The current production proof surface is the native Rust `memory-engine-api`
+  process on Misty Step's isolated DigitalOcean public application host,
+  backed by Neon Postgres and served at `https://scry.study`.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
-  `MEMORY_ENGINE_*` environment variables still carry the old name. Renaming
-  each one crosses a storage, network, or deployment boundary, so they are
-  tracked as separate Powder work rather than treated as an oversight.
+  `MEMORY_ENGINE_*` environment variables deliberately retain the old name.
+  Do not rename a storage, network, deployment, or compatibility boundary
+  without a shaped GitHub issue and migration proof.
 
 ## Stack & Boundaries
 
@@ -55,8 +55,8 @@ promotion.
   `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
-- Powder is the sole work ledger: cards hold active work, closure, relations,
-  and proof. Git history holds archived source history.
+- GitHub Issues is the sole work ledger: issues hold shaped work, status,
+  relations, proof, and closure. Git history holds archived source history.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
   consumer-facing Rust facade and module exports.
@@ -86,7 +86,7 @@ oracle.
 
 1. One ticket, one branch, one PR. Branch from `master`; use `cx/...` by
    default.
-2. Do not implement feature work without an active shaped Powder card.
+2. Do not implement feature work without an active shaped GitHub issue.
 3. TDD is the default — test behavior, not implementation; do not mock
    repo-owned pure collaborators (see Conventions for the full statement).
 4. Core is pure: no Convex, React, Hono, Node/Bun APIs, filesystem,
@@ -138,7 +138,7 @@ oracle.
   import, benchmark, and QA tooling.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
-- Powder — shaped tickets, claims, closure, and proof for `/deliver`.
+- GitHub Issues — shaped work, assignment, status, relations, proof, and closure.
 - `SPEC.md` / `docs/rust-migration.md` — technical strategy and cutover context;
   `VISION.md` governs product positioning.
 
@@ -159,11 +159,15 @@ oracle.
 
 ## Work Lifecycle
 
-Powder is authoritative. Claim the shaped card before implementation; record
-status, proof links, and completion on that card. Use `Refs-Powder:` trailers
-when a Git commit needs ticket attribution. `/deliver` stops at merge-ready;
-`/ship` records the landed commit and completion proof in Powder, then invokes
-bounded `/reflect`. `/groom` always reconciles Powder before strategy.
+GitHub Issues is authoritative. `status:backlog` is groomed but not claimable;
+`status:ready` has executable acceptance and proof with no unresolved blocker;
+`status:blocked` names an external dependency. Assign the issue and apply
+`status:in-progress` before implementation; record progress and proof as issue
+comments. Use `Refs #<issue>` in commits and pull requests. Use
+`Closes #<issue>` only when the merge satisfies every acceptance criterion and
+no post-merge proof remains. `/deliver` stops at merge-ready; `/ship` links the
+landed commit and production proof, then closes the issue and invokes bounded
+`/reflect`. `/groom` reconciles open GitHub issues before strategy.
 
 ## Known Debt
 

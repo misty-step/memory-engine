@@ -1,6 +1,6 @@
 # QA 074 — Honest browser response time before grading (2026-07-09)
 
-Ticket: Powder `memory-engine-074`. The rendered review form used to post a
+Legacy work item: `memory-engine-074`. The rendered review form used to post a
 hard-coded `responseTimeMs=1800` for every answer, so every mature correct
 answer looked like fast recall and rated `Easy` (the rating policy treats a
 correct answer with `prior_reps >= 3` at or under 4 000 ms as `Easy`). This
@@ -92,7 +92,7 @@ are usable for later response-time analysis.
 ## Gates
 
 - `bun run ci` (fmt, workspace tests, clippy `-D warnings`, rustdoc): green.
-- `bun run ci:full`: recorded in the delivery evidence on the Powder card.
+- `bun run ci:full`: recorded in the delivery evidence.
 
 ## Residual
 

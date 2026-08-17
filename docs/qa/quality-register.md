@@ -1,9 +1,8 @@
 # Quality Improvement Register
 
-Refs-Powder: memory-engine-025
 
 This register records quality opportunities found by QA. These are not all
-bugs. Create a Powder card when an item becomes necessary for delivery,
+bugs. Create a GitHub issue when an item becomes necessary for delivery,
 beta/product proof, or a shaped extraction decision.
 
 ## Active Opportunities
