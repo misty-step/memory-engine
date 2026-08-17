@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+base="${SCRY_BASE_URL:-https://scry.study}"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+status="$(curl -fsS --max-time 20 -o "$tmp_dir/healthz" -w '%{http_code}' "$base/healthz")"
+test "$status" = 200
+grep -q '"status":"ok"' "$tmp_dir/healthz"
+
+status="$(curl -fsS --max-time 20 -o "$tmp_dir/readyz" -w '%{http_code}' "$base/readyz")"
+test "$status" = 200
+grep -q '"status":"ready"' "$tmp_dir/readyz"
+
+status="$(curl -fsS --max-time 20 -o "$tmp_dir/home" -w '%{http_code}' "$base/")"
+test "$status" = 200
+
+status="$(curl -sS --max-time 20 -o "$tmp_dir/anonymous" -w '%{http_code}' \
+  -X POST "$base/v1/accounts/smoke-anonymous/sources/smoke-source/generation-jobs")"
+test "$status" = 401
+
+printf 'Scry production smoke passed: %s\n' "$base"

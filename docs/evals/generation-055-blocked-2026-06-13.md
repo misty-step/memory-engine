@@ -70,16 +70,12 @@ curl -fsS --max-time 20 \
   "$base/v1/accounts"
 ```
 
-Result: HTTP 403, so no production generation latency number was recorded.
-The deployed v1 account-creation path is allowlist-protected; an allowlisted
-account/session token or a production-safe latency harness is required before
-this ticket can close.
+Result: HTTP 403; no production generation latency number was recorded. The
+deployed account-creation path was allowlist-protected, and this shell did not
+have an approved account or session credential.
 
-The runbook has been corrected to require `MEMORY_ENGINE_ACCOUNT_ID` and
-`MEMORY_ENGINE_SESSION_TOKEN` instead of creating a throwaway production
-account. This shell did not have those credentials exported, so no production
-latency receipt was generated.
-
-Current status: blocked. Infrastructure and evidence from this branch may land,
-but do not archive legacy work item memory-engine-055 or claim the ticket is shipped until both
-required evidence gates are satisfied.
+This file preserves historical negative evidence. The 2026-08-16 grooming pass
+retired legacy work item `memory-engine-055` rather than migrating its stale
+gate. GitHub issue
+[#106](https://github.com/misty-step/scry/issues/106) owns current end-to-end
+generation quality and cost proof. This receipt is not an active work item.

@@ -54,7 +54,7 @@ Boundary crates own orchestration, persistence, source ingestion, generation pro
 
 ## Current Production Surface
 
-The current production proof surface is the Rust `memory-engine-api` application on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the Scry product domain. Its deployment, auth, storage, rollback, and smoke contract live in `docs/runbook.md`. This document describes the product; the runbook and executable QA documents provide operational proof.
+The current production proof surface is the native Rust `memory-engine-api` process on Misty Step's isolated DigitalOcean public application host, backed by Neon Postgres and served at `https://scry.study`. Its deployment, auth, storage, rollback, and smoke contract live in `docs/runbook.md`. This document describes the product; the runbook and executable QA documents provide operational proof.
 
 ## Proof Bar
 

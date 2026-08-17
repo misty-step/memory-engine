@@ -28,10 +28,11 @@ crates. The kernel owns deterministic scheduling, grading, progression, queue
 selection, and learning invariants. Boundary crates own persistence, generation,
 sessions, identity, API routes, rendering, deployment, and QA.
 
-The current production proof surface is the Rust `memory-engine-api` application on
-DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the Scry
-product domain. Deployment, environment, auth, storage, rollback, and smoke-test
-details live in [docs/runbook.md](./docs/runbook.md).
+The current production proof surface is the native Rust `memory-engine-api`
+process on Misty Step's isolated DigitalOcean public application host, backed
+by Neon Postgres and served at `https://scry.study`. Deployment, environment,
+auth, storage, rollback, and smoke-test details live in
+[docs/runbook.md](./docs/runbook.md).
 
 ## What It Owns
 
@@ -66,10 +67,11 @@ The Rust migration is complete for the main runtime:
 - service, persistence, generation, study, and local HTTP app hosts
 - Rust QA and benchmark receipt runners
 
-The sole current production dogfood surface is `memory-engine-api`, the Rust
-binary on DigitalOcean App Platform backed by Neon Postgres. It serves the Scry
-product domain `scry.study`. Agent-facing deployment, environment, auth, storage,
-rollback, and smoke-test details live in [docs/runbook.md](./docs/runbook.md).
+The sole current production dogfood surface is the native
+`memory-engine-api` process on the isolated public application host, backed by
+Neon Postgres and served at `https://scry.study`. Agent-facing deployment,
+environment, auth, storage, rollback, and smoke-test details live in
+[docs/runbook.md](./docs/runbook.md).
 
 Current strategy and verification docs:
 

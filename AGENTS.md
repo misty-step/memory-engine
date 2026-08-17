@@ -15,9 +15,9 @@ product contract.
   only; there is no OAuth path. Machine faces use operator-gated service sessions.
   Subscription is intended; public signup waits for bounded costs, privacy,
   reliability, and Stripe proof.
-- The current production proof surface is the Rust `memory-engine-api` application
-  on DigitalOcean App Platform backed by Neon Postgres, with `scry.study` as the
-  product domain.
+- The current production proof surface is the native Rust `memory-engine-api`
+  process on Misty Step's isolated DigitalOcean public application host,
+  backed by Neon Postgres and served at `https://scry.study`.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
   `MEMORY_ENGINE_*` environment variables deliberately retain the old name.
   Do not rename a storage, network, deployment, or compatibility boundary

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       head_sha:
-        description: Full commit SHA of the final card061 commit on origin/master
+        description: Full commit SHA of the reviewed issue #98 proof commit on origin/master
         required: true
         type: string
       pull_request_number:
@@ -58,7 +58,7 @@ jobs:
           test "$HEAD_SHA" = "$(git rev-parse refs/remotes/origin/master)"
           git cat-file -e "$HEAD_SHA^{commit}"
           git cat-file -e "$HEAD_SHA^1"
-          echo "validated exact origin/master card061 target $HEAD_SHA"
+          echo "validated exact origin/master reviewed proof target $HEAD_SHA for issue #98"
 
       - name: Verify protected-master gates passed on the evaluated commit
         env:

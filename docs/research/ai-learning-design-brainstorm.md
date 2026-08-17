@@ -177,7 +177,10 @@ Build an eval where agents are graded on tool use and pedagogy:
 - did it produce schema-valid commands?
 - did it update schedule only after a real attempt?
 
-## Candidate GitHub Issues
+## Archived experiment sketches
+
+These pre-Rust sketches are historical research context, not active GitHub
+Issues. Dependency slugs below preserve the planning record only.
 
 ### AI Content Compiler Experiment
 

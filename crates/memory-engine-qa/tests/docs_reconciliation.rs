@@ -103,6 +103,170 @@ fn agent_docs_match_post_cutover_contract() {
 }
 
 #[test]
+fn current_product_docs_keep_the_native_host_contract() {
+    for relative in [
+        "AGENTS.md",
+        "README.md",
+        "VISION.md",
+        "docs/runbook.md",
+        ".agents/skills/scry-qa/SKILL.md",
+    ] {
+        let text = read_repo_file(relative);
+        assert!(
+            text.contains("native Rust `memory-engine-api`"),
+            "{relative} must name the native production runtime"
+        );
+        let lower = text.to_ascii_lowercase();
+        for retired_surface in [
+            "digitalocean app platform",
+            "memory-engine-api-i2xcr.ondigitalocean.app",
+            "5ab05b73-9265-43c9-a01c-fef53f5f46a4",
+            "encrypted app platform",
+            "digitalocean app spec",
+            "baked\ninto the image",
+        ] {
+            assert!(
+                !lower.contains(retired_surface),
+                "{relative} retains retired runtime surface `{retired_surface}`"
+            );
+        }
+    }
+
+    let runbook = read_repo_file("docs/runbook.md");
+    assert_contains_all(
+        "docs/runbook.md",
+        &runbook,
+        &[
+            "systemd unit `scry.service`",
+            "/opt/public-apps/scry/releases/<git-commit>",
+            "/opt/public-apps/scry/current",
+            "/etc/public-apps/scry.env",
+            "ln -sfn \"$root/current/bin/send-magic-link\" /usr/local/bin/send-magic-link",
+            "## Deployed smoke",
+            "base=\"https://scry.study\"",
+            "curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w \"%{http_code}\" \"$base/healthz\"",
+            "curl -fsS --max-time 15 -o /tmp/memory-engine-readyz -w \"%{http_code}\" \"$base/readyz\"",
+            "curl -fsS --max-time 15 -o /tmp/memory-engine-home -w \"%{http_code}\" \"$base/\"",
+            "curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w \"%{http_code}\" -X POST \"$base/app/generate\"",
+            "case \"$status\" in 4??)",
+        ],
+    );
+    let fetch = runbook
+        .find("git fetch --quiet origin master")
+        .expect("runbook fetches the protected remote tip");
+    let protected_tip_gate = runbook
+        .find("test \"$release\" = \"$(git rev-parse refs/remotes/origin/master)\"")
+        .expect("runbook rejects an unreviewed local master commit");
+    let build = runbook
+        .find("cargo build --release --locked")
+        .expect("runbook builds a release");
+    let upload = runbook
+        .find("scp \"$archive\"")
+        .expect("runbook uploads a release");
+    assert!(
+        fetch < protected_tip_gate && protected_tip_gate < build && build < upload,
+        "protected-tip verification must run before build and upload"
+    );
+    assert_eq!(
+        runbook.matches("./bin/smoke-production").count(),
+        2,
+        "deploy and rollback must invoke the same complete production smoke"
+    );
+    assert!(
+        !runbook.contains("memory-engine-097"),
+        "current runbook must not assign work to a retired legacy card"
+    );
+    assert!(
+        !repo_root().join(".github/workflows/deploy.yml").exists(),
+        "the retired provider deploy workflow must not be restored"
+    );
+    assert!(
+        !repo_root().join("fly.toml").exists(),
+        "the retired provider manifest must not remain a runnable rollback path"
+    );
+    for (workflow, text) in github_workflows() {
+        for retired_surface in ["flyctl", "FLY_API_TOKEN", "memory-engine-api.fly.dev"] {
+            assert!(
+                !text.contains(retired_surface),
+                ".github/workflows/{workflow} restores retired provider surface `{retired_surface}`"
+            );
+        }
+    }
+    let smoke = read_repo_file("bin/smoke-production");
+    assert_contains_all(
+        "bin/smoke-production",
+        &smoke,
+        &[
+            "\"$base/healthz\"",
+            "\"$base/readyz\"",
+            "\"$base/\"",
+            "\"$base/v1/accounts/smoke-anonymous/sources/smoke-source/generation-jobs\"",
+            "test \"$status\" = 401",
+        ],
+    );
+}
+
+#[test]
+fn historical_planning_docs_do_not_assign_retired_work() {
+    let generation = read_repo_file("docs/evals/generation-055-blocked-2026-06-13.md");
+    assert!(
+        generation.contains("historical negative evidence")
+            && !generation.contains("Current status: blocked"),
+        "retired generation receipt must not remain an active ticket"
+    );
+
+    let reminders = read_repo_file("docs/qa/097-scheduled-return-reminders-2026-07-15.md");
+    assert!(
+        reminders.contains("historical implementation evidence")
+            && !reminders.contains("Card092 remains open"),
+        "retired reminder receipt must not assign active legacy-card work"
+    );
+
+    let recovery = read_repo_file("docs/qa/092-return-recovery-2026-07-15.md");
+    assert!(
+        recovery.contains("historical local receipt")
+            && recovery.contains("https://github.com/misty-step/scry/issues/98")
+            && !recovery.contains("memory-engine-056"),
+        "return-recovery receipt must route current proof to GitHub issue #98"
+    );
+
+    let brainstorm = read_repo_file("docs/research/ai-learning-design-brainstorm.md");
+    assert!(
+        brainstorm.contains("## Archived experiment sketches")
+            && !brainstorm.contains("## Candidate GitHub Issues"),
+        "historical research sketches must not masquerade as active GitHub issues"
+    );
+}
+
+#[test]
+fn live_generation_lane_uses_github_issue_ownership() {
+    let lane = read_repo_file("docs/evals/generation-061-live-lane.md");
+    assert!(
+        lane.contains("https://github.com/misty-step/scry/issues/98"),
+        "live-generation proof must link its owning GitHub issue"
+    );
+
+    let workflow = read_repo_file(".github/workflows/generation-061-live.yml");
+    assert!(
+        workflow.contains("issue #98") && workflow.contains("reviewed proof target"),
+        "live workflow must name the GitHub issue and reviewed proof target"
+    );
+
+    for retired_reference in ["card061", "memory-engine-061", "Card 098"] {
+        assert!(
+            !lane.contains(retired_reference),
+            "live-generation lane retains legacy tracker reference `{retired_reference}`"
+        );
+    }
+    for retired_reference in ["card061", "Card 098"] {
+        assert!(
+            !workflow.contains(retired_reference),
+            "live workflow retains legacy tracker reference `{retired_reference}`"
+        );
+    }
+}
+
+#[test]
 fn shaped_issue_form_requires_exact_work_metadata_and_proof_fields() {
     let relative = ".github/ISSUE_TEMPLATE/work.yml";
     let template: serde_yaml::Value =
@@ -188,6 +352,40 @@ fn hosted_ci_passes_commit_sha_to_every_latency_receipt() {
             "dagger call action-latency-postgres --source=. --git-sha=\"$GITHUB_SHA\" export",
         ],
     );
+
+    let workflow_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&workflow).expect("parse hosted CI workflow");
+    assert_eq!(
+        workflow_yaml["permissions"]["contents"].as_str(),
+        Some("read"),
+        "hosted CI must grant only explicit read access to repository contents"
+    );
+    let checkout = workflow_yaml["jobs"]["ci"]["steps"]
+        .as_sequence()
+        .expect("hosted CI steps")
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("checkout step");
+    assert_eq!(
+        checkout["with"]["persist-credentials"].as_bool(),
+        Some(false),
+        "PR-controlled commands must not receive the checkout credential"
+    );
+}
+
+#[test]
+fn action_latency_pr_code_cannot_read_checkout_git_metadata() {
+    let dagger = read_repo_file(".dagger/src/index.ts");
+    assert!(
+        !dagger.contains("SOURCE_EXCLUDES_WITH_GIT")
+            && !dagger.contains("rustContainer(source, true)")
+            && !dagger.contains("includeGit"),
+        "PR-controlled latency code must not receive checkout Git metadata"
+    );
 }
 
 #[test]
@@ -253,52 +451,6 @@ fn readme_quickstart_points_to_current_rust_and_deployed_surface() {
     assert!(
         !readme.contains("Roadmap and shaping docs"),
         "README must not present historical slice packets as the active roadmap"
-    );
-}
-
-#[test]
-fn runbook_contains_reproducible_digitalocean_smoke_commands() {
-    let runbook = read_repo_file("docs/runbook.md");
-
-    assert_contains_all(
-        "docs/runbook.md",
-        &runbook,
-        &[
-            "App: `memory-engine-api`",
-            "Platform: DigitalOcean App Platform",
-            "direct origin `https://memory-engine-api-i2xcr.ondigitalocean.app`",
-            "MEMORY_ENGINE_POSTGRES_URL",
-            "MEMORY_ENGINE_ENABLE_FILE_STORE=true",
-            "MEMORY_ENGINE_AUTH_ALLOWED_EMAILS",
-            "do-connecting-ip",
-            "## Deployed smoke",
-            "base=\"https://scry.study\"",
-            "curl -fsS --max-time 15 -o /tmp/memory-engine-healthz -w \"%{http_code}\" \"$base/healthz\"",
-            "curl -fsS --max-time 15 -o /tmp/memory-engine-home -w \"%{http_code}\" \"$base/\"",
-            "curl -fsS --max-time 15 -o /tmp/memory-engine-auth-boundary -w \"%{http_code}\" -X POST \"$base/app/generate\"",
-            "case \"$status\" in 4??)",
-        ],
-    );
-
-    assert!(
-        !repo_root().join(".github/workflows/deploy.yml").exists(),
-        "the retired provider deploy workflow must not be restored after the DigitalOcean cutover"
-    );
-    assert!(
-        !repo_root().join("fly.toml").exists(),
-        "the retired provider manifest must not remain a runnable rollback path"
-    );
-    for (workflow, text) in github_workflows() {
-        for retired_surface in ["flyctl", "FLY_API_TOKEN", "memory-engine-api.fly.dev"] {
-            assert!(
-                !text.contains(retired_surface),
-                ".github/workflows/{workflow} restores retired Fly surface `{retired_surface}`"
-            );
-        }
-    }
-    assert!(
-        !runbook.contains("still deployed by CI on every push"),
-        "the runbook must not advertise the retired provider as a live deployment target"
     );
 }
 

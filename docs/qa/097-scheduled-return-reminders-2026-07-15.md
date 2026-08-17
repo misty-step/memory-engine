@@ -1,4 +1,4 @@
-# Card 097 scheduled return reminders QA receipt
+# Legacy Card 097 scheduled return reminders QA receipt
 
 Date: 2026-07-15  
 Branch: `cx/097-scheduled-reminders`  
@@ -8,12 +8,12 @@ Draft PR: [#57](https://github.com/misty-step/memory-engine/pull/57)
 
 ## Contract exercised
 
-The production scheduler is an owned background task. It enumerates only
-enabled, due, retry-ready accounts without an unexpired claim, claims through
-the file or Postgres adapter, and sends the signed card092 retry envelope with
-the persisted delivery key. A successful completion samples the clock after
-the provider returns; failures release with a post-provider retry timestamp.
-The file outbox enforces the same delivery-key uniqueness while holding the
+The scheduler implementation used an owned background task. It enumerated only
+enabled, due, retry-ready accounts without an unexpired claim, claimed through
+the file or Postgres adapter, and sent the persisted retry envelope with its
+delivery key. A successful completion sampled the clock after the provider
+returned; failures released with a post-provider retry timestamp. The file
+outbox enforced the same delivery-key uniqueness while holding the
 descriptor-owned nonblocking libc lock.
 
 The operator-only manual endpoint is:
@@ -59,7 +59,8 @@ start or mutate a send. `GET /healthz` returns `status: "ok"`,
 
 ## Residuals
 
-This is merge-ready but intentionally not merged or marked complete. Production
-scheduled-reminder evidence awaits deployment. Card092 remains open
-for child056 real inbox deliverability; its merged/deployed proof and the
-097 relation was recorded in the legacy ledger.
+This historical implementation evidence predates merge and deployment.
+Production scheduled-reminder delivery was not captured. The 2026-08-16
+grooming pass retired the reminder card rather than migrating it. GitHub issue
+[#98](https://github.com/misty-step/scry/issues/98) owns the current,
+narrower invite-link delivery proof; this receipt is not an active work item.

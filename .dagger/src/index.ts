@@ -23,24 +23,16 @@ const POSTGRES_IMAGE = 'postgres:17-alpine';
 const POSTGRES_TEST_URL = 'postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable';
 const RUST_IMAGE = 'rust:1.94-bookworm';
 const SOURCE_EXCLUDES = ['.git/', '.tmp/', 'target/'];
-const SOURCE_EXCLUDES_WITH_GIT = ['.tmp/', 'target/'];
 
 function ciSource(source: Directory): Directory {
   return source.filter({ gitignore: true, exclude: SOURCE_EXCLUDES });
 }
 
-function rustSource(source: Directory, includeGit = false): Directory {
-  const excludes = includeGit
-    ? SOURCE_EXCLUDES.filter((path) => path !== '.git/')
-    : SOURCE_EXCLUDES;
-  return source.filter({ gitignore: true, exclude: excludes });
-}
-
-function rustContainer(source: Directory, includeGit = false): Container {
+function rustContainer(source: Directory): Container {
   return dag
     .container()
     .from(RUST_IMAGE)
-    .withMountedDirectory('/src', rustSource(source, includeGit))
+    .withMountedDirectory('/src', ciSource(source))
     .withMountedCache('/usr/local/cargo/registry', dag.cacheVolume('memory-engine-cargo-registry'))
     .withMountedCache('/usr/local/cargo/git', dag.cacheVolume('memory-engine-cargo-git'))
     .withMountedCache('/cargo-target', dag.cacheVolume('memory-engine-cargo-target'), {
@@ -119,10 +111,10 @@ export class MemoryEngine {
    */
   @func()
   async actionLatencyPostgres(
-    @argument({ ignore: SOURCE_EXCLUDES_WITH_GIT }) source: Directory,
+    @argument({ ignore: SOURCE_EXCLUDES }) source: Directory,
     gitSha: string,
   ): Promise<Directory> {
-    return rustContainer(source, true)
+    return rustContainer(source)
       .withServiceBinding('postgres', postgresService())
       .withEnvVariable('MEMORY_ENGINE_POSTGRES_TEST_URL', POSTGRES_TEST_URL)
       .withEnvVariable('MEMORY_ENGINE_PERF_GIT_SHA', gitSha)
