@@ -3271,4 +3271,3 @@ mod projected_choices_tests {
         );
     }
 }
-

@@ -390,11 +390,7 @@ fn multiple_choice_choices_shuffle_between_reviews_without_changing_answer() {
         );
         let mut session =
             BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
-        let current = session
-            .start()
-            .expect("start")
-            .current
-            .expect("current");
+        let current = session.start().expect("start").current.expect("current");
         assert_eq!(current.review_unit_id, first.review_unit_id);
         assert_eq!(current.revision_expected_answer, "ALFA");
         assert!(current.choices.iter().any(|choice| choice == "ALFA"));
@@ -2366,9 +2362,7 @@ fn sorted(mut values: Vec<String>) -> Vec<String> {
 }
 
 fn stored_mcq_choices(path: &std::path::Path, review_unit_id: &ReviewUnitId) -> Vec<String> {
-    let snapshot = BetaPersistenceStore::open(path)
-        .expect("store")
-        .snapshot();
+    let snapshot = BetaPersistenceStore::open(path).expect("store").snapshot();
     let draft = snapshot
         .generated_prompt_drafts
         .iter()
