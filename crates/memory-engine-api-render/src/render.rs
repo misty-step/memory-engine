@@ -16,7 +16,8 @@ use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{
-    BetaStudyConceptProgress, BetaStudyCurrent, LibrarySourceRow, SourcePermission,
+    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, LibrarySourceRow,
+    SourcePermission,
 };
 
 use memory_engine_api_state::{
@@ -822,8 +823,9 @@ fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> Strin
 <textarea class="ae-input" id="me-edit-prompt" name="prompt" rows="4" required>{prompt}</textarea>
 <label class="ae-label" for="me-edit-answer">Answer</label>
 <input class="ae-input" id="me-edit-answer" name="expectedAnswer" value="{answer}" required autocomplete="off">
-<div class="me-actions"><button class="ae-button" type="submit">Save changes</button><a class="ae-button-quiet" href="/">Cancel</a></div>
+<div class="me-actions"><button class="ae-button" type="submit">Save changes</button></div>
 </form>
+<form action="/app/next" method="post">{csrf}<button class="ae-button-quiet" type="submit">Cancel</button></form>
 </section>"#,
         csrf = hidden_csrf_input(account),
         id = escape_html(&current.review_unit_id.to_string()),
@@ -1115,12 +1117,14 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
 <p class="ae-dim">Expected answer: <span class="ae-item">{}</span></p>
 {}
 {}
-<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
+{}
+<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required>{}<div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
 <div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
 </article>"#,
             escape_html(&draft.concept_label),
             escape_html(&draft.prompt),
             escape_html(&draft.answer),
+            render_draft_choice_list(draft),
             provenance,
             spans,
             hidden_csrf_input(account),
@@ -1131,6 +1135,7 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
             escape_html(&draft.id),
             escape_html(&draft.id),
             escape_html(&draft.answer),
+            render_draft_choice_fields(draft),
             hidden_csrf_input(account),
             escape_html(&draft.id),
             hidden_csrf_input(account),
@@ -1141,6 +1146,45 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
         return String::new();
     }
     format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
+}
+
+fn render_draft_choice_list(draft: &BetaStudyDraftRow) -> String {
+    if draft.choices.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<ul class=\"me-draft-choices\">");
+    for choice in &draft.choices {
+        let mark = if choice == &draft.answer {
+            " <span class=\"ae-dim\">correct</span>"
+        } else {
+            ""
+        };
+        let _ = write!(
+            html,
+            "<li><span class=\"ae-item\">{}</span>{mark}</li>",
+            escape_html(choice)
+        );
+    }
+    html.push_str("</ul>");
+    html
+}
+
+fn render_draft_choice_fields(draft: &BetaStudyDraftRow) -> String {
+    let distractors = draft
+        .choices
+        .iter()
+        .filter(|choice| *choice != &draft.answer)
+        .map(|choice| escape_html(choice))
+        .collect::<Vec<_>>();
+    if distractors.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<label class="ae-label" for="draft-choices-{id}">Distractors</label><textarea class="ae-input" id="draft-choices-{id}" name="choices" rows="{rows}">{value}</textarea>"#,
+        id = escape_html(&draft.id),
+        rows = distractors.len().max(2),
+        value = distractors.join("\n"),
+    )
 }
 
 /// A source whose generation is already queued, running, or done never

@@ -342,6 +342,73 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
 }
 
 #[tokio::test]
+async fn editing_mcq_distractor_keeps_coherent_card_and_returns_to_review() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    assert_eq!(generated.status(), StatusCode::OK);
+    state.run_pending_jobs_blocking();
+
+    let pending = workspace_html(&app, &cookie).await;
+    assert!(
+        pending.contains("BRAVO") && pending.contains("CHARLIE"),
+        "pending MCQ must show every choice before Keep: {pending}"
+    );
+    assert!(
+        pending.contains(r#"name="choices""#),
+        "edit form must expose distractors: {pending}"
+    );
+    assert!(
+        pending.contains("Keep as written"),
+        "Keep as written must stay one tap: {pending}"
+    );
+
+    let draft_id = pending
+        .split(r#"<article class="me-pending-draft">"#)
+        .skip(1)
+        .find(|article| article.contains(r#"name="choices""#))
+        .map(|article| html_value(article, "draftId"))
+        .expect("MCQ draft id");
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/edit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("draftId", &draft_id),
+                ("prompt", "What is the NATO phonetic alphabet word for A?"),
+                ("expectedAnswer", "ALFA"),
+                ("choices", "DELTA\nCHARLIE"),
+            ],
+        ))
+        .await
+        .expect("edit distractor");
+    let status = edited.status();
+    let edited = response_text(edited).await;
+    assert_eq!(status, StatusCode::OK, "edit distractor failed: {edited}");
+    assert!(
+        edited.contains("Reveal answer") || edited.contains("name=\"answer\""),
+        "edit must land back in review: {edited}"
+    );
+    assert!(
+        edited.contains("DELTA"),
+        "edited distractor must be the live MCQ choice: {edited}"
+    );
+}
+
+#[tokio::test]
 async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_bytes() {
     let state = local_fixture_state();
     let app = router(state.clone());

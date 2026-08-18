@@ -2945,6 +2945,7 @@ enum PostgresLearnerDecision {
     Edit {
         prompt_text: String,
         expected_answer: String,
+        choices: Vec<String>,
     },
     Reject,
 }
@@ -3282,6 +3283,7 @@ impl AccountStudyStore<'_> {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
         self.decide_learner_draft(
@@ -3289,6 +3291,7 @@ impl AccountStudyStore<'_> {
             &PostgresLearnerDecision::Edit {
                 prompt_text: prompt_text.to_owned(),
                 expected_answer: expected_answer.to_owned(),
+                choices: choices.to_vec(),
             },
             decided_at,
         )?
@@ -3363,13 +3366,18 @@ impl AccountStudyStore<'_> {
             }
             let reject = matches!(decision, &PostgresLearnerDecision::Reject);
             let edited = matches!(decision, &PostgresLearnerDecision::Edit { .. });
-            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = decision {
+            if let PostgresLearnerDecision::Edit {
+                prompt_text,
+                expected_answer,
+                choices,
+            } = decision
+            {
                 let prompt_text = prompt_text.trim();
                 let expected_answer = expected_answer.trim();
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
                 replace_prompt_text(&mut draft.prompt, prompt_text);
-                replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+                apply_learner_prompt_answer(&mut draft.prompt, expected_answer, choices)?;
                 if !draft.critique_notes.iter().any(|note| note == "Learner edited pending wording.") {
                     draft.critique_notes.push("Learner edited pending wording.".to_owned());
                 }
@@ -4539,6 +4547,7 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::edit_and_keep_generated_prompt_draft(
@@ -4546,6 +4555,7 @@ impl BetaStudyStore for AccountStudyStore<'_> {
             draft_id,
             prompt_text,
             expected_answer,
+            choices,
             decided_at,
         )
     }
@@ -5202,11 +5212,9 @@ fn learner_decision_matches(
             PostgresLearnerDecision::Edit {
                 prompt_text,
                 expected_answer,
+                choices,
             },
-        ) => {
-            prompt_text_for_export(&draft.prompt) == prompt_text.trim()
-                && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
-        }
+        ) => learner_edit_matches_draft(&draft.prompt, prompt_text, expected_answer, choices),
         _ => false,
     }
 }
@@ -5258,6 +5266,86 @@ fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) -> Result<(), Postgr
         }
     }
     Ok(())
+}
+
+fn apply_learner_prompt_answer(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), PostgresStoreError> {
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return replace_prompt_answer(prompt, expected_answer);
+    }
+    replace_prompt_choices(prompt, expected_answer, choices)
+}
+
+fn replace_prompt_choices(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), PostgresStoreError> {
+    let Prompt::Mcq {
+        choices: stored,
+        correct_choice,
+        ..
+    } = prompt
+    else {
+        return replace_prompt_answer(prompt, expected_answer);
+    };
+    let next = normalize_mcq_choices(expected_answer, choices)?;
+    expected_answer.clone_into(correct_choice);
+    *stored = next;
+    Ok(())
+}
+
+fn normalize_mcq_choices(
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<Vec<String>, PostgresStoreError> {
+    let mut next = Vec::new();
+    for choice in choices {
+        let trimmed = choice.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !next.iter().any(|existing| existing == trimmed) {
+            next.push(trimmed.to_owned());
+        }
+    }
+    if !next.iter().any(|choice| choice == expected_answer) {
+        next.insert(0, expected_answer.to_owned());
+    }
+    if next.len() < 2 {
+        return Err(PostgresStoreError::Blank {
+            label: "Learner MCQ choices",
+        });
+    }
+    Ok(next)
+}
+
+fn learner_edit_matches_draft(
+    prompt: &Prompt,
+    prompt_text: &str,
+    expected_answer: &str,
+    choices: &[String],
+) -> bool {
+    if prompt_text_for_export(prompt) != prompt_text.trim()
+        || prompt_expected_answer_for_export(prompt) != expected_answer.trim()
+    {
+        return false;
+    }
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return true;
+    }
+    normalize_mcq_choices(expected_answer.trim(), choices)
+        .is_ok_and(|next| prompt_choices_for_export(prompt) == next)
+}
+
+fn prompt_choices_for_export(prompt: &Prompt) -> Vec<String> {
+    match prompt {
+        Prompt::Mcq { choices, .. } => choices.clone(),
+        Prompt::Boolean { .. } | Prompt::Exact(_) => Vec::new(),
+    }
 }
 
 #[must_use]
@@ -7239,6 +7327,7 @@ mod tests {
                     &edit_draft.id,
                     "Edited stale prompt",
                     "Edited stale answer",
+                    &[],
                     NOW + 18,
                 ),
                 Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))
