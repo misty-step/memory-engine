@@ -504,6 +504,7 @@
       })
       .then(function (response) {
         if (!response) throw new Error("submit failed");
+        if (response.status === 401 || response.status === 403) throw new Error("auth");
         var type = response.headers && response.headers.get
           ? response.headers.get("content-type") || ""
           : "";

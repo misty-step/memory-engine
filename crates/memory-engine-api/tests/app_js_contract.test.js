@@ -744,6 +744,7 @@ test("keep error HTML swaps without a second POST", async () => {
     fetchImpl() {
       return Promise.resolve({
         ok: false,
+        status: 409,
         headers: { get: () => "text/html; charset=utf-8" },
         text: () =>
           Promise.resolve(htmlReviewLanding("", "0 due", "Draft already decided.")),
@@ -785,6 +786,37 @@ test("skip fetch failure reloads instead of posting twice", async () => {
   expect(browser.prevented()).toBe(2);
   expect(browser.nativeSubmits()).toBe(0);
 });
+
+test("skip 401 reloads instead of swapping recovery into review", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/skip",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Skip",
+    viewHtml: '<p class="me-prompt">Letter N</p>',
+    fetchImpl() {
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(
+            `<!doctype html><html><body><div class="ae-view"><div class="me-cover">Return to your workspace</div></div></body></html>`,
+          ),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Letter N");
+  expect(browser.viewHtml()).not.toContain("Return to your workspace");
+  expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual(["reload"]);
+  expect(browser.busy()).toBeTrue();
+});
+
 
 
 
