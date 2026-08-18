@@ -21,7 +21,7 @@ product contract.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
   `MEMORY_ENGINE_*` environment variables deliberately retain the old name.
   Do not rename a storage, network, deployment, or compatibility boundary
-  without a shaped GitHub issue and migration proof.
+  without a shaped `backlog/` item and migration proof.
 
 ## Stack & Boundaries
 
@@ -55,7 +55,7 @@ promotion.
   `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
-- GitHub Issues is the sole work ledger: issues hold shaped work, status,
+- `backlog/` is the sole work ledger: markdown items hold shaped work, status,
   relations, proof, and closure. Git history holds archived source history.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
@@ -86,7 +86,7 @@ oracle.
 
 1. One ticket, one branch, one PR. Branch from `master`; use `cx/...` by
    default.
-2. Do not implement feature work without an active shaped GitHub issue.
+2. Do not implement feature work without an active shaped `backlog/` item.
 3. TDD is the default — test behavior, not implementation; do not mock
    repo-owned pure collaborators (see Conventions for the full statement).
 4. Core is pure: no Convex, React, Hono, Node/Bun APIs, filesystem,
@@ -138,7 +138,7 @@ oracle.
   import, benchmark, and QA tooling.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
-- GitHub Issues — shaped work, assignment, status, relations, proof, and closure.
+- `backlog/` — shaped work, assignment, status, relations, proof, and closure.
 - `SPEC.md` / `docs/rust-migration.md` — technical strategy and cutover context;
   `VISION.md` governs product positioning.
 
@@ -159,15 +159,17 @@ oracle.
 
 ## Work Lifecycle
 
-GitHub Issues is authoritative. `status:backlog` is groomed but not claimable;
-`status:ready` has executable acceptance and proof with no unresolved blocker;
-`status:blocked` names an external dependency. Assign the issue and apply
-`status:in-progress` before implementation; record progress and proof as issue
-comments. Use `Refs #<issue>` in commits and pull requests. Use
-`Closes #<issue>` only when the merge satisfies every acceptance criterion and
+`backlog/` is authoritative. `status: later` is parked and not claimable;
+`status: ready` has executable acceptance and proof with no unresolved blocker;
+`status: design` still has open product questions; `status: proof` is merged
+with production evidence remaining. Claim a ready item by setting
+`status: in-progress` in its file. Record progress and proof in that file.
+Use `Refs backlog/<id>` in commits and pull requests. Use
+`Closes backlog/<id>` only when the merge satisfies every acceptance criterion and
 no post-merge proof remains. `/deliver` stops at merge-ready; `/ship` links the
-landed commit and production proof, then closes the issue and invokes bounded
-`/reflect`. `/groom` reconciles open GitHub issues before strategy.
+landed commit and production proof, then moves the item to `proof` or deletes it.
+`/groom` reconciles `backlog/` before strategy.
+
 
 ## Known Debt
 

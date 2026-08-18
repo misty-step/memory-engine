@@ -27,7 +27,7 @@
     {
       "id": "fleet-integration",
       "label": "Fleet Integration",
-      "description": "Current repo-owned evidence for Canary, GitHub Issues, Landmark, the project map, and Cerberus review."
+      "description": "Current repo-owned evidence for Canary, the local backlog, Landmark, the project map, and Cerberus review."
     }
   ],
   "nodes": [
@@ -715,15 +715,15 @@
       ]
     },
     {
-      "id": "node.fleet.github-issues",
-      "label": "GitHub Issues Work Ledger",
+      "id": "node.fleet.backlog",
+      "label": "Local Backlog Work Ledger",
       "kind": "issue",
-      "summary": "GitHub Issues is the sole active work ledger; no repository-local backlog or second tracker is kept.",
+      "summary": "backlog/ is the sole active work ledger; markdown items replace the previous remote issue queue.",
       "viewTags": ["fleet-integration"],
       "layout": {"fleet-integration": {"x": 280, "y": 360}},
       "refs": [
         {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
-        {"kind": "issue", "path": "https://github.com/misty-step/scry/issues", "label": "active issue queue"}
+        {"kind": "issue", "path": "backlog/", "label": "active issue queue"}
       ]
     },
     {

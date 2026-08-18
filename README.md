@@ -89,7 +89,7 @@ active delivery oracles:
 - [SLICE-4-SERVICE-PROTOTYPE.md](./SLICE-4-SERVICE-PROTOTYPE.md)
 - [exemplars.md](./exemplars.md)
 
-The active [GitHub Issues queue](https://github.com/misty-step/scry/issues)
+The active [`backlog/`](./backlog/README.md) queue
 tracks Scry production dogfood usefulness, service hardening, learning-science
 quality, input capture, and capability-boundary work on top of the Rust stack.
 
