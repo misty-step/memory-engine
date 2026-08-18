@@ -9,8 +9,9 @@
 
 // One state machine for review-loop forms: response timing, immediate
 // acknowledgment, in-place fetch swap, and the cross-document performance
-// handoff stay together. Native form navigation remains the JS-off path and
-// the automatic fallback when fetch cannot complete.
+// handoff stay together. Native form navigation remains the JS-off path.
+// Submit and next fall back to native submit when fetch cannot complete.
+// Other in-place actions apply any HTML body, then reload if they cannot.
 (function () {
   "use strict";
 
@@ -40,6 +41,7 @@
     // resumed, that it is stale rather than firing with leftover state.
     landingEpoch: 0
   };
+
 
   function isFiniteNumber(value) {
     return typeof value === "number" && isFinite(value);
@@ -73,8 +75,21 @@
   function isInPlaceActionForm(form) {
     if (!isNativeForm(form) || typeof form.getAttribute !== "function") return false;
     var action = form.getAttribute("action") || "";
-    return action === "/app/submit" || action === "/app/next";
+    return (
+      action === "/app/submit" ||
+      action === "/app/next" ||
+      action === "/app/draft/keep" ||
+      action === "/app/draft/reject" ||
+      action === "/app/skip" ||
+      action === "/app/snooze" ||
+      action === "/app/snooze-concept" ||
+      action === "/app/reveal" ||
+      action === "/app/reference" ||
+      action === "/app/bridge"
+    );
   }
+
+
 
   function responseClockNow() {
     return hasMonotonicClock ? perf.now() : Date.now();
@@ -212,6 +227,10 @@
     if (action === "/app/reveal") return "Revealing…";
     if (action === "/app/skip") return "Skipping…";
     if (action === "/app/snooze" || action === "/app/snooze-concept") return "Snoozing…";
+    if (action === "/app/draft/keep") return "Keeping…";
+    if (action === "/app/draft/reject") return "Rejecting…";
+    if (action === "/app/reference") return "Loading…";
+    if (action === "/app/bridge") return "Building…";
     if (action === "/app/submit" && control && !hasClass(control, "me-choice")) {
       return "Checking…";
     }
@@ -471,6 +490,7 @@
     var body = formBody(form, control);
     if (!body) return false;
     var requestToken = state.token;
+    var nativeFallback = action === "/app/submit" || action === "/app/next";
     window
       .fetch(action, {
         method: "POST",
@@ -483,7 +503,8 @@
         redirect: "follow"
       })
       .then(function (response) {
-        if (!response || !response.ok) throw new Error("submit failed");
+        if (!response) throw new Error("submit failed");
+        if (response.status === 401 || response.status === 403) throw new Error("auth");
         var type = response.headers && response.headers.get
           ? response.headers.get("content-type") || ""
           : "";
@@ -497,13 +518,26 @@
       })
       .catch(function () {
         if (state.form !== form) return;
-        // Drop any fetch-only handoff before the native navigation path.
         if (requestToken) removeHandoffIfToken(requestToken);
+        if (nativeFallback) {
+          clearTimeoutIfAny();
+          nativeSubmit(form, control);
+          return;
+        }
+        if (window.location && typeof window.location.reload === "function") {
+          try {
+            window.location.reload();
+            return;
+          } catch (error) {
+            // Unlock only if the browser refuses the reload.
+          }
+        }
         clearTimeoutIfAny();
-        nativeSubmit(form, control);
+        resetState();
       });
     return true;
   }
+
 
   document.addEventListener("submit", function (event) {
     var form = event && event.target;

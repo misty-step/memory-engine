@@ -25,6 +25,7 @@ use super::{
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
 };
+use memory_engine_api_render::{SKIP_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE};
 use memory_engine_api_state::AppAccount;
 
 /// Non-auth route tests need seeded accounts without depending on production
@@ -2661,34 +2662,49 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let opened_bridge = next_review_html(&app, &cookie, &csrf_token, "bridge").await;
     let bridge_id = html_value(&opened_bridge, "reviewUnitId");
     assert!(bridge_id.starts_with("bridge-"));
+    skip_then_snooze_current(&app, &cookie, &csrf_token, &bridge_id).await;
+}
+
+async fn skip_then_snooze_current(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+) {
     let skipped = app
         .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/skip",
-            &cookie,
-            &[("csrfToken", &csrf_token), ("reviewUnitId", &bridge_id)],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", review_unit_id)],
         ))
         .await
         .expect("skip");
     assert_eq!(skipped.status(), StatusCode::OK);
     let skipped = response_text(skipped).await;
-    let next_bridge_id = html_value(&skipped, "reviewUnitId");
-    assert!(next_bridge_id.starts_with("bridge-"));
-    assert_ne!(next_bridge_id, bridge_id);
+    assert!(
+        skipped.contains(SKIP_CONFIRM_NOTICE),
+        "skip result must carry the server confirm"
+    );
+    let next_id = html_value(&skipped, "reviewUnitId");
+    assert_ne!(next_id, review_unit_id);
     let snoozed = app
+        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/snooze",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &next_bridge_id),
-            ],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", &next_id)],
         ))
         .await
         .expect("snooze");
     assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_text(snoozed).await;
+    assert!(
+        snoozed.contains(SNOOZE_CONFIRM_NOTICE),
+        "snooze result must carry the server confirm"
+    );
 }
 
 #[tokio::test]

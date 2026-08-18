@@ -27,14 +27,15 @@ mod icons;
 use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
-    render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
-    render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_create_page, render_edit_review_html,
-    render_library_page, render_login_requested, render_return_notification_confirmation,
-    render_return_notification_disabled, render_return_notification_recovery,
-    render_submit_action_result_html, render_submit_recovery, render_waitlist_joined,
-    render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions,
-    ContentFeedbackRecovery, LEDGER_CSS,
+    render_account_page, render_action_result_html, render_action_result_html_with_notice,
+    render_analytics_page, render_app_shell, render_auth_recovery,
+    render_content_feedback_recovery_html, render_content_feedback_result_html, render_create_page,
+    render_edit_review_html, render_library_page, render_login_requested,
+    render_return_notification_confirmation, render_return_notification_disabled,
+    render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
+    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
+    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS, SKIP_CONFIRM_NOTICE,
+    SNOOZE_CONCEPT_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE,
 };
 use memory_engine_api_state::{
     browser_session_cookie_header_for_request, browser_session_cookie_present, csrf_token,
@@ -2256,13 +2257,17 @@ async fn skip_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
-
-    with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
-        &account,
-        &headers,
-        &uri,
-    )
+    let response = match result {
+        Ok(view) => Html(render_action_result_html_with_notice(
+            &state,
+            &account,
+            Ok(view),
+            Some(SKIP_CONFIRM_NOTICE),
+        ))
+        .into_response(),
+        Err(error) => Html(render_action_result_html(&state, &account, Err(error))).into_response(),
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn delete_app_review(
@@ -2372,13 +2377,17 @@ async fn snooze_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
-
-    with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
-        &account,
-        &headers,
-        &uri,
-    )
+    let response = match result {
+        Ok(view) => Html(render_action_result_html_with_notice(
+            &state,
+            &account,
+            Ok(view),
+            Some(SNOOZE_CONFIRM_NOTICE),
+        ))
+        .into_response(),
+        Err(error) => Html(render_action_result_html(&state, &account, Err(error))).into_response(),
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn snooze_concept_app_review(
@@ -2395,7 +2404,13 @@ async fn snooze_concept_app_review(
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
 
     let response = match result {
-        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
+        Ok(view) => Html(render_action_result_html_with_notice(
+            &state,
+            &account,
+            Ok(view),
+            Some(SNOOZE_CONCEPT_CONFIRM_NOTICE),
+        ))
+        .into_response(),
         Err(error) => {
             let status = error.status();
             (
