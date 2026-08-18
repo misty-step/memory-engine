@@ -3034,7 +3034,8 @@ fn shuffle_mcq_choices(
     let mut state = presentation_rng_state(review_unit_id, display_attempts);
     for i in (1..projected.len()).rev() {
         let mix = next_presentation_u64(&mut state);
-        let j = (mix as usize) % (i + 1);
+        let bound = u64::try_from(i + 1).unwrap_or(1);
+        let j = usize::try_from(mix % bound).unwrap_or(0);
         projected.swap(i, j);
     }
     projected
