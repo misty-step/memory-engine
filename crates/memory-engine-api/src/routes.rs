@@ -1138,7 +1138,6 @@ struct AppStartForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1148,7 +1147,6 @@ struct AppSourceForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1697,7 +1695,7 @@ async fn start_app_study(
     };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture, form.permission),
+        &capture_request(form.title, form.body, form.capture),
     );
 
     html_with_browser_session_for_request(
@@ -1721,7 +1719,7 @@ async fn create_app_source(
         };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture, form.permission),
+        &capture_request(form.title, form.body, form.capture),
     );
 
     with_browser_session_cookie(
@@ -1752,7 +1750,7 @@ async fn capture_app_source(
             Ok(account) => account,
             Err(error) => return app_failure_response(&error),
         };
-    let request = capture_request(form.title, form.body, form.capture, form.permission);
+    let request = capture_request(form.title, form.body, form.capture);
     let notice = match state.save_app_source(&account, &request) {
         Ok(source) => {
             match state.enqueue_generation_job_by_source(
@@ -1805,7 +1803,6 @@ fn capture_request(
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 ) -> CreateSourceRequest {
     let body = capture.or(body).unwrap_or_default();
     let title = title
@@ -1815,7 +1812,7 @@ fn capture_request(
     CreateSourceRequest {
         title,
         body,
-        permission: permission.unwrap_or_default(),
+        permission: SourcePermission::ModelEligible,
     }
 }
 

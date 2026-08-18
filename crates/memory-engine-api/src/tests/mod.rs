@@ -364,10 +364,11 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
     assert_eq!(captured.status(), StatusCode::OK);
     let _ = response_text(captured).await;
 
-    // The capture POST returns the Create view; the permission label lives on
-    // the Library view where the source is managed.
+    // Capture ignores a posted local-only flag. Library can still change
+    // permission after the source exists.
     let library = library_html(&app, &cookie).await;
-    assert!(library.contains("Local only · never sent to a model"));
+    assert!(library.contains("Model eligible"));
+    assert!(!library.contains("Local only · never sent to a model"));
 
     let edited = app
         .clone()
@@ -11847,8 +11848,8 @@ async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
         );
     }
     assert!(
-        page.contains(r#"class="me-more-capture""#),
-        "the disclosure must carry the capture punch-out: {page}"
+        page.contains(r#"class="me-more-capture" href="/app/create""#),
+        "Capture more must open Create, not Home: {page}"
     );
     assert!(
         !page.contains(r#"class="me-hatches""#),
@@ -12235,7 +12236,7 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         "Hide every card for this concept until tomorrow.",
         "Generate easier warm-up cards, then revisit this one later.",
         "Remove this card from review for good.",
-        "Capture new material without leaving review.",
+        "Add new material.",
     ];
     for tooltip in tooltips {
         let marker = format!(r#"title="{tooltip}"><svg class="ae-icon""#);
