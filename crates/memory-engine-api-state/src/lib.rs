@@ -2803,16 +2803,41 @@ fn session_cookie_header(session_id: &str, secure: bool, max_age_seconds: u64) -
     } else {
         APP_SESSION_INSECURE_COOKIE_NAME
     };
-    let secure_attribute = if secure { " Secure;" } else { "" };
     format!(
-        "{name}={}; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age={max_age_seconds}",
-        cookie_value(session_id)
+        "{name}={}; HttpOnly;{} SameSite={}; Path=/; Max-Age={max_age_seconds}",
+        cookie_value(session_id),
+        session_cookie_secure_attribute(secure),
+        session_cookie_same_site(secure),
     )
 }
 
 fn clear_session_cookie_header(name: &str, secure: bool) -> String {
-    let secure_attribute = if secure { " Secure;" } else { "" };
-    format!("{name}=; HttpOnly;{secure_attribute} SameSite=Lax; Path=/; Max-Age=0")
+    format!(
+        "{name}=; HttpOnly;{} SameSite={}; Path=/; Max-Age=0",
+        session_cookie_secure_attribute(secure),
+        session_cookie_same_site(secure),
+    )
+}
+
+fn session_cookie_secure_attribute(secure: bool) -> &'static str {
+    if secure {
+        " Secure;"
+    } else {
+        ""
+    }
+}
+
+fn session_cookie_same_site(secure: bool) -> &'static str {
+    // iOS treats a Home Screen / standalone PWA as a cross-site context, so a
+    // SameSite=Lax cookie set when Safari consumes the magic link is omitted
+    // on the next standalone navigation. SameSite=None; Secure is valid on
+    // the __Host- cookie; mutations stay CSRF-protected. Local HTTP cannot
+    // use None — browsers reject None without Secure — so it stays Lax.
+    if secure {
+        "None"
+    } else {
+        "Lax"
+    }
 }
 
 fn cookie_value(value: &str) -> String {
@@ -3981,6 +4006,102 @@ mod tests {
                 .status,
             StatusCode::FORBIDDEN
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_host_cookie_is_samesite_none_so_ios_standalone_pwa_sends_it() {
+        // Named cause: iOS treats a Home Screen / standalone PWA as a
+        // cross-site context. SameSite=Lax cookies set when Safari consumes
+        // the magic link are omitted on the next standalone navigation.
+        // SameSite=None; Secure on the __Host- cookie is what the installed
+        // app can send. Logout must clear that same cookie identity.
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-pwa-session-cookie-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(AuthConfig::for_local_tests()),
+        );
+        let guest = state.create_guest_account().expect("guest");
+        let session = state
+            .create_browser_session(&guest)
+            .expect("browser session");
+
+        let issued = html_with_browser_session(&session, String::new());
+        let cookie = issued
+            .headers()
+            .get(SET_COOKIE)
+            .expect("production session cookie")
+            .to_str()
+            .expect("cookie header");
+        assert!(
+            cookie.starts_with("__Host-memory_engine_session="),
+            "production cookie must stay host-only: {cookie}"
+        );
+        assert!(
+            cookie.contains("SameSite=None"),
+            "standalone PWA / cross-site navigations omit SameSite=Lax: {cookie}"
+        );
+        assert!(
+            !cookie.contains("SameSite=Lax"),
+            "SameSite must not regress to Lax-only: {cookie}"
+        );
+        assert!(cookie.contains("Secure"), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+        assert!(!cookie.contains("Domain="), "{cookie}");
+
+        let cleared = html_with_cleared_browser_session(String::new());
+        let clear_cookies = cleared
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("clear cookie"))
+            .collect::<Vec<_>>();
+        let host_clear = clear_cookies
+            .iter()
+            .find(|cookie| cookie.starts_with("__Host-memory_engine_session="))
+            .expect("host clear cookie");
+        assert!(
+            host_clear.contains("SameSite=None"),
+            "clearing must match the production cookie identity: {host_clear}"
+        );
+        assert!(
+            !host_clear.contains("SameSite=Lax"),
+            "host clear cookie must not regress to Lax-only: {host_clear}"
+        );
+        assert!(host_clear.contains("Secure"), "{host_clear}");
+        assert!(host_clear.contains("Max-Age=0"), "{host_clear}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_http_session_cookie_stays_samesite_lax_without_secure() {
+        // SameSite=None without Secure is rejected by browsers, so the
+        // local HTTP cookie cannot follow the production PWA attribute.
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-local-http-session-cookie-{}",
+            rand::random::<u128>()
+        ));
+        let state = ApiState::new(
+            AccountRegistry::with_store_root(&root).with_auth_config(AuthConfig::for_local_tests()),
+        );
+        let guest = state.create_guest_account().expect("guest");
+        let session = state
+            .create_browser_session(&guest)
+            .expect("browser session");
+        let cookie = browser_session_cookie_header_for_request(
+            &session,
+            &HeaderMap::new(),
+            &Uri::from_static("http://127.0.0.1/"),
+        );
+        assert!(cookie.starts_with("memory_engine_session="), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+        assert!(!cookie.contains("SameSite=None"), "{cookie}");
+        assert!(!cookie.contains("Secure"), "{cookie}");
 
         let _ = std::fs::remove_dir_all(root);
     }

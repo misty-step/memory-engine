@@ -9809,7 +9809,6 @@ fn session_cookie(response: &axum::response::Response) -> String {
         "session cookie must use the host or plain local name: {set_cookie}"
     );
     assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Path=/"));
     let max_age = set_cookie
         .split(';')
@@ -9827,10 +9826,22 @@ fn session_cookie(response: &axum::response::Response) -> String {
             set_cookie.contains("Secure"),
             "host-only production cookie must be Secure: {set_cookie}"
         );
+        assert!(
+            set_cookie.contains("SameSite=None"),
+            "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
+        );
+        assert!(
+            !set_cookie.contains("SameSite=Lax"),
+            "host cookie must not regress to Lax-only: {set_cookie}"
+        );
     } else {
         assert!(
             !set_cookie.contains("Secure"),
             "plain local HTTP cookie must omit Secure: {set_cookie}"
+        );
+        assert!(
+            set_cookie.contains("SameSite=Lax"),
+            "local HTTP cookie cannot be SameSite=None without Secure: {set_cookie}"
         );
     }
     set_cookie
@@ -11028,7 +11039,8 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
     assert!(host_cookie.starts_with("__Host-memory_engine_session="));
     assert!(host_cookie.contains("HttpOnly"));
     assert!(host_cookie.contains("Secure"));
-    assert!(host_cookie.contains("SameSite=Lax"));
+    assert!(host_cookie.contains("SameSite=None"));
+    assert!(!host_cookie.contains("SameSite=Lax"));
     assert!(host_cookie.contains("Path=/"));
     let host_max_age = host_cookie
         .split(';')
@@ -11038,6 +11050,189 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
         .expect("numeric Max-Age");
     assert!((7_775_999..=7_776_000).contains(&host_max_age));
     assert!(!host_cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn ios_standalone_pwa_resumes_https_session_on_home_navigation() {
+    // Named cause: iOS treats a Home Screen / standalone PWA as a cross-site
+    // context. SameSite=Lax cookies set when Safari consumes the magic link
+    // are omitted on the next standalone navigation. SameSite=None; Secure
+    // on the __Host- cookie is what the installed app can send.
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=standalone+pwa+session"))
+                .expect("HTTPS start"),
+        )
+        .await
+        .expect("HTTPS start response");
+    assert_eq!(started.status(), StatusCode::OK);
+    let set_cookie = started
+        .headers()
+        .get(SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("cookie header")
+        .to_owned();
+    assert_pwa_host_session_cookie(&set_cookie);
+
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+    let home = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("x-forwarded-proto", "https")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-site", "none")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("standalone home"),
+        )
+        .await
+        .expect("standalone home response");
+    assert_eq!(home.status(), StatusCode::OK);
+    let home_set_cookie = home
+        .headers()
+        .get(SET_COOKIE)
+        .expect("sliding host cookie")
+        .to_str()
+        .expect("sliding cookie header")
+        .to_owned();
+    assert!(
+        home_set_cookie.contains("SameSite=None"),
+        "GET / must reissue the PWA-sendable cookie: {home_set_cookie}"
+    );
+    assert!(
+        !home_set_cookie.contains("SameSite=Lax"),
+        "sliding renewal must not regress to Lax-only: {home_set_cookie}"
+    );
+    let home_html = response_text(home).await;
+    assert!(
+        home_html.contains(r#"action="/app/logout""#),
+        "standalone GET must resume the session: {home_html}"
+    );
+}
+
+#[tokio::test]
+async fn ios_standalone_pwa_cookie_still_requires_csrf_and_clears_on_logout() {
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=standalone+pwa+csrf"))
+                .expect("HTTPS start"),
+        )
+        .await
+        .expect("HTTPS start response");
+    let set_cookie = started
+        .headers()
+        .get(SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("cookie header")
+        .to_owned();
+    assert_pwa_host_session_cookie(&set_cookie);
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("x-forwarded-proto", "https")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("home"),
+        )
+        .await
+        .expect("home response");
+    let home_html = response_text(home).await;
+
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/logout")
+                .header("x-forwarded-proto", "https")
+                .header("origin", "https://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("forged logout"),
+        )
+        .await
+        .expect("forged logout response");
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+    let csrf_token = html_value(&home_html, "csrfToken");
+    let logged_out = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/logout")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::from(form_body(&[("csrfToken", csrf_token.as_str())])))
+                .expect("explicit logout"),
+        )
+        .await
+        .expect("explicit logout response");
+    assert_eq!(logged_out.status(), StatusCode::OK);
+    let host_clear = logged_out
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("set-cookie"))
+        .find(|value| value.starts_with("__Host-memory_engine_session="))
+        .expect("host clear cookie");
+    assert!(
+        host_clear.contains("SameSite=None") && host_clear.contains("Max-Age=0"),
+        "logout must clear the PWA-sendable host cookie: {host_clear}"
+    );
+}
+
+fn assert_pwa_host_session_cookie(set_cookie: &str) {
+    assert!(
+        set_cookie.starts_with("__Host-memory_engine_session="),
+        "production cookie must stay host-only: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("SameSite=None"),
+        "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
+    );
+    assert!(
+        !set_cookie.contains("SameSite=Lax"),
+        "SameSite must not regress to Lax-only: {set_cookie}"
+    );
+    assert!(set_cookie.contains("Secure"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+    assert!(!set_cookie.contains("Domain="), "{set_cookie}");
 }
 
 #[tokio::test]
