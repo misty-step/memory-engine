@@ -4022,8 +4022,7 @@ mod tests {
             rand::random::<u128>()
         ));
         let state = ApiState::new(
-            AccountRegistry::with_store_root(&root)
-                .with_auth_config(AuthConfig::for_local_tests()),
+            AccountRegistry::with_store_root(&root).with_auth_config(AuthConfig::for_local_tests()),
         );
         let guest = state.create_guest_account().expect("guest");
         let session = state
@@ -4088,8 +4087,7 @@ mod tests {
             rand::random::<u128>()
         ));
         let state = ApiState::new(
-            AccountRegistry::with_store_root(&root)
-                .with_auth_config(AuthConfig::for_local_tests()),
+            AccountRegistry::with_store_root(&root).with_auth_config(AuthConfig::for_local_tests()),
         );
         let guest = state.create_guest_account().expect("guest");
         let session = state
