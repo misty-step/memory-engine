@@ -3007,22 +3007,51 @@ fn projected_choices(
         .iter()
         .filter(|attempt| attempt.review_unit_id == draft.review_unit_id)
         .count();
+    // Recap holds the just-graded order by seeding with attempts - 1.
     let display_attempts = if hold_latest_attempt {
         attempts.saturating_sub(1)
     } else {
         attempts
     };
-    let mut projected = choices.clone();
-    let offset = (stable_seed(draft.review_unit_id.as_str()).saturating_add(display_attempts))
-        % projected.len();
-    projected.rotate_left(offset);
-    projected
+    shuffle_mcq_choices(choices, draft.review_unit_id.as_str(), display_attempts)
 }
 
 fn stable_seed(value: &str) -> usize {
     value.bytes().fold(0usize, |hash, byte| {
         hash.wrapping_mul(16_777_619) ^ usize::from(byte)
     })
+}
+
+fn shuffle_mcq_choices(
+    choices: &[String],
+    review_unit_id: &str,
+    display_attempts: usize,
+) -> Vec<String> {
+    if choices.len() <= 1 {
+        return choices.to_vec();
+    }
+    let mut projected = choices.to_vec();
+    let mut state = presentation_rng_state(review_unit_id, display_attempts);
+    for i in (1..projected.len()).rev() {
+        let mix = next_presentation_u64(&mut state);
+        let j = (mix as usize) % (i + 1);
+        projected.swap(i, j);
+    }
+    projected
+}
+
+fn presentation_rng_state(review_unit_id: &str, display_attempts: usize) -> u64 {
+    (stable_seed(review_unit_id) as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(display_attempts as u64)
+}
+
+fn next_presentation_u64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut mixed = *state;
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed ^ (mixed >> 31)
 }
 
 fn prompt_expected_answer(prompt: &Prompt) -> String {
@@ -3167,3 +3196,79 @@ fn api_pressure() -> Vec<String> {
     .map(str::to_owned)
     .collect()
 }
+
+#[cfg(test)]
+mod projected_choices_tests {
+    use super::shuffle_mcq_choices;
+
+    fn stored() -> Vec<String> {
+        vec![
+            "ALFA".to_owned(),
+            "BRAVO".to_owned(),
+            "CHARLIE".to_owned(),
+            "DELTA".to_owned(),
+        ]
+    }
+
+    fn is_cyclic_shift(original: &[String], candidate: &[String]) -> bool {
+        if original.len() != candidate.len() {
+            return false;
+        }
+        let n = original.len();
+        (0..n).any(|offset| {
+            original
+                .iter()
+                .cycle()
+                .skip(offset)
+                .take(n)
+                .eq(candidate.iter())
+        })
+    }
+
+    #[test]
+    fn same_id_and_display_attempts_is_stable() {
+        let choices = stored();
+        assert_eq!(
+            shuffle_mcq_choices(&choices, "nato-letter-a", 3),
+            shuffle_mcq_choices(&choices, "nato-letter-a", 3)
+        );
+    }
+
+    #[test]
+    fn different_display_attempts_can_change_order() {
+        let choices = stored();
+        let first = shuffle_mcq_choices(&choices, "nato-letter-a", 0);
+        assert!(
+            (1..24).any(|attempts| {
+                shuffle_mcq_choices(&choices, "nato-letter-a", attempts) != first
+            }),
+            "a later presentation must be able to show a different order"
+        );
+    }
+
+    #[test]
+    fn shuffle_keeps_every_stored_choice() {
+        let choices = stored();
+        let projected = shuffle_mcq_choices(&choices, "nato-letter-a", 7);
+        let mut got = projected.clone();
+        got.sort();
+        let mut expected = choices;
+        expected.sort();
+        assert_eq!(got, expected);
+        assert!(projected.iter().any(|choice| choice == "ALFA"));
+    }
+
+    #[test]
+    fn three_plus_choice_list_is_not_always_a_rotation() {
+        let choices = stored();
+        let saw_non_rotation = (0..24).any(|attempts| {
+            let projected = shuffle_mcq_choices(&choices, "nato-letter-a", attempts);
+            !is_cyclic_shift(&choices, &projected)
+        });
+        assert!(
+            saw_non_rotation,
+            "Fisher-Yates must be able to break stored relative order, not only rotate"
+        );
+    }
+}
+
