@@ -2257,18 +2257,17 @@ async fn skip_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
-    with_browser_session_cookie(
-        Html(render_action_result_html_with_notice(
+    let response = match result {
+        Ok(view) => Html(render_action_result_html_with_notice(
             &state,
             &account,
-            result,
+            Ok(view),
             Some(SKIP_CONFIRM_NOTICE),
         ))
         .into_response(),
-        &account,
-        &headers,
-        &uri,
-    )
+        Err(error) => Html(render_action_result_html(&state, &account, Err(error))).into_response(),
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn delete_app_review(
@@ -2378,18 +2377,17 @@ async fn snooze_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
-    with_browser_session_cookie(
-        Html(render_action_result_html_with_notice(
+    let response = match result {
+        Ok(view) => Html(render_action_result_html_with_notice(
             &state,
             &account,
-            result,
+            Ok(view),
             Some(SNOOZE_CONFIRM_NOTICE),
         ))
         .into_response(),
-        &account,
-        &headers,
-        &uri,
-    )
+        Err(error) => Html(render_action_result_html(&state, &account, Err(error))).into_response(),
+    };
+    with_browser_session_cookie(response, &account, &headers, &uri)
 }
 
 async fn snooze_concept_app_review(

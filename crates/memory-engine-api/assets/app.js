@@ -518,14 +518,20 @@
       .catch(function () {
         if (state.form !== form) return;
         if (requestToken) removeHandoffIfToken(requestToken);
-        clearTimeoutIfAny();
         if (nativeFallback) {
+          clearTimeoutIfAny();
           nativeSubmit(form, control);
           return;
         }
         if (window.location && typeof window.location.reload === "function") {
-          window.location.reload();
+          try {
+            window.location.reload();
+            return;
+          } catch (error) {
+            // Unlock only if the browser refuses the reload.
+          }
         }
+        clearTimeoutIfAny();
         resetState();
       });
     return true;

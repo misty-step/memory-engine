@@ -779,7 +779,11 @@ test("skip fetch failure reloads instead of posting twice", async () => {
   expect(browser.navigations).toEqual(["reload"]);
   expect(browser.viewHtml()).toContain('value="typed"');
   expect(browser.viewHtml()).not.toContain("Try again");
-  expect(browser.busy()).toBeFalse();
+  expect(browser.busy()).toBeTrue();
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(2);
+  expect(browser.nativeSubmits()).toBe(0);
 });
 
 
