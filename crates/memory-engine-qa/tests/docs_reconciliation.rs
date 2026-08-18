@@ -78,26 +78,22 @@ fn agent_docs_match_post_cutover_contract() {
         "AGENTS.md must identify SLICE docs and exemplars as historical context"
     );
     assert!(
-        agents.contains("`backlog/` is authoritative"),
-        "AGENTS.md must name backlog/ as the work ledger"
+        agents.contains("Powder is authoritative"),
+        "AGENTS.md must name Powder as the work ledger"
     );
     assert!(
-        agents.contains("Refs backlog/") && agents.contains("Closes backlog/"),
-        "AGENTS.md must document backlog attribution without premature closure"
-    );
-    assert!(
-        !agents.contains("Powder"),
-        "AGENTS.md must not retain the retired Powder workflow"
+        agents.contains("Refs <job-id>") && agents.contains("powder list --takeable"),
+        "AGENTS.md must document Powder attribution and the takeable board"
     );
     for relative in ["README.md", "VISION.md", "docs/fleet-onboarding.md"] {
         let text = read_repo_file(relative);
         assert!(
-            text.contains("backlog/"),
-            "{relative} must point at the active local backlog ledger"
+            text.contains("Powder"),
+            "{relative} must point at the active Powder ledger"
         );
         assert!(
-            !text.contains("Powder"),
-            "{relative} must not retain the retired Powder workflow"
+            !text.contains("`backlog/` is the sole"),
+            "{relative} must not retain the local markdown ledger as authority"
         );
     }
 }
@@ -267,45 +263,26 @@ fn live_generation_lane_uses_github_issue_ownership() {
 }
 
 #[test]
-fn shaped_backlog_items_require_exact_work_metadata_and_proof_fields() {
-    let index = read_repo_file("backlog/README.md");
-    for heading in [
-        "Outcome",
-        "Why now",
-        "Acceptance",
-        "Dependencies",
-        "Proof",
-        "Non-goals",
+fn powder_ledger_contract_is_documented() {
+    let agents = read_repo_file("AGENTS.md");
+    for needle in [
+        "powder list --takeable",
+        "powder done",
+        "takeable Powder job",
+        "One live lease per agent",
     ] {
         assert!(
-            index.contains(heading),
-            "backlog/README.md must name the `{heading}` item field"
+            agents.contains(needle),
+            "AGENTS.md must document Powder contract `{needle}`"
         );
     }
     assert!(
-        index.contains("`backlog/` is the sole active work ledger"),
-        "backlog/README.md must declare the local ledger"
+        !repo_root().join("backlog/README.md").exists(),
+        "local markdown backlog must not remain as a second ledger"
     );
 
-    let item = read_repo_file("backlog/119-instant-actions.md");
-    for heading in [
-        "## Outcome",
-        "## Why now",
-        "## Acceptance",
-        "## Dependencies",
-        "## Proof",
-        "## Non-goals",
-    ] {
-        assert!(
-            item.contains(heading),
-            "ready backlog item must include `{heading}`"
-        );
-    }
-    assert!(
-        item.contains("status: ready"),
-        "119 must stay claimable until implemented"
-    );
 }
+
 
 
 #[test]
@@ -511,7 +488,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "memory-engine.map.json",
             "CANARY_ENDPOINT",
             "memory-engine-api",
-            "backlog/",
+            "Powder",
             "Cerberus",
             "Bitterblossom",
         ],
@@ -519,7 +496,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
 }
 
 #[test]
-fn architecture_map_has_one_exact_backlog_ledger_node() {
+fn architecture_map_has_one_exact_powder_ledger_node() {
     let map: serde_json::Value =
         serde_json::from_str(&read_repo_file("docs/architecture/memory-engine.map.json"))
             .expect("parse architecture map");
@@ -528,7 +505,7 @@ fn architecture_map_has_one_exact_backlog_ledger_node() {
         "node.fleet.landmark",
         "node.fleet.cerberus",
         "node.fleet.canary",
-        "node.fleet.backlog",
+        "node.fleet.powder",
     ] {
         assert!(
             nodes.iter().any(|node| node["id"].as_str() == Some(id)),
@@ -537,34 +514,34 @@ fn architecture_map_has_one_exact_backlog_ledger_node() {
     }
     assert!(
         nodes.iter().all(|node| {
-            node["id"].as_str() != Some("node.fleet.powder")
+            node["id"].as_str() != Some("node.fleet.backlog")
                 && node["id"].as_str() != Some("node.fleet.github-issues")
-                && node["kind"].as_str() != Some("powder")
         }),
-        "the architecture map must not retain a retired remote work ledger"
+        "the architecture map must not retain a retired work ledger node"
     );
 
-    let backlog = nodes
+    let powder = nodes
         .iter()
-        .find(|node| node["id"].as_str() == Some("node.fleet.backlog"))
-        .expect("backlog node");
-    assert_eq!(backlog["kind"].as_str(), Some("issue"));
-    assert!(backlog["viewTags"]
+        .find(|node| node["id"].as_str() == Some("node.fleet.powder"))
+        .expect("powder node");
+    assert_eq!(powder["kind"].as_str(), Some("issue"));
+    assert!(powder["viewTags"]
         .as_array()
-        .expect("backlog view tags")
+        .expect("powder view tags")
         .iter()
         .any(|tag| tag.as_str() == Some("fleet-integration")));
     assert!(
-        backlog["refs"]
+        powder["refs"]
             .as_array()
-            .expect("backlog refs")
+            .expect("powder refs")
             .iter()
             .any(|reference| {
                 reference["kind"].as_str() == Some("issue")
-                    && reference["path"].as_str() == Some("backlog/")
+                    && reference["path"].as_str()
+                        == Some("powder list --takeable --repo misty-step/scry")
                     && reference["label"].as_str() == Some("active issue queue")
             }),
-        "backlog node must link the active local issue collection"
+        "powder node must link the takeable job list"
     );
 }
 

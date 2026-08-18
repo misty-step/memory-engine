@@ -27,7 +27,7 @@
     {
       "id": "fleet-integration",
       "label": "Fleet Integration",
-      "description": "Current repo-owned evidence for Canary, the local backlog, Landmark, the project map, and Cerberus review."
+      "description": "Current repo-owned evidence for Canary, Powder, Landmark, the project map, and Cerberus review."
     }
   ],
   "nodes": [
@@ -715,15 +715,15 @@
       ]
     },
     {
-      "id": "node.fleet.backlog",
-      "label": "Local Backlog Work Ledger",
+      "id": "node.fleet.powder",
+      "label": "Powder Work Ledger",
       "kind": "issue",
-      "summary": "backlog/ is the sole active work ledger; markdown items replace the previous remote issue queue.",
+      "summary": "Powder is the sole active work ledger; takeable jobs replace the local markdown backlog.",
       "viewTags": ["fleet-integration"],
       "layout": {"fleet-integration": {"x": 280, "y": 360}},
       "refs": [
         {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
-        {"kind": "issue", "path": "backlog/", "label": "active issue queue"}
+        {"kind": "issue", "path": "powder list --takeable --repo misty-step/scry", "label": "active issue queue"}
       ]
     },
     {
