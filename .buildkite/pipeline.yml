@@ -6,5 +6,5 @@ steps:
     key: ci
     command: bash .buildkite/ci.sh
     artifact_paths:
-      - "target/perf/action-latency-postgres-*"
+      - "target/perf/**/*"
     timeout_in_minutes: 60
