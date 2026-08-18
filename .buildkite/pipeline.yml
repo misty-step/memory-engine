@@ -1,0 +1,19 @@
+agents:
+  queue: linux-small
+
+steps:
+  - label: ":dagger: ci"
+    key: ci
+    command: |
+      set -euo pipefail
+      curl -fsSL https://bun.sh/install | bash
+      export BUN_INSTALL="$HOME/.bun"
+      export PATH="$BUN_INSTALL/bin:$PATH"
+      curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR="$HOME/.local/bin" sh
+      export PATH="$HOME/.local/bin:$PATH"
+      bun run ci:full
+      mkdir -p "target/perf/action-latency-postgres-${BUILDKITE_COMMIT}"
+      dagger call action-latency-postgres --source=. --git-sha="$BUILDKITE_COMMIT" export --path="target/perf/action-latency-postgres-${BUILDKITE_COMMIT}"
+    artifact_paths:
+      - "target/perf/action-latency-postgres-*"
+    timeout_in_minutes: 60
