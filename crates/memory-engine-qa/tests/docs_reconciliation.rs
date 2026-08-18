@@ -78,22 +78,26 @@ fn agent_docs_match_post_cutover_contract() {
         "AGENTS.md must identify SLICE docs and exemplars as historical context"
     );
     assert!(
-        agents.contains("Powder is authoritative"),
-        "AGENTS.md must name Powder as the work ledger"
+        agents.contains("GitHub Issues is authoritative"),
+        "AGENTS.md must name GitHub Issues as the work ledger"
     );
     assert!(
-        agents.contains("Refs <job-id>") && agents.contains("powder list --takeable"),
-        "AGENTS.md must document Powder attribution and the takeable board"
+        agents.contains("Refs #") && agents.contains("Closes #"),
+        "AGENTS.md must document issue attribution without premature closure"
+    );
+    assert!(
+        !agents.contains("Powder"),
+        "AGENTS.md must not retain the retired Powder workflow"
     );
     for relative in ["README.md", "VISION.md", "docs/fleet-onboarding.md"] {
         let text = read_repo_file(relative);
         assert!(
-            text.contains("Powder"),
-            "{relative} must point at the active Powder ledger"
+            text.contains("GitHub Issues"),
+            "{relative} must point at the active GitHub Issues ledger"
         );
         assert!(
-            !text.contains("`backlog/` is the sole"),
-            "{relative} must not retain the local markdown ledger as authority"
+            !text.contains("Powder"),
+            "{relative} must not retain the retired Powder workflow"
         );
     }
 }
@@ -263,23 +267,78 @@ fn live_generation_lane_uses_github_issue_ownership() {
 }
 
 #[test]
-fn powder_ledger_contract_is_documented() {
-    let agents = read_repo_file("AGENTS.md");
-    for needle in [
-        "powder list --takeable",
-        "powder done",
-        "takeable Powder job",
-        "One live lease per agent",
+fn shaped_issue_form_requires_exact_work_metadata_and_proof_fields() {
+    let relative = ".github/ISSUE_TEMPLATE/work.yml";
+    let template: serde_yaml::Value =
+        serde_yaml::from_str(&read_repo_file(relative)).expect("parse shaped issue form");
+    assert_eq!(template["name"].as_str(), Some("Shaped work"));
+    assert_eq!(
+        template["labels"].as_sequence(),
+        Some(&vec![serde_yaml::Value::String(
+            "status:backlog".to_owned()
+        )])
+    );
+
+    let body = template["body"].as_sequence().expect("issue form body");
+    for (id, field_type, label) in [
+        ("outcome", "textarea", "Outcome"),
+        ("why-now", "textarea", "Why now"),
+        ("priority", "dropdown", "Priority"),
+        ("work-type", "dropdown", "Type"),
+        ("acceptance", "textarea", "Acceptance"),
+        ("dependencies", "textarea", "Dependencies"),
+        ("proof", "textarea", "Proof"),
+        ("non-goals", "textarea", "Non-goals"),
     ] {
-        assert!(
-            agents.contains(needle),
-            "AGENTS.md must document Powder contract `{needle}`"
+        let field = body
+            .iter()
+            .find(|field| field["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("{relative} is missing body field `{id}`"));
+        assert_eq!(field["type"].as_str(), Some(field_type), "{id} type");
+        assert_eq!(
+            field["attributes"]["label"].as_str(),
+            Some(label),
+            "{id} label"
+        );
+        assert_eq!(
+            field["validations"]["required"].as_bool(),
+            Some(true),
+            "{id} must be required"
         );
     }
-    assert!(
-        !repo_root().join("backlog/README.md").exists(),
-        "local markdown backlog must not remain as a second ledger"
-    );
+
+    for (id, expected) in [
+        (
+            "priority",
+            ["priority:p0", "priority:p1", "priority:p2", "priority:p3"].as_slice(),
+        ),
+        (
+            "work-type",
+            [
+                "type:bug",
+                "type:feature",
+                "type:infrastructure",
+                "type:maintenance",
+                "type:performance",
+                "type:product-proof",
+                "type:roadmap",
+                "type:security",
+            ]
+            .as_slice(),
+        ),
+    ] {
+        let field = body
+            .iter()
+            .find(|field| field["id"].as_str() == Some(id))
+            .expect("metadata field");
+        let options = field["attributes"]["options"]
+            .as_sequence()
+            .expect("metadata options")
+            .iter()
+            .map(|option| option.as_str().expect("string option"))
+            .collect::<Vec<_>>();
+        assert_eq!(options, expected, "{id} options");
+    }
 }
 
 #[test]
@@ -485,7 +544,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
             "memory-engine.map.json",
             "CANARY_ENDPOINT",
             "memory-engine-api",
-            "Powder",
+            "GitHub Issues",
             "Cerberus",
             "Bitterblossom",
         ],
@@ -493,7 +552,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
 }
 
 #[test]
-fn architecture_map_has_one_exact_powder_ledger_node() {
+fn architecture_map_has_one_exact_github_issues_ledger_node() {
     let map: serde_json::Value =
         serde_json::from_str(&read_repo_file("docs/architecture/memory-engine.map.json"))
             .expect("parse architecture map");
@@ -502,7 +561,7 @@ fn architecture_map_has_one_exact_powder_ledger_node() {
         "node.fleet.landmark",
         "node.fleet.cerberus",
         "node.fleet.canary",
-        "node.fleet.powder",
+        "node.fleet.github-issues",
     ] {
         assert!(
             nodes.iter().any(|node| node["id"].as_str() == Some(id)),
@@ -511,34 +570,34 @@ fn architecture_map_has_one_exact_powder_ledger_node() {
     }
     assert!(
         nodes.iter().all(|node| {
-            node["id"].as_str() != Some("node.fleet.backlog")
-                && node["id"].as_str() != Some("node.fleet.github-issues")
+            node["id"].as_str() != Some("node.fleet.powder")
+                && node["kind"].as_str() != Some("powder")
         }),
-        "the architecture map must not retain a retired work ledger node"
+        "the architecture map must not retain the retired Powder work ledger"
     );
 
-    let powder = nodes
+    let github_issues = nodes
         .iter()
-        .find(|node| node["id"].as_str() == Some("node.fleet.powder"))
-        .expect("powder node");
-    assert_eq!(powder["kind"].as_str(), Some("issue"));
-    assert!(powder["viewTags"]
+        .find(|node| node["id"].as_str() == Some("node.fleet.github-issues"))
+        .expect("GitHub Issues node");
+    assert_eq!(github_issues["kind"].as_str(), Some("issue"));
+    assert!(github_issues["viewTags"]
         .as_array()
-        .expect("powder view tags")
+        .expect("GitHub Issues view tags")
         .iter()
         .any(|tag| tag.as_str() == Some("fleet-integration")));
     assert!(
-        powder["refs"]
+        github_issues["refs"]
             .as_array()
-            .expect("powder refs")
+            .expect("GitHub Issues refs")
             .iter()
             .any(|reference| {
                 reference["kind"].as_str() == Some("issue")
                     && reference["path"].as_str()
-                        == Some("powder list --takeable --repo misty-step/scry")
+                        == Some("https://github.com/misty-step/scry/issues")
                     && reference["label"].as_str() == Some("active issue queue")
             }),
-        "powder node must link the takeable job list"
+        "GitHub Issues node must link the active issue collection"
     );
 }
 
