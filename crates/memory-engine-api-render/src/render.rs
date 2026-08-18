@@ -1062,9 +1062,6 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like &ldquo;NATO phonetic alphabet&rdquo;, a list, or pasted notes."></textarea>
-<label class="ae-label" for="me-capture-permission">Permission</label>
-<select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
-<p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
 <div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
@@ -1819,7 +1816,7 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
     // tomorrow (`DEFAULT_SNOOZE_DEFER_MS`, 24 hours); see
     // `memory_engine_study::skip_current`/`snooze_current`.
     format!(
-        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}{edit}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}{edit}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/app/create" title="Add new material.">{ICON_PLUS}Capture more</a></div></details>"#,
         reference = render_review_action(
             account,
             current,
@@ -2141,7 +2138,7 @@ mod source_loading_tests {
     }
 
     #[test]
-    fn capture_form_exposes_an_accessible_permission_choice_and_default() {
+    fn capture_form_is_one_field_and_create_without_a_permission_toggle() {
         let state = super::render_test_state("render-permission@example.com");
         let account = state
             .create_account("render-permission@example.com")
@@ -2149,11 +2146,12 @@ mod source_loading_tests {
             .expect("account");
         let html = render_capture(&account);
 
-        assert!(html.contains(r#"id="me-capture-permission" name="permission""#));
-        assert!(html.contains(r#"aria-describedby="me-capture-permission-hint""#));
-        assert!(html.contains(r#"value="model-eligible" selected"#));
-        assert!(html.contains("Keep local / Never send to a model"));
-        assert!(html.contains("prevent model providers from receiving this capture"));
+        assert!(html.contains(r#"name="capture""#));
+        assert!(html.contains("Create"));
+        assert!(html.contains("Generates in the background."));
+        assert!(!html.contains(r#"name="permission""#));
+        assert!(!html.contains("me-capture-permission"));
+        assert!(!html.contains("Keep local / Never send to a model"));
     }
 }
 
