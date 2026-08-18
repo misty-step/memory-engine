@@ -32,6 +32,7 @@
     form: null,
     control: null,
     dimmed: [],
+    hatchSiblings: [],
     token: null,
     timeoutId: null,
     landingAttempted: false,
@@ -40,6 +41,7 @@
     // resumed, that it is stale rather than firing with leftover state.
     landingEpoch: 0
   };
+
 
   function isFiniteNumber(value) {
     return typeof value === "number" && isFinite(value);
@@ -73,8 +75,27 @@
   function isInPlaceActionForm(form) {
     if (!isNativeForm(form) || typeof form.getAttribute !== "function") return false;
     var action = form.getAttribute("action") || "";
-    return action === "/app/submit" || action === "/app/next";
+    return (
+      action === "/app/submit" ||
+      action === "/app/next" ||
+      action === "/app/draft/keep" ||
+      action === "/app/draft/reject" ||
+      action === "/app/skip" ||
+      action === "/app/snooze" ||
+      action === "/app/snooze-concept" ||
+      action === "/app/reveal" ||
+      action === "/app/reference" ||
+      action === "/app/bridge"
+    );
   }
+
+  function confirmCopyFor(action) {
+    if (action === "/app/skip") return "You'll see this later this session.";
+    if (action === "/app/snooze") return "You'll see this tomorrow.";
+    if (action === "/app/snooze-concept") return "You'll see this concept tomorrow.";
+    return null;
+  }
+
 
   function responseClockNow() {
     return hasMonotonicClock ? perf.now() : Date.now();
@@ -179,8 +200,13 @@
     for (var i = 0; i < state.dimmed.length; i++) {
       state.dimmed[i].removeAttribute("data-dim");
     }
+    for (var h = 0; h < state.hatchSiblings.length; h++) {
+      state.hatchSiblings[h].removeAttribute("aria-disabled");
+    }
     state.control = null;
     state.dimmed = [];
+    state.hatchSiblings = [];
+
   }
 
   function resetState() {
@@ -212,6 +238,10 @@
     if (action === "/app/reveal") return "Revealing…";
     if (action === "/app/skip") return "Skipping…";
     if (action === "/app/snooze" || action === "/app/snooze-concept") return "Snoozing…";
+    if (action === "/app/draft/keep") return "Keeping…";
+    if (action === "/app/draft/reject") return "Rejecting…";
+    if (action === "/app/reference") return "Loading…";
+    if (action === "/app/bridge") return "Building…";
     if (action === "/app/submit" && control && !hasClass(control, "me-choice")) {
       return "Checking…";
     }
@@ -243,6 +273,17 @@
             choices[i].setAttribute("data-dim", "");
             state.dimmed.push(choices[i]);
           }
+        }
+      }
+    }
+    if (typeof document.querySelectorAll === "function") {
+      var hatches = document.querySelectorAll(
+        ".me-more-sheet button, .me-hatch-row button"
+      );
+      for (var j = 0; j < hatches.length; j++) {
+        if (hatches[j] !== control) {
+          hatches[j].setAttribute("aria-disabled", "true");
+          state.hatchSiblings.push(hatches[j]);
         }
       }
     }
@@ -493,17 +534,35 @@
       .then(function (html) {
         if (state.form !== form) return;
         if (!applyInPlaceDocument(html)) throw new Error("swap failed");
+        var confirm = confirmCopyFor(action);
+        var view = viewRoot();
+        if (confirm && view && typeof view.innerHTML === "string") {
+          view.innerHTML =
+            '<p class="me-notice me-confirm" role="status">' + confirm + "</p>" +
+            view.innerHTML;
+        }
         resetState();
       })
       .catch(function () {
         if (state.form !== form) return;
-        // Drop any fetch-only handoff before the native navigation path.
         if (requestToken) removeHandoffIfToken(requestToken);
         clearTimeoutIfAny();
-        nativeSubmit(form, control);
+        if (action === "/app/submit" || action === "/app/next") {
+          nativeSubmit(form, control);
+          return;
+        }
+        var view = viewRoot();
+        if (view && typeof view.innerHTML === "string") {
+          view.innerHTML =
+            '<p class="me-notice me-confirm" role="status">That didn\'t go through. Try again.</p>' +
+            view.innerHTML;
+        }
+        resetState();
       });
+
     return true;
   }
+
 
   document.addEventListener("submit", function (event) {
     var form = event && event.target;

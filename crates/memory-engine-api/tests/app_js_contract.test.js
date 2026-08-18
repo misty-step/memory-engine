@@ -186,6 +186,9 @@ function browserHarness(options = {}) {
     },
     getElementById: (id) => (id === "me-jobs" ? options.jobsList ?? null : null),
     querySelectorAll(selector) {
+      if (selector === ".me-more-sheet button, .me-hatch-row button") {
+        return options.hatchButtons ?? [];
+      }
       const match = selector.match(/^meta\[name="([^"]+)"\]$/);
       if (!match) return [];
       const value = headMetas.get(match[1]);
@@ -193,6 +196,7 @@ function browserHarness(options = {}) {
         ? []
         : [{ getAttribute: () => value }];
     },
+
     createElement: (tag) => {
       if (tag === "meta") {
         return {
@@ -613,6 +617,155 @@ test("continue uses in-place fetch and does not write a submit handoff", async (
   expect(browser.footerHtml()).toContain("review");
   expect(browser.busy()).toBeFalse();
 });
+
+function htmlReviewLanding(prompt, due = "1 due") {
+  return `<!doctype html><html><body>
+<span class="me-due">${due}</span>
+<div class="ae-view"><p class="me-prompt">${prompt}</p></div>
+<footer class="ae-bar"><p class="me-tagline">review</p></footer>
+</body></html>`;
+}
+
+test("skip fetches in place and confirms later this session", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/skip",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Skip",
+    fetchImpl() {
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () => Promise.resolve(htmlReviewLanding("Letter O")),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  expect(browser.controlLabel()).toBe("Skipping…");
+  expect(browser.handoff()).toBeNull();
+  expect(browser.fetches[0].url).toBe("/app/skip");
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Letter O");
+  expect(browser.viewHtml()).toContain("later this session");
+  expect(browser.viewHtml()).toContain('role="status"');
+  expect(browser.busy()).toBeFalse();
+  expect(browser.nativeSubmits()).toBe(0);
+});
+
+test("snooze fetches in place and names tomorrow", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/snooze",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Snooze",
+    fetchImpl() {
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () => Promise.resolve(htmlReviewLanding("Letter P")),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.controlLabel()).toBe("Snoozing…");
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("tomorrow");
+  expect(browser.nativeSubmits()).toBe(0);
+});
+
+test("keep draft fetches in place and updates the due count", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/draft/keep",
+    formClass: "me-keep",
+    controlClasses: ["ae-button-quiet"],
+    controlLabel: "Keep as written",
+    dueText: "0 due",
+    viewHtml: '<article class="me-pending-draft"><p>Draft</p></article>',
+    fetchImpl() {
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(
+            htmlReviewLanding("Kept card", "1 due").replace(
+              '<p class="me-prompt">Kept card</p>',
+              "<p>Queue ready</p>",
+            ),
+          ),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  expect(browser.controlLabel()).toBe("Keeping…");
+  expect(browser.handoff()).toBeNull();
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Queue ready");
+  expect(browser.viewHtml()).not.toContain("me-pending-draft");
+  expect(browser.dueText()).toBe("1 due");
+  expect(browser.nativeSubmits()).toBe(0);
+});
+
+test("in-flight hatch disables sibling overflow controls", () => {
+  const sibling = {
+    attrs: {},
+    setAttribute(name, value) {
+      this.attrs[name] = value;
+    },
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    removeAttribute(name) {
+      delete this.attrs[name];
+    },
+  };
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/bridge",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Bridge",
+    hatchButtons: [sibling],
+    fetchImpl() {
+      return new Promise(() => {});
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.controlLabel()).toBe("Building…");
+  expect(sibling.attrs["aria-disabled"]).toBe("true");
+});
+
+test("skip fetch failure restores controls without a second POST", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/skip",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Skip",
+    viewHtml: '<p class="me-prompt">Letter N</p>',
+    fetchImpl() {
+      return Promise.reject(new Error("network down"));
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  await flushMicrotasks();
+  expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.busy()).toBeFalse();
+  expect(browser.viewHtml()).toContain("Try again");
+  expect(browser.controlLabel()).toBe("Skip");
+});
+
+
 test("every native form keeps instant acknowledgment and duplicate suppression", () => {
   const browser = browserHarness({ action: "/app/next" });
   browser.dispatchSubmit();
