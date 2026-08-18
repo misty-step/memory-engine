@@ -330,7 +330,12 @@ function browserHarness(options = {}) {
       return id;
     },
     clearTimeout: (id) => timers.delete(id),
-    location: { assign: (url) => navigations.push(url) },
+    location: {
+      assign: (url) => navigations.push(url),
+      reload() {
+        navigations.push("reload");
+      },
+    },
   };
   if (enableInPlace) {
     window.FormData = FakeFormData;
@@ -618,15 +623,18 @@ test("continue uses in-place fetch and does not write a submit handoff", async (
   expect(browser.busy()).toBeFalse();
 });
 
-function htmlReviewLanding(prompt, due = "1 due") {
+function htmlReviewLanding(prompt, due = "1 due", notice = "") {
+  const banner = notice
+    ? `<p class="me-notice" role="status">${notice}</p>`
+    : "";
   return `<!doctype html><html><body>
 <span class="me-due">${due}</span>
-<div class="ae-view"><p class="me-prompt">${prompt}</p></div>
+<div class="ae-view">${banner}<p class="me-prompt">${prompt}</p></div>
 <footer class="ae-bar"><p class="me-tagline">review</p></footer>
 </body></html>`;
 }
 
-test("skip fetches in place and confirms later this session", async () => {
+test("skip fetches in place and keeps the server confirm", async () => {
   const browser = browserHarness({
     inPlace: true,
     action: "/app/skip",
@@ -637,7 +645,14 @@ test("skip fetches in place and confirms later this session", async () => {
       return Promise.resolve({
         ok: true,
         headers: { get: () => "text/html; charset=utf-8" },
-        text: () => Promise.resolve(htmlReviewLanding("Letter O")),
+        text: () =>
+          Promise.resolve(
+            htmlReviewLanding(
+              "Letter O",
+              "1 due",
+              "You'll see this later this session.",
+            ),
+          ),
       });
     },
   });
@@ -653,9 +668,10 @@ test("skip fetches in place and confirms later this session", async () => {
   expect(browser.viewHtml()).toContain('role="status"');
   expect(browser.busy()).toBeFalse();
   expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual([]);
 });
 
-test("snooze fetches in place and names tomorrow", async () => {
+test("snooze fetches in place and keeps the server tomorrow notice", async () => {
   const browser = browserHarness({
     inPlace: true,
     action: "/app/snooze",
@@ -666,7 +682,10 @@ test("snooze fetches in place and names tomorrow", async () => {
       return Promise.resolve({
         ok: true,
         headers: { get: () => "text/html; charset=utf-8" },
-        text: () => Promise.resolve(htmlReviewLanding("Letter P")),
+        text: () =>
+          Promise.resolve(
+            htmlReviewLanding("Letter P", "1 due", "You'll see this tomorrow."),
+          ),
       });
     },
   });
@@ -676,6 +695,7 @@ test("snooze fetches in place and names tomorrow", async () => {
   await flushMicrotasks();
   expect(browser.viewHtml()).toContain("tomorrow");
   expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual([]);
 });
 
 test("keep draft fetches in place and updates the due count", async () => {
@@ -713,44 +733,40 @@ test("keep draft fetches in place and updates the due count", async () => {
   expect(browser.nativeSubmits()).toBe(0);
 });
 
-test("in-flight hatch disables sibling overflow controls", () => {
-  const sibling = {
-    attrs: {},
-    setAttribute(name, value) {
-      this.attrs[name] = value;
-    },
-    getAttribute(name) {
-      return this.attrs[name] ?? null;
-    },
-    removeAttribute(name) {
-      delete this.attrs[name];
-    },
-  };
+test("keep error HTML swaps without a second POST", async () => {
   const browser = browserHarness({
     inPlace: true,
-    action: "/app/bridge",
-    formClass: "me-hatch",
-    controlClasses: ["ae-button"],
-    controlLabel: "Bridge",
-    hatchButtons: [sibling],
+    action: "/app/draft/keep",
+    formClass: "me-keep",
+    controlClasses: ["ae-button-quiet"],
+    controlLabel: "Keep as written",
+    viewHtml: '<article class="me-pending-draft"><p>Draft</p></article>',
     fetchImpl() {
-      return new Promise(() => {});
+      return Promise.resolve({
+        ok: false,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(htmlReviewLanding("", "0 due", "Draft already decided.")),
+      });
     },
   });
 
   browser.dispatchSubmit();
-  expect(browser.controlLabel()).toBe("Building…");
-  expect(sibling.attrs["aria-disabled"]).toBe("true");
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Draft already decided.");
+  expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual([]);
+  expect(browser.busy()).toBeFalse();
 });
 
-test("skip fetch failure restores controls without a second POST", async () => {
+test("skip fetch failure reloads instead of posting twice", async () => {
   const browser = browserHarness({
     inPlace: true,
     action: "/app/skip",
     formClass: "me-hatch",
     controlClasses: ["ae-button"],
     controlLabel: "Skip",
-    viewHtml: '<p class="me-prompt">Letter N</p>',
+    viewHtml: '<input class="me-answer-input" value="typed"><p class="me-prompt">Letter N</p>',
     fetchImpl() {
       return Promise.reject(new Error("network down"));
     },
@@ -760,10 +776,12 @@ test("skip fetch failure restores controls without a second POST", async () => {
   expect(browser.prevented()).toBe(1);
   await flushMicrotasks();
   expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual(["reload"]);
+  expect(browser.viewHtml()).toContain('value="typed"');
+  expect(browser.viewHtml()).not.toContain("Try again");
   expect(browser.busy()).toBeFalse();
-  expect(browser.viewHtml()).toContain("Try again");
-  expect(browser.controlLabel()).toBe("Skip");
 });
+
 
 
 test("every native form keeps instant acknowledgment and duplicate suppression", () => {

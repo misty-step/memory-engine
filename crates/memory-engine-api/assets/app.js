@@ -9,8 +9,9 @@
 
 // One state machine for review-loop forms: response timing, immediate
 // acknowledgment, in-place fetch swap, and the cross-document performance
-// handoff stay together. Native form navigation remains the JS-off path and
-// the automatic fallback when fetch cannot complete.
+// handoff stay together. Native form navigation remains the JS-off path.
+// Submit and next fall back to native submit when fetch cannot complete.
+// Other in-place actions apply any HTML body, then reload if they cannot.
 (function () {
   "use strict";
 
@@ -32,7 +33,6 @@
     form: null,
     control: null,
     dimmed: [],
-    hatchSiblings: [],
     token: null,
     timeoutId: null,
     landingAttempted: false,
@@ -89,12 +89,6 @@
     );
   }
 
-  function confirmCopyFor(action) {
-    if (action === "/app/skip") return "You'll see this later this session.";
-    if (action === "/app/snooze") return "You'll see this tomorrow.";
-    if (action === "/app/snooze-concept") return "You'll see this concept tomorrow.";
-    return null;
-  }
 
 
   function responseClockNow() {
@@ -200,13 +194,8 @@
     for (var i = 0; i < state.dimmed.length; i++) {
       state.dimmed[i].removeAttribute("data-dim");
     }
-    for (var h = 0; h < state.hatchSiblings.length; h++) {
-      state.hatchSiblings[h].removeAttribute("aria-disabled");
-    }
     state.control = null;
     state.dimmed = [];
-    state.hatchSiblings = [];
-
   }
 
   function resetState() {
@@ -273,17 +262,6 @@
             choices[i].setAttribute("data-dim", "");
             state.dimmed.push(choices[i]);
           }
-        }
-      }
-    }
-    if (typeof document.querySelectorAll === "function") {
-      var hatches = document.querySelectorAll(
-        ".me-more-sheet button, .me-hatch-row button"
-      );
-      for (var j = 0; j < hatches.length; j++) {
-        if (hatches[j] !== control) {
-          hatches[j].setAttribute("aria-disabled", "true");
-          state.hatchSiblings.push(hatches[j]);
         }
       }
     }
@@ -512,6 +490,7 @@
     var body = formBody(form, control);
     if (!body) return false;
     var requestToken = state.token;
+    var nativeFallback = action === "/app/submit" || action === "/app/next";
     window
       .fetch(action, {
         method: "POST",
@@ -524,7 +503,7 @@
         redirect: "follow"
       })
       .then(function (response) {
-        if (!response || !response.ok) throw new Error("submit failed");
+        if (!response) throw new Error("submit failed");
         var type = response.headers && response.headers.get
           ? response.headers.get("content-type") || ""
           : "";
@@ -534,32 +513,21 @@
       .then(function (html) {
         if (state.form !== form) return;
         if (!applyInPlaceDocument(html)) throw new Error("swap failed");
-        var confirm = confirmCopyFor(action);
-        var view = viewRoot();
-        if (confirm && view && typeof view.innerHTML === "string") {
-          view.innerHTML =
-            '<p class="me-notice me-confirm" role="status">' + confirm + "</p>" +
-            view.innerHTML;
-        }
         resetState();
       })
       .catch(function () {
         if (state.form !== form) return;
         if (requestToken) removeHandoffIfToken(requestToken);
         clearTimeoutIfAny();
-        if (action === "/app/submit" || action === "/app/next") {
+        if (nativeFallback) {
           nativeSubmit(form, control);
           return;
         }
-        var view = viewRoot();
-        if (view && typeof view.innerHTML === "string") {
-          view.innerHTML =
-            '<p class="me-notice me-confirm" role="status">That didn\'t go through. Try again.</p>' +
-            view.innerHTML;
+        if (window.location && typeof window.location.reload === "function") {
+          window.location.reload();
         }
         resetState();
       });
-
     return true;
   }
 

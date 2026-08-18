@@ -41,13 +41,27 @@ pub struct ContentFeedbackRecovery<'a> {
     pub message: &'a str,
 }
 
+pub const SKIP_CONFIRM_NOTICE: &str = "You'll see this later this session.";
+pub const SNOOZE_CONFIRM_NOTICE: &str = "You'll see this tomorrow.";
+pub const SNOOZE_CONCEPT_CONFIRM_NOTICE: &str = "You'll see this concept tomorrow.";
+
 #[must_use]
 pub fn render_action_result_html(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
 ) -> String {
-    render_action_result_html_with_head(state, account, result, None, "")
+    render_action_result_html_with_notice(state, account, result, None)
+}
+
+#[must_use]
+pub fn render_action_result_html_with_notice(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<StudyViewResponse, ApiFailure>,
+    notice: Option<&str>,
+) -> String {
+    render_action_result_html_with_head(state, account, result, notice, "")
 }
 
 #[must_use]
