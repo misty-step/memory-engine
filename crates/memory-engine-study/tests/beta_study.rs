@@ -409,6 +409,33 @@ fn multiple_choice_choices_shuffle_between_reviews_without_changing_answer() {
 }
 
 #[test]
+fn graded_mcq_recap_keeps_presentation_choice_order() {
+    let directory = TempDirectory::new("mcq-recap-order");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
+    let presented = study.start().expect("start").current.expect("current");
+    let pre_submit_choices = presented.choices.clone();
+    assert!(
+        !pre_submit_choices.is_empty(),
+        "MCQ presentation must expose choices"
+    );
+    let graded = study
+        .submit_answer("ALFA", 1_800)
+        .expect("grade presentation");
+    assert_eq!(
+        graded.current.expect("graded").choices,
+        pre_submit_choices,
+        "submit_answer recap must keep the presentation order"
+    );
+}
+
+#[test]
 fn queue_rotates_due_variants_with_the_same_concept_and_stage() {
     let directory = TempDirectory::new("variant-rotation");
     let path = directory.path().join("study.json");
