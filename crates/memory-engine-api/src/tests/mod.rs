@@ -11053,13 +11053,11 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
 }
 
 #[tokio::test]
-async fn ios_standalone_pwa_sends_https_session_cookie_and_csrf_still_blocks_forged_posts() {
+async fn ios_standalone_pwa_resumes_https_session_on_home_navigation() {
     // Named cause: iOS treats a Home Screen / standalone PWA as a cross-site
     // context. SameSite=Lax cookies set when Safari consumes the magic link
     // are omitted on the next standalone navigation. SameSite=None; Secure
-    // on the __Host- cookie is what the installed app can send. Mutations
-    // already require the form CSRF token, so widening SameSite does not
-    // open cookie-only POSTs.
+    // on the __Host- cookie is what the installed app can send.
     let app = router(local_fixture_state());
     let started = app
         .clone()
@@ -11082,31 +11080,14 @@ async fn ios_standalone_pwa_sends_https_session_cookie_and_csrf_still_blocks_for
         .to_str()
         .expect("cookie header")
         .to_owned();
-    assert!(
-        set_cookie.starts_with("__Host-memory_engine_session="),
-        "production cookie must stay host-only: {set_cookie}"
-    );
-    assert!(
-        set_cookie.contains("SameSite=None"),
-        "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
-    );
-    assert!(
-        !set_cookie.contains("SameSite=Lax"),
-        "SameSite must not regress to Lax-only: {set_cookie}"
-    );
-    assert!(set_cookie.contains("Secure"), "{set_cookie}");
-    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
-    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
-    assert!(!set_cookie.contains("Domain="), "{set_cookie}");
+    assert_pwa_host_session_cookie(&set_cookie);
 
     let cookie = set_cookie
         .split(';')
         .next()
         .expect("cookie pair")
         .to_owned();
-
     let home = app
-        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -11127,7 +11108,8 @@ async fn ios_standalone_pwa_sends_https_session_cookie_and_csrf_still_blocks_for
         .get(SET_COOKIE)
         .expect("sliding host cookie")
         .to_str()
-        .expect("sliding cookie header");
+        .expect("sliding cookie header")
+        .to_owned();
     assert!(
         home_set_cookie.contains("SameSite=None"),
         "GET / must reissue the PWA-sendable cookie: {home_set_cookie}"
@@ -11141,6 +11123,52 @@ async fn ios_standalone_pwa_sends_https_session_cookie_and_csrf_still_blocks_for
         home_html.contains(r#"action="/app/logout""#),
         "standalone GET must resume the session: {home_html}"
     );
+}
+
+#[tokio::test]
+async fn ios_standalone_pwa_cookie_still_requires_csrf_and_clears_on_logout() {
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=standalone+pwa+csrf"))
+                .expect("HTTPS start"),
+        )
+        .await
+        .expect("HTTPS start response");
+    let set_cookie = started
+        .headers()
+        .get(SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("cookie header")
+        .to_owned();
+    assert_pwa_host_session_cookie(&set_cookie);
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("x-forwarded-proto", "https")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("home"),
+        )
+        .await
+        .expect("home response");
+    let home_html = response_text(home).await;
 
     let forged = app
         .clone()
@@ -11175,20 +11203,36 @@ async fn ios_standalone_pwa_sends_https_session_cookie_and_csrf_still_blocks_for
         .await
         .expect("explicit logout response");
     assert_eq!(logged_out.status(), StatusCode::OK);
-    let clear_cookies = logged_out
+    let host_clear = logged_out
         .headers()
         .get_all(SET_COOKIE)
         .iter()
         .map(|value| value.to_str().expect("set-cookie"))
-        .collect::<Vec<_>>();
-    let host_clear = clear_cookies
-        .iter()
         .find(|value| value.starts_with("__Host-memory_engine_session="))
         .expect("host clear cookie");
     assert!(
         host_clear.contains("SameSite=None") && host_clear.contains("Max-Age=0"),
         "logout must clear the PWA-sendable host cookie: {host_clear}"
     );
+}
+
+fn assert_pwa_host_session_cookie(set_cookie: &str) {
+    assert!(
+        set_cookie.starts_with("__Host-memory_engine_session="),
+        "production cookie must stay host-only: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("SameSite=None"),
+        "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
+    );
+    assert!(
+        !set_cookie.contains("SameSite=Lax"),
+        "SameSite must not regress to Lax-only: {set_cookie}"
+    );
+    assert!(set_cookie.contains("Secure"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+    assert!(!set_cookie.contains("Domain="), "{set_cookie}");
 }
 
 #[tokio::test]
