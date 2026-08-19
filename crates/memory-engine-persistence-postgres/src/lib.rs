@@ -56,7 +56,7 @@ static CONNECTION_POOLS: LazyLock<Mutex<BTreeMap<String, r2d2::Pool<PostgresConn
 
 /// Max live connections per database URL for the single App Platform instance.
 const POOL_MAX_SIZE: u32 = 8;
-const POOL_MIN_IDLE: u32 = 1;
+const POOL_MIN_IDLE: u32 = 0;
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
