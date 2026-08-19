@@ -714,18 +714,19 @@ impl JobQueue {
                     .map(|cost| (card_count, cost))
             })
             .map_err(|failure| failure.message);
+        let retry = result.is_err();
         let _ = with_postgres_store(database_url, |store| {
             store.finish_generation_job(
                 &job.account_id,
                 &job.id,
                 job.lease_token.as_deref().unwrap_or_default(),
                 self.inner.registry.now(),
-                result.clone(),
+                result,
                 MAX_ATTEMPTS,
                 RETRY_DELAY_MS,
             )
         });
-        if result.is_err() {
+        if retry {
             self.wake_postgres_worker_after(std::time::Duration::from_millis(
                 u64::try_from(RETRY_DELAY_MS).unwrap_or(1_000),
             ));
@@ -972,18 +973,19 @@ impl JobQueue {
         let Some(database_url) = self.inner.postgres_url.as_deref() else {
             return Ok(false);
         };
+        let retry = outcome.is_err();
         let finished = with_postgres_store(database_url, |store| {
             store.finish_generation_job(
                 &job.account_id,
                 &job.id,
                 job.lease_token.as_deref().unwrap_or_default(),
                 self.inner.registry.now(),
-                outcome.clone(),
+                outcome,
                 MAX_ATTEMPTS,
                 RETRY_DELAY_MS,
             )
         });
-        if outcome.is_err() {
+        if retry {
             self.wake_postgres_worker_after(std::time::Duration::from_millis(
                 u64::try_from(RETRY_DELAY_MS).unwrap_or(1_000),
             ));
