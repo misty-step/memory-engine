@@ -720,11 +720,16 @@ impl JobQueue {
                 &job.id,
                 job.lease_token.as_deref().unwrap_or_default(),
                 self.inner.registry.now(),
-                result,
+                result.clone(),
                 MAX_ATTEMPTS,
                 RETRY_DELAY_MS,
             )
         });
+        if result.is_err() {
+            self.wake_postgres_worker_after(std::time::Duration::from_millis(
+                u64::try_from(RETRY_DELAY_MS).unwrap_or(1_000),
+            ));
+        }
     }
 
     fn next_queued(&self) -> Option<String> {
@@ -790,7 +795,21 @@ impl JobQueue {
     }
 
     fn wake_postgres_worker(&self) {
-        self.inner.wake.notify_waiters();
+        self.inner.wake.notify_one();
+    }
+
+    fn wake_postgres_worker_after(&self, delay: std::time::Duration) {
+        let worker = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                worker.wake_postgres_worker();
+            });
+        } else {
+            self.wake_postgres_worker();
+        }
     }
 
     async fn wait_for_postgres_work(&self) {
@@ -953,17 +972,23 @@ impl JobQueue {
         let Some(database_url) = self.inner.postgres_url.as_deref() else {
             return Ok(false);
         };
-        with_postgres_store(database_url, |store| {
+        let finished = with_postgres_store(database_url, |store| {
             store.finish_generation_job(
                 &job.account_id,
                 &job.id,
                 job.lease_token.as_deref().unwrap_or_default(),
                 self.inner.registry.now(),
-                outcome,
+                outcome.clone(),
                 MAX_ATTEMPTS,
                 RETRY_DELAY_MS,
             )
-        })
+        });
+        if outcome.is_err() {
+            self.wake_postgres_worker_after(std::time::Duration::from_millis(
+                u64::try_from(RETRY_DELAY_MS).unwrap_or(1_000),
+            ));
+        }
+        finished
     }
 
     async fn run_job(&self, job_id: &str) {
@@ -1970,9 +1995,10 @@ mod tests {
 
     #[test]
     fn postgres_idle_poll_is_not_a_busy_loop() {
-        assert!(
-            POSTGRES_IDLE_POLL >= std::time::Duration::from_secs(5),
-            "idle Postgres claim must not poll more than once per 5s"
+        assert_eq!(
+            POSTGRES_IDLE_POLL,
+            std::time::Duration::from_secs(15),
+            "idle Postgres claim must wait 15s unless enqueue wakes it"
         );
     }
 
