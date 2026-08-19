@@ -2,9 +2,9 @@
 
 Everything here is CLI-driven; no dashboard is required. Scry runs as the
 native Rust `memory-engine-api` process on Misty Step's isolated DigitalOcean
-public application host, backed by Neon Postgres and served at
+public application host, backed by Postgres on that same host and served at
 `https://scry.study`. DNS and TLS terminate at Caddy on the same host. Rollback
-switches an immutable host release; Neon data remains unchanged.
+switches an immutable host release; it does not change the local store.
 
 ## Agent surface summary
 
@@ -407,7 +407,7 @@ REMOTE
 `do-connecting-ip`.
 
 Rollback changes only the active symlink, then reruns the same smoke. It does
-not modify the environment file or Neon:
+not modify the environment file or the local Postgres data directory:
 
 ```sh
 known_good="${KNOWN_GOOD_COMMIT:?set an installed release commit}"
@@ -499,7 +499,7 @@ secret values, then restart `scry.service` and rerun the deployed smoke.
 
 | Secret | Purpose |
 | --- | --- |
-| `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
+| `MEMORY_ENGINE_POSTGRES_URL` | Local Unix-socket URL `postgresql:///scry?host=/var/run/postgresql&sslmode=disable`. Peer-auth as systemd user `scry`. |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
 | `MEMORY_ENGINE_AUTH_MAILER_COMMAND` | Path to the installed production command `/usr/local/bin/send-magic-link`; do not replace it with the local outbox. |
 | `RESEND_API_KEY` | Encrypted Resend credential consumed only by the bundled mailer; never print or place in a command line. |
@@ -526,18 +526,20 @@ secret values, then restart `scry.service` and rerun the deployed smoke.
 
 Migrations run once per process at first database use, not per request.
 
-## Database (Neon)
+## Database (local Postgres)
 
-Project `memory-engine-prod` (`twilight-brook-49749008`, aws-us-east-2),
-fully managed by CLI:
+Postgres 16 runs on `public-apps`. The `scry` OS user owns database `scry`
+via peer auth on `/var/run/postgresql`. `scry.service` waits for
+`postgresql.service`.
 
-```sh
-neonctl projects list
-neonctl connection-string --project-id twilight-brook-49749008 --pooled
-neonctl branches create --project-id twilight-brook-49749008 --name migration-test
-```
+Nightly custom-format dumps land in `/var/backups/scry` via
+`/usr/local/sbin/scry-pg-dump` (`/etc/cron.d/scry-pg-dump`). Restore drill:
+`pg_restore` into a side database owned by `scry`, then drop it. A dump must
+also leave the box.
 
-Use a branch to rehearse risky migrations against real data, then delete it.
+The retired Neon project `memory-engine-prod` (`twilight-brook-49749008`) is
+kept until a restoreable Neon dump exists. Do not delete it. Do not point
+production back at Neon.
 
 ## Human login (magic links over email)
 
