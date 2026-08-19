@@ -171,6 +171,7 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
                     &revision.draft_id,
                     &revision.prompt,
                     &revision.expected_answer,
+                    &[],
                 ),
             ),
             Err(error) => HttpResponse::bad_request(&error),

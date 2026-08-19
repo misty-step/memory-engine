@@ -197,6 +197,8 @@ struct EnqueuedGenerationJobResource {
 struct EditDraftRequest {
     prompt: String,
     expected_answer: String,
+    #[serde(default)]
+    choices: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -972,6 +974,7 @@ async fn edit_draft(
         &draft_id,
         &request.prompt,
         &request.expected_answer,
+        &request.choices,
     )?))
 }
 
@@ -1198,6 +1201,8 @@ struct AppDraftEditForm {
     draft_id: String,
     prompt: String,
     expected_answer: String,
+    #[serde(default)]
+    choices: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -2046,6 +2051,7 @@ async fn edit_app_draft(
         &form.draft_id,
         &form.prompt,
         &form.expected_answer,
+        &split_draft_choices(&form.choices),
     );
     let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
@@ -2144,6 +2150,14 @@ fn client_rate_limit_key(headers: &HeaderMap) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map_or_else(|| "unknown".to_owned(), str::to_owned)
+}
+
+fn split_draft_choices(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn app_failure_response(error: &ApiFailure) -> Response {

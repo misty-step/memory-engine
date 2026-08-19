@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memory_engine_api_render::{
-    render_account_page, render_content_feedback_result_html, render_library_page,
+    render_account_page, render_content_feedback_result_html, render_edit_review_html,
+    render_library_page,
 };
 use memory_engine_api_state::{
     AccountRegistry, ApiState, AuthConfig, CreateSourceRequest, EnqueueOutcome, SourcePermission,
@@ -77,6 +78,107 @@ fn active_review_render_skips_workspace_material() {
     assert!(!html.contains("NATO practice notes"));
     assert!(!html.contains("Generate cards"));
     assert!(html.contains("Reveal answer"));
+}
+
+#[test]
+fn pending_mcq_draft_shows_every_choice_and_distractor_fields() {
+    let email = unique_email("pending-mcq");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let source = state
+        .save_app_source(
+            &account,
+            &CreateSourceRequest {
+                title: "NATO practice notes".to_owned(),
+                body: nato_source_body(),
+                permission: SourcePermission::default(),
+            },
+        )
+        .expect("source");
+    assert!(matches!(
+        state.enqueue_generation_job_by_source(&account, &source.source_id, &source.title),
+        EnqueueOutcome::Started(_)
+    ));
+    state.run_pending_jobs_blocking();
+
+    let view = state.app_study_view(&account).expect("pending drafts");
+    assert!(
+        view.drafts.iter().any(|draft| !draft.choices.is_empty()),
+        "NATO fixture must produce an MCQ draft: {:?}",
+        view.drafts
+            .iter()
+            .map(|draft| (&draft.prompt, &draft.answer, &draft.choices))
+            .collect::<Vec<_>>()
+    );
+    let html = render_account_page(&state, &account, Some(&view), None);
+
+    assert!(
+        html.contains("BRAVO"),
+        "pending MCQ must show distractors before Keep: {html}"
+    );
+    assert!(
+        html.contains("CHARLIE"),
+        "pending MCQ must show every choice before Keep: {html}"
+    );
+    assert!(
+        html.contains(r#"name="choices""#),
+        "edit form must expose distractor fields: {html}"
+    );
+    assert!(
+        html.contains("Keep as written"),
+        "Keep as written must stay one tap: {html}"
+    );
+}
+
+#[test]
+fn edit_cancel_returns_to_in_progress_review() {
+    let email = unique_email("edit-cancel");
+    let state = render_test_state(&email);
+    let created = state.create_account(&email).expect("account");
+    let account = state
+        .create_browser_session(&created)
+        .expect("browser session");
+    let source = state
+        .save_app_source(
+            &account,
+            &CreateSourceRequest {
+                title: "NATO practice notes".to_owned(),
+                body: nato_source_body(),
+                permission: SourcePermission::default(),
+            },
+        )
+        .expect("source");
+    assert!(matches!(
+        state.enqueue_generation_job_by_source(&account, &source.source_id, &source.title),
+        EnqueueOutcome::Started(_)
+    ));
+    state.run_pending_jobs_blocking();
+    let pending = state.next_app_review(&account).expect("pending review");
+    let view = state
+        .keep_draft(
+            account.account_id(),
+            account.session_token(),
+            &pending.drafts[0].id,
+        )
+        .expect("keep review");
+    assert!(view.current.is_some(), "kept draft must open review");
+
+    let html = render_edit_review_html(&state, &account, &view, None);
+    assert!(
+        html.contains(r#"action="/app/next""#),
+        "Cancel must restore the in-progress review: {html}"
+    );
+    assert!(
+        html.contains(">Cancel</button>"),
+        "Cancel must stay a tap, not a Home link: {html}"
+    );
+    assert!(
+        !html.contains(r#"href="/">Cancel</a>"#),
+        "Cancel must not dump the learner on Home: {html}"
+    );
 }
 
 #[test]

@@ -1362,6 +1362,7 @@ impl AccountRegistry {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure> {
         let account = self.require_account(account_id, session_token)?;
         let prompt = normalize_required_text(prompt, "Learner prompt")?;
@@ -1376,6 +1377,7 @@ impl AccountRegistry {
             draft_id,
             &prompt,
             &expected_answer,
+            choices,
         )
     }
 

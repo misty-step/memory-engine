@@ -531,9 +531,16 @@ impl StudyStorage {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure> {
-        self.inner
-            .edit_pending_draft(account_id, store_path, draft_id, prompt, expected_answer)
+        self.inner.edit_pending_draft(
+            account_id,
+            store_path,
+            draft_id,
+            prompt,
+            expected_answer,
+            choices,
+        )
     }
 
     pub(crate) fn reject_pending_draft(
@@ -1098,6 +1105,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure>;
     fn reject_pending_draft(
         &self,
@@ -2356,10 +2364,11 @@ impl StudyStorageAdapter for FileStudyStorage {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.with_locked_study(store_path, |study| {
             let view = study
-                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .edit_and_keep_draft(draft_id, prompt, expected_answer, choices)
                 .map_err(file_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })
@@ -3344,11 +3353,12 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
             let mut study = BetaStudySession::from_store(account, self.now);
             let view = study
-                .edit_and_keep_draft(draft_id, prompt, expected_answer)
+                .edit_and_keep_draft(draft_id, prompt, expected_answer, choices)
                 .map_err(postgres_study_failure)?;
             Ok(StudyViewResponse::from_view(view))
         })

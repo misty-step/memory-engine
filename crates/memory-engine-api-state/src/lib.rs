@@ -636,6 +636,7 @@ impl ApiState {
         draft_id: &str,
         prompt: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.accounts.edit_pending_draft(
             account_id,
@@ -643,6 +644,7 @@ impl ApiState {
             draft_id,
             prompt,
             expected_answer,
+            choices,
         )
     }
 

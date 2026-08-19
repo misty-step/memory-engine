@@ -1080,6 +1080,66 @@ fn mcq_prompt_edit_keeps_new_answer_in_choices() {
 }
 
 #[test]
+fn mcq_draft_edit_replaces_distractors_and_stays_coherent() {
+    let directory = TempDirectory::new("mcq-draft-choices");
+    let path = directory.path().join("store.json");
+    let mut store = BetaPersistenceStore::open(&path).expect("open store");
+    let source = store
+        .save_source_document(source_document("mcq-choice-source"))
+        .expect("source");
+    let reference = store
+        .save_reference_span(reference_span("mcq-choice-reference", &source.id))
+        .expect("reference");
+    let mut draft = accepted_draft(
+        "mcq-choice-draft",
+        "mcq-choice-unit",
+        &[source.id.as_str()],
+        &[reference.id.as_str()],
+        Some("mcq-choice-run"),
+    );
+    draft.prompt = Prompt::Mcq {
+        review_unit_id: draft.review_unit_id.clone(),
+        prompt: "What is the NATO word for A?".to_owned(),
+        choices: vec!["ALFA".to_owned(), "BRAVO".to_owned(), "CHARLIE".to_owned()],
+        correct_choice: "ALFA".to_owned(),
+    };
+    store
+        .save_generated_prompt_draft(draft.clone())
+        .expect("pending draft");
+    store
+        .save_generation_run(generation_run(
+            "mcq-choice-run",
+            &[source.id.as_str()],
+            &[draft.id.as_str()],
+        ))
+        .expect("generation run");
+
+    let kept = store
+        .edit_and_keep_generated_prompt_draft(
+            &draft.id,
+            "What is the NATO word for A?",
+            "ALFA",
+            &["ALFA".to_owned(), "DELTA".to_owned(), "CHARLIE".to_owned()],
+            NOW,
+        )
+        .expect("edit distractor");
+    match kept.prompt {
+        Prompt::Mcq {
+            choices,
+            correct_choice,
+            ..
+        } => {
+            assert_eq!(correct_choice, "ALFA");
+            assert_eq!(
+                choices,
+                vec!["ALFA".to_owned(), "DELTA".to_owned(), "CHARLIE".to_owned()]
+            );
+        }
+        prompt => panic!("expected coherent MCQ, got {prompt:?}"),
+    }
+}
+
+#[test]
 fn boolean_prompt_edit_rejects_invalid_answer_without_mutation() {
     let directory = TempDirectory::new("boolean-prompt-edit");
     let path = directory.path().join("store.json");
@@ -1329,6 +1389,7 @@ fn learner_trust_driver_keeps_pending_decisions_and_exports_after_reload() {
             draft_ids[1],
             "  Edited trust prompt  ",
             "  Edited trust answer  ",
+            &[],
             NOW + 1,
         )
         .expect("edit and keep");
@@ -1391,6 +1452,7 @@ fn assert_decision_retries(
                 draft_ids[1],
                 "Edited trust prompt",
                 "Edited trust answer",
+                &[],
                 NOW + 4,
             )
             .expect("idempotent edit"),
@@ -1401,6 +1463,7 @@ fn assert_decision_retries(
             draft_ids[1],
             "Different trust prompt",
             "Edited trust answer",
+            &[],
             NOW + 5,
         )
         .is_err());
