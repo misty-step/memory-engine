@@ -23,7 +23,7 @@ use memory_engine_persistence_postgres::{
     PostgresEnqueueOutcome, PostgresGenerationJob, PostgresStudyStore,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
 
 use crate::AccountRegistry;
 
@@ -40,6 +40,8 @@ const JOB_RECLAIM_GRACE_MS: i64 = 2 * 60 * 1_000;
 const RETRY_DELAY_MS: i64 = 1_000;
 const ACCOUNT_MODEL_BUDGET_USD_MICROS: i64 = 100_000;
 const MODEL_BUDGET_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Safety poll when no job was claimed. Enqueue still wakes immediately.
+const POSTGRES_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 /// Capacity of the SSE broadcast buffer. Events are full job snapshots, so a
 /// slow subscriber that lags simply skips to the latest state.
 const UPDATES_BUFFER: usize = 256;
@@ -246,6 +248,8 @@ struct Inner {
     worker_started: AtomicBool,
     worker_ready: AtomicBool,
     worker_id: String,
+    /// Wakes the Postgres worker when a job is enqueued or retried.
+    wake: Notify,
 }
 
 impl JobQueue {
@@ -299,6 +303,7 @@ impl JobQueue {
                 worker_started: AtomicBool::new(false),
                 worker_ready: AtomicBool::new(false),
                 worker_id: format!("api-{}-{:032x}", std::process::id(), rand::random::<u128>()),
+                wake: Notify::new(),
             }),
         }
     }
@@ -431,6 +436,7 @@ impl JobQueue {
         match result {
             Ok(PostgresEnqueueOutcome::Started(job)) => {
                 self.broadcast_postgres(&job);
+                self.wake_postgres_worker();
                 EnqueueOutcome::Started(job.into())
             }
             Ok(PostgresEnqueueOutcome::AlreadyInFlight(job)) => {
@@ -484,7 +490,7 @@ impl JobQueue {
     #[allow(clippy::must_use_candidate)]
     pub fn retry(&self, account_id: &str, job_id: &str) -> bool {
         if let Some(database_url) = self.inner.postgres_url.as_deref() {
-            return with_postgres_store(database_url, |store| {
+            let retried = with_postgres_store(database_url, |store| {
                 store.retry_generation_job(
                     account_id,
                     job_id,
@@ -493,6 +499,10 @@ impl JobQueue {
                 )
             })
             .unwrap_or(false);
+            if retried {
+                self.wake_postgres_worker();
+            }
+            return retried;
         }
         let requeued = {
             let mut jobs = self.lock_jobs();
@@ -751,7 +761,7 @@ impl JobQueue {
             else {
                 self.inner.worker_ready.store(false, Ordering::Release);
                 drop(permit);
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                self.wait_for_postgres_work().await;
                 continue;
             };
             let job = match claimed {
@@ -759,13 +769,13 @@ impl JobQueue {
                 Ok(None) => {
                     self.inner.worker_ready.store(true, Ordering::Release);
                     drop(permit);
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    self.wait_for_postgres_work().await;
                     continue;
                 }
                 Err(_) => {
                     self.inner.worker_ready.store(false, Ordering::Release);
                     drop(permit);
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    self.wait_for_postgres_work().await;
                     continue;
                 }
             };
@@ -776,6 +786,17 @@ impl JobQueue {
                 let _permit = permit;
                 worker.run_claimed_postgres(job).await;
             });
+        }
+    }
+
+    fn wake_postgres_worker(&self) {
+        self.inner.wake.notify_waiters();
+    }
+
+    async fn wait_for_postgres_work(&self) {
+        tokio::select! {
+            () = self.inner.wake.notified() => {}
+            () = tokio::time::sleep(POSTGRES_IDLE_POLL) => {}
         }
     }
 
@@ -1945,6 +1966,14 @@ mod tests {
             .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
             .expect("drop schema");
         result
+    }
+
+    #[test]
+    fn postgres_idle_poll_is_not_a_busy_loop() {
+        assert!(
+            POSTGRES_IDLE_POLL >= std::time::Duration::from_secs(5),
+            "idle Postgres claim must not poll more than once per 5s"
+        );
     }
 
     #[tokio::test]
