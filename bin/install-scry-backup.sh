@@ -49,6 +49,20 @@ install -m 0644 "$stage/etc/systemd/scry-backup-offhost.service" /etc/systemd/sy
 install -m 0644 "$stage/etc/systemd/scry-backup-offhost.timer" /etc/systemd/system/scry-backup-offhost.timer
 install -m 0644 "$stage/etc/systemd/scry-backup-alert.service" /etc/systemd/system/scry-backup-alert.service
 
+# Dependency gate BEFORE arming the timer: a replacement host without
+# boto3 must fail this install, not pass a missing-env probe and break at
+# its first configured backup. Distro package preferred; nothing is piped.
+if ! python3 -c 'import boto3' >/dev/null 2>&1; then
+  echo "python3-boto3 missing; installing python3-boto3"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq python3-boto3
+fi
+python3 -c 'import boto3' >/dev/null || {
+  echo "ERROR: python3-boto3 unavailable after install attempt" >&2
+  exit 1
+}
+
 systemctl daemon-reload
 systemctl enable --now scry-backup-offhost.timer
 # Propagates: the script's skip path exits 0, so a non-zero rc here means
