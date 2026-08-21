@@ -1,0 +1,10 @@
+[Unit]
+OnFailure=scry-backup-alert.service
+Description=Scry encrypted off-host Postgres backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/scry-backup-offhost
+Nice=10
+IOSchedulingClass=idle

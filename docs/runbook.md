@@ -533,9 +533,28 @@ via peer auth on `/var/run/postgresql`. `scry.service` waits for
 `postgresql.service`.
 
 Nightly custom-format dumps land in `/var/backups/scry` via
-`/usr/local/sbin/scry-pg-dump` (`/etc/cron.d/scry-pg-dump`). Restore drill:
-`pg_restore` into a side database owned by `scry`, then drop it. A dump must
-also leave the box.
+`/usr/local/sbin/scry-pg-dump` (`/etc/cron.d/scry-pg-dump`), pruned after
+seven days. Restore drill: `pg_restore` into a side database owned by
+`scry`, then drop it.
+
+### Off-host backup
+
+`scry-backup-offhost` (03:45 UTC timer) encrypts the newest dump with GPG
+AES256 and uploads it to the Scry Spaces bucket (`scry/` prefix, 30-day
+age-based lifecycle, versioning). Source of truth lives in this
+repository: `bin/scry-backup-offhost`, `etc/systemd/scry-backup-*`, and
+the idempotent `bin/install-scry-backup.sh`. Never edit `/usr/local`
+copies directly; reinstall from the repo.
+
+The pipeline stays inert until `/etc/public-apps/scry-backup.env`
+(mode 0600) defines `SCRY_BACKUP_SPACES_BUCKET`, `SCRY_BACKUP_SPACES_KEY`,
+`SCRY_BACKUP_SPACES_SECRET`, `SCRY_BACKUP_PASSPHRASE`, and optional
+`SCRY_BACKUP_REGION` (default `nyc3`). The passphrase must also live in
+an operator-managed off-host credential store; without that copy the
+ciphertext is unrestorable after droplet loss. Outcomes record to
+`/var/lib/scry-backup/last-run`; failures fail the unit and trigger
+`scry-backup-alert.service` (`FAILURE` flag + `daemon.alert` journal).
+Design and custody: Estate ADR 0011.
 
 The retired Neon project `memory-engine-prod` (`twilight-brook-49749008`) is
 kept until a restoreable Neon dump exists. Do not delete it. Do not point

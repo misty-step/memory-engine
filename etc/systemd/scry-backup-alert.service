@@ -1,0 +1,8 @@
+[Unit]
+Description=Flag and log a failed Scry off-host backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/install -d -m 0700 /var/lib/scry-backup
+ExecStart=/bin/sh -c 'date -u +%%FT%%T%%Z > /var/lib/scry-backup/FAILURE'
+ExecStart=/usr/bin/logger -p daemon.alert -t scry-backup offhost-backup-failed
