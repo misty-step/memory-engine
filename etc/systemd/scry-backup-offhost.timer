@@ -2,7 +2,7 @@
 Description=Nightly Scry off-host backup
 
 [Timer]
-OnCalendar=*-*-* 03:45:00
+OnCalendar=*-*-* 03:45:00 UTC
 RandomizedDelaySec=600
 Persistent=true
 
