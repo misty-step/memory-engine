@@ -185,3 +185,5 @@ landed commit and production proof, then closes the issue and invokes bounded
 
 General-purpose hosting or auth frameworks, chat tutoring, and generalized content
 import.
+
+Organization root context: @~/Development/misty-step/AGENTS.md
