@@ -145,12 +145,14 @@ impl memory_engine_study::BetaStudyStore for SnapshotCountingStore {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, StoreError> {
         self.inner.edit_and_keep_generated_prompt_draft(
             draft_id,
             prompt_text,
             expected_answer,
+            choices,
             decided_at,
         )
     }

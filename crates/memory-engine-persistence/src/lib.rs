@@ -673,6 +673,7 @@ enum LearnerDraftDecisionInput<'a> {
     Edit {
         prompt_text: &'a str,
         expected_answer: &'a str,
+        choices: &'a [String],
     },
     Reject,
 }
@@ -1160,6 +1161,7 @@ impl BetaPersistenceStore {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, BetaStoreError> {
         self.decide_generated_prompt_draft(
@@ -1167,6 +1169,7 @@ impl BetaPersistenceStore {
             &LearnerDraftDecisionInput::Edit {
                 prompt_text,
                 expected_answer,
+                choices,
             },
             decided_at,
         )
@@ -2024,12 +2027,12 @@ fn record_learner_draft_decision(
                 LearnerDraftDecisionInput::Edit {
                     prompt_text,
                     expected_answer,
+                    choices,
                 },
             ) => {
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
-                prompt_text_for_export(&draft.prompt) == prompt_text.trim()
-                    && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
+                learner_edit_matches_draft(&draft.prompt, prompt_text, expected_answer, choices)
             }
             _ => false,
         };
@@ -2060,13 +2063,14 @@ fn record_learner_draft_decision(
         LearnerDraftDecisionInput::Edit {
             prompt_text,
             expected_answer,
+            choices,
         } => {
             let prompt_text = prompt_text.trim();
             let expected_answer = expected_answer.trim();
             assert_non_blank(prompt_text, "Learner prompt")?;
             assert_non_blank(expected_answer, "Learner expected answer")?;
             replace_prompt_text(&mut draft.prompt, prompt_text);
-            replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+            apply_learner_prompt_answer(&mut draft.prompt, expected_answer, choices)?;
             if !draft
                 .critique_notes
                 .iter()
@@ -2162,6 +2166,86 @@ fn replace_prompt_answer(prompt: &mut Prompt, expected_answer: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+fn apply_learner_prompt_answer(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), BetaStoreError> {
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return replace_prompt_answer(prompt, expected_answer);
+    }
+    replace_prompt_choices(prompt, expected_answer, choices)
+}
+
+fn replace_prompt_choices(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), BetaStoreError> {
+    let Prompt::Mcq {
+        choices: stored,
+        correct_choice,
+        ..
+    } = prompt
+    else {
+        return replace_prompt_answer(prompt, expected_answer);
+    };
+    let next = normalize_mcq_choices(expected_answer, choices)?;
+    expected_answer.clone_into(correct_choice);
+    *stored = next;
+    Ok(())
+}
+
+fn normalize_mcq_choices(
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<Vec<String>, BetaStoreError> {
+    let mut next = Vec::new();
+    for choice in choices {
+        let trimmed = choice.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !next.iter().any(|existing| existing == trimmed) {
+            next.push(trimmed.to_owned());
+        }
+    }
+    if !next.iter().any(|choice| choice == expected_answer) {
+        next.insert(0, expected_answer.to_owned());
+    }
+    if next.len() < 2 {
+        return Err(BetaStoreError::Blank {
+            label: "Learner MCQ choices",
+        });
+    }
+    Ok(next)
+}
+
+fn learner_edit_matches_draft(
+    prompt: &Prompt,
+    prompt_text: &str,
+    expected_answer: &str,
+    choices: &[String],
+) -> bool {
+    if prompt_text_for_export(prompt) != prompt_text.trim()
+        || prompt_expected_answer_for_export(prompt) != expected_answer.trim()
+    {
+        return false;
+    }
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return true;
+    }
+    normalize_mcq_choices(expected_answer.trim(), choices)
+        .is_ok_and(|next| prompt_choices_for_export(prompt) == next)
+}
+
+fn prompt_choices_for_export(prompt: &Prompt) -> Vec<String> {
+    match prompt {
+        Prompt::Mcq { choices, .. } => choices.clone(),
+        Prompt::Boolean { .. } | Prompt::Exact(_) => Vec::new(),
+    }
 }
 
 trait HasId {

@@ -1,6 +1,5 @@
 # Post-answer feedback QA
 
-Refs-Powder: memory-engine-053
 
 ## Scope
 

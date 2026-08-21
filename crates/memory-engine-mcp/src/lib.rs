@@ -2,9 +2,8 @@
 
 //! Stdio MCP server wrapping the deployed `memory-engine-api` v1 study/review
 //! contract. Tools are agent-intent-shaped (`create_deck`, `list_due`,
-//! `review_next`, `submit_answer`, ...), not 1:1 REST wrappers — the same
-//! discipline `powder-mcp` established for this fleet. It adds no new server
-//! surface: every tool composes one or more existing v1 routes.
+//! `review_next`, `submit_answer`, ...), not 1:1 REST wrappers. It adds no new
+//! server surface: every tool composes one or more existing v1 routes.
 //!
 //! Generation is queue-based end to end: `create_deck` enqueues a durable
 //! generation job and polls it to a bounded terminal state, never the legacy
@@ -389,7 +388,7 @@ mod tests {
         for entry in array {
             assert!(entry["name"].is_string());
             assert!(entry["description"].is_string());
-            assert!(entry["inputSchema"]["type"] == "object");
+            assert_eq!(entry["inputSchema"]["type"], "object");
         }
     }
 

@@ -1,9 +1,5 @@
 # Evals And Benchmarks
 
-Refs-Powder: memory-engine-020
-Refs-Powder: memory-engine-050
-Refs-Powder: memory-engine-051
-Refs-Powder: memory-engine-052
 
 Scry's Rust engine uses behavior tests as the first eval layer. The goal is to
 catch learning-semantic drift before dogfood clients and experimental AI
@@ -83,7 +79,7 @@ Run a live model field comparison through Mint's credential-safe egress path:
 # MINT_BASE_URL and the runtime credential alias are private environment inputs.
 OPENROUTER_BASE_URL="${MINT_BASE_URL}/proxy/https/openrouter.ai/api/v1" \
 OPENROUTER_PROXY_TOKEN="${OPENROUTER_MINT_ALIAS:?private runtime alias required}" \
-cargo run -p memory-engine-bench -- generation --model google/gemini-3.5-flash \
+cargo run -p memory-engine-bench -- generation --model google/gemini-3.7-flash \
   --prompt principled --out docs/evals/generation-<model>-<date>.md
 ```
 

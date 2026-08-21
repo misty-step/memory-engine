@@ -56,9 +56,9 @@ static CONNECTION_POOLS: LazyLock<Mutex<BTreeMap<String, r2d2::Pool<PostgresConn
 
 /// Max live connections per database URL for the single App Platform instance.
 const POOL_MAX_SIZE: u32 = 8;
-const POOL_MIN_IDLE: u32 = 1;
+const POOL_MIN_IDLE: u32 = 0;
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 const RENEW_GENERATION_JOB_SQL: &str = "UPDATE memory_engine_generation_jobs
              SET lease_expires_at_ms = $4::BIGINT + $5::BIGINT, updated_at_ms = $4::BIGINT
@@ -263,7 +263,7 @@ CREATE INDEX IF NOT EXISTS memory_engine_content_feedback_account_review_idx
 /// metadata, and drops the raw-token copies only after the replacement insert
 /// succeeds. A failed transaction leaves the legacy schema intact for retry.
 const SESSION_SCHEMA_MIGRATION_SQL: &str = r"
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;
 
 DO $$
 BEGIN
@@ -2359,14 +2359,14 @@ impl PostgresStudyStore {
         account_id: &str,
         run_id: &str,
     ) -> Result<i64, PostgresStoreError> {
-        let row = self.client.borrow_mut().query_one(
+        let row = self.client.borrow_mut().query_opt(
             "SELECT COALESCE((run->'usage'->>'costUsdMicros')::BIGINT, 0)::BIGINT
              FROM memory_engine_generation_runs
              WHERE account_id = $1::TEXT AND generation_run_id = $2::TEXT
              LIMIT 1",
             &[&account_id, &run_id],
         )?;
-        Ok(row.get(0))
+        Ok(row.map_or(0, |row| row.get(0)))
     }
 
     /// Read the receipt for one exact durable provider attempt.
@@ -2945,6 +2945,7 @@ enum PostgresLearnerDecision {
     Edit {
         prompt_text: String,
         expected_answer: String,
+        choices: Vec<String>,
     },
     Reject,
 }
@@ -3282,6 +3283,7 @@ impl AccountStudyStore<'_> {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, PostgresStoreError> {
         self.decide_learner_draft(
@@ -3289,6 +3291,7 @@ impl AccountStudyStore<'_> {
             &PostgresLearnerDecision::Edit {
                 prompt_text: prompt_text.to_owned(),
                 expected_answer: expected_answer.to_owned(),
+                choices: choices.to_vec(),
             },
             decided_at,
         )?
@@ -3363,13 +3366,18 @@ impl AccountStudyStore<'_> {
             }
             let reject = matches!(decision, &PostgresLearnerDecision::Reject);
             let edited = matches!(decision, &PostgresLearnerDecision::Edit { .. });
-            if let PostgresLearnerDecision::Edit { prompt_text, expected_answer } = decision {
+            if let PostgresLearnerDecision::Edit {
+                prompt_text,
+                expected_answer,
+                choices,
+            } = decision
+            {
                 let prompt_text = prompt_text.trim();
                 let expected_answer = expected_answer.trim();
                 assert_non_blank(prompt_text, "Learner prompt")?;
                 assert_non_blank(expected_answer, "Learner expected answer")?;
                 replace_prompt_text(&mut draft.prompt, prompt_text);
-                replace_prompt_answer(&mut draft.prompt, expected_answer)?;
+                apply_learner_prompt_answer(&mut draft.prompt, expected_answer, choices)?;
                 if !draft.critique_notes.iter().any(|note| note == "Learner edited pending wording.") {
                     draft.critique_notes.push("Learner edited pending wording.".to_owned());
                 }
@@ -4130,13 +4138,16 @@ impl AccountStudyStore<'_> {
         attempt: i32,
         lease_token: &str,
         now_ms: i64,
-        lease_valid: bool,
+        _lease_valid: bool,
     ) -> Result<bool, PostgresStoreError> {
         let account_id = self.scope.account_id.clone();
         self.with_account_transaction(|transaction| {
-            let lease_row = if lease_valid {
-                transaction.query_opt(
-                    "SELECT attempt.job_id
+            // The in-memory worker fence is advisory. A false negative there
+            // (swallowed store error, cost-read glitch) must not delete a run
+            // whose attempt/job lease is still valid. Cleanup only when the
+            // durable lease row is absent.
+            let lease_row = transaction.query_opt(
+                "SELECT attempt.job_id
                          FROM memory_engine_generation_job_attempts attempt
                          JOIN memory_engine_generation_jobs job
                            ON job.account_id = attempt.account_id
@@ -4152,11 +4163,8 @@ impl AccountStudyStore<'_> {
                            AND job.lease_expires_at_ms > $5::BIGINT
                          FOR UPDATE OF attempt, job
                          LIMIT 1",
-                    &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
-                )?
-            } else {
-                None
-            };
+                &[&account_id, &run_id, &attempt, &lease_token, &now_ms],
+            )?;
             if let Some(lease_row) = lease_row {
                 let job_id: String = lease_row.get(0);
                 let updated = transaction.execute(
@@ -4539,6 +4547,7 @@ impl BetaStudyStore for AccountStudyStore<'_> {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         AccountStudyStore::edit_and_keep_generated_prompt_draft(
@@ -4546,6 +4555,7 @@ impl BetaStudyStore for AccountStudyStore<'_> {
             draft_id,
             prompt_text,
             expected_answer,
+            choices,
             decided_at,
         )
     }
@@ -5202,11 +5212,9 @@ fn learner_decision_matches(
             PostgresLearnerDecision::Edit {
                 prompt_text,
                 expected_answer,
+                choices,
             },
-        ) => {
-            prompt_text_for_export(&draft.prompt) == prompt_text.trim()
-                && prompt_expected_answer_for_export(&draft.prompt) == expected_answer.trim()
-        }
+        ) => learner_edit_matches_draft(&draft.prompt, prompt_text, expected_answer, choices),
         _ => false,
     }
 }
@@ -5258,6 +5266,86 @@ fn replace_prompt_answer(prompt: &mut Prompt, answer: &str) -> Result<(), Postgr
         }
     }
     Ok(())
+}
+
+fn apply_learner_prompt_answer(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), PostgresStoreError> {
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return replace_prompt_answer(prompt, expected_answer);
+    }
+    replace_prompt_choices(prompt, expected_answer, choices)
+}
+
+fn replace_prompt_choices(
+    prompt: &mut Prompt,
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<(), PostgresStoreError> {
+    let Prompt::Mcq {
+        choices: stored,
+        correct_choice,
+        ..
+    } = prompt
+    else {
+        return replace_prompt_answer(prompt, expected_answer);
+    };
+    let next = normalize_mcq_choices(expected_answer, choices)?;
+    expected_answer.clone_into(correct_choice);
+    *stored = next;
+    Ok(())
+}
+
+fn normalize_mcq_choices(
+    expected_answer: &str,
+    choices: &[String],
+) -> Result<Vec<String>, PostgresStoreError> {
+    let mut next = Vec::new();
+    for choice in choices {
+        let trimmed = choice.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !next.iter().any(|existing| existing == trimmed) {
+            next.push(trimmed.to_owned());
+        }
+    }
+    if !next.iter().any(|choice| choice == expected_answer) {
+        next.insert(0, expected_answer.to_owned());
+    }
+    if next.len() < 2 {
+        return Err(PostgresStoreError::Blank {
+            label: "Learner MCQ choices",
+        });
+    }
+    Ok(next)
+}
+
+fn learner_edit_matches_draft(
+    prompt: &Prompt,
+    prompt_text: &str,
+    expected_answer: &str,
+    choices: &[String],
+) -> bool {
+    if prompt_text_for_export(prompt) != prompt_text.trim()
+        || prompt_expected_answer_for_export(prompt) != expected_answer.trim()
+    {
+        return false;
+    }
+    if choices.is_empty() || !matches!(prompt, Prompt::Mcq { .. }) {
+        return true;
+    }
+    normalize_mcq_choices(expected_answer.trim(), choices)
+        .is_ok_and(|next| prompt_choices_for_export(prompt) == next)
+}
+
+fn prompt_choices_for_export(prompt: &Prompt) -> Vec<String> {
+    match prompt {
+        Prompt::Mcq { choices, .. } => choices.clone(),
+        Prompt::Boolean { .. } | Prompt::Exact(_) => Vec::new(),
+    }
 }
 
 #[must_use]
@@ -5524,6 +5612,7 @@ mod tests {
     fn migration_uses_account_scoped_primary_keys_and_durable_receipts() {
         let sql = migration_sql();
         let session_sql = super::SESSION_SCHEMA_MIGRATION_SQL;
+        assert!(session_sql.contains("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public;"));
         let jobs_sql = generation_jobs_migration_sql();
 
         assert!(sql.contains("memory_engine_accounts"));
@@ -6467,6 +6556,198 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn live_generation_job_reconciliation_removes_stale_output_and_preserves_successor() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!("skipping live stale-output reconciliation test; MEMORY_ENGINE_POSTGRES_TEST_URL is unset");
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_jobs_reconcile_{}_{}",
+            std::process::id(),
+            NOW
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect admin postgres");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), PostgresStoreError> {
+            let mut store = PostgresStudyStore::connect(&scoped_url)?;
+            store.migrate()?;
+            {
+                let mut account = store.for_account(AccountScope::new("acct_reconcile")?);
+                account.ensure_account(NOW)?;
+            }
+            let started = store.enqueue_generation_job(
+                "acct_reconcile",
+                "job-reconcile",
+                "src-nato-live",
+                "Live reconcile",
+                "deterministic",
+                NOW,
+                2,
+                4,
+                100,
+                86_400_000,
+            )?;
+            let PostgresEnqueueOutcome::Started(_) = started else {
+                panic!("reconciliation job must start");
+            };
+            let first = store
+                .claim_generation_job("worker-a", NOW, 10, 0, 1, 3)?
+                .expect("first attempt");
+            let first_run_id = format!("job:{}:attempt:{}", first.id, first.attempts);
+            assert!(store.bind_generation_job_attempt_run(
+                "acct_reconcile",
+                &first.id,
+                first.attempts,
+                first.lease_token.as_deref().expect("first token"),
+                &first_run_id,
+            )?);
+            {
+                let account = store.for_account(AccountScope::new("acct_reconcile")?);
+                let mut study = BetaStudySession::from_store(account, live_now);
+                study
+                    .add_source(study_source_input())
+                    .map_err(|error| PostgresStoreError::StudySession(error.to_string()))?;
+                study
+                    .generate_with_run_id(
+                        Some(vec!["src-nato-live".to_owned()]),
+                        first_run_id.clone(),
+                    )
+                    .map_err(|error| PostgresStoreError::StudySession(error.to_string()))?;
+            }
+
+            let first_count = store
+                .for_account(AccountScope::new("acct_reconcile")?)
+                .snapshot()?
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| draft.generation_run_id.as_deref() == Some(first_run_id.as_str()))
+                .count();
+            assert!(
+                first_count > 0,
+                "real first generation must persist pending output"
+            );
+
+            {
+                let mut other = store.for_account(AccountScope::new("acct_other")?);
+                other.ensure_account(NOW)?;
+                let other_draft = accepted_draft(
+                    "draft-other-account",
+                    &ReviewUnitId::new("unit-other-account"),
+                    &["src-nato-live"],
+                    &[],
+                    Some(&first_run_id),
+                );
+                other.save_generation_run(&generation_run(
+                    &first_run_id,
+                    &["src-nato-live"],
+                    &["draft-other-account"],
+                ))?;
+                other.save_generated_prompt_draft(&other_draft)?;
+            }
+
+            // A fresh worker reclaims the expired lease. This is the crash
+            // boundary: the old process persisted output but never ran the
+            // post-generation fence/discard.
+            let mut restarted = PostgresStudyStore::connect(&scoped_url)?;
+            restarted.migrate()?;
+            let successor = restarted
+                .claim_generation_job("worker-b", NOW + 16, 10, 0, 1, 3)?
+                .expect("expired attempt must be reclaimed");
+            assert_eq!(successor.attempts, 2);
+            let after_reclaim = restarted
+                .for_account(AccountScope::new("acct_reconcile")?)
+                .snapshot()?;
+            assert!(
+                after_reclaim
+                    .generated_prompt_drafts
+                    .iter()
+                    .all(|draft| draft.generation_run_id.as_deref() != Some(first_run_id.as_str())),
+                "restart reconciliation must remove stale pending output"
+            );
+            let other_snapshot = restarted
+                .for_account(AccountScope::new("acct_other")?)
+                .snapshot()?;
+            assert_eq!(
+                other_snapshot
+                    .generated_prompt_drafts
+                    .iter()
+                    .filter(|draft| draft.id == "draft-other-account")
+                    .count(),
+                1,
+                "same run id in another account must remain untouched"
+            );
+
+            assert!(
+                after_reclaim
+                    .generation_runs
+                    .iter()
+                    .all(|run| run.id != first_run_id),
+                "restart reconciliation must remove stale run receipt"
+            );
+
+            let second_run_id = format!("job:{}:attempt:{}", successor.id, successor.attempts);
+            assert!(restarted.bind_generation_job_attempt_run(
+                "acct_reconcile",
+                &successor.id,
+                successor.attempts,
+                successor.lease_token.as_deref().expect("successor token"),
+                &second_run_id,
+            )?);
+            {
+                let account = restarted.for_account(AccountScope::new("acct_reconcile")?);
+                let mut study = BetaStudySession::from_store(account, live_now);
+                study
+                    .generate_with_run_id(
+                        Some(vec!["src-nato-live".to_owned()]),
+                        second_run_id.clone(),
+                    )
+                    .map_err(|error| PostgresStoreError::StudySession(error.to_string()))?;
+            }
+            let successor_count = restarted
+                .for_account(AccountScope::new("acct_reconcile")?)
+                .snapshot()?
+                .generated_prompt_drafts
+                .iter()
+                .filter(|draft| draft.generation_run_id.as_deref() == Some(second_run_id.as_str()))
+                .count();
+            assert!(
+                successor_count > 0,
+                "real successor generation must persist pending output"
+            );
+            // Replaying startup reconciliation must be idempotent and must not
+            // delete valid successor-attempt output.
+            let mut replay = PostgresStudyStore::connect(&scoped_url)?;
+            replay.migrate()?;
+            assert!(replay
+                .claim_generation_job("worker-c", NOW + 17, 10, 0, 1, 3)?
+                .is_none());
+            let final_snapshot = replay
+                .for_account(AccountScope::new("acct_reconcile")?)
+                .snapshot()?;
+            assert_eq!(
+                final_snapshot
+                    .generated_prompt_drafts
+                    .iter()
+                    .filter(
+                        |draft| draft.generation_run_id.as_deref() == Some(second_run_id.as_str())
+                    )
+                    .count(),
+                successor_count,
+                "successor output must survive stale cleanup replay"
+            );
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop schema");
+        result.expect("stale-output reconciliation contract");
+    }
+
     fn claim_generation_job_sql_contains(fragment: &str) -> bool {
         let claim_sql = r"
             UPDATE memory_engine_generation_job_attempts attempt
@@ -6796,6 +7077,96 @@ mod tests {
     }
 
     #[test]
+    fn live_postgres_valid_lease_publishes_when_memory_fence_is_false() {
+        let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
+            eprintln!(
+                "skipping live Postgres durable-lease publication; MEMORY_ENGINE_POSTGRES_TEST_URL is unset"
+            );
+            return;
+        };
+        let schema = format!(
+            "memory_engine_test_generation_durable_fence_{}_{}",
+            std::process::id(),
+            NOW + 5
+        );
+        let mut admin = crate::connect_client(&database_url).expect("connect durable fence admin");
+        admin
+            .batch_execute(&format!(r#"CREATE SCHEMA "{schema}";"#))
+            .expect("create durable fence schema");
+        let scoped_url = scoped_postgres_url(&database_url, &schema);
+        let result = (|| -> Result<(), super::PostgresStoreError> {
+            let mut setup = super::PostgresStudyStore::connect(&scoped_url)?;
+            setup.migrate()?;
+            let source = source_document("source-generation-durable-fence");
+            let reference = reference_span("reference-generation-durable-fence", &source.id);
+            let unit = ReviewUnitId::new("unit-generation-durable-fence");
+            let draft = accepted_draft(
+                "draft-generation-durable-fence",
+                &unit,
+                &[&source.id],
+                &[&reference.id],
+                Some("run-generation-durable-fence"),
+            );
+            let run = generation_run("run-generation-durable-fence", &[&source.id], &[&draft.id]);
+            let (attempt, token) = {
+                let mut account =
+                    setup.for_account(AccountScope::new("acct-generation-durable-fence")?);
+                account.ensure_account(NOW)?;
+                account.save_source_document(&source)?;
+                account.save_reference_span(&reference)?;
+                account.save_generation_run(&run)?;
+                account.save_generated_prompt_draft(&draft)?;
+                drop(account);
+                let started = setup.enqueue_generation_job(
+                    "acct-generation-durable-fence",
+                    "job-generation-durable-fence",
+                    &source.id,
+                    "Durable fence",
+                    "model-durable-fence",
+                    NOW,
+                    2,
+                    4,
+                    100,
+                    10_000,
+                )?;
+                assert!(matches!(started, PostgresEnqueueOutcome::Started(_)));
+                let claimed = setup
+                    .claim_generation_job("worker-durable-fence", NOW, 10, 0, 1, 3)?
+                    .expect("durable fence claim");
+                let token = claimed.lease_token.clone().expect("durable fence token");
+                assert!(setup.bind_generation_job_attempt_run(
+                    "acct-generation-durable-fence",
+                    "job-generation-durable-fence",
+                    claimed.attempts,
+                    &token,
+                    &run.id,
+                )?);
+                (
+                    i32::try_from(claimed.attempts).expect("attempt fits i32"),
+                    token,
+                )
+            };
+            let mut publisher = super::PostgresStudyStore::connect(&scoped_url)?;
+            let mut account =
+                publisher.for_account(AccountScope::new("acct-generation-durable-fence")?);
+            assert!(
+                account.finalize_generation_run(&run.id, attempt, &token, NOW + 1, false)?,
+                "a still-valid durable lease must publish even when the in-memory fence is false"
+            );
+            let snapshot = account.snapshot()?;
+            assert_eq!(snapshot.generation_runs.len(), 1);
+            assert_eq!(snapshot.generation_runs[0].completed_at, Some(NOW + 1));
+            assert_eq!(snapshot.generated_prompt_drafts.len(), 1);
+            assert_eq!(snapshot.generated_prompt_drafts[0].id, draft.id);
+            Ok(())
+        })();
+        admin
+            .batch_execute(&format!(r#"DROP SCHEMA "{schema}" CASCADE;"#))
+            .expect("drop durable fence schema");
+        result.expect("durable lease publication contract");
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn live_postgres_stale_finalizer_wins_against_second_connection_decisions() {
         let Some(database_url) = std::env::var("MEMORY_ENGINE_POSTGRES_TEST_URL").ok() else {
@@ -6956,6 +7327,7 @@ mod tests {
                     &edit_draft.id,
                     "Edited stale prompt",
                     "Edited stale answer",
+                    &[],
                     NOW + 18,
                 ),
                 Err(super::PostgresStoreError::UnknownGeneratedPromptDraft(_))

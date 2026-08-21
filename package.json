@@ -28,7 +28,7 @@
     "rust:ci": "bun run test:browser-contract && cargo fmt --all --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo doc --workspace --no-deps && bun run perf:actions",
     "ci:fast": "bun run rust:ci",
     "ci:local": "bun run ci:fast",
-    "ci:full": "dagger call check --source=.",
+    "ci:full": "dagger call check --source=. --git-sha=$(git rev-parse HEAD)",
     "ci": "bun run ci:fast"
   }
 }

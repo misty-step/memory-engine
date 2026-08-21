@@ -25,6 +25,7 @@ use super::{
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS, WAITLIST_RATE_LIMIT_MAX_ATTEMPTS,
 };
+use memory_engine_api_render::{SKIP_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE};
 use memory_engine_api_state::AppAccount;
 
 /// Non-auth route tests need seeded accounts without depending on production
@@ -341,6 +342,73 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
 }
 
 #[tokio::test]
+async fn editing_mcq_distractor_keeps_coherent_card_and_returns_to_review() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    assert_eq!(generated.status(), StatusCode::OK);
+    state.run_pending_jobs_blocking();
+
+    let pending = workspace_html(&app, &cookie).await;
+    assert!(
+        pending.contains("BRAVO") && pending.contains("CHARLIE"),
+        "pending MCQ must show every choice before Keep: {pending}"
+    );
+    assert!(
+        pending.contains(r#"name="choices""#),
+        "edit form must expose distractors: {pending}"
+    );
+    assert!(
+        pending.contains("Keep as written"),
+        "Keep as written must stay one tap: {pending}"
+    );
+
+    let draft_id = pending
+        .split(r#"<article class="me-pending-draft">"#)
+        .skip(1)
+        .find(|article| article.contains(r#"name="choices""#))
+        .map(|article| html_value(article, "draftId"))
+        .expect("MCQ draft id");
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/edit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("draftId", &draft_id),
+                ("prompt", "What is the NATO phonetic alphabet word for A?"),
+                ("expectedAnswer", "ALFA"),
+                ("choices", "DELTA\nCHARLIE"),
+            ],
+        ))
+        .await
+        .expect("edit distractor");
+    let status = edited.status();
+    let edited = response_text(edited).await;
+    assert_eq!(status, StatusCode::OK, "edit distractor failed: {edited}");
+    assert!(
+        edited.contains("Reveal answer") || edited.contains("name=\"answer\""),
+        "edit must land back in review: {edited}"
+    );
+    assert!(
+        edited.contains("DELTA"),
+        "edited distractor must be the live MCQ choice: {edited}"
+    );
+}
+
+#[tokio::test]
 async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_bytes() {
     let state = local_fixture_state();
     let app = router(state.clone());
@@ -363,10 +431,11 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
     assert_eq!(captured.status(), StatusCode::OK);
     let _ = response_text(captured).await;
 
-    // The capture POST returns the Create view; the permission label lives on
-    // the Library view where the source is managed.
+    // Capture ignores a posted local-only flag. Library can still change
+    // permission after the source exists.
     let library = library_html(&app, &cookie).await;
-    assert!(library.contains("Local only · never sent to a model"));
+    assert!(library.contains("Model eligible"));
+    assert!(!library.contains("Local only · never sent to a model"));
 
     let edited = app
         .clone()
@@ -2661,34 +2730,49 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let opened_bridge = next_review_html(&app, &cookie, &csrf_token, "bridge").await;
     let bridge_id = html_value(&opened_bridge, "reviewUnitId");
     assert!(bridge_id.starts_with("bridge-"));
+    skip_then_snooze_current(&app, &cookie, &csrf_token, &bridge_id).await;
+}
+
+async fn skip_then_snooze_current(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+) {
     let skipped = app
         .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/skip",
-            &cookie,
-            &[("csrfToken", &csrf_token), ("reviewUnitId", &bridge_id)],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", review_unit_id)],
         ))
         .await
         .expect("skip");
     assert_eq!(skipped.status(), StatusCode::OK);
     let skipped = response_text(skipped).await;
-    let next_bridge_id = html_value(&skipped, "reviewUnitId");
-    assert!(next_bridge_id.starts_with("bridge-"));
-    assert_ne!(next_bridge_id, bridge_id);
+    assert!(
+        skipped.contains(SKIP_CONFIRM_NOTICE),
+        "skip result must carry the server confirm"
+    );
+    let next_id = html_value(&skipped, "reviewUnitId");
+    assert_ne!(next_id, review_unit_id);
     let snoozed = app
+        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/snooze",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &next_bridge_id),
-            ],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", &next_id)],
         ))
         .await
         .expect("snooze");
     assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_text(snoozed).await;
+    assert!(
+        snoozed.contains(SNOOZE_CONFIRM_NOTICE),
+        "snooze result must carry the server confirm"
+    );
 }
 
 #[tokio::test]
@@ -5593,9 +5677,7 @@ async fn concurrent_generations_for_one_account_do_not_clobber_each_other() {
             .unwrap_or(0)
     };
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while std::fs::read_to_string(&jobs_file)
-            .map(|text| terminal_count(&text))
-            .unwrap_or(0)
+        while std::fs::read_to_string(&jobs_file).map_or(0, |text| terminal_count(&text))
             != source_count
         {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -9811,7 +9893,6 @@ fn session_cookie(response: &axum::response::Response) -> String {
         "session cookie must use the host or plain local name: {set_cookie}"
     );
     assert!(set_cookie.contains("HttpOnly"));
-    assert!(set_cookie.contains("SameSite=Lax"));
     assert!(set_cookie.contains("Path=/"));
     let max_age = set_cookie
         .split(';')
@@ -9829,10 +9910,22 @@ fn session_cookie(response: &axum::response::Response) -> String {
             set_cookie.contains("Secure"),
             "host-only production cookie must be Secure: {set_cookie}"
         );
+        assert!(
+            set_cookie.contains("SameSite=None"),
+            "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
+        );
+        assert!(
+            !set_cookie.contains("SameSite=Lax"),
+            "host cookie must not regress to Lax-only: {set_cookie}"
+        );
     } else {
         assert!(
             !set_cookie.contains("Secure"),
             "plain local HTTP cookie must omit Secure: {set_cookie}"
+        );
+        assert!(
+            set_cookie.contains("SameSite=Lax"),
+            "local HTTP cookie cannot be SameSite=None without Secure: {set_cookie}"
         );
     }
     set_cookie
@@ -11030,7 +11123,8 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
     assert!(host_cookie.starts_with("__Host-memory_engine_session="));
     assert!(host_cookie.contains("HttpOnly"));
     assert!(host_cookie.contains("Secure"));
-    assert!(host_cookie.contains("SameSite=Lax"));
+    assert!(host_cookie.contains("SameSite=None"));
+    assert!(!host_cookie.contains("SameSite=Lax"));
     assert!(host_cookie.contains("Path=/"));
     let host_max_age = host_cookie
         .split(';')
@@ -11040,6 +11134,189 @@ async fn browser_session_cookie_attributes_follow_request_scheme() {
         .expect("numeric Max-Age");
     assert!((7_775_999..=7_776_000).contains(&host_max_age));
     assert!(!host_cookie.contains("Domain="));
+}
+
+#[tokio::test]
+async fn ios_standalone_pwa_resumes_https_session_on_home_navigation() {
+    // Named cause: iOS treats a Home Screen / standalone PWA as a cross-site
+    // context. SameSite=Lax cookies set when Safari consumes the magic link
+    // are omitted on the next standalone navigation. SameSite=None; Secure
+    // on the __Host- cookie is what the installed app can send.
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=standalone+pwa+session"))
+                .expect("HTTPS start"),
+        )
+        .await
+        .expect("HTTPS start response");
+    assert_eq!(started.status(), StatusCode::OK);
+    let set_cookie = started
+        .headers()
+        .get(SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("cookie header")
+        .to_owned();
+    assert_pwa_host_session_cookie(&set_cookie);
+
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+    let home = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("x-forwarded-proto", "https")
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-site", "none")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("standalone home"),
+        )
+        .await
+        .expect("standalone home response");
+    assert_eq!(home.status(), StatusCode::OK);
+    let home_set_cookie = home
+        .headers()
+        .get(SET_COOKIE)
+        .expect("sliding host cookie")
+        .to_str()
+        .expect("sliding cookie header")
+        .to_owned();
+    assert!(
+        home_set_cookie.contains("SameSite=None"),
+        "GET / must reissue the PWA-sendable cookie: {home_set_cookie}"
+    );
+    assert!(
+        !home_set_cookie.contains("SameSite=Lax"),
+        "sliding renewal must not regress to Lax-only: {home_set_cookie}"
+    );
+    let home_html = response_text(home).await;
+    assert!(
+        home_html.contains(r#"action="/app/logout""#),
+        "standalone GET must resume the session: {home_html}"
+    );
+}
+
+#[tokio::test]
+async fn ios_standalone_pwa_cookie_still_requires_csrf_and_clears_on_logout() {
+    let app = router(local_fixture_state());
+    let started = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/start")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("capture=standalone+pwa+csrf"))
+                .expect("HTTPS start"),
+        )
+        .await
+        .expect("HTTPS start response");
+    let set_cookie = started
+        .headers()
+        .get(SET_COOKIE)
+        .expect("session set-cookie")
+        .to_str()
+        .expect("cookie header")
+        .to_owned();
+    assert_pwa_host_session_cookie(&set_cookie);
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("x-forwarded-proto", "https")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("home"),
+        )
+        .await
+        .expect("home response");
+    let home_html = response_text(home).await;
+
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/logout")
+                .header("x-forwarded-proto", "https")
+                .header("origin", "https://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("forged logout"),
+        )
+        .await
+        .expect("forged logout response");
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+    let csrf_token = html_value(&home_html, "csrfToken");
+    let logged_out = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/logout")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::from(form_body(&[("csrfToken", csrf_token.as_str())])))
+                .expect("explicit logout"),
+        )
+        .await
+        .expect("explicit logout response");
+    assert_eq!(logged_out.status(), StatusCode::OK);
+    let host_clear = logged_out
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("set-cookie"))
+        .find(|value| value.starts_with("__Host-memory_engine_session="))
+        .expect("host clear cookie");
+    assert!(
+        host_clear.contains("SameSite=None") && host_clear.contains("Max-Age=0"),
+        "logout must clear the PWA-sendable host cookie: {host_clear}"
+    );
+}
+
+fn assert_pwa_host_session_cookie(set_cookie: &str) {
+    assert!(
+        set_cookie.starts_with("__Host-memory_engine_session="),
+        "production cookie must stay host-only: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("SameSite=None"),
+        "standalone PWA / cross-site navigations omit SameSite=Lax: {set_cookie}"
+    );
+    assert!(
+        !set_cookie.contains("SameSite=Lax"),
+        "SameSite must not regress to Lax-only: {set_cookie}"
+    );
+    assert!(set_cookie.contains("Secure"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+    assert!(!set_cookie.contains("Domain="), "{set_cookie}");
 }
 
 #[tokio::test]
@@ -11638,8 +11915,8 @@ async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
         );
     }
     assert!(
-        page.contains(r#"class="me-more-capture""#),
-        "the disclosure must carry the capture punch-out: {page}"
+        page.contains(r#"class="me-more-capture" href="/app/create""#),
+        "Capture more must open Create, not Home: {page}"
     );
     assert!(
         !page.contains(r#"class="me-hatches""#),
@@ -12026,7 +12303,7 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         "Hide every card for this concept until tomorrow.",
         "Generate easier warm-up cards, then revisit this one later.",
         "Remove this card from review for good.",
-        "Capture new material without leaving review.",
+        "Add new material.",
     ];
     for tooltip in tooltips {
         let marker = format!(r#"title="{tooltip}"><svg class="ae-icon""#);

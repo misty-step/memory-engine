@@ -8,8 +8,9 @@ manual workflow on `master`; it is not a pull-request workflow.
 
 The workflow checks out `master` as its trusted source with
 `persist-credentials: false` and accepts one full 40-character commit SHA for
-the final card061 commit on `origin/master`. Before any credential is available
-it requires the input to equal the exact `refs/remotes/origin/master` object. A
+the reviewed proof commit for GitHub issue
+[#98](https://github.com/misty-step/scry/issues/98) on `origin/master`.
+Before any credential is available, it requires the input to equal the exact `refs/remotes/origin/master` object. A
 fork SHA, abbreviated SHA, mutable ref, or target from any other branch fails
 closed.
 
@@ -150,13 +151,14 @@ supporting target behavior; the provider attestation is the acceptance oracle.
 
 ## Dispatch
 
-From a checked-out repository, after the final card061 pull request is
-squash-merged so its merge commit is the current `master` tip:
+From a checked-out repository, after the proof pull request for GitHub issue
+[#98](https://github.com/misty-step/scry/issues/98) is squash-merged so its
+merge commit is the current `master` tip:
 
 ```sh
 gh workflow run generation-061-live.yml --ref master \
   -f head_sha="$(git rev-parse refs/remotes/origin/master)" \
-  -f pull_request_number=<merged card061 PR number>
+  -f pull_request_number=<merged proof PR number>
 gh run watch
 ```
 
@@ -164,9 +166,9 @@ The pull request number is required: the workflow refuses to run unless that
 PR is merged, its squash commit is exactly `head_sha`, and the reviewed PR
 head tree equals the `head_sha` tree.
 
-The live receipt is the required proof for memory-engine-061. Card 098 does not
-claim a live receipt while this workflow is still draft; successful live
-dispatch and its artifact remain downstream card061 acceptance work. A
+The live receipt is required proof for GitHub issue
+[#98](https://github.com/misty-step/scry/issues/98). Successful dispatch and
+its artifact remain outstanding while this workflow is draft. A
 missing-secret run is expected to fail and is not live-generation proof; it
 demonstrates the fail-closed precondition only.
 
@@ -227,4 +229,4 @@ Read-only verification on 2026-07-15, using
 - force pushes: disabled; deletions: disabled.
 
 This policy is infrastructure authority for the default branch and was not
-mutated by the 098 repair.
+mutated by the work that added this lane.

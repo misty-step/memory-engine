@@ -1,11 +1,5 @@
 # Scry QA System
 
-Refs-Powder: memory-engine-025
-Refs-Powder: memory-engine-051
-Refs-Powder: memory-engine-052
-Refs-Powder: memory-engine-053
-Refs-Powder: memory-engine-054
-Refs-Powder: memory-engine-055
 
 ## Purpose
 
@@ -92,10 +86,10 @@ quality comparisons stay explicit and write dated receipts under `docs/evals/`:
 
 ```sh
 cargo run -p memory-engine-bench -- generation \
-  --model google/gemini-3.5-flash \
+  --model google/gemini-3.7-flash \
   --prompt principled \
   --judge anthropic/claude-sonnet-4.6 \
-  --out docs/evals/generation-gemini-3.5-flash-judged-$(date +%F).md
+  --out docs/evals/generation-gemini-3.7-flash-judged-$(date +%F).md
 ```
 
 ## Operating Procedure
@@ -136,7 +130,7 @@ Register entries should name:
 - quality dimension
 - current evidence
 - improvement
-- trigger for creating a shaped Powder card
+- trigger for creating a shaped GitHub issue
 
 Do not use the register for vague wishes. If an item is actionable now and
 blocks the active work, fix it instead of recording it.

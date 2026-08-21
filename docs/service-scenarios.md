@@ -1,6 +1,5 @@
 # Service Scenario Fixtures
 
-Refs-Powder: memory-engine-017
 
 ## Purpose
 

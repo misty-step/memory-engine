@@ -1,6 +1,5 @@
 # Mobile Beta Study Interface
 
-Refs-Powder: memory-engine-028
 
 ## Purpose
 

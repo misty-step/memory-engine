@@ -75,11 +75,10 @@ fn concept(
     trend: &str,
     summary_text: &str,
 ) -> BetaStudyConceptProgress {
-    let pct = if attempts > 0 {
-        correct * 100 / attempts
-    } else {
-        0
-    };
+    let pct = correct
+        .saturating_mul(100)
+        .checked_div(attempts)
+        .unwrap_or(0);
     BetaStudyConceptProgress {
         concept_key: label.to_lowercase().replace([' ', ':'], "-"),
         concept_label: label.to_owned(),
@@ -538,8 +537,8 @@ fn conformance_graded_review_holds_until_continue() {
         "pre-grade hatches must collapse behind the More disclosure"
     );
     assert!(
-        answering.contains(r#"class="me-more-capture""#),
-        "the More disclosure must carry the capture punch-out"
+        answering.contains(r#"class="me-more-capture" href="/app/create""#),
+        "Capture more must open Create, not Home: {answering}"
     );
 }
 

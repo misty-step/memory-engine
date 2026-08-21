@@ -343,8 +343,8 @@ fn post_answer_feedback_summarizes_item_and_concept_history() {
 }
 
 #[test]
-fn multiple_choice_choices_rotate_between_reviews_without_changing_answer() {
-    let directory = TempDirectory::new("mcq-choice-rotation");
+fn multiple_choice_choices_shuffle_between_reviews_without_changing_answer() {
+    let directory = TempDirectory::new("mcq-choice-shuffle");
     let path = directory.path().join("study.json");
     {
         let mut study =
@@ -369,43 +369,70 @@ fn multiple_choice_choices_rotate_between_reviews_without_changing_answer() {
         ["ALFA".to_owned(), "BRAVO".to_owned(), "CHARLIE".to_owned()]
     );
 
-    record_graded_attempt_with_response_time(
-        &path,
-        "study-run-1-draft-src-nato-1-nato-letter-a",
-        false,
-        1,
-        2_400,
-    );
-    let mut second_session =
-        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
-    let second = second_session
+    let mut stable_session =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("resume");
+    let stable = stable_session
         .start()
         .expect("start")
         .current
         .expect("current");
+    assert_eq!(stable.choices, first.choices);
 
-    assert_eq!(second.review_unit_id, first.review_unit_id);
-    assert_eq!(second.revision_expected_answer, "ALFA");
-    assert!(second.choices.iter().any(|choice| choice == "ALFA"));
-    assert_ne!(second.choices, first.choices);
+    let stored = stored_mcq_choices(&path, &first.review_unit_id);
+    let mut orders = vec![first.choices.clone()];
+    for offset in 1..=8 {
+        record_graded_attempt_with_response_time(
+            &path,
+            "study-run-1-draft-src-nato-1-nato-letter-a",
+            offset % 2 == 0,
+            offset,
+            2_000,
+        );
+        let mut session =
+            BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
+        let current = session.start().expect("start").current.expect("current");
+        assert_eq!(current.review_unit_id, first.review_unit_id);
+        assert_eq!(current.revision_expected_answer, "ALFA");
+        assert!(current.choices.iter().any(|choice| choice == "ALFA"));
+        assert_eq!(sorted(current.choices.clone()), sorted(stored.clone()));
+        orders.push(current.choices);
+    }
 
-    record_graded_attempt_with_response_time(
-        &path,
-        "study-run-1-draft-src-nato-1-nato-letter-a",
-        true,
-        2,
-        1_900,
+    assert!(
+        orders.windows(2).any(|pair| pair[0] != pair[1]),
+        "different attempt counts must be able to change presentation order"
     );
-    let mut third_session =
-        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(later)).expect("resume");
-    let third = third_session
-        .start()
-        .expect("start")
-        .current
-        .expect("current");
+    assert!(
+        orders.iter().any(|order| !is_cyclic_shift(&stored, order)),
+        "shuffle must be able to break stored relative order, not only rotate"
+    );
+}
 
-    assert_eq!(third.review_unit_id, first.review_unit_id);
-    assert_ne!(third.choices, second.choices);
+#[test]
+fn graded_mcq_recap_keeps_presentation_choice_order() {
+    let directory = TempDirectory::new("mcq-recap-order");
+    let path = directory.path().join("study.json");
+    let mut study =
+        BetaStudySession::open(BetaStudyOptions::new(&path).with_clock(now)).expect("open");
+    study.add_source(source_input()).expect("source");
+    study.generate(None).expect("generate");
+    study
+        .keep_draft("study-run-1-draft-src-nato-1-nato-letter-a")
+        .expect("keep");
+    let presented = study.start().expect("start").current.expect("current");
+    let pre_submit_choices = presented.choices.clone();
+    assert!(
+        !pre_submit_choices.is_empty(),
+        "MCQ presentation must expose choices"
+    );
+    let graded = study
+        .submit_answer("ALFA", 1_800)
+        .expect("grade presentation");
+    assert_eq!(
+        graded.current.expect("graded").choices,
+        pre_submit_choices,
+        "submit_answer recap must keep the presentation order"
+    );
 }
 
 #[test]
@@ -2359,6 +2386,34 @@ fn record_graded_attempt_for_review_unit(
 fn sorted(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values
+}
+
+fn stored_mcq_choices(path: &std::path::Path, review_unit_id: &ReviewUnitId) -> Vec<String> {
+    let snapshot = BetaPersistenceStore::open(path).expect("store").snapshot();
+    let draft = snapshot
+        .generated_prompt_drafts
+        .iter()
+        .find(|draft| draft.review_unit_id == *review_unit_id)
+        .expect("draft");
+    match &draft.prompt {
+        Prompt::Mcq { choices, .. } => choices.clone(),
+        other => panic!("expected MCQ, got {other:?}"),
+    }
+}
+
+fn is_cyclic_shift(original: &[String], candidate: &[String]) -> bool {
+    if original.len() != candidate.len() {
+        return false;
+    }
+    let n = original.len();
+    (0..n).any(|offset| {
+        original
+            .iter()
+            .cycle()
+            .skip(offset)
+            .take(n)
+            .eq(candidate.iter())
+    })
 }
 
 fn grade_result(is_correct: bool) -> GradeResult {

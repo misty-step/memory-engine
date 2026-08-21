@@ -1,6 +1,6 @@
-# Powder Hygiene
+# Legacy Work Hygiene
 
-Powder is the work queue and historical ledger. A `ready` card must be
+This historical receipt describes the retired work queue and ledger. A `ready` card must be
 claimable with an executable oracle; a `done` card must not appear in the
 ready query.
 
@@ -18,9 +18,9 @@ Active card evidence must name:
 - the fast gate, `bun run ci`, plus the full `bun run ci:full` handoff gate
   when the branch is ready for handoff.
 
-## Completed Cards
+## Completed Legacy Cards
 
-Completed Powder cards are historical receipts. Attach closure evidence or a
+Completed legacy cards are historical receipts. Attach closure evidence or a
 commit/PR link concrete enough for a cold reviewer to re-run the proof.
 
 ## QA Receipts
@@ -36,7 +36,7 @@ stable report files, such as release notes, a PR bot, dashboard import, or
 cross-repo comparison. Until then, copy the relevant command receipts into the
 handoff, trace, or commit message.
 
-## Powder 30 Delivery Receipt
+## Legacy Work Item 30 Delivery Receipt
 
 This hygiene pass used stdout receipts rather than adding
 `memory-engine-qa --report <path>`.
@@ -52,7 +52,7 @@ This hygiene pass used stdout receipts rather than adding
 
 ## Current Slice 6 Queue
 
-The prior Powder hygiene pass completed the beta persistence, beta generation,
+The prior ledger hygiene pass completed the beta persistence, beta generation,
 and hygiene cards. The remaining historical Slice 6 path started with the
 mobile beta interface as the highest-priority product proof:
 

@@ -1,6 +1,6 @@
 # QA 078 — Ledger design system ship (2026-07-09)
 
-Ticket: Powder `memory-engine-078`. Operator verdict (design lab LAB-001,
+Legacy work item: `memory-engine-078`. Operator verdict (design lab LAB-001,
 round 1) locked TASTE-1 "Ledger" as the memory-engine design system, with
 rulings: pre-grade card minimal, card meta post-grade only, no left-border
 cards, no horizontal scroll, every click justified or eliminated. `DESIGN.md`
@@ -70,7 +70,7 @@ Interaction law verified live:
 
 - `bun run ci` (fmt, workspace tests incl. rewritten conformance, clippy
   `-D warnings`, rustdoc): green.
-- `bun run ci:full` and hosted CI: recorded on the Powder card at ship time.
+- `bun run ci:full` and hosted CI: recorded with the ship evidence.
 
 ## Residual
 

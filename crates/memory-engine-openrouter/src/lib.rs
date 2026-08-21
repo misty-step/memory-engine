@@ -34,14 +34,12 @@ pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 pub const PROXY_TOKEN_ENV: &str = "OPENROUTER_PROXY_TOKEN";
 /// Environment variable overriding the generation model id.
 pub const MODEL_ENV: &str = "MEMORY_ENGINE_GENERATION_MODEL";
-/// Default model, chosen from the 2026-06-11 field run in
-/// `docs/evals/generation-field-2026-06-11.md`: the quality ceiling (100%
-/// provenance and answerability, zero failures across runs). It costs
-/// ~$0.025/source, a deliberate trade above the original $0.02 estimate in
-/// favor of output quality; `MEMORY_ENGINE_GENERATION_MODEL` overrides it,
-/// and `deepseek/deepseek-v4-flash` is the documented budget alternative at
-/// ~$0.0004/source.
-pub const DEFAULT_MODEL: &str = "google/gemini-3.5-flash";
+/// Default model. Operator ruling 2026-08-17: `google/gemini-3.7-flash`.
+/// Override with `MEMORY_ENGINE_GENERATION_MODEL`. The 2026-06-11 field
+/// run that first picked a quality-ceiling default is
+/// `docs/evals/generation-field-2026-06-11.md`; `deepseek/deepseek-v4-flash`
+/// remains the documented budget alternative at ~$0.0004/source.
+pub const DEFAULT_MODEL: &str = "google/gemini-3.7-flash";
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Trusted hosted evaluation may replace the upstream with a local provider
 /// proxy. The proxy owns the real key; target code receives only a one-run
@@ -1020,7 +1018,12 @@ fn non_empty(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_json_object, parse_bridge_stage};
+    use super::{extract_json_object, parse_bridge_stage, DEFAULT_MODEL};
+
+    #[test]
+    fn default_model_is_gemini_3_7_flash() {
+        assert_eq!(DEFAULT_MODEL, "google/gemini-3.7-flash");
+    }
 
     #[test]
     fn unwraps_markdown_fenced_json() {

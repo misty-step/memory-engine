@@ -16,7 +16,8 @@ use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{
-    BetaStudyConceptProgress, BetaStudyCurrent, LibrarySourceRow, SourcePermission,
+    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, LibrarySourceRow,
+    SourcePermission,
 };
 
 use memory_engine_api_state::{
@@ -41,13 +42,27 @@ pub struct ContentFeedbackRecovery<'a> {
     pub message: &'a str,
 }
 
+pub const SKIP_CONFIRM_NOTICE: &str = "You'll see this later this session.";
+pub const SNOOZE_CONFIRM_NOTICE: &str = "You'll see this tomorrow.";
+pub const SNOOZE_CONCEPT_CONFIRM_NOTICE: &str = "You'll see this concept tomorrow.";
+
 #[must_use]
 pub fn render_action_result_html(
     state: &ApiState,
     account: &AppAccount,
     result: Result<StudyViewResponse, ApiFailure>,
 ) -> String {
-    render_action_result_html_with_head(state, account, result, None, "")
+    render_action_result_html_with_notice(state, account, result, None)
+}
+
+#[must_use]
+pub fn render_action_result_html_with_notice(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<StudyViewResponse, ApiFailure>,
+    notice: Option<&str>,
+) -> String {
+    render_action_result_html_with_head(state, account, result, notice, "")
 }
 
 #[must_use]
@@ -808,8 +823,9 @@ fn render_edit_review(account: &AppAccount, current: &BetaStudyCurrent) -> Strin
 <textarea class="ae-input" id="me-edit-prompt" name="prompt" rows="4" required>{prompt}</textarea>
 <label class="ae-label" for="me-edit-answer">Answer</label>
 <input class="ae-input" id="me-edit-answer" name="expectedAnswer" value="{answer}" required autocomplete="off">
-<div class="me-actions"><button class="ae-button" type="submit">Save changes</button><a class="ae-button-quiet" href="/">Cancel</a></div>
+<div class="me-actions"><button class="ae-button" type="submit">Save changes</button></div>
 </form>
+<form action="/app/next" method="post">{csrf}<button class="ae-button-quiet" type="submit">Cancel</button></form>
 </section>"#,
         csrf = hidden_csrf_input(account),
         id = escape_html(&current.review_unit_id.to_string()),
@@ -826,9 +842,7 @@ fn render_home_body(account: &AppAccount, view: Option<&StudyViewResponse>) -> S
     if let Some(view) = view {
         html.push_str(&render_review_status(account, view));
     }
-    if view.is_none()
-        || view.is_some_and(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0)
-    {
+    if view.is_none_or(|v| v.due_count == 0 && v.summary.approved_review_unit_count == 0) {
         html.push_str(
             r#"<p class="ae-lede me-welcome">Type a topic or paste anything worth remembering.</p>"#,
         );
@@ -1050,9 +1064,6 @@ fn render_capture(account: &AppAccount) -> String {
 {csrf}
 <label class="ae-label me-capture-label" for="me-capture">What do you want to remember?</label>
 <textarea class="ae-input" id="me-capture" name="capture" rows="3" required placeholder="A topic like &ldquo;NATO phonetic alphabet&rdquo;, a list, or pasted notes."></textarea>
-<label class="ae-label" for="me-capture-permission">Permission</label>
-<select class="ae-input" id="me-capture-permission" name="permission" aria-describedby="me-capture-permission-hint"><option value="model-eligible" selected>Allow model help</option><option value="local-only">Keep local / Never send to a model</option></select>
-<p class="ae-dim me-hint" id="me-capture-permission-hint">Allow model help is the default. Choose keep local / never send to a model to prevent model providers from receiving this capture.</p>
 <div class="me-actions"><button class="ae-button" type="submit">Create {ICON_ARROW}</button><span class="ae-dim me-hint me-live-hint">Generates in the background.</span></div>
 </form>
 </section>"#,
@@ -1106,12 +1117,14 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
 <p class="ae-dim">Expected answer: <span class="ae-item">{}</span></p>
 {}
 {}
-<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required><div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
+{}
+<form action="/app/draft/edit" method="post">{}<input type="hidden" name="draftId" value="{}"><label class="ae-label" for="draft-prompt-{}">Edit prompt</label><textarea class="ae-input" id="draft-prompt-{}" name="prompt" rows="3" required>{}</textarea><label class="ae-label" for="draft-answer-{}">Edit answer</label><input class="ae-input" id="draft-answer-{}" name="expectedAnswer" value="{}" required>{}<div class="me-actions"><button class="ae-button" type="submit">Edit and keep</button></div></form>
 <div class="me-row-actions"><form action="/app/draft/keep" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Keep as written</button></form><form action="/app/draft/reject" method="post">{}<input type="hidden" name="draftId" value="{}"><button class="ae-button-quiet ae-button-compact" type="submit">Reject</button></form></div>
 </article>"#,
             escape_html(&draft.concept_label),
             escape_html(&draft.prompt),
             escape_html(&draft.answer),
+            render_draft_choice_list(draft),
             provenance,
             spans,
             hidden_csrf_input(account),
@@ -1122,6 +1135,7 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
             escape_html(&draft.id),
             escape_html(&draft.id),
             escape_html(&draft.answer),
+            render_draft_choice_fields(draft),
             hidden_csrf_input(account),
             escape_html(&draft.id),
             hidden_csrf_input(account),
@@ -1132,6 +1146,45 @@ fn render_pending_drafts(account: &AppAccount, view: Option<&StudyViewResponse>)
         return String::new();
     }
     format!("<section class=\"ae-group me-pending-drafts\"><h2 class=\"ae-h\">Review generated drafts</h2><p class=\"ae-lede ae-dim\">Nothing enters your queue until you choose.</p>{rows}</section>")
+}
+
+fn render_draft_choice_list(draft: &BetaStudyDraftRow) -> String {
+    if draft.choices.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<ul class=\"me-draft-choices\">");
+    for choice in &draft.choices {
+        let mark = if choice == &draft.answer {
+            " <span class=\"ae-dim\">correct</span>"
+        } else {
+            ""
+        };
+        let _ = write!(
+            html,
+            "<li><span class=\"ae-item\">{}</span>{mark}</li>",
+            escape_html(choice)
+        );
+    }
+    html.push_str("</ul>");
+    html
+}
+
+fn render_draft_choice_fields(draft: &BetaStudyDraftRow) -> String {
+    let distractors = draft
+        .choices
+        .iter()
+        .filter(|choice| *choice != &draft.answer)
+        .map(|choice| escape_html(choice))
+        .collect::<Vec<_>>();
+    if distractors.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<label class="ae-label" for="draft-choices-{id}">Distractors</label><textarea class="ae-input" id="draft-choices-{id}" name="choices" rows="{rows}">{value}</textarea>"#,
+        id = escape_html(&draft.id),
+        rows = distractors.len().max(2),
+        value = distractors.join("\n"),
+    )
 }
 
 /// A source whose generation is already queued, running, or done never
@@ -1765,11 +1818,12 @@ fn compare_success_rate(
 }
 
 fn render_concept_row(concept: &BetaStudyConceptProgress) -> String {
-    let pct = if concept.attempts > 0 {
-        (concept.correct * 100 / concept.attempts).min(100)
-    } else {
-        0
-    };
+    let pct = concept
+        .correct
+        .saturating_mul(100)
+        .checked_div(concept.attempts)
+        .unwrap_or(0)
+        .min(100);
     format!(
         r#"<article class="me-concept" data-health="{health}">
 <div class="me-concept-head"><div class="me-concept-label"><strong>{label}</strong><span class="me-health-label {fill}">{health}</span></div><span class="me-trend ae-dim">{trend_icon} {trend}</span></div>
@@ -1806,7 +1860,7 @@ fn render_escape_hatches(account: &AppAccount, current: &BetaStudyCurrent) -> St
     // tomorrow (`DEFAULT_SNOOZE_DEFER_MS`, 24 hours); see
     // `memory_engine_study::skip_current`/`snooze_current`.
     format!(
-        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}{edit}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/" title="Capture new material without leaving review.">{ICON_PLUS}Capture more</a></div></details>"#,
+        r#"<details class="me-more"><summary aria-label="More actions">···</summary><div class="me-more-sheet">{reference}{skip}{snooze}{concept_snooze}{bridge}{edit}<span class="me-hatch-delete">{delete}</span><a class="me-more-capture" href="/app/create" title="Add new material.">{ICON_PLUS}Capture more</a></div></details>"#,
         reference = render_review_action(
             account,
             current,
@@ -2128,7 +2182,7 @@ mod source_loading_tests {
     }
 
     #[test]
-    fn capture_form_exposes_an_accessible_permission_choice_and_default() {
+    fn capture_form_is_one_field_and_create_without_a_permission_toggle() {
         let state = super::render_test_state("render-permission@example.com");
         let account = state
             .create_account("render-permission@example.com")
@@ -2136,11 +2190,12 @@ mod source_loading_tests {
             .expect("account");
         let html = render_capture(&account);
 
-        assert!(html.contains(r#"id="me-capture-permission" name="permission""#));
-        assert!(html.contains(r#"aria-describedby="me-capture-permission-hint""#));
-        assert!(html.contains(r#"value="model-eligible" selected"#));
-        assert!(html.contains("Keep local / Never send to a model"));
-        assert!(html.contains("prevent model providers from receiving this capture"));
+        assert!(html.contains(r#"name="capture""#));
+        assert!(html.contains("Create"));
+        assert!(html.contains("Generates in the background."));
+        assert!(!html.contains(r#"name="permission""#));
+        assert!(!html.contains("me-capture-permission"));
+        assert!(!html.contains("Keep local / Never send to a model"));
     }
 }
 

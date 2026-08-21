@@ -1,0 +1,82 @@
+name: Shaped work
+description: Define an executable Scry outcome and its proof
+title: ""
+labels:
+  - status:backlog
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the observable result and its owner.
+      placeholder: The learner or operator can...
+    validations:
+      required: true
+  - type: textarea
+    id: why-now
+    attributes:
+      label: Why now
+      description: Name the binding product evidence, production observation, or code invariant.
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: Select the priority label that the groomer must apply.
+      options:
+        - priority:p0
+        - priority:p1
+        - priority:p2
+        - priority:p3
+    validations:
+      required: true
+  - type: dropdown
+    id: work-type
+    attributes:
+      label: Type
+      description: Select the work-type label that the groomer must apply.
+      options:
+        - type:bug
+        - type:feature
+        - type:infrastructure
+        - type:maintenance
+        - type:performance
+        - type:product-proof
+        - type:roadmap
+        - type:security
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Use behavior-level checkboxes. Include failure paths and boundaries.
+      placeholder: |
+        - [ ] Observable behavior
+        - [ ] Failure behavior
+        - [ ] Exact proof and gates
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link only hard blockers or state None.
+      placeholder: None.
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: Proof
+      description: Name the real interface, scenario, fixture, artifacts, and required gates.
+    validations:
+      required: true
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+      description: State scope that must not enter this issue.
+    validations:
+      required: true
