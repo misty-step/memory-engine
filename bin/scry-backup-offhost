@@ -1,8 +1,11 @@
 #!/bin/sh
 # Nightly encrypted off-host Scry Postgres backup.
 # Pipeline: pg_dump -> AES256 gpg -> DigitalOcean Spaces via boto3 (S3 API).
-# The script NEVER issues a remote DELETE; object expiry is owned by the
-# bucket lifecycle rule declared in Estate OpenTofu (30-day age-based).
+# The script NEVER issues a remote DELETE. Object expiry is intended to be
+# owned by a 30-day age-based bucket lifecycle rule; that lifecycle and
+# versioning are NOT yet provisioned (Estate OpenTofu card pending), so
+# until then objects accumulate and retention depends on the provisioning
+# step landing before credentials are added.
 # Custody: SCRY_BACKUP_PASSPHRASE must also live in an operator-managed
 # off-host store; without that copy the ciphertext is unrestorable after
 # droplet loss, so the backup job stays open until the operator records it.
