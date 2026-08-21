@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+umask 077
+dir=/var/backups/scry
+install -d -o scry -g scry -m 0750 "$dir"
+out="$dir/scry-$(date -u +%Y%m%dT%H%M%SZ).dump"
+sudo -u scry pg_dump -Fc scry -f "$out"
+chown scry:scry "$out"
+chmod 0600 "$out"
+find "$dir" -type f -name "scry-*.dump" -mtime +6 -delete
+echo "$out"
