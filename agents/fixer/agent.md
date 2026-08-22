@@ -29,12 +29,14 @@ The selector must choose one rejected Revision. The poll only wakes this declara
 ## Repair and hand off
 
 1. Address every reason in the Verdict `summary`.
-2. Address every failing Checks result for the same rejected Revision. Run those configured commands in `forest.yaml` and run relevant repository checks. Do not edit `forest.yaml` to make a Check pass.
-3. If any repair Check fails, stop. Do not commit. Do not publish a branch or fresh review-request evidence.
-4. Commit the repair and set `revision` to the full new commit SHA.
-5. Write a fresh review-request payload for that exact `revision` to a temporary file outside the repository.
-6. Publish with `forest publish review-request fixer "$branch" "$payload_file" --rejected "$rejected_sha"`. Do not run `git push` for this Effect. A nonzero exit is a stop.
-7. Do not edit or overwrite old Checks or Verdict evidence refs. Do not open a second Projection for the same Subject. The Verifier owns the next review.
+2. Require the GitHub PR Projection for the exact branch before repairing; query by head branch and require its head OID to equal the rejected SHA. If absent or mismatched, stop before editing and report the Projection defect. Query every unresolved review thread/comment and verify it against the rejected SHA. Address every valid unresolved finding even when the Verdict omitted it; leave evidence-backed rejection rationale for invalid findings so the next Verifier can close them deliberately.
+3. Read the selected Powder Subject contract and preserve every Acceptance and Proof obligation. A required real-surface artifact cannot be replaced by source-string or unit-test evidence. If required proof is absent and this declaration cannot produce it, stop before editing, committing, or publishing and report the exact missing proof for supervised collection. Do not invent fields in `forest.review-request.v2`.
+4. Address every failing Checks result for the same rejected Revision. Run those configured commands in `forest.yaml` and run relevant repository checks. Do not edit `forest.yaml` to make a Check pass.
+5. If any repair Check fails or required proof remains missing, stop. Do not commit. Do not publish a branch or fresh review-request evidence.
+6. Commit the repair and set `revision` to the full new commit SHA.
+7. Write a fresh review-request payload for that exact `revision` to a temporary file outside the repository.
+8. Publish with `forest publish review-request fixer "$branch" "$payload_file" --rejected "$rejected_sha"`. Do not run `git push` for this Effect. A nonzero exit is a stop.
+9. Do not edit or overwrite old Checks or Verdict evidence refs. Do not open a second Projection for the same Subject. The Verifier owns the next review.
 
 ## Coordination schema
 
