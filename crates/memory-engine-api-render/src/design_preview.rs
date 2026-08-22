@@ -196,6 +196,11 @@ fn graded(verdict: Verdict, rating: Rating, with_feedback: bool) -> BetaStudyCur
         is_correct: verdict == Verdict::Correct,
     });
     if with_feedback {
+        let bridge_message = matches!(verdict, Verdict::Wrong | Verdict::Close | Verdict::Revealed)
+            .then(|| {
+                "Easier practice cards are ready. We'll ask you those before this card returns."
+                    .to_owned()
+            });
         current.feedback = Some(BetaStudyFeedback {
             verdict: format!("{verdict:?}").to_lowercase(),
             expected_answer: "efímero".to_owned(),
@@ -208,6 +213,7 @@ fn graded(verdict: Verdict, rating: Rating, with_feedback: bool) -> BetaStudyCur
                 "slipping",
                 "One more like that lifts this concept above half.",
             )),
+            bridge_message,
         });
     }
     current
@@ -498,10 +504,32 @@ fn conformance_graded_review_holds_until_continue() {
         graded.contains(r#"class="me-verdict""#),
         "graded verdict must use the verdict register"
     );
+    assert!(
+        graded.contains(r#"class="me-grade-reason"#),
+        "graded review must show a concise grading reason: {graded}"
+    );
+    assert!(
+        graded.contains(r#"<details class="me-dossier">"#),
+        "graded review must collapse the dossier behind Details: {graded}"
+    );
+    assert!(
+        graded.contains(r#"<summary class="me-dossier-summary">Details</summary>"#),
+        "Details disclosure must read Details: {graded}"
+    );
     // The card's dossier is post-grade only (DESIGN.md): present here…
     assert!(
         graded.contains(r#"class="me-meta-ledger""#),
         "graded review must show the meta ledger"
+    );
+    // …but tucked inside the disclosure, after the disclosure opens. The
+    // default view never leads with stage/last-seen/success rows.
+    let dossier = graded.find(r#"<details class="me-dossier">"#).unwrap_or(0);
+    let ledger = graded
+        .find(r#"class="me-meta-ledger""#)
+        .unwrap_or(usize::MAX);
+    assert!(
+        ledger > dossier,
+        "the meta ledger must live inside the Details disclosure, not before it"
     );
     // Skip/Snooze/Bridge are pre-answer moves; they must vanish once graded.
     assert!(
@@ -521,6 +549,10 @@ fn conformance_graded_review_holds_until_continue() {
     assert!(
         wrong.contains(r#"class="me-meta-ledger""#),
         "the dossier shows on misses too"
+    );
+    assert!(
+        wrong.contains(r#"<p class="me-bridge">"#),
+        "a miss must surface the automatic-bridge notice: {wrong}"
     );
 
     // The pre-grade card is minimal: no dossier, hatches collapsed behind

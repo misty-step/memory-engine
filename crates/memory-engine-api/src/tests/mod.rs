@@ -10125,10 +10125,11 @@ fn assert_due_review_html(body: &str, due_count: usize) {
 }
 
 fn assert_submitted_review_html(body: &str) {
-    // Ledger graded screen (DESIGN.md): the verdict, the answer revealed in
-    // place (correct option marked), the card's meta ledger, one quiet line
-    // on when it returns, and a primary Continue. Raw internals still never
-    // leak.
+    // Ledger graded screen (DESIGN.md): the default view is the answer key —
+    // verdict, revealed answer, a one-line reason, and a primary Continue.
+    // The reflective dossier (horizon, source, concept, success ledger, and
+    // the generated-card quality poll) is one accessible Details disclosure.
+    // Raw internals still never leak.
     assert!(body.contains(r#"<span class="me-verdict">Correct</span>"#));
     // The first due card may be MCQ or free response, so accept either reveal
     // form: a marked correct option, or a one-line answer.
@@ -10138,10 +10139,23 @@ fn assert_submitted_review_html(body: &str) {
         reveals_answer,
         "graded screen must reveal the answer: {body}"
     );
-    assert!(body.contains("you'll see this again"));
+    assert!(body.contains(r#"class="me-grade-reason"#));
+    assert!(body.contains(r#"<details class="me-dossier">"#));
     assert!(body.contains("Continue"));
-    assert!(body.contains(r#"class="me-meta-ledger""#));
-    assert!(body.contains("This item:"));
+    // The dossier is present but not in the default flow: it must follow the
+    // Details disclosure marker.
+    let dossier = body.find(r#"<details class="me-dossier">"#).unwrap_or(0);
+    for dossier_item in [
+        "you'll see this again",
+        r#"class="me-meta-ledger""#,
+        "This item:",
+    ] {
+        let position = body.find(dossier_item).unwrap_or(usize::MAX);
+        assert!(
+            position > dossier,
+            "{dossier_item} must live inside the Details disclosure, not the default view"
+        );
+    }
     assert!(body.contains("Was this generated card worth keeping?"));
     assert_not_contains_any(
         body,
@@ -10149,7 +10163,6 @@ fn assert_submitted_review_html(body: &str) {
             "Answer feedback",
             "Expected answer",
             "Concept health",
-            "response time",
             "Last result",
             "Progress",
             "Correct(",
@@ -11966,6 +11979,14 @@ async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
     let graded = response_text(graded).await;
     assert!(graded.contains(r#"<span class="me-verdict">Correct</span>"#));
     assert!(
+        graded.contains(r#"class="me-grade-reason"#),
+        "graded card must show the concise grading reason: {graded}"
+    );
+    assert!(
+        graded.contains(r#"<details class="me-dossier">"#),
+        "graded card must collapse its dossier behind Details: {graded}"
+    );
+    assert!(
         graded.contains(r#"class="me-meta-ledger""#),
         "graded card must show its meta ledger: {graded}"
     );
@@ -12009,6 +12030,8 @@ async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
     assert_eq!(missed.status(), StatusCode::OK);
     let missed = response_text(missed).await;
     assert!(missed.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(missed.contains(r#"class="me-grade-reason"#));
+    assert!(missed.contains(r#"<details class="me-dossier">"#));
     assert!(missed.contains(r#"class="me-meta-ledger""#));
     assert!(
         !missed.contains("data-auto-advance"),

@@ -260,6 +260,11 @@ pub struct BetaStudyFeedback {
     pub expected_answer: String,
     pub item_history: BetaStudyItemHistory,
     pub concept_progress: Option<BetaStudyConceptProgress>,
+    /// Set when automatic remediation (bridge) material was generated for this
+    /// miss and is waiting ahead of the parent card. The render surface shows
+    /// this as a single quiet line, never as an auto-advance or second verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2444,12 +2449,24 @@ fn feedback_for_current(
         .iter()
         .find(|concept| concept.concept_key == concept_key)
         .cloned();
+    let bridge_message = snapshot
+        .remediation_packs
+        .iter()
+        .find(|pack| {
+            pack.status == RemediationPackStatus::Active
+                && pack.parent_review_unit_id == draft.review_unit_id
+        })
+        .map(|_| {
+            "Easier practice cards are ready. We'll ask you those before this card returns."
+                .to_owned()
+        });
 
     BetaStudyFeedback {
         verdict: verdict_label(grade.verdict).to_owned(),
         expected_answer: prompt_expected_answer(&draft.prompt),
         item_history,
         concept_progress,
+        bridge_message,
     }
 }
 

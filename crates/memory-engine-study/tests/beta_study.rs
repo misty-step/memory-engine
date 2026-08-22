@@ -1198,14 +1198,15 @@ fn wrong_answer_triggers_remediation_pack_before_parent_returns() {
     let graded = study
         .submit_answer("wrong answer", 1_800)
         .expect("wrong submit");
-    assert_eq!(
-        graded
-            .current
-            .expect("graded current")
-            .grade
-            .expect("grade")
-            .verdict,
-        Verdict::Wrong
+    let graded_current = graded.current.expect("graded current");
+    assert_eq!(graded_current.grade.expect("grade").verdict, Verdict::Wrong);
+    assert!(
+        graded_current
+            .feedback
+            .as_ref()
+            .and_then(|feedback| feedback.bridge_message.as_deref())
+            .is_some(),
+        "a miss that spawns a remediation pack must surface the automatic-bridge notice"
     );
 
     let snapshot = BetaPersistenceStore::open(&path).expect("store").snapshot();

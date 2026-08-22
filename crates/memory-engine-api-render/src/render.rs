@@ -16,8 +16,8 @@ use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{
-    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, LibrarySourceRow,
-    SourcePermission,
+    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyFeedback,
+    LibrarySourceRow, SourcePermission,
 };
 
 use memory_engine_api_state::{
@@ -1314,28 +1314,89 @@ fn render_answering(account: &AppAccount, current: &BetaStudyCurrent) -> String 
     )
 }
 
-/// After grading: stay close to the card the learner just answered. The chosen
-/// answer is revealed in place (the correct option marked, the rest dimmed; or a
-/// one-line answer for free response), the verdict reads, one quiet line says
-/// when it returns, and Next is the primary action. The per-item metrics and
-/// concept health that used to pile up here live on the workspace, off the
-/// per-card loop — so the review stays a fast, low-friction rhythm.
+/// After grading: the default view is the learner's immediate answer key —
+/// verdict, accepted answer, a one-line grading reason, and a deliberate
+/// Continue. Everything reflective (horizon, source, concept, success ledger,
+/// and the generated-card quality poll) moves behind one accessible Details
+/// disclosure so the graded card stays a fast, low-friction rhythm.
 fn render_graded_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
     format!(
         r#"<p class="me-prompt">{prompt}</p>
 {reveal}
 {verdict}
-{meta}
-{content_feedback}
-{reference}
-{next}"#,
+{reason}
+{bridge}
+{next}
+{details}"#,
         prompt = escape_html(&current.prompt),
         reveal = render_answer_reveal(current),
-        verdict = render_graded_verdict(current),
-        meta = render_meta_ledger(current),
-        content_feedback = render_content_feedback(account, current),
-        reference = render_reference(current),
+        verdict = render_verdict(current),
+        reason = render_grading_reason(current),
+        bridge = render_bridge_message(current),
         next = render_next(account, current),
+        details = render_graded_details(account, current),
+    )
+}
+
+/// One quiet line explaining the verdict. This is deliberately a tiny,
+/// deterministic explanation, not the rubric dossier: the graded card keeps the
+/// learner's attention on what was right or wrong and what to do next.
+fn render_grading_reason(current: &BetaStudyCurrent) -> String {
+    current.grade.as_ref().map_or_else(String::new, |grade| {
+        let reason = grading_reason(grade.verdict);
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<p class="me-grade-reason ae-dim">{}</p>"#,
+                escape_html(reason)
+            )
+        }
+    })
+}
+
+/// The automatic-bridge notice, shown only when remediation material was
+/// actually generated for this miss (see `memory_engine_study`).
+fn render_bridge_message(current: &BetaStudyCurrent) -> String {
+    current
+        .feedback
+        .as_ref()
+        .and_then(|feedback| feedback.bridge_message.as_deref())
+        .map_or_else(String::new, |message| {
+            format!(r#"<p class="me-bridge">{}</p>"#, escape_html(message))
+        })
+}
+
+/// The collapsed post-grade dossier. Schedule horizon, source reference,
+/// concept health, and the historical success ledger all live here — not in the
+/// default graded view — while remaining one accessible disclosure away.
+fn render_graded_details(account: &AppAccount, current: &BetaStudyCurrent) -> String {
+    let Some(feedback) = current.feedback.as_ref() else {
+        return String::new();
+    };
+    let horizon = if feedback.item_history.next_review.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="me-next-when me-dossier-horizon">{}</p>"#,
+            escape_html(&feedback.item_history.next_review)
+        )
+    };
+    format!(
+        r#"<details class="me-dossier">
+<summary class="me-dossier-summary">Details</summary>
+<div class="me-dossier-panel">
+{horizon}
+{concept}
+{meta}
+{reference}
+{content_feedback}
+</div>
+</details>"#,
+        concept = render_concept_dossier(feedback),
+        meta = render_meta_ledger(current),
+        reference = render_reference(current),
+        content_feedback = render_content_feedback(account, current),
     )
 }
 
@@ -1382,9 +1443,10 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
     )
 }
 
-/// The card's dossier — post-grade only (DESIGN.md): stage, last seen, and
-/// success record, plus the concept line when the grade rolled one up. This
-/// never renders pre-grade; before the answer the question owns the screen.
+/// The card's historical success ledger — post-grade only, and rendered inside
+/// the Details disclosure (DESIGN.md): stage, last seen, and success record.
+/// Concept health renders as its own dossier block, not as a fourth ledger row,
+/// so the default graded view stays concise.
 fn render_meta_ledger(current: &BetaStudyCurrent) -> String {
     let Some(feedback) = current.feedback.as_ref() else {
         return String::new();
@@ -1407,15 +1469,38 @@ fn render_meta_ledger(current: &BetaStudyCurrent) -> String {
         escape_html(&history.success_rate),
         escape_html(&history.trend)
     );
-    if let Some(concept) = feedback.concept_progress.as_ref() {
-        let _ = write!(
-            rows,
-            r"<div><dt>Concept</dt><dd>{} · {}</dd></div>",
-            escape_html(&concept.concept_label),
-            escape_html(&concept.health)
-        );
-    }
     format!(r#"<dl class="me-meta-ledger">{rows}</dl>"#)
+}
+
+/// The concept line for the post-grade dossier: label, health, and a one-line
+/// summary of the rollup. It sits beside the historical ledger inside Details,
+/// not on the default graded card.
+fn render_concept_dossier(feedback: &BetaStudyFeedback) -> String {
+    feedback
+        .concept_progress
+        .as_ref()
+        .map_or_else(String::new, |concept| {
+            format!(
+                r#"<div class="me-dossier-concept">
+<span class="me-dossier-label">Concept</span>
+<p class="me-dossier-value">{label} · {health}</p>
+<p class="me-dossier-note">{summary}</p>
+</div>"#,
+                label = escape_html(&concept.concept_label),
+                health = escape_html(&concept.health),
+                summary = escape_html(&concept.summary),
+            )
+        })
+}
+
+fn grading_reason(verdict: impl std::fmt::Debug) -> &'static str {
+    match verdict_label(verdict) {
+        "Correct" => "You matched the accepted answer.",
+        "Close" => "Close — a small miss.",
+        "Try again" => "Your answer doesn't match the accepted answer.",
+        "Revealed" => "You revealed the answer.",
+        _ => "",
+    }
 }
 
 /// Reveal the answer in place. Multiple-choice marks the correct option and dims
@@ -1454,22 +1539,6 @@ fn render_answer_reveal(current: &BetaStudyCurrent) -> String {
         );
     }
     format!(r#"<ol class="me-choices me-choices-graded">{rows}</ol>"#)
-}
-
-/// The verdict (the moment) plus one quiet line on when the card returns.
-fn render_graded_verdict(current: &BetaStudyCurrent) -> String {
-    let when = current
-        .feedback
-        .as_ref()
-        .map(|feedback| feedback.item_history.next_review.as_str())
-        .filter(|phrase| !phrase.is_empty())
-        .map_or_else(String::new, |phrase| {
-            format!(
-                r#"<p class="me-next-when ae-dim">{}</p>"#,
-                escape_html(phrase)
-            )
-        });
-    format!("{}{when}", render_verdict(current))
 }
 
 /// The answer mechanism, chosen by card shape. Pre-grade, multiple-choice cards

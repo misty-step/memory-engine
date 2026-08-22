@@ -112,12 +112,15 @@ permission → Library; reminders → Home. Each POST returns to the view that
 owns the action, so the learner never lands on a scroll of unrelated
 sections after submitting.
 
-## Post-grade meta ledger
+## Post-grade feedback
 
-After grading (and only after), the card shows its record: verdict + revealed
-answer, "you'll see this again …" horizon, then a mono ledger of stage,
-last seen, success rate (n/N and trend), and the concept line. This is the
-learner's honest dossier on the card; it never appears pre-grade.
+After grading (and only after), the default view shows the answer key, not the
+dossier: verdict, accepted answer, a one-line grading reason, an
+automatic-bridge notice when remediation material was generated, and one
+deliberate Continue. The reflective record — schedule horizon, source
+reference, concept health, and the mono success ledger (stage, last seen,
+success rate n/N and trend), plus the generated-card quality poll — collapses
+behind one accessible Details disclosure. None of it appears pre-grade.
 
 ## Component grammar
 
