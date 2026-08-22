@@ -3,7 +3,7 @@ repo: misty-step/scry
 # Factory Manager scope: only jobs groomed ready for the Kernel.
 scope:
   subjects:
-    - scry-126-backup-retention-preflight
+    - scry-123-graded-card
 
 agents:
   builder:  { poll: "./forest poll builder",  interval: 300 }
