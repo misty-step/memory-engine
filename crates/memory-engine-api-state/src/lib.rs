@@ -275,6 +275,23 @@ impl ApiState {
             .request_magic_link(email, client_rate_limit_key)
     }
 
+    /// Route one signed-out human request to magic-link delivery or the
+    /// invite-beta waitlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the email is invalid, rate-limited, or the
+    /// selected durable operation fails.
+    pub fn request_app_access(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<MagicLinkRequest, ApiFailure> {
+        self.accounts
+            .request_app_access(email, source, client_rate_limit_key)
+    }
+
     /// Verify an auth magic link and return a browser session.
     ///
     /// # Errors

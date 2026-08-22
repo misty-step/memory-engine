@@ -109,20 +109,22 @@ credential, never a persisted SHA-256 digest.
 
 ## Waitlist (invite-beta first-run)
 
-The signed-out landing page offers two actions: sign in (allowlisted emails,
-existing flow) and join the waitlist (anyone, no account). `POST
-/app/waitlist` records only a normalized email, a created/updated timestamp
-pair, and a source tag (`"first-run"`) — no account, session, or generation
-job is ever created. Joining is idempotent on normalized email and returns
-the identical response whether the address is brand new, already on the
-list, or already allowlisted, so the response can never be used to probe
-registration or allowlist state. Rate limiting runs per normalized email and
-per trusted edge-overwritten client identity. Caddy overwrites
-`do-connecting-ip` with `{http.request.remote.host}` before proxying to the
-loopback service. The API uses that value. Generic caller-controlled
-`x-real-ip` and `x-forwarded-for` headers never influence a quota. If the edge
-identity is missing, requests use the deterministic `unknown` bucket. The
-active edge contract is `/etc/caddy/Caddyfile`.
+The signed-out landing page has one email field and one action. `POST
+/app/account` normalizes the address, then either sends the existing magic link
+for configured or durably invited access, or records the address on the
+waitlist. A waitlist row contains only the normalized email, a created/updated
+timestamp pair, and the `"first-run"` source tag — no account, session, or
+generation job is created. Joining is idempotent. Production success responses
+are identical for invited, new, and repeated addresses, so the route cannot be
+used to probe registration or invite state.
+
+The unified entry limit runs per normalized email and per trusted
+edge-overwritten client identity. Caddy overwrites `do-connecting-ip` with
+`{http.request.remote.host}` before proxying to the loopback service. The API
+uses that value. Generic caller-controlled `x-real-ip` and `x-forwarded-for`
+headers never influence a quota. If the edge identity is missing, requests use
+the deterministic `unknown` bucket. The active edge contract is
+`/etc/caddy/Caddyfile`.
 
 Storage is dual-backend, dispatched the same way as every other
 `memory-engine-api` store: `MEMORY_ENGINE_POSTGRES_URL` set → Postgres
@@ -133,7 +135,7 @@ transition); unset → the local file store only
 the other store-root sidecars under `MEMORY_ENGINE_API_STORE_DIR`, with its
 own `_waitlist_audit.jsonl` mirroring the same audit contract for local
 dev/tests without a database). Production always runs Postgres-backed; the
-join and admin routes below no longer return `503` there.
+unified entry and admin routes below no longer return `503` there.
 
 Operator surface, gated by `MEMORY_ENGINE_ADMIN_TOKEN` (the same admin token
 used by service sessions) — list, export, mark invited, and delete, with no

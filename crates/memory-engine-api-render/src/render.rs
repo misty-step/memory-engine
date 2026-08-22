@@ -453,7 +453,7 @@ pub fn render_analytics_page(
 }
 
 #[must_use]
-pub fn render_login_requested(debug_link: Option<&str>) -> String {
+pub fn render_entry_requested(debug_link: Option<&str>) -> String {
     let debug = debug_link.map_or_else(String::new, |link| {
         format!(
             r#"<p><a href="{}" class="ae-accent">Open sign-in link</a></p>"#,
@@ -461,64 +461,51 @@ pub fn render_login_requested(debug_link: Option<&str>) -> String {
         )
     });
     let view = format!(
-        r#"<p class="ae-lede"><span class="ae-item">Check your email.</span> If that address can sign in, a link is on the way.</p>
-{debug}
-<p><a class="ae-accent" href="/">Back to start</a></p>"#
-    );
-    document(&screen_centered("", &view, FOOTER_TAGLINE))
-}
-
-#[must_use]
-pub fn render_waitlist_joined() -> String {
-    let view = r#"<div class="me-cover">
-<p class="me-kicker">You're on the list</p>
-<h1 class="me-display">Thanks for joining.</h1>
-<p class="ae-lede ae-dim me-support">We’ll email you when a spot opens. No account was created and nothing else happens until then.</p>
-<p><a class="ae-accent" href="/">Back to start</a></p>
-</div>"#;
-    document(&screen_centered("", view, FOOTER_TAGLINE))
-}
-
-#[must_use]
-pub fn render_waitlist_recovery(title: &str, message: &str) -> String {
-    let view = format!(
         r#"<div class="me-cover">
-<p class="me-kicker">Waitlist</p>
-<h1 class="me-display">{}</h1>
-<p class="ae-lede ae-dim me-support">{}</p>
-<section class="ae-group me-capture-hero">
-<form action="/app/waitlist" method="post">
-<label class="ae-label" for="me-waitlist-recovery-email">Your email</label>
-<input class="ae-input me-hero-email" id="me-waitlist-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button" type="submit">Try again</button></div>
-</form>
-</section>
+<p class="me-kicker">Request received</p>
+<h1 class="me-display">Check your email.</h1>
+<p class="ae-lede ae-dim me-support">If you’re invited, a sign-in link is on the way. Otherwise, you’re on the waitlist and we’ll email when a spot opens.</p>
+{debug}
 <p><a class="ae-accent" href="/">Back to start</a></p>
-</div>"#,
-        escape_html(title),
-        escape_html(message),
+</div>"#
     );
     document(&screen_centered("", &view, FOOTER_TAGLINE))
+}
+
+#[must_use]
+pub fn render_entry_recovery(title: &str, message: &str) -> String {
+    render_email_recovery("Scry · Invite-only beta", title, message, "Try again")
 }
 
 #[must_use]
 pub fn render_auth_recovery(title: &str, message: &str) -> String {
+    render_email_recovery(
+        "Return to your workspace",
+        title,
+        message,
+        "Request a new link",
+    )
+}
+
+fn render_email_recovery(kicker: &str, title: &str, message: &str, action: &str) -> String {
     let view = format!(
         r#"<div class="me-cover">
-<p class="me-kicker">Return to your workspace</p>
+<p class="me-kicker">{}</p>
 <h1 class="me-display">{}</h1>
 <p class="ae-lede ae-dim me-support">{}</p>
 <section class="ae-group me-capture-hero">
 <form action="/app/account" method="post">
 <label class="ae-label" for="me-recovery-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-recovery-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button" type="submit">Request a new link</button></div>
+<div class="me-actions"><button class="ae-button" type="submit">{}</button></div>
 </form>
 </section>
 <p><a class="ae-accent" href="/">Back to start</a></p>
 </div>"#,
+        escape_html(kicker),
         escape_html(title),
         escape_html(message),
+        escape_html(action),
     );
     document(&screen_centered("", &view, FOOTER_TAGLINE))
 }
@@ -650,38 +637,20 @@ fn screen_with(stage: &str, header_right: &str, view: &str, footer: &str) -> Str
 }
 
 fn render_signed_out(notice: Option<&str>) -> String {
-    // Onboarding is auth-first. Accounts are required (the magic-link
-    // allowlist), so anonymous visitors never see the capture form — they would
-    // only dead-end on it. The display promise leads, then one primary action:
-    // sign in with an allowlisted email. New visitors who don't yet have an
-    // account reveal a separate waitlist form below it. Both forms read
-    // identically to a visitor who doesn't know their own allowlist state, so
-    // neither response can be used to probe it.
     let view = format!(
         r#"<div class="me-cover">
 {notice}
-<p class="me-kicker">Scry</p>
+<p class="me-kicker">Scry · Invite-only beta</p>
 <h1 class="me-display">Remember everything.</h1>
 <p class="ae-lede ae-dim me-support">Capture anything worth remembering. We bring it back when it matters.</p>
 <section class="ae-group me-capture-hero">
-<form action="/app/account" method="post">
+<form class="me-entry-form" action="/app/account" method="post">
 <label class="ae-label" for="me-email">Your email</label>
 <input class="ae-input me-hero-email" id="me-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. We’ll email a link.</span></div>
+<div class="me-actions"><button class="ae-button" type="submit">Get started</button><span class="ae-dim me-hint">No password. Scry will email a link or save your place.</span></div>
+<p class="me-entry-status ae-dim" aria-live="polite"></p>
 </form>
 </section>
-<details class="me-waitlist">
-<summary class="me-waitlist-toggle">
-<span class="me-kicker">New here?</span>
-<span class="me-waitlist-toggle-label">Join the waitlist</span>
-</summary>
-<form class="me-waitlist-form" action="/app/waitlist" method="post">
-<label class="ae-label" for="me-waitlist-email">Your email</label>
-<input class="ae-input me-hero-email" id="me-waitlist-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com" aria-label="Email address">
-<div class="me-actions"><button class="ae-button-quiet" type="submit">Join the waitlist</button><span class="ae-dim me-hint">We’ll email you when a spot opens. No account yet.</span></div>
-<p class="me-waitlist-status ae-dim" aria-live="polite"></p>
-</form>
-</details>
 </div>"#,
         notice = render_notice(notice, &[]),
     );

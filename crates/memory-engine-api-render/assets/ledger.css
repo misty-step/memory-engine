@@ -341,39 +341,6 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; min-width: 0; margin-top: 14px; }
 .me-actions > * { min-width: 0; }
 .me-actions .me-hint { flex: 1 1 180px; }
-.me-waitlist { width: 100%; max-width: 20rem; margin-top: 8px; }
-.me-waitlist-toggle {
-  list-style: none;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 16px 0;
-  border-top: 1px solid var(--lg-line);
-  color: var(--lg-ink-2);
-  font: 600 13px/1.3 var(--lg-sans);
-  user-select: none;
-}
-.me-waitlist-toggle::-webkit-details-marker { display: none; }
-.me-waitlist-toggle .me-kicker { margin: 0; }
-.me-waitlist-toggle-label { color: var(--lg-ink); }
-.me-waitlist-toggle::after {
-  content: '';
-  margin-left: auto;
-  width: 7px;
-  height: 7px;
-  border-right: 1.5px solid currentColor;
-  border-bottom: 1.5px solid currentColor;
-  transform: rotate(45deg);
-  transition: transform var(--lg-quick) var(--lg-ease);
-}
-.me-waitlist[open] > .me-waitlist-toggle { color: var(--lg-ink); }
-.me-waitlist[open] > .me-waitlist-toggle::after {
-  transform: rotate(-135deg);
-  margin-top: 4px;
-}
-.me-waitlist form { margin-top: 16px; }
 
 @media (max-width: 420px) {
   .me-display { font-size: 2.2rem; }

@@ -184,16 +184,54 @@ impl AccountRegistry {
         if !auth_config.email_allowed(&email) && !self.persisted_invite_allows(&email) {
             return Ok(MagicLinkRequest { debug_link: None });
         }
+        self.deliver_magic_link(&email, &auth_config)
+    }
 
+    /// Route one signed-out human request to magic-link delivery or the
+    /// invite-beta waitlist without making the visitor select a path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when the email is malformed, the shared entry
+    /// limit is spent, or the selected durable operation fails.
+    pub(crate) fn request_app_access(
+        &self,
+        email: &str,
+        source: &str,
+        client_rate_limit_key: &str,
+    ) -> Result<MagicLinkRequest, ApiFailure> {
+        let Some(email) = normalize_email(email) else {
+            self.record_app_account_request(None, client_rate_limit_key)?;
+            return Err(ApiFailure::bad_request(
+                "Account email must contain one @ and a domain.",
+            ));
+        };
+        self.record_app_account_request(Some(&email), client_rate_limit_key)?;
+        let auth_config = {
+            let data = self.lock_data();
+            data.auth_config.clone()
+        };
+        if auth_config.email_allowed(&email) || self.persisted_invite_allows(&email) {
+            return self.deliver_magic_link(&email, &auth_config);
+        }
+        self.persist_waitlist_join(&email, source)?;
+        Ok(MagicLinkRequest { debug_link: None })
+    }
+
+    fn deliver_magic_link(
+        &self,
+        email: &str,
+        auth_config: &AuthConfig,
+    ) -> Result<MagicLinkRequest, ApiFailure> {
         let token = new_magic_link_token();
         let token_hash = secret_hash(&token);
         self.storage().save_auth_challenge(
             &token_hash,
-            &email,
+            email,
             self.now().saturating_add(AUTH_CHALLENGE_TTL_MS),
         )?;
         let link = format!("/app/login/verify?token={token}");
-        auth_config.deliver_magic_link(&email, &link)?;
+        auth_config.deliver_magic_link(email, &link)?;
 
         Ok(MagicLinkRequest {
             debug_link: auth_config.expose_debug_links.then_some(link),
@@ -250,11 +288,15 @@ impl AccountRegistry {
             ));
         };
         self.record_waitlist_request(Some(&email), client_rate_limit_key)?;
+        self.persist_waitlist_join(&email, source)
+    }
+
+    fn persist_waitlist_join(&self, email: &str, source: &str) -> Result<(), ApiFailure> {
         let now = self.now();
         if let Some(database_url) = self.postgres_url() {
             return crate::with_postgres_store(&database_url, |store| {
                 store
-                    .waitlist_join(&email, source, now)
+                    .waitlist_join(email, source, now)
                     .map_err(crate::postgres_failure)
             });
         }
@@ -263,7 +305,7 @@ impl AccountRegistry {
                 "Waitlist persistence is not configured.".to_owned(),
             ));
         };
-        crate::waitlist::join(&store_path, &email, source, now)
+        crate::waitlist::join(&store_path, email, source, now)
     }
 
     /// List every waitlist entry for the operator.

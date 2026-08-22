@@ -690,14 +690,14 @@ test("a rejected landing consumes the handoff without emitting telemetry", () =>
   expect(landing.fetches).toHaveLength(0);
 });
 
-function waitlistFormHarness() {
+function entryFormHarness() {
   const formEvents = new Map();
-  const button = { disabled: false, textContent: "Join the waitlist" };
+  const button = { disabled: false, textContent: "Get started" };
   const status = { textContent: "" };
   const form = {
     tagName: "FORM",
-    classList: { contains: (name) => name === "me-waitlist-form" },
-    getAttribute: (name) => (name === "action" ? "/app/waitlist" : null),
+    classList: { contains: (name) => name === "me-entry-form" },
+    getAttribute: (name) => (name === "action" ? "/app/account" : null),
     addEventListener: (name, handler) => {
       const handlers = formEvents.get(name) ?? [];
       handlers.push(handler);
@@ -705,7 +705,7 @@ function waitlistFormHarness() {
     },
     querySelector: (selector) => {
       if (selector === 'button[type="submit"]') return button;
-      if (selector === ".me-waitlist-status") return status;
+      if (selector === ".me-entry-status") return status;
       return null;
     },
   };
@@ -716,7 +716,7 @@ function waitlistFormHarness() {
       hasAttribute: () => false,
     },
     addEventListener: () => {},
-    querySelector: (selector) => (selector === "form.me-waitlist-form" ? form : null),
+    querySelector: (selector) => (selector === "form.me-entry-form" ? form : null),
     querySelectorAll: () => [],
     createElement: () => ({ setAttribute() {}, value: "" }),
   };
@@ -751,15 +751,8 @@ function waitlistFormHarness() {
   };
 }
 
-test("waitlist join announces a pending state synchronously, before the deferred network settles", async () => {
-  const browser = waitlistFormHarness();
-
-  // Stand in for the real native POST: a Postgres-backed join connects and
-  // migrates per call (observed 161-700ms TTFB), so model that round trip as
-  // a promise that only settles well after the acknowledgment budget. The
-  // synchronous submit handler must already have updated the DOM before this
-  // "network" is even given a chance to run, since JS never preempts a
-  // running handler to service a timer.
+test("entry request announces a pending state synchronously, before the network settles", async () => {
+  const browser = entryFormHarness();
   let networkSettled = false;
   const network = new Promise((resolve) => {
     setTimeout(() => {
@@ -774,20 +767,20 @@ test("waitlist join announces a pending state synchronously, before the deferred
 
   expect(elapsed).toBeLessThan(100);
   expect(browser.button.disabled).toBe(true);
-  expect(browser.button.textContent).toBe("Joining…");
-  expect(browser.status.textContent).toBe("Joining…");
+  expect(browser.button.textContent).toBe("Checking…");
+  expect(browser.status.textContent).toBe("Checking…");
   expect(networkSettled).toBe(false);
 
   await network;
   expect(networkSettled).toBe(true);
 });
 
-test("waitlist join enhancement is a no-op once the button is already pending", () => {
-  const browser = waitlistFormHarness();
+test("entry request enhancement is a no-op once the button is pending", () => {
+  const browser = entryFormHarness();
   browser.submit();
-  browser.button.textContent = "Joining… (server response pending)";
+  browser.button.textContent = "Checking… (server response pending)";
   browser.submit();
-  expect(browser.button.textContent).toBe("Joining… (server response pending)");
+  expect(browser.button.textContent).toBe("Checking… (server response pending)");
 });
 
 test("a BFCache-restored landing clears the handoff and never schedules emission", () => {

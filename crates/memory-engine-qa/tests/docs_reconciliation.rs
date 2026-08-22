@@ -280,10 +280,7 @@ fn powder_ledger_contract_is_documented() {
         !repo_root().join("backlog/README.md").exists(),
         "local markdown backlog must not remain as a second ledger"
     );
-
 }
-
-
 
 #[test]
 fn hosted_ci_passes_commit_sha_to_every_latency_receipt() {
@@ -544,7 +541,6 @@ fn architecture_map_has_one_exact_powder_ledger_node() {
         "powder node must link the takeable job list"
     );
 }
-
 
 #[test]
 fn trusted_live_generation_lane_is_default_branch_only_and_fail_closed() {

@@ -24,7 +24,7 @@ use memory_engine_study::{
     BetaStudyGrade, BetaStudyItemHistory, BetaStudySummary,
 };
 
-use crate::{render_app_shell, render_login_requested};
+use crate::{render_app_shell, render_entry_requested};
 use memory_engine_api_state::{
     AccountRegistry, ApiState, AppAccount, AuthConfig, GenerationJob, JobStatus, SourceRecord,
     StudyViewResponse,
@@ -384,7 +384,7 @@ fn pages() -> Vec<(&'static str, String)> {
         ),
         (
             "10-check-email",
-            render_login_requested(Some("/app/login/verify?token=preview-token")),
+            render_entry_requested(Some("/app/login/verify?token=preview-token")),
         ),
     ]
 }
