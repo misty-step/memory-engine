@@ -29,10 +29,12 @@ The selector must choose one branch tip. The poll only wakes this declaration; i
 
 1. Read `forest.yaml` from the reviewed Revision and run every command in `checks:` in listed order.
 2. Record each check name and numeric exit code. A check is `ok: true` only when its exit code is zero.
-3. Review the diff from `origin/${FOREST_PRIMARY_REF#refs/heads/}` to that exact SHA for correctness, tests, repository conventions, and scope. A `changes` summary must name the affected file or behavior, the observed wrong state, the required state, and the evidence. "Not verifiable" is not enough when the defect is in the diff.
-4. Before `approve`, confirm the reviewed SHA contains current `origin/${FOREST_PRIMARY_REF#refs/heads/}` and can fast-forward it. If `git merge-base --is-ancestor origin/${FOREST_PRIMARY_REF#refs/heads/} <sha>` fails, the Revision is stale: decide `changes`, publish Checks and Verdict, and do not attempt the approval Gate.
-5. Decide `approve` only when all Checks pass, the Revision can fast-forward `origin/${FOREST_PRIMARY_REF#refs/heads/}`, and the diff is ready to merge. Otherwise, decide `changes` and put concrete reasons in `summary`.
-6. Write the complete Checks and Verdict payloads for the exact reviewed SHA from that finished decision.
+3. Read the selected Subject contract before reviewing. For a Powder Subject, run `powder show <subject>` and treat every Acceptance and Proof item as part of the Gate. Missing required real-surface evidence (for example phone screenshots/behavior for a UI change) is a concrete `changes` finding even when code checks pass.
+4. Require the GitHub PR Projection for the exact branch and SHA before deciding. Request evidence may wake this Run before Builder finishes `gh pr create`, so query by exact head branch with a bounded wait (six attempts, ten seconds apart) and require the Projection head OID to equal the reviewed SHA. If it remains absent or mismatched, decide `changes` with a concrete missing/mismatched-Projection summary; never proceed as if there were no comments. Once present, query every unresolved review thread/comment and verify each against the exact SHA: every valid finding joins the `changes` summary; every rejected finding gets an evidence-backed rationale. Never approve while a valid thread or required Subject proof remains unresolved.
+5. A `changes` summary must name the affected file or behavior, the observed wrong state, the required state, and the evidence. "Not verifiable" is not enough when the defect is in the diff.
+6. Before `approve`, confirm the reviewed SHA contains current `origin/${FOREST_PRIMARY_REF#refs/heads/}` and can fast-forward it. If `git merge-base --is-ancestor origin/${FOREST_PRIMARY_REF#refs/heads/} <sha>` fails, the Revision is stale: decide `changes`, publish Checks and Verdict, and do not attempt the approval Gate.
+7. Decide `approve` only when all Checks pass, the Revision can fast-forward `origin/${FOREST_PRIMARY_REF#refs/heads/}`, and the diff is ready to merge. Otherwise, decide `changes` and put concrete reasons in `summary`.
+8. Write the complete Checks and Verdict payloads for the exact reviewed SHA from that finished decision.
 
 ## Coordination schema v1
 
