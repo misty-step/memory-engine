@@ -68,9 +68,13 @@ the pulse; state color applies instantly.
   separate confirm.
 - Free response: type, then one submit.
 - Graded Correct and Graded Close / Try again / Revealed: **no auto-advance,
-  ever.** Verdict prints in place (correct row tinted pine, horizon on the
-  row), meta ledger below, and the page holds indefinitely: the learner
-  reviews the verdict, answer key, and dossier for as long as they want. Only
+  ever.** Verdict prints in place (correct row tinted pine), the answer key
+  and a one-line grading reason show in the default view, and the reflective
+  record — schedule horizon, source reference, concept health, the success
+  ledger, and the generated-card quality poll — collapses behind one
+  accessible Details disclosure. The page holds indefinitely: the learner
+  reviews the verdict, answer key, and the dossier behind Details for as long
+  as they want. Only
   a deliberate Continue tap (or Enter while it is focused) advances the card
   — incidental taps while reading must never advance it. Operator ruling
   from live dogfood use (memory-engine-081) reverses the two-speed advance
@@ -126,7 +130,7 @@ behind one accessible Details disclosure. None of it appears pre-grade.
 
 - **Choices** (`lg-choice`): full-width rows on `--lg-paper-2`, 1px `--lg-line`
   border, radius 7, min-height 56px, mono key chip. Graded: correct row pine
-  wash (`color-mix` ~14%) + pine border + horizon; chosen-wrong row clay wash;
+  wash (`color-mix` ~14%) + pine border; chosen-wrong row clay wash;
   others dim to 42%. Never a left-only border stripe.
 - **Buttons**: contained ink (`lg-btn`) for primary; accent fill only for
   Start review; quiet outline (`lg-quiet`) for hatches. All tap targets are
