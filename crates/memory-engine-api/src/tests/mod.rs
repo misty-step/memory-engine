@@ -2787,6 +2787,62 @@ async fn app_session_mutations_require_csrf() {
     assert_review_mutations_require_csrf(&app, &cookie, &review_unit_id).await;
 }
 
+#[tokio::test]
+async fn app_study_actions_return_html_status_for_stale_review_ids() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let _review_unit_id =
+        schedule_review_for_csrf(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    for action in [
+        "/app/reveal",
+        "/app/reference",
+        "/app/skip",
+        "/app/delete",
+        "/app/snooze",
+        "/app/bridge",
+        "/app/edit",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                action,
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", "missing-review-unit"),
+                ],
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{action}: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{action} must not succeed for a missing review id"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            "text/html; charset=utf-8",
+            "{action} must stay HTML"
+        );
+        let body = response_text(response).await;
+        assert!(
+            !body.trim_start().starts_with('{'),
+            "{action} leaked a JSON envelope: {body}"
+        );
+        assert!(
+            body.contains("Review unit not found."),
+            "{action} missing not-found copy: {body}"
+        );
+    }
+}
+
 async fn start_app_session_for_csrf(app: &axum::Router) -> (String, String, String) {
     let started = app
         .clone()

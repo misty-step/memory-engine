@@ -817,6 +817,33 @@ test("skip 401 reloads instead of swapping recovery into review", async () => {
   expect(browser.busy()).toBeTrue();
 });
 
+test("skip 404 HTML swaps without reload or a second POST", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/skip",
+    formClass: "me-hatch",
+    controlClasses: ["ae-button"],
+    controlLabel: "Skip",
+    viewHtml: '<p class="me-prompt">Letter N</p>',
+    fetchImpl() {
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(htmlReviewLanding("", "1 due", "Review unit not found.")),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Review unit not found.");
+  expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual([]);
+  expect(browser.busy()).toBeFalse();
+});
+
 
 
 
