@@ -95,6 +95,7 @@ def main() -> None:
                             enabled_rule(
                                 Filter={"Prefix": "other/"},
                                 Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
                             )
                         ]
                     },
@@ -102,9 +103,27 @@ def main() -> None:
             ),
         ),
         (
-            "bucket-wide-expiration",
-            lambda: assert_passes(
-                "bucket-wide-expiration",
+            "narrow-scry-prefix",
+            lambda: assert_refused(
+                "narrow-scry-prefix",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Filter={"Prefix": "scry/archive/"},
+                                Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "current-expiration-only",
+            lambda: assert_refused(
+                "current-expiration-only",
                 StubClient(
                     {"Status": "Enabled"},
                     {"Rules": [enabled_rule(Expiration={"Days": 30})]},
@@ -112,15 +131,50 @@ def main() -> None:
             ),
         ),
         (
-            "scry-prefix-noncurrent-expiration",
-            lambda: assert_passes(
-                "scry-prefix-noncurrent-expiration",
+            "noncurrent-expiration-only",
+            lambda: assert_refused(
+                "noncurrent-expiration-only",
                 StubClient(
                     {"Status": "Enabled"},
                     {
                         "Rules": [
                             enabled_rule(
                                 Filter={"Prefix": "scry/"},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "bucket-wide-current-and-noncurrent",
+            lambda: assert_passes(
+                "bucket-wide-current-and-noncurrent",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "scry-prefix-current-and-noncurrent",
+            lambda: assert_passes(
+                "scry-prefix-current-and-noncurrent",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Filter={"Prefix": "scry/"},
+                                Expiration={"Days": 30},
                                 NoncurrentVersionExpiration={"NoncurrentDays": 30},
                             )
                         ]

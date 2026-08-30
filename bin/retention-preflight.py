@@ -43,6 +43,12 @@ def _rule_prefix(rule: dict[str, Any]) -> str | None:
     return prefix if isinstance(prefix, str) else None
 
 
+def _covers_uploads(prefix: str) -> bool:
+    # Uploads are scry/<basename>. Only a bucket-wide rule or an exact scry/
+    # prefix covers every object the uploader writes.
+    return prefix in ("", "scry/")
+
+
 def check(client: Any, bucket: str) -> None:
     """Validate versioning and lifecycle retention for ``bucket``.
 
@@ -74,15 +80,21 @@ def check(client: Any, bucket: str) -> None:
     if not enabled_rules:
         _refuse(f"bucket {bucket!r} has no Enabled lifecycle rule")
 
+    covering: list[dict[str, Any]] = []
     for rule in enabled_rules:
-        if not rule.get("Expiration") and not rule.get("NoncurrentVersionExpiration"):
-            _refuse("Enabled lifecycle rule has no Expiration or NoncurrentVersionExpiration")
-
         prefix = _rule_prefix(rule)
         if prefix is None:
             _refuse("Enabled lifecycle rule has an unscoped filter")
-        if prefix and not prefix.startswith("scry/"):
-            _refuse(f"Enabled lifecycle rule expires non-Scry prefix {prefix!r}")
+        if _covers_uploads(prefix):
+            covering.append(rule)
+
+    if not covering:
+        _refuse(f"bucket {bucket!r} has no Enabled lifecycle rule covering scry/ uploads")
+
+    if not any(rule.get("Expiration") for rule in covering):
+        _refuse("covering lifecycle rule has no current-object Expiration")
+    if not any(rule.get("NoncurrentVersionExpiration") for rule in covering):
+        _refuse("covering lifecycle rule has no NoncurrentVersionExpiration")
 
 
 def main() -> None:
