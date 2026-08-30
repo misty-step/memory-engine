@@ -544,9 +544,10 @@ seven days. Restore drill: `pg_restore` into a side database owned by
 `scry-backup-offhost` (03:45 UTC timer) encrypts the newest dump with GPG
 AES256 and uploads it to the Scry Spaces bucket (`scry/` prefix). Source
 of truth lives in this repository: `bin/scry-backup-offhost`,
-`etc/systemd/scry-backup-*`, and the idempotent
-`bin/install-scry-backup.sh`. Never edit `/usr/local` copies directly;
-reinstall from the repo.
+`bin/retention-preflight.py`, `etc/systemd/scry-backup-*`, and the idempotent
+`bin/install-scry-backup.sh`. The installer places the preflight at
+`/usr/local/lib/scry/retention-preflight.py`; never edit `/usr/local` copies
+directly, reinstall from the repo.
 
 **Provisioning status:** the bucket does not exist yet. The 30-day
 age-based lifecycle and versioning described in Estate ADR 0011 are
