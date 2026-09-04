@@ -1288,8 +1288,7 @@ async fn create_app_account(
     headers: HeaderMap,
     Form(form): Form<AppAccountForm>,
 ) -> Response {
-    let result =
-        state.request_app_access(&form.email, "first-run", &client_rate_limit_key(&headers));
+    let result = state.request_app_access(&form.email, &client_rate_limit_key(&headers));
 
     no_store_response(match result {
         Ok(request) => Html(render_entry_requested(request.debug_link.as_deref())).into_response(),
@@ -2142,7 +2141,7 @@ fn app_entry_failure_response(error: &ApiFailure) -> Response {
         ),
         _ => (
             "We couldn’t complete that request",
-            "Nothing was changed. Please try again shortly.",
+            "We couldn’t finish that request. Please try again shortly.",
         ),
     };
     let mut response = Html(render_entry_recovery(title, message)).into_response();
@@ -2165,15 +2164,10 @@ fn app_failure_response(error: &ApiFailure) -> Response {
             "Your session expired",
             "Your study data is safe. Sign in again to continue where you left off.",
         )
-    } else if status == StatusCode::BAD_REQUEST {
-        (
-            "Check the email address",
-            "That email address is not valid. Check it and try again.",
-        )
     } else if status == StatusCode::TOO_MANY_REQUESTS {
         (
             "Please try again later",
-            "We’re taking a short break from requests. Wait a little while, then try again.",
+            "We’re taking a short break from sign-in attempts. Wait a little while, then request a fresh link.",
         )
     } else if error.is_magic_link_recovery() {
         (
@@ -2182,8 +2176,8 @@ fn app_failure_response(error: &ApiFailure) -> Response {
         )
     } else {
         (
-            "We couldn’t complete that request",
-            "Nothing was changed. Please try again shortly.",
+            "We couldn’t complete sign-in",
+            "We couldn’t complete that request. Request a fresh sign-in link and try again.",
         )
     };
     let mut response = Html(render_auth_recovery(title, message)).into_response();

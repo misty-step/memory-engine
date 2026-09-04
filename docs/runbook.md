@@ -134,8 +134,8 @@ transition); unset → the local file store only
 (`crates/memory-engine-api-state/src/waitlist.rs`, `_waitlist.json` beside
 the other store-root sidecars under `MEMORY_ENGINE_API_STORE_DIR`, with its
 own `_waitlist_audit.jsonl` mirroring the same audit contract for local
-dev/tests without a database). Production always runs Postgres-backed; the
-unified entry and admin routes below no longer return `503` there.
+dev/tests without a database). Production uses Postgres. Healthy storage avoids
+the old missing-store failure; durable-storage outages return a branded `503`.
 
 Operator surface, gated by `MEMORY_ENGINE_ADMIN_TOKEN` (the same admin token
 used by service sessions) — list, export, mark invited, and delete, with no

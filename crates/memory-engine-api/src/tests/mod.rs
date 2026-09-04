@@ -12596,7 +12596,7 @@ async fn one_entry_mail_failure_is_branded_and_privacy_safe() {
         "owner@example.com",
     )
     .await;
-    assert!(body.contains("Nothing was changed"));
+    assert!(body.contains("We couldn’t finish that request"));
     assert!(!body.contains("missing-mailer"));
 }
 

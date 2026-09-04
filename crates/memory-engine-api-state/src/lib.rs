@@ -285,11 +285,10 @@ impl ApiState {
     pub fn request_app_access(
         &self,
         email: &str,
-        source: &str,
         client_rate_limit_key: &str,
     ) -> Result<MagicLinkRequest, ApiFailure> {
         self.accounts
-            .request_app_access(email, source, client_rate_limit_key)
+            .request_app_access(email, client_rate_limit_key)
     }
 
     /// Verify an auth magic link and return a browser session.

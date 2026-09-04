@@ -181,7 +181,7 @@ impl AccountRegistry {
             let data = self.lock_data();
             data.auth_config.clone()
         };
-        if !auth_config.email_allowed(&email) && !self.persisted_invite_allows(&email) {
+        if !auth_config.email_allowed(&email) && !self.persisted_invite_allows(&email)? {
             return Ok(MagicLinkRequest { debug_link: None });
         }
         self.deliver_magic_link(&email, &auth_config)
@@ -197,7 +197,6 @@ impl AccountRegistry {
     pub(crate) fn request_app_access(
         &self,
         email: &str,
-        source: &str,
         client_rate_limit_key: &str,
     ) -> Result<MagicLinkRequest, ApiFailure> {
         let Some(email) = normalize_email(email) else {
@@ -211,10 +210,10 @@ impl AccountRegistry {
             let data = self.lock_data();
             data.auth_config.clone()
         };
-        if auth_config.email_allowed(&email) || self.persisted_invite_allows(&email) {
+        if auth_config.email_allowed(&email) || self.persisted_invite_allows(&email)? {
             return self.deliver_magic_link(&email, &auth_config);
         }
-        self.persist_waitlist_join(&email, source)?;
+        self.persist_waitlist_join(&email, "first-run")?;
         Ok(MagicLinkRequest { debug_link: None })
     }
 
@@ -241,7 +240,7 @@ impl AccountRegistry {
     /// Consult the durable waitlist before issuing a magic link. The process
     /// allowlist remains useful for configured operators, but invited access
     /// must survive restart and work across replicas for both adapters.
-    fn persisted_invite_allows(&self, email: &str) -> bool {
+    fn persisted_invite_allows(&self, email: &str) -> Result<bool, ApiFailure> {
         if let Some(database_url) = self.postgres_url() {
             return crate::with_postgres_store(&database_url, |store| {
                 Ok(store
@@ -249,17 +248,14 @@ impl AccountRegistry {
                     .map_err(crate::postgres_failure)?
                     .into_iter()
                     .any(|entry| entry.email == email && entry.invited_at_ms.is_some()))
-            })
-            .unwrap_or(false);
+            });
         }
         let Some(store_path) = self.waitlist_store_path() else {
-            return false;
+            return Ok(false);
         };
-        crate::waitlist::list(&store_path).is_ok_and(|entries| {
-            entries
-                .into_iter()
-                .any(|entry| entry.email == email && entry.invited_at_ms.is_some())
-        })
+        Ok(crate::waitlist::list(&store_path)?
+            .into_iter()
+            .any(|entry| entry.email == email && entry.invited_at_ms.is_some()))
     }
 
     /// Join the invite-beta waitlist.
@@ -495,7 +491,7 @@ impl AccountRegistry {
             let data = self.lock_data();
             data.auth_config.email_allowed(&email)
         };
-        if !configured_allowed && !self.persisted_invite_allows(&email) {
+        if !configured_allowed && !self.persisted_invite_allows(&email)? {
             return Err(ApiFailure::forbidden("This invite is no longer active."));
         }
         let storage = self.storage();
@@ -692,10 +688,11 @@ impl AccountRegistry {
             // admitted through the static allowlist. Without this, a
             // learner invited only through the durable flow can sign in
             // and study but can never enable reminders.
-            let allowed = {
+            let configured_allowed = {
                 let data = self.lock_data();
                 data.auth_config.email_allowed(&email)
-            } || self.persisted_invite_allows(&email);
+            };
+            let allowed = configured_allowed || self.persisted_invite_allows(&email)?;
             if !allowed {
                 return Err(ApiFailure::forbidden(
                     "That reminder email is not allowed for this account.",
@@ -2380,6 +2377,23 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), 1, "one delivery key produces one durable send");
         assert!(lines[0].contains("slow-delivery-key"));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn durable_invite_lookup_preserves_file_store_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-engine-invite-lookup-{}-{}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        fs::create_dir_all(&root).expect("test root");
+        fs::write(root.join("_waitlist.json"), b"not-json").expect("corrupt waitlist");
+        let registry = AccountRegistry::with_store_root(&root);
+
+        assert!(registry
+            .persisted_invite_allows("invited@example.com")
+            .is_err());
+
         let _ = fs::remove_dir_all(root);
     }
 }
