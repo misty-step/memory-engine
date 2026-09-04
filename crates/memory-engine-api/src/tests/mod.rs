@@ -7385,11 +7385,10 @@ async fn assert_postgres_submit_receipt(
 }
 /// inflated beyond reality. This closes that gap: memory-engine-109 review
 /// finding — Postgres reads nested inside the timed render window on the
-/// empty-queue/error path (`app_study_view_with_timings`,
-/// `list_app_sources_with_timings`, `jobs_for_app_account_with_timings`)
-/// used to be double-counted into both `render` and `pgconnect`/`pgop`,
-/// which raises `phase_sum`, and therefore the reported `total`, above the
-/// real elapsed time. `measured_ms` is real wall-clock elapsed time around
+/// consumed-review 404 path (`app_study_view_with_timings`) used to be
+/// double-counted into both `render` and `pgconnect`/`pgop`, which raises
+/// `phase_sum`, and therefore the reported `total`, above the real elapsed
+/// time. `measured_ms` is real wall-clock elapsed time around
 /// the entire in-process `oneshot` call, so the honestly reported total can
 /// never legitimately exceed it by more than harness/rounding slack.
 fn assert_reported_total_is_not_inflated_beyond_measured_wall_clock(
@@ -7528,12 +7527,10 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
     let workspace_submit_measured_ms =
         u64::try_from(workspace_submit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     assert_eq!(workspace_submit.status(), StatusCode::NOT_FOUND);
-    assert_postgres_submit_timing(&workspace_submit, 11, 3);
-    // This is the exact empty-queue/error-render path (missing review unit,
-    // no active review) that nests app_study_view_with_timings +
-    // list_app_sources_with_timings + jobs_for_app_account_with_timings
-    // inside the timed render window — see
-    // assert_reported_total_is_not_inflated_beyond_measured_wall_clock.
+    assert_postgres_submit_timing(&workspace_submit, 13, 3);
+    // After Continue, a missing review unit is consumed-review 404 HTML.
+    // Error render still loads `app_study_view_with_timings` inside the timed
+    // render window — see
     assert_reported_total_is_not_inflated_beyond_measured_wall_clock(
         &workspace_submit,
         workspace_submit_measured_ms,
