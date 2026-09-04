@@ -344,10 +344,10 @@ account until the operator restores the pre-migration store snapshot.
 
 ## Deploy and rollback
 
-Production deployment is an explicit host release from a reviewed `master`
-commit. A merge does not mutate production. Branch protection (`ci` and
-`review`, including administrators) proves the source gate; the release receipt
-must name the deployed commit and pass the real public smoke below.
+Production deployment is an explicit host release from a protected `master`
+commit. A merge does not mutate production. Branch protection (`ci`, including
+administrators) proves the source gate; the release receipt must name the
+deployed commit and pass the real public smoke below.
 
 Build and install a release from the Scry repository:
 

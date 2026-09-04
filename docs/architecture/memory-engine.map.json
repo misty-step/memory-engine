@@ -27,7 +27,7 @@
     {
       "id": "fleet-integration",
       "label": "Fleet Integration",
-      "description": "Current repo-owned evidence for Canary, GitHub Issues, Landmark, the project map, and Cerberus review."
+      "description": "Current repo-owned evidence for Canary, GitHub Issues, Landmark, and the project map."
     }
   ],
   "nodes": [
@@ -725,18 +725,6 @@
         {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
         {"kind": "issue", "path": "https://github.com/misty-step/scry/issues", "label": "active issue queue"}
       ]
-    },
-    {
-      "id": "node.fleet.cerberus",
-      "label": "Cerberus PR Review",
-      "kind": "review",
-      "summary": "Pinned CI-native Cerberus review-pr path with explicit GitHub auth and narrow provider-key preflight.",
-      "viewTags": ["fleet-integration"],
-      "layout": {"fleet-integration": {"x": 610, "y": 360}},
-      "refs": [
-        {"kind": "config", "path": ".github/workflows/cerberus-review.yml", "label": "PR review workflow"},
-        {"kind": "doc", "path": "docs/fleet-onboarding.md", "label": "Cerberus boundary"}
-      ]
     }
   ],
   "edges": [
@@ -1308,18 +1296,6 @@
       "viewTags": ["fleet-integration"],
       "refs": [
         {"kind": "source", "path": "crates/memory-engine-api-state/src/lib.rs", "label": "Canary reporter integration"}
-      ]
-    },
-    {
-      "id": "edge.fleet.cerberus-to-github",
-      "from": "node.fleet.cerberus",
-      "to": "node.fleet.project-map",
-      "label": "workflow is declarative",
-      "kind": "declares",
-      "summary": "The review path is kept in GitHub workflow configuration and documented without runtime-crate changes.",
-      "viewTags": ["fleet-integration"],
-      "refs": [
-        {"kind": "config", "path": ".github/workflows/cerberus-review.yml", "label": "Cerberus workflow"}
       ]
     }
   ]
