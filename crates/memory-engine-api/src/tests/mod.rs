@@ -7487,7 +7487,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
         ))
         .await
         .expect("Postgres browser submit");
-    assert_postgres_submit_receipt(graded, 23, 1).await;
+    assert_postgres_submit_receipt(graded, 25, 1).await;
 
     let completed_browser_app = router(ApiState::new(
         AccountRegistry::with_postgres_url(database.scoped_url.clone())
