@@ -1,37 +1,36 @@
 #!/bin/sh
 # Nightly encrypted off-host Scry Postgres backup.
 # Pipeline: pg_dump -> AES256 gpg -> DigitalOcean Spaces via boto3 (S3 API).
-# The script NEVER issues a remote DELETE. Object expiry is intended to be
-# owned by a 30-day age-based bucket lifecycle rule; that lifecycle and
-# versioning are NOT yet provisioned (Estate OpenTofu card pending), so
-# until then objects accumulate and retention depends on the provisioning
-# step landing before credentials are added.
+# The script NEVER issues a remote DELETE. Object expiry is owned by the
+# bucket lifecycle rule, and versioning keeps the remote recovery history
+# explicit. The retention preflight below refuses to run before credentials
+# can cause unbounded growth.
 # Custody: SCRY_BACKUP_PASSPHRASE must also live in an operator-managed
 # off-host store; without that copy the ciphertext is unrestorable after
 # droplet loss, so the backup job stays open until the operator records it.
 set -eu
 umask 077
-ENV_FILE=/etc/public-apps/scry-backup.env
+ENV_FILE="${SCRY_BACKUP_ENV_FILE:-/etc/public-apps/scry-backup.env}"
 STATE_DIR=/var/lib/scry-backup
-install -d -m 0700 "$STATE_DIR"
-record() { printf "%s\n" "$1" > "$STATE_DIR/last-run"; }
+
+# A missing env file is a safe, non-root skip in local probes. Production
+# runs still create and record the state directory when it is available.
+record() {
+  if [ ! -d "$STATE_DIR" ]; then
+    install -d -m 0700 "$STATE_DIR" 2>/dev/null || return 0
+  fi
+  printf "%s\n" "$1" > "$STATE_DIR/last-run" 2>/dev/null || true
+}
 
 # Any non-zero exit must land in last-run before the process dies.
 trap 'rc=$?; if [ "$rc" -ne 0 ]; then record "$(date -u +%FT%TZ) failed rc=$rc"; fi' EXIT
 
-# Replacement hosts start without this directory; the sweep and dump
-# retention both need it before anything else runs.
-install -d -o scry -g scry -m 0750 /var/backups/scry
-
-# Bound on-host ciphertext: anything older than a day is a leftover
-# from a failed run (success deletes its own artifact below).
-find /var/backups/scry -name "scry-*.dump.gpg" -mtime +0 -delete
-
 if [ ! -f "$ENV_FILE" ]; then
-  echo "scry-backup-offhost: SKIPPED: $ENV_FILE missing; Spaces target not provisioned (Estate OpenTofu plan pending operator review)"
+  echo "scry-backup-offhost: skipped target-not-provisioned: $ENV_FILE missing; Spaces target not provisioned"
   record "$(date -u +%FT%TZ) skipped target-not-provisioned"
   exit 0
 fi
+
 # Custody: the env file carries provider keys and the recovery passphrase.
 # A non-root-owned or world/group-readable file fails closed before sourcing.
 stat_out="$(stat -c %u:%g:%a "$ENV_FILE")"
@@ -50,6 +49,22 @@ export AWS_ACCESS_KEY_ID="$SCRY_BACKUP_SPACES_KEY"
 export AWS_SECRET_ACCESS_KEY="$SCRY_BACKUP_SPACES_SECRET"
 ENDPOINT="https://${SCRY_BACKUP_REGION}.digitaloceanspaces.com"
 
+# The installed uploader lives in /usr/local/sbin and the preflight beside
+# it in /usr/local/lib/scry. Resolve from this script rather than relying on
+# the caller's working directory.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PREFLIGHT="$SCRIPT_DIR/../lib/scry/retention-preflight.py"
+ENDPOINT="$ENDPOINT" BUCKET="$SCRY_BACKUP_SPACES_BUCKET" \
+  python3 "$PREFLIGHT"
+
+# Replacement hosts start without this directory; the sweep and dump
+# retention both need it before anything else runs.
+install -d -m 0700 "$STATE_DIR"
+install -d -o scry -g scry -m 0750 /var/backups/scry
+
+# Bound on-host ciphertext: anything older than a day is a leftover
+# from a failed run (success deletes its own artifact below).
+find /var/backups/scry -name "scry-*.dump.gpg" -mtime +0 -delete
 dump="$(/usr/local/sbin/scry-pg-dump)"
 artifact="${dump}.gpg"
 printf "%s" "$SCRY_BACKUP_PASSPHRASE" \
