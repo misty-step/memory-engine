@@ -501,6 +501,12 @@ fn architecture_map_has_one_exact_github_issues_ledger_node() {
         }),
         "the architecture map must not retain the retired Powder work ledger"
     );
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node["id"].as_str() != Some("node.fleet.cerberus")),
+        "the architecture map must not retain the retired Cerberus review node"
+    );
 
     let github_issues = nodes
         .iter()
