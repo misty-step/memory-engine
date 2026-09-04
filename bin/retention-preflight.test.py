@@ -148,6 +148,76 @@ def main() -> None:
             ),
         ),
         (
+            "current-expiration-without-days",
+            lambda: assert_refused(
+                "current-expiration-without-days",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"ExpiredObjectDeleteMarker": True},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "current-expiration-exceeds-thirty-days",
+            lambda: assert_refused(
+                "current-expiration-exceeds-thirty-days",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"Days": 31},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 30},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "noncurrent-expiration-without-days",
+            lambda: assert_refused(
+                "noncurrent-expiration-without-days",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={
+                                    "NewerNoncurrentVersions": 1
+                                },
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
+            "noncurrent-expiration-exceeds-thirty-days",
+            lambda: assert_refused(
+                "noncurrent-expiration-exceeds-thirty-days",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={"NoncurrentDays": 31},
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
             "bucket-wide-current-and-noncurrent",
             lambda: assert_passes(
                 "bucket-wide-current-and-noncurrent",

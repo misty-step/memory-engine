@@ -26,7 +26,7 @@ record() {
 trap 'rc=$?; if [ "$rc" -ne 0 ]; then record "$(date -u +%FT%TZ) failed rc=$rc"; fi' EXIT
 
 if [ ! -f "$ENV_FILE" ]; then
-  echo "scry-backup-offhost: skipped target-not-provisioned: $ENV_FILE missing; Spaces target not provisioned (Estate OpenTofu plan pending operator review)"
+  echo "scry-backup-offhost: skipped target-not-provisioned: $ENV_FILE missing; Spaces target not provisioned"
   record "$(date -u +%FT%TZ) skipped target-not-provisioned"
   exit 0
 fi

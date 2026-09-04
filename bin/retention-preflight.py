@@ -49,6 +49,11 @@ def _covers_uploads(prefix: str) -> bool:
     return prefix in ("", "scry/")
 
 
+def _has_30_day_action(rule: dict[str, Any], action: str, days_field: str) -> bool:
+    value = rule.get(action)
+    return isinstance(value, dict) and value.get(days_field) == 30
+
+
 def check(client: Any, bucket: str) -> None:
     """Validate versioning and lifecycle retention for ``bucket``.
 
@@ -91,10 +96,15 @@ def check(client: Any, bucket: str) -> None:
     if not covering:
         _refuse(f"bucket {bucket!r} has no Enabled lifecycle rule covering scry/ uploads")
 
-    if not any(rule.get("Expiration") for rule in covering):
-        _refuse("covering lifecycle rule has no current-object Expiration")
-    if not any(rule.get("NoncurrentVersionExpiration") for rule in covering):
-        _refuse("covering lifecycle rule has no NoncurrentVersionExpiration")
+    if not any(_has_30_day_action(rule, "Expiration", "Days") for rule in covering):
+        _refuse("covering lifecycle rule has no 30-day current-object Expiration")
+    if not any(
+        _has_30_day_action(
+            rule, "NoncurrentVersionExpiration", "NoncurrentDays"
+        )
+        for rule in covering
+    ):
+        _refuse("covering lifecycle rule has no 30-day NoncurrentVersionExpiration")
 
 
 def main() -> None:

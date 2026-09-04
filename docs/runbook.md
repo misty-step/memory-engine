@@ -549,14 +549,13 @@ of truth lives in this repository: `bin/scry-backup-offhost`,
 `/usr/local/lib/scry/retention-preflight.py`; never edit `/usr/local` copies
 directly, reinstall from the repo.
 
-**Provisioning status:** the bucket does not exist yet. The 30-day
-age-based lifecycle and versioning described in Estate ADR 0011 are
-mandatory properties of that provisioning step — they are NOT active
+**Provisioning status:** the bucket does not exist yet. The required provider
+configuration is bucket versioning plus 30-day current and noncurrent
+age-based expiration covering the complete `scry/` prefix. Neither is active
 today. Because the uploader has no DELETE path, objects would accumulate
-without bound if credentials were added before lifecycle/versioning
-exist; provisioning order is therefore bucket+lifecycle first, credentials
-second. Until then the timer runs and records
-`skipped target-not-provisioned`.
+without bound if credentials were added before lifecycle/versioning exist;
+provisioning order is therefore bucket+lifecycle first, credentials second.
+Until then the timer runs and records `skipped target-not-provisioned`.
 
 The pipeline stays inert until `/etc/public-apps/scry-backup.env`
 (mode 0600) defines `SCRY_BACKUP_SPACES_BUCKET`, `SCRY_BACKUP_SPACES_KEY`,
@@ -566,7 +565,6 @@ an operator-managed off-host credential store; without that copy the
 ciphertext is unrestorable after droplet loss. Outcomes record to
 `/var/lib/scry-backup/last-run`; failures fail the unit and trigger
 `scry-backup-alert.service` (`FAILURE` flag + `daemon.alert` journal).
-Design and custody: Estate ADR 0011.
 
 The retired Neon project `memory-engine-prod` (`twilight-brook-49749008`) is
 kept until a restoreable Neon dump exists. Do not delete it. Do not point
