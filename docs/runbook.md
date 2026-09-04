@@ -514,7 +514,7 @@ secret values, then restart `scry.service` and rerun the deployed smoke.
 | `MEMORY_ENGINE_RETURN_NOTIFICATION_SCHEDULER_INTERVAL_SECONDS` | Optional sweep interval, default 900 seconds and capped at 86400. |
 | `MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH` | Local/dev-only magic-link outbox fallback; never use it as production delivery proof. |
 | `OPENROUTER_API_KEY` | Enables model-backed generation for pasted prose; absent → structured-block parsing only. |
-| `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.7-flash`; see docs/evals/). |
+| `MEMORY_ENGINE_GENERATION_MODEL` | Optional model override (default `google/gemini-3.7-flash`; see docs/evals.md). |
 | `CANARY_ENDPOINT` / `CANARY_API_KEY` | Ingest-only Canary error, check-in, and bounded performance export; absent → reporting is a no-op. |
 | `MEMORY_ENGINE_ENVIRONMENT` | Environment label on Canary error events. |
 ## Store backend selection
