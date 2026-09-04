@@ -2065,7 +2065,7 @@ const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">Scry — Remember everythin
 const ICON_OK: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>"#;
 const ICON_WARN: &str = r#"<svg class="ae-icon ae-warn" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>"#;
 const ICON_ERR: &str = r#"<svg class="ae-icon ae-err" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
-const ICON_REVEALED: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const ICON_REVEALED: &str = r#"<svg class="ae-icon ae-revealed" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_INFO: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>"#;
 const ICON_ARROW: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>"#;
 const ICON_UP: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>"#;

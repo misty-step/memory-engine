@@ -627,6 +627,18 @@ fn conformance_graded_review_holds_until_continue() {
             "{name}: concise grading reason missing"
         );
         assert!(html.contains("efímero"), "{name}: accepted answer missing");
+        if name.ends_with("mcq") {
+            assert!(
+                html.contains(r#"class="me-graded-choice me-graded-choice-correct""#),
+                "{name}: accepted MCQ answer row missing"
+            );
+        }
+        if verdict == "Revealed" {
+            assert!(
+                html.contains(r#"class="ae-icon ae-revealed""#),
+                "{name}: revealed status tint hook missing"
+            );
+        }
         assert!(
             html.contains(">Continue"),
             "{name}: deliberate Continue missing"

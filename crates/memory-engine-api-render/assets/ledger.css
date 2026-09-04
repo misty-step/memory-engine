@@ -293,6 +293,7 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .ae-ok { color: var(--lg-pine); }
 .ae-warn { color: var(--lg-ochre); }
 .ae-err { color: var(--lg-clay); }
+.ae-revealed { color: var(--lg-slate); }
 
 .ae-meter {
   height: 4px;
@@ -633,6 +634,7 @@ textarea.ae-input { min-height: 64px; resize: vertical; }
 .me-result:has(.ae-ok) .me-verdict { color: var(--lg-pine); }
 .me-result:has(.ae-err) .me-verdict { color: var(--lg-clay); }
 .me-result:has(.ae-warn) .me-verdict { color: var(--lg-ochre); }
+.me-result:has(.ae-revealed) .me-verdict { color: var(--lg-slate); }
 .me-result .ae-ok { stroke-dasharray: 26; animation: lg-draw 480ms var(--lg-ease) both; }
 @keyframes lg-draw { from { stroke-dashoffset: 26; } }
 

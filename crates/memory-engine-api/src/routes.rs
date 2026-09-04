@@ -2876,7 +2876,7 @@ async fn record_app_content_feedback(
         Ok(view) => view,
         Err(error) => {
             return with_browser_session_cookie(
-                app_failure_response(&error),
+                submit_failure_response(&error),
                 &account,
                 &headers,
                 &uri,

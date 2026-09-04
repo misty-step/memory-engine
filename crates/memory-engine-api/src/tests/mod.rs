@@ -2444,6 +2444,10 @@ async fn continue_tombstones_a_missing_active_graded_projection() {
     )
     .await;
     assert_eq!(stale_feedback.status(), StatusCode::NOT_FOUND);
+    let stale_feedback = response_text(stale_feedback).await;
+    assert!(stale_feedback.contains("Review not submitted"));
+    assert!(stale_feedback.contains("Reload the app and try again."));
+    assert!(!stale_feedback.contains("fresh sign-in link"));
 }
 
 #[tokio::test]
