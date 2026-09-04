@@ -51,7 +51,14 @@ def _covers_uploads(prefix: str) -> bool:
 
 def _has_30_day_action(rule: dict[str, Any], action: str, days_field: str) -> bool:
     value = rule.get(action)
-    return isinstance(value, dict) and value.get(days_field) == 30
+    return (
+        isinstance(value, dict)
+        and value.get(days_field) == 30
+        and (
+            action != "NoncurrentVersionExpiration"
+            or "NewerNoncurrentVersions" not in value
+        )
+    )
 
 
 def check(client: Any, bucket: str) -> None:

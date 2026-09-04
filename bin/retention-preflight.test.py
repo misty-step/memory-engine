@@ -218,6 +218,26 @@ def main() -> None:
             ),
         ),
         (
+            "noncurrent-expiration-with-version-threshold",
+            lambda: assert_refused(
+                "noncurrent-expiration-with-version-threshold",
+                StubClient(
+                    {"Status": "Enabled"},
+                    {
+                        "Rules": [
+                            enabled_rule(
+                                Expiration={"Days": 30},
+                                NoncurrentVersionExpiration={
+                                    "NoncurrentDays": 30,
+                                    "NewerNoncurrentVersions": 1,
+                                },
+                            )
+                        ]
+                    },
+                ),
+            ),
+        ),
+        (
             "bucket-wide-current-and-noncurrent",
             lambda: assert_passes(
                 "bucket-wide-current-and-noncurrent",
