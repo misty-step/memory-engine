@@ -7527,7 +7527,7 @@ async fn assert_postgres_browser_submit_traces(database: &PostgresTestDatabase) 
         .expect("Postgres browser submit without an active review");
     let workspace_submit_measured_ms =
         u64::try_from(workspace_submit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    assert_eq!(workspace_submit.status(), StatusCode::OK);
+    assert_eq!(workspace_submit.status(), StatusCode::NOT_FOUND);
     assert_postgres_submit_timing(&workspace_submit, 11, 3);
     // This is the exact empty-queue/error-render path (missing review unit,
     // no active review) that nests app_study_view_with_timings +
