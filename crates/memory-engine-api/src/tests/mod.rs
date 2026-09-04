@@ -2423,13 +2423,16 @@ async fn continue_tombstones_a_missing_active_graded_projection() {
         "continue without active projection",
     )
     .await;
-    let _replay = submit_review_response(
-        &restarted,
-        &cookie,
-        &csrf_token,
-        &review_unit_id,
-        "deliberately wrong",
-        &review_key,
+    assert_no_graded_card(
+        submit_review_response(
+            &restarted,
+            &cookie,
+            &csrf_token,
+            &review_unit_id,
+            "deliberately wrong",
+            &review_key,
+        )
+        .await,
     )
     .await;
     let stale_feedback = submit_content_feedback_response(
@@ -11096,7 +11099,9 @@ async fn response_text(response: axum::response::Response) -> String {
 }
 
 async fn assert_no_graded_card(response: axum::response::Response) {
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = response_text(response).await;
+    assert!(body.contains("Review unit not found."));
     assert!(
         !body.contains(r#"class="me-verdict""#),
         "consumed review replay must not render a graded card"

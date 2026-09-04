@@ -2514,13 +2514,13 @@ async fn submit_app_review(
         &mut postgres,
     ) {
         Ok((account, result)) => {
-            let outcome = match &result {
-                Ok(_) => SubmitPerformanceOutcome::Succeeded,
-                Err(error) => submit_outcome(error.status()),
+            let (outcome, status) = match &result {
+                Ok(_) => (SubmitPerformanceOutcome::Succeeded, StatusCode::OK),
+                Err(error) => (submit_outcome(error.status()), error.status()),
             };
             let render_started = Instant::now();
             let postgres_before_render = postgres;
-            let response = with_browser_session_cookie(
+            let mut response = with_browser_session_cookie(
                 Html(render_submit_action_result_html(
                     &state,
                     &account,
@@ -2534,6 +2534,7 @@ async fn submit_app_review(
                 &headers,
                 &uri,
             );
+            *response.status_mut() = status;
             let render_ms = render_only_ms(render_started, postgres_before_render, postgres);
             (response, render_ms, outcome)
         }
