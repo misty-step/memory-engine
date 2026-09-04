@@ -2778,25 +2778,6 @@ fn valid_browser_submit_performance(event: &BrowserSubmitPerformance) -> bool {
     event.graded_visible_ms.abs_diff(reconstructed) <= 4
 }
 
-fn render_content_feedback_follow_up_failure(
-    state: &ApiState,
-    account: &AppAccount,
-    error: ApiFailure,
-) -> Response {
-    if error.is_session_expired() {
-        return app_failure_response(&error);
-    }
-    let status = error.status();
-    let message = error.message;
-    let html = match state.next_app_review(account) {
-        Ok(view) => render_content_feedback_result_html(state, account, &view, &message),
-        Err(_) => render_account_page(state, account, None, Some(&message)),
-    };
-    let mut response = Html(html).into_response();
-    *response.status_mut() = status;
-    response
-}
-
 pub(crate) fn resolve_content_feedback_recovery_revision(
     conflict_retry: bool,
     review_unit_id: &str,
@@ -2880,23 +2861,6 @@ pub(crate) fn render_content_feedback_persistence_failure(
     no_store_response(response)
 }
 
-pub(crate) fn render_content_feedback_follow_up(
-    state: &ApiState,
-    account: &AppAccount,
-    next_review: Result<StudyViewResponse, ApiFailure>,
-) -> Response {
-    match next_review {
-        Ok(view) => Html(render_content_feedback_result_html(
-            state,
-            account,
-            &view,
-            "Saved. This card will help improve future generation.",
-        ))
-        .into_response(),
-        Err(error) => render_content_feedback_follow_up_failure(state, account, error),
-    }
-}
-
 async fn record_app_content_feedback(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2908,6 +2872,17 @@ async fn record_app_content_feedback(
             Ok(account) => account,
             Err(error) => return app_failure_response(&error),
         };
+    let mut graded_view = match state.active_graded_app_review(&account, &form.review_unit_id) {
+        Ok(view) => view,
+        Err(error) => {
+            return with_browser_session_cookie(
+                app_failure_response(&error),
+                &account,
+                &headers,
+                &uri,
+            );
+        }
+    };
     let request = ContentFeedbackRequest {
         verdict: form.verdict,
         rationale: form.rationale,
@@ -2916,8 +2891,17 @@ async fn record_app_content_feedback(
     };
     let result = state.record_app_content_feedback(&account, &form.review_unit_id, &request);
     let response = match result {
-        Ok(_) => {
-            render_content_feedback_follow_up(&state, &account, state.next_app_review(&account))
+        Ok(feedback) => {
+            if let Some(current) = graded_view.current.as_mut() {
+                current.content_feedback_head_id = Some(feedback.id);
+            }
+            Html(render_content_feedback_result_html(
+                &state,
+                &account,
+                &graded_view,
+                "Saved. This card will help improve future generation.",
+            ))
+            .into_response()
         }
         Err(error) => render_content_feedback_persistence_failure(
             &state,

@@ -1727,9 +1727,8 @@ async fn free_response_review_shows_a_prominent_input_not_choice_buttons() {
     assert!(!free.contains(r#"class="me-choice""#));
     let review_unit_id = html_value(&free, "reviewUnitId");
 
-    // Graded (D): a free-response card has no options to mark, so the answer
-    // is revealed on one line, with the verdict and the when-it-returns line.
-    // No metrics wall, no concept health on the card.
+    // A graded free-response card reveals the accepted answer on one line.
+    // Schedule and quality controls stay inside the collapsed dossier.
     let graded = app
         .clone()
         .oneshot(form_request_with_cookie(
@@ -1750,18 +1749,23 @@ async fn free_response_review_shows_a_prominent_input_not_choice_buttons() {
     let graded = response_text(graded).await;
     assert!(graded.contains(r#"<span class="me-verdict">Correct</span>"#));
     assert!(
-        graded.contains(r#"<p class="me-answer"><span class="me-answer-label">Answer</span>"#),
-        "free-response graded must reveal the answer on one line: {graded}"
+        graded.contains(
+            r#"<p class="me-answer"><span class="me-answer-label">Accepted answer</span>"#
+        ),
+        "free-response graded must reveal the accepted answer: {graded}"
     );
     assert!(graded.contains("CHARLIE ALFA TANGO"));
-    assert!(graded.contains(r#"<p class="me-next-when"#));
-    // No choice rows in the markup (the .me-graded-choice CSS rule still ships
-    // in the inline stylesheet — assert on the element, not the class string).
     assert!(!graded.contains(r#"<li class="me-graded-choice"#));
-    assert!(graded.contains("This item:"));
+    assert_dossier_markers(
+        &graded,
+        &[
+            r#"<p class="me-next-when"#,
+            "Card quality",
+            "me-content-feedback-rationale",
+        ],
+    );
     assert!(graded.contains("Keep"));
     assert!(graded.contains("Drop"));
-    assert!(graded.contains("me-content-feedback-rationale"));
     assert_not_contains_any(&graded, &["Answer feedback", "Concept health"]);
 }
 
@@ -2147,9 +2151,9 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
     assert_eq!(feedback.status(), StatusCode::OK);
     let feedback = response_text(feedback).await;
     assert!(feedback.contains("Saved. This card will help improve future generation."));
-    assert!(feedback.contains("Review complete"));
-    assert!(feedback.contains(r#"href="/">Back to workspace</a>"#));
-    assert!(!feedback.contains("What do you want to remember?"));
+    assert!(feedback.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(feedback.contains(">Continue"));
+    assert_eq!(html_value(&feedback, "reviewUnitId"), review_unit_id);
 
     let replay = app
         .oneshot(form_request_with_cookie(
@@ -2168,12 +2172,13 @@ async fn mobile_submit_review_reveals_the_verdict_and_correct_answer() {
         .expect("replay content feedback");
     assert_eq!(replay.status(), StatusCode::OK);
     let replay = response_text(replay).await;
-    assert!(replay.contains("Review complete"));
-    assert!(!replay.contains("What do you want to remember?"));
+    assert!(replay.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(replay.contains(">Continue"));
+    assert_eq!(html_value(&replay, "reviewUnitId"), review_unit_id);
 }
 
 #[tokio::test]
-async fn app_content_feedback_advances_to_the_next_due_review() {
+async fn app_content_feedback_keeps_the_graded_review_until_continue() {
     let state = local_fixture_state();
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
@@ -2183,7 +2188,7 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
         next_review_html(&app, &cookie, &csrf_token, "start first feedback review").await;
     let first_review_unit_id = html_value(&first_prompt, "reviewUnitId");
     let first_review_key = html_value(&first_prompt, "idempotencyKey");
-    submit_review_ok(
+    let graded = submit_review_ok(
         &app,
         &cookie,
         &csrf_token,
@@ -2192,6 +2197,7 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
         &first_review_key,
     )
     .await;
+    assert!(graded.contains(r#"class="me-dossier""#));
 
     let invalid = app
         .clone()
@@ -2234,13 +2240,196 @@ async fn app_content_feedback_advances_to_the_next_due_review() {
     .await;
 
     assert!(continued.contains("Saved. This card will help improve future generation."));
-    assert!(continued.contains(r#"action="/app/submit""#));
-    assert!(!continued.contains("What do you want to remember?"));
-    assert_ne!(
+    assert!(continued.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(continued.contains(r#"<details class="me-dossier">"#));
+    assert!(continued.contains(">Continue"));
+    assert_eq!(
         html_value(&continued, "reviewUnitId"),
         first_review_unit_id,
-        "feedback must advance into the next due review"
+        "feedback must preserve the exact graded card until Continue"
     );
+
+    let next = next_review_html(&app, &cookie, &csrf_token, "continue after feedback").await;
+    assert_ne!(
+        html_value(&next, "reviewUnitId"),
+        first_review_unit_id,
+        "Continue must remain the only action that advances"
+    );
+}
+
+#[tokio::test]
+async fn active_graded_review_survives_restart_but_not_continue() {
+    let store_root = temp_store_root("active-graded-review-restart");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    );
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let prompt = next_review_html(&app, &cookie, &csrf_token, "start durable graded review").await;
+    let review_unit_id = html_value(&prompt, "reviewUnitId");
+    let review_key = html_value(&prompt, "idempotencyKey");
+    let graded = submit_review_ok(
+        &app,
+        &cookie,
+        &csrf_token,
+        &review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+    assert!(graded.contains(r#"<span class="me-verdict">Try again</span>"#));
+
+    let active_path = fs::read_dir(&store_root)
+        .expect("read account stores")
+        .flatten()
+        .map(|entry| entry.path().join("active-graded-review.json"))
+        .find(|path| path.is_file())
+        .expect("active graded review");
+    fs::remove_file(&active_path).expect("simulate active projection write loss");
+
+    let restarted = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    ));
+    let mismatched_review_unit_id = format!("{review_unit_id}-other");
+    let mismatched = submit_review_response(
+        &restarted,
+        &cookie,
+        &csrf_token,
+        &mismatched_review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+    let mismatched = response_text(mismatched).await;
+    assert!(!mismatched.contains(r#"class="me-verdict""#));
+    assert!(!active_path.exists());
+
+    let recovered = submit_review_response(
+        &restarted,
+        &cookie,
+        &csrf_token,
+        &review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered = response_text(recovered).await;
+    assert!(recovered.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert_eq!(html_value(&recovered, "reviewUnitId"), review_unit_id);
+
+    let feedback = submit_content_feedback_ok(
+        &restarted,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &review_unit_id),
+            ("verdict", "kept"),
+            ("idempotencyKey", "durable-graded-feedback"),
+        ],
+    )
+    .await;
+    assert!(feedback.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert_eq!(html_value(&feedback, "reviewUnitId"), review_unit_id);
+
+    let next = next_review_html(&restarted, &cookie, &csrf_token, "continue durable review").await;
+    assert_ne!(html_value(&next, "reviewUnitId"), review_unit_id);
+
+    let replayed = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    ));
+    let _replay = submit_review_response(
+        &replayed,
+        &cookie,
+        &csrf_token,
+        &review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+
+    let stale_feedback = submit_content_feedback_response(
+        &replayed,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &review_unit_id),
+            ("verdict", "dropped"),
+            ("idempotencyKey", "stale-replay-feedback"),
+        ],
+    )
+    .await;
+    assert_eq!(stale_feedback.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn continue_tombstones_a_missing_active_graded_projection() {
+    let store_root = temp_store_root("missing-active-graded-continue");
+    let state = ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    );
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    let prompt = next_review_html(&app, &cookie, &csrf_token, "start lost graded review").await;
+    let review_unit_id = html_value(&prompt, "reviewUnitId");
+    let review_key = html_value(&prompt, "idempotencyKey");
+    submit_review_ok(
+        &app,
+        &cookie,
+        &csrf_token,
+        &review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+    let active_path = fs::read_dir(&store_root)
+        .expect("read account stores")
+        .flatten()
+        .map(|entry| entry.path().join("active-graded-review.json"))
+        .find(|path| path.is_file())
+        .expect("active graded review");
+    fs::remove_file(active_path).expect("simulate active projection write loss");
+
+    let restarted = router(ApiState::new(
+        AccountRegistry::with_store_root(&store_root)
+            .with_auth_config(AuthConfig::for_local_tests()),
+    ));
+    next_review_html(
+        &restarted,
+        &cookie,
+        &csrf_token,
+        "continue without active projection",
+    )
+    .await;
+    let _replay = submit_review_response(
+        &restarted,
+        &cookie,
+        &csrf_token,
+        &review_unit_id,
+        "deliberately wrong",
+        &review_key,
+    )
+    .await;
+    let stale_feedback = submit_content_feedback_response(
+        &restarted,
+        &cookie,
+        &[
+            ("csrfToken", &csrf_token),
+            ("reviewUnitId", &review_unit_id),
+            ("verdict", "dropped"),
+            ("idempotencyKey", "lost-active-replay-feedback"),
+        ],
+    )
+    .await;
+    assert_eq!(stale_feedback.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -2315,11 +2504,12 @@ async fn app_content_feedback_persistence_recovery_fields_can_be_submitted() {
     .await;
 
     assert!(continued.contains("Saved. This card will help improve future generation."));
-    assert!(continued.contains(r#"action="/app/submit""#));
-    assert_ne!(
+    assert!(continued.contains(r#"<span class="me-verdict">Try again</span>"#));
+    assert!(continued.contains(">Continue"));
+    assert_eq!(
         html_value(&continued, "reviewUnitId"),
         first_review_unit_id,
-        "a submitted persistence-recovery form must advance to the next due review"
+        "a submitted persistence-recovery form must restore the exact graded review"
     );
 }
 
@@ -10070,16 +10260,15 @@ fn content_feedback_value(html: &str, name: &str) -> String {
     section[start..end].to_owned()
 }
 
-async fn submit_review_ok(
+async fn submit_review_response(
     app: &axum::Router,
     cookie: &str,
     csrf_token: &str,
     review_unit_id: &str,
     answer: &str,
     idempotency_key: &str,
-) -> String {
-    let response = app
-        .clone()
+) -> axum::response::Response {
+    app.clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/submit",
@@ -10093,18 +10282,36 @@ async fn submit_review_ok(
             ],
         ))
         .await
-        .expect("review submit");
+        .expect("review submit")
+}
+
+async fn submit_review_ok(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+    answer: &str,
+    idempotency_key: &str,
+) -> String {
+    let response = submit_review_response(
+        app,
+        cookie,
+        csrf_token,
+        review_unit_id,
+        answer,
+        idempotency_key,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     response_text(response).await
 }
 
-async fn submit_content_feedback_ok(
+async fn submit_content_feedback_response(
     app: &axum::Router,
     cookie: &str,
     fields: &[(&str, &str)],
-) -> String {
-    let response = app
-        .clone()
+) -> axum::response::Response {
+    app.clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/content-feedback",
@@ -10112,7 +10319,15 @@ async fn submit_content_feedback_ok(
             fields,
         ))
         .await
-        .expect("content feedback submit");
+        .expect("content feedback submit")
+}
+
+async fn submit_content_feedback_ok(
+    app: &axum::Router,
+    cookie: &str,
+    fields: &[(&str, &str)],
+) -> String {
+    let response = submit_content_feedback_response(app, cookie, fields).await;
     assert_eq!(response.status(), StatusCode::OK);
     response_text(response).await
 }
@@ -10122,16 +10337,7 @@ async fn submit_content_feedback_conflict(
     cookie: &str,
     fields: &[(&str, &str)],
 ) -> String {
-    let response = app
-        .clone()
-        .oneshot(form_request_with_cookie(
-            "POST",
-            "/app/content-feedback",
-            cookie,
-            fields,
-        ))
-        .await
-        .expect("conflicting content feedback submit");
+    let response = submit_content_feedback_response(app, cookie, fields).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     response_text(response).await
 }
@@ -10187,24 +10393,24 @@ fn assert_due_review_html(body: &str, due_count: usize) {
 }
 
 fn assert_submitted_review_html(body: &str) {
-    // Ledger graded screen (DESIGN.md): the verdict, the answer revealed in
-    // place (correct option marked), the card's meta ledger, one quiet line
-    // on when it returns, and a primary Continue. Raw internals still never
-    // leak.
     assert!(body.contains(r#"<span class="me-verdict">Correct</span>"#));
-    // The first due card may be MCQ or free response, so accept either reveal
-    // form: a marked correct option, or a one-line answer.
     let reveals_answer = body.contains(r#"<li class="me-graded-choice me-graded-choice-correct">"#)
         || body.contains(r#"<p class="me-answer">"#);
     assert!(
         reveals_answer,
-        "graded screen must reveal the answer: {body}"
+        "graded screen must reveal the accepted answer: {body}"
     );
-    assert!(body.contains("you'll see this again"));
+    assert!(body.contains(r#"class="me-grade-reason""#));
     assert!(body.contains("Continue"));
-    assert!(body.contains(r#"class="me-meta-ledger""#));
-    assert!(body.contains("This item:"));
-    assert!(body.contains("Was this generated card worth keeping?"));
+    assert_dossier_markers(
+        body,
+        &[
+            "you'll see this again",
+            r#"class="me-meta-ledger""#,
+            "Card quality",
+            "Was this generated card worth keeping?",
+        ],
+    );
     assert_not_contains_any(
         body,
         &[
@@ -10219,6 +10425,25 @@ fn assert_submitted_review_html(body: &str) {
             "scheduleChange",
         ],
     );
+}
+
+fn assert_dossier_markers(body: &str, markers: &[&str]) {
+    let open = body
+        .find(r#"<details class="me-dossier">"#)
+        .expect("graded Details disclosure");
+    let close = body[open..]
+        .find("</details>")
+        .map(|offset| open + offset)
+        .expect("closed graded Details disclosure");
+    for marker in markers {
+        let position = body
+            .find(marker)
+            .unwrap_or_else(|| panic!("graded dossier marker missing: {marker}"));
+        assert!(
+            position > open && position < close,
+            "graded dossier marker must remain inside Details: {marker}"
+        );
+    }
 }
 
 fn management_answer_for_prompt(body: &str) -> &'static str {
@@ -11994,17 +12219,14 @@ async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
 
 #[tokio::test]
 async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
-    // Ledger interaction law (DESIGN.md), operator ruling from live dogfood
-    // use (memory-engine-081): after grading the card shows its dossier
-    // (stage, last seen, success rate, next horizon) and holds indefinitely
-    // — correct or not, only an explicit Continue tap ever advances it. This
-    // reverses the two-speed auto-advance shipped in memory-engine-078.
+    // The answer key remains concise for every verdict. Reflective facts stay
+    // inside Details, and only Continue advances the review.
     let state = local_fixture_state();
     let app = router(state.clone());
     let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
     generate_source_html(&app, &state, &cookie, &csrf_token, &source_id).await;
 
-    // Correct free-response answer: meta ledger + auto-advance.
+    // Correct free-response answer.
     let page = advance_to_prompt(&app, &cookie, &csrf_token, "Spell CAT over the phone").await;
     let review_unit_id = html_value(&page, "reviewUnitId");
     let idempotency_key = html_value(&page, "idempotencyKey");
@@ -12027,17 +12249,17 @@ async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
     assert_eq!(graded.status(), StatusCode::OK);
     let graded = response_text(graded).await;
     assert!(graded.contains(r#"<span class="me-verdict">Correct</span>"#));
-    assert!(
-        graded.contains(r#"class="me-meta-ledger""#),
-        "graded card must show its meta ledger: {graded}"
+    assert!(graded.contains(r#"class="me-grade-reason""#));
+    assert_dossier_markers(
+        &graded,
+        &[
+            r#"class="me-meta-ledger""#,
+            "Stage",
+            "Last seen",
+            "Success",
+            "you'll see this again",
+        ],
     );
-    for key in ["Stage", "Last seen", "Success"] {
-        assert!(
-            graded.contains(key),
-            "meta ledger must carry {key}: {graded}"
-        );
-    }
-    assert!(graded.contains("you'll see this again"));
     assert!(
         !graded.contains("data-auto-advance"),
         "a correct verdict must never auto-advance: {graded}"
@@ -12071,7 +12293,8 @@ async fn graded_review_shows_meta_ledger_and_holds_for_continue() {
     assert_eq!(missed.status(), StatusCode::OK);
     let missed = response_text(missed).await;
     assert!(missed.contains(r#"<span class="me-verdict">Try again</span>"#));
-    assert!(missed.contains(r#"class="me-meta-ledger""#));
+    assert!(missed.contains(r#"class="me-grade-reason""#));
+    assert_dossier_markers(&missed, &[r#"class="me-meta-ledger""#]);
     assert!(
         !missed.contains("data-auto-advance"),
         "a miss must hold for study, never auto-advance: {missed}"

@@ -208,8 +208,23 @@ fn graded(verdict: Verdict, rating: Rating, with_feedback: bool) -> BetaStudyCur
                 "slipping",
                 "One more like that lifts this concept above half.",
             )),
+            remediation_drafts_pending: matches!(
+                verdict,
+                Verdict::Close | Verdict::Wrong | Verdict::Revealed
+            ),
         });
     }
+    current
+}
+
+fn graded_mcq(verdict: Verdict, rating: Rating) -> BetaStudyCurrent {
+    let mut current = graded(verdict, rating, true);
+    current.choices = vec![
+        "fugaz".to_owned(),
+        "efímero".to_owned(),
+        "duradero".to_owned(),
+        "cotidiano".to_owned(),
+    ];
     current
 }
 
@@ -271,8 +286,8 @@ fn pages() -> Vec<(&'static str, String)> {
 
     let open = current("Translate to Spanish: “ephemeral”.");
 
-    let mut revealed = graded(Verdict::Revealed, Rating::Again, false);
-    revealed.reference_text = Some(
+    let mut revealed_without_feedback = graded(Verdict::Revealed, Rating::Again, false);
+    revealed_without_feedback.reference_text = Some(
         "“efímero” — lasting a very short time; from the Greek ephēmeros, ‘lasting a day’."
             .to_owned(),
     );
@@ -341,7 +356,7 @@ fn pages() -> Vec<(&'static str, String)> {
             ),
         ),
         (
-            "07-graded-correct",
+            "07-graded-correct-free",
             render_app_shell(
                 Some(&acct),
                 &sources,
@@ -357,7 +372,23 @@ fn pages() -> Vec<(&'static str, String)> {
             ),
         ),
         (
-            "08-graded-wrong",
+            "08-graded-close-free",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(graded(Verdict::Close, Rating::Hard, true)),
+                    concepts.clone(),
+                    3,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "09-graded-wrong-free",
             render_app_shell(
                 Some(&acct),
                 &sources,
@@ -373,17 +404,103 @@ fn pages() -> Vec<(&'static str, String)> {
             ),
         ),
         (
-            "09-revealed",
+            "10-graded-revealed-free",
             render_app_shell(
                 Some(&acct),
                 &sources,
-                Some(&view(vec![], Some(revealed), concepts, 3, vec![])),
+                Some(&view(
+                    vec![],
+                    Some(graded(Verdict::Revealed, Rating::Again, true)),
+                    concepts.clone(),
+                    3,
+                    vec![],
+                )),
                 &[],
                 None,
             ),
         ),
         (
-            "10-check-email",
+            "11-graded-correct-mcq",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(graded_mcq(Verdict::Correct, Rating::Good)),
+                    concepts.clone(),
+                    2,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "12-graded-close-mcq",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(graded_mcq(Verdict::Close, Rating::Hard)),
+                    concepts.clone(),
+                    3,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "13-graded-wrong-mcq",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(graded_mcq(Verdict::Wrong, Rating::Again)),
+                    concepts.clone(),
+                    3,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "14-graded-revealed-mcq",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(graded_mcq(Verdict::Revealed, Rating::Again)),
+                    concepts.clone(),
+                    3,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "15-graded-revealed-no-feedback",
+            render_app_shell(
+                Some(&acct),
+                &sources,
+                Some(&view(
+                    vec![],
+                    Some(revealed_without_feedback),
+                    concepts,
+                    3,
+                    vec![],
+                )),
+                &[],
+                None,
+            ),
+        ),
+        (
+            "16-check-email",
             render_entry_requested(Some("/app/login/verify?token=preview-token")),
         ),
     ]
@@ -487,50 +604,74 @@ fn conformance_every_state_consumes_the_design_system() {
 #[test]
 fn conformance_graded_review_holds_until_continue() {
     let pages = pages();
-    let Some((_, graded)) = pages.iter().find(|(name, _)| *name == "07-graded-correct") else {
-        panic!("graded-correct preview state missing");
-    };
-    assert!(
-        graded.contains(r#"class="ae-icon ae-ok""#),
-        "graded verdict must carry its status glyph"
-    );
-    assert!(
-        graded.contains(r#"class="me-verdict""#),
-        "graded verdict must use the verdict register"
-    );
-    // The card's dossier is post-grade only (DESIGN.md): present here…
-    assert!(
-        graded.contains(r#"class="me-meta-ledger""#),
-        "graded review must show the meta ledger"
-    );
-    // Skip/Snooze/Bridge are pre-answer moves; they must vanish once graded.
-    assert!(
-        !graded.contains(r#"class="me-more""#),
-        "graded review must not show escape hatches"
+    for (name, verdict) in [
+        ("07-graded-correct-free", "Correct"),
+        ("08-graded-close-free", "Close"),
+        ("09-graded-wrong-free", "Try again"),
+        ("10-graded-revealed-free", "Revealed"),
+        ("11-graded-correct-mcq", "Correct"),
+        ("12-graded-close-mcq", "Close"),
+        ("13-graded-wrong-mcq", "Try again"),
+        ("14-graded-revealed-mcq", "Revealed"),
+    ] {
+        let html = pages
+            .iter()
+            .find_map(|(page_name, html)| (*page_name == name).then_some(html))
+            .unwrap_or_else(|| panic!("{name} preview state missing"));
+        assert!(
+            html.contains(&format!(r#"<span class="me-verdict">{verdict}</span>"#)),
+            "{name}: canonical verdict missing"
+        );
+        assert!(
+            html.contains(r#"class="me-grade-reason""#),
+            "{name}: concise grading reason missing"
+        );
+        assert!(html.contains("efímero"), "{name}: accepted answer missing");
+        assert!(
+            html.contains(">Continue"),
+            "{name}: deliberate Continue missing"
+        );
+        assert!(
+            !html.contains("data-auto-advance"),
+            "{name}: graded review must hold until Continue"
+        );
+        assert_dossier_contains(
+            html,
+            name,
+            &[
+                r#"class="me-next-when"#,
+                r#"class="me-meta-ledger""#,
+                r#"class="me-dossier-concept""#,
+                r#"class="me-content-feedback""#,
+            ],
+        );
+        assert!(
+            !html.contains(r#"class="me-more""#),
+            "{name}: graded review must not show pre-grade escape hatches"
+        );
+    }
+
+    let revealed_without_feedback = pages
+        .iter()
+        .find_map(|(name, html)| (*name == "15-graded-revealed-no-feedback").then_some(html))
+        .expect("feedback-less revealed preview state missing");
+    assert_dossier_contains(
+        revealed_without_feedback,
+        "15-graded-revealed-no-feedback",
+        &[
+            "Review history is unavailable for this result.",
+            r#"class="me-reference""#,
+            r#"class="me-content-feedback""#,
+        ],
     );
 
-    // The miss holds for study too — a correct verdict never advances on its
-    // own either, so both states must be identical in this respect.
-    let Some((_, wrong)) = pages.iter().find(|(name, _)| *name == "08-graded-wrong") else {
-        panic!("graded-wrong preview state missing");
-    };
+    let answering = pages
+        .iter()
+        .find_map(|(name, html)| (*name == "06-review-open").then_some(html))
+        .expect("review-open preview state missing");
     assert!(
-        !wrong.contains("data-auto-advance"),
-        "a miss must hold for study, never auto-advance"
-    );
-    assert!(
-        wrong.contains(r#"class="me-meta-ledger""#),
-        "the dossier shows on misses too"
-    );
-
-    // The pre-grade card is minimal: no dossier, hatches collapsed behind
-    // the single More disclosure.
-    let Some((_, answering)) = pages.iter().find(|(name, _)| *name == "06-review-open") else {
-        panic!("review-open preview state missing");
-    };
-    assert!(
-        !answering.contains(r#"class="me-meta-ledger""#),
-        "card meta must never render pre-grade"
+        !answering.contains(r#"class="me-dossier""#),
+        "card dossier must never render pre-grade"
     );
     assert!(
         answering.contains(r#"<details class="me-more">"#),
@@ -540,6 +681,25 @@ fn conformance_graded_review_holds_until_continue() {
         answering.contains(r#"class="me-more-capture" href="/app/create""#),
         "Capture more must open Create, not Home: {answering}"
     );
+}
+
+fn assert_dossier_contains(html: &str, name: &str, markers: &[&str]) {
+    let open = html
+        .find(r#"<details class="me-dossier">"#)
+        .unwrap_or_else(|| panic!("{name}: Details disclosure missing"));
+    let close = html[open..].find("</details>").map_or_else(
+        || panic!("{name}: Details disclosure is not closed"),
+        |offset| open + offset,
+    );
+    for marker in markers {
+        let position = html
+            .find(marker)
+            .unwrap_or_else(|| panic!("{name}: dossier item {marker} missing"));
+        assert!(
+            position > open && position < close,
+            "{name}: dossier item {marker} must stay inside Details"
+        );
+    }
 }
 
 /// Operator dogfood finding (memory-engine-081): the "Generating…" notice

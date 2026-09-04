@@ -68,13 +68,13 @@ the pulse; state color applies instantly.
   separate confirm.
 - Free response: type, then one submit.
 - Graded Correct and Graded Close / Try again / Revealed: **no auto-advance,
-  ever.** Verdict prints in place (correct row tinted pine, horizon on the
-  row), meta ledger below, and the page holds indefinitely: the learner
-  reviews the verdict, answer key, and dossier for as long as they want. Only
-  a deliberate Continue tap (or Enter while it is focused) advances the card
-  — incidental taps while reading must never advance it. Operator ruling
-  from live dogfood use (memory-engine-081) reverses the two-speed advance
-  shipped in memory-engine-078: it is dead law, correct or not.
+  ever.** The default view shows the verdict, accepted answer, one concise
+  grading reason, a truthful bridge notice when easier drafts await review,
+  and deliberate Continue. Schedule horizon, source reference, concept
+  progress, success history, and generated-card quality controls live inside
+  one collapsed Details disclosure. The page holds indefinitely. Quality
+  feedback saves in place; only a deliberate Continue tap (or Enter while it
+  is focused) advances the card.
 - Pre-grade shows **no card meta**: no stage, no last-seen, no success rate,
   no health. Just kicker, prompt, the answer mechanism, and the hatch row.
 - Escape hatches: only **Reveal answer** stays on the card, beside one `···`
@@ -112,19 +112,22 @@ permission → Library; reminders → Home. Each POST returns to the view that
 owns the action, so the learner never lands on a scroll of unrelated
 sections after submitting.
 
-## Post-grade meta ledger
+## Post-grade feedback
 
-After grading (and only after), the card shows its record: verdict + revealed
-answer, "you'll see this again …" horizon, then a mono ledger of stage,
-last seen, success rate (n/N and trend), and the concept line. This is the
-learner's honest dossier on the card; it never appears pre-grade.
+After grading (and only after), the default view is the answer key, not the
+dossier. It contains the canonical verdict, accepted answer, a concise reason,
+relevant recovery, and Continue. The reflective record stays one disclosure
+away: schedule horizon, source reference, concept progress, the historical
+success ledger, and generated-card quality controls all live inside Details.
+When history is unavailable, Details says so and keeps any available reference
+and quality controls. None of this dossier appears before grading.
 
 ## Component grammar
 
 - **Choices** (`lg-choice`): full-width rows on `--lg-paper-2`, 1px `--lg-line`
   border, radius 7, min-height 56px, mono key chip. Graded: correct row pine
-  wash (`color-mix` ~14%) + pine border + horizon; chosen-wrong row clay wash;
-  others dim to 42%. Never a left-only border stripe.
+  wash (`color-mix` ~14%) + pine border; other rows dim to 42%. The recap keeps
+  presentation order. Never a left-only border stripe.
 - **Buttons**: contained ink (`lg-btn`) for primary; accent fill only for
   Start review; quiet outline (`lg-quiet`) for hatches. All tap targets are
   at least 44px.
@@ -154,8 +157,10 @@ memory-engine-074).
 
 - `design_preview.rs` conformance tests assert the Ledger law: token sheet
   present, register scale exact, verdict tint classes, hatch collapse,
-  pre-grade/post-grade meta split, no raw hex outside tokens in `render.rs`.
-- Behavior tests in `memory-engine-api` assert the interaction law at the
-  route boundary (one-tap MCQ, meta split, Continue as the only advance).
+  pre-grade/post-grade split, Details containment, all four verdicts, and no raw
+  hex outside tokens in `render.rs`.
+- Behavior tests in `memory-engine-api` assert the interaction law at the route
+  boundary: one-tap MCQ, dossier containment, feedback save-in-place, and
+  Continue as the only advance.
 - The live phone walk (390×844) is the overflow gate: no horizontal scroll on
   cover, workspace, review, graded, and sheet-open states.

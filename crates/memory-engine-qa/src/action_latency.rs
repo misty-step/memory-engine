@@ -649,6 +649,9 @@ async fn run_review_mutation(
     let fixture = Fixture::new(options, spec.name, iteration)?;
     let session = seed_review(&fixture, true).await?;
     let review_unit_id = session.review_unit_id();
+    if spec.kind == ActionKind::ReviewContentFeedback {
+        seed_graded_review(&fixture, &session, iteration).await?;
+    }
     let request = match spec.kind {
         ActionKind::ReviewSubmit => form_request_with_cookie(
             "POST",
@@ -842,6 +845,39 @@ async fn seed_review(fixture: &Fixture, open_review: bool) -> Result<Session, La
     }
 
     Ok(session)
+}
+
+async fn seed_graded_review(
+    fixture: &Fixture,
+    session: &Session,
+    iteration: usize,
+) -> Result<(), LatencyError> {
+    let response = send(
+        &fixture.app,
+        form_request_with_cookie(
+            "POST",
+            "/app/submit",
+            &session.cookie,
+            &[
+                ("csrfToken", &session.csrf_token),
+                ("reviewUnitId", session.review_unit_id()),
+                ("answer", "ALFA"),
+                ("responseTimeMs", "1800"),
+                (
+                    "idempotencyKey",
+                    &format!("latency-feedback-seed-{iteration}"),
+                ),
+            ],
+        )?,
+    )
+    .await?;
+    let (status, _timing, _body) = finish(response).await?;
+    if status != StatusCode::OK.as_u16() {
+        return Err(LatencyError::new(format!(
+            "fixture review submit returned HTTP {status}"
+        )));
+    }
+    Ok(())
 }
 
 async fn timed(app: &Router, request: Request<Body>) -> Result<Observation, LatencyError> {

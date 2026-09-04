@@ -1529,10 +1529,15 @@ impl AccountRegistry {
 
         if let Some(account_id) = cached_account_id.as_deref() {
             let data = self.lock_data();
-            if let Some(response) = data
-                .accounts
-                .get(account_id)
-                .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+            if let Some(response) =
+                data.accounts
+                    .get(account_id)
+                    .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+                    .filter(|response| {
+                        response.current.as_ref().is_some_and(|current| {
+                            current.review_unit_id.as_str() == review_unit_id
+                        })
+                    })
             {
                 let session = data
                     .browser_sessions
@@ -1578,21 +1583,12 @@ impl AccountRegistry {
         }
         let session = validation.session;
         let account_id = session.account_id.clone();
-        if let Ok(view) = &work {
-            // Resolve the store path before locking: storage() takes the data
-            // lock, so calling it inside or_insert_with would self-deadlock.
-            let store_path = self.storage().account_store_path(&account_id);
-            let mut data = self.lock_data();
-            data.accounts
-                .entry(account_id.clone())
-                .or_insert_with(|| AccountRecord {
-                    store_path,
-                    sources: BTreeMap::new(),
-                    submitted_reviews: BTreeMap::new(),
-                })
-                .submitted_reviews
-                .insert(idempotency_key, view.clone());
-        }
+        let work = work.map(|outcome| {
+            if outcome.applied {
+                self.cache_submitted_review(&account_id, idempotency_key, &outcome.view);
+            }
+            outcome.view
+        });
         Ok((
             AppAccount {
                 browser_session_id: session_id.to_owned(),
@@ -1829,15 +1825,20 @@ impl AccountRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let data = self.lock_data();
-            if let Some(response) = data
-                .accounts
-                .get(account_id)
-                .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+            if let Some(response) =
+                data.accounts
+                    .get(account_id)
+                    .and_then(|account| account.submitted_reviews.get(&idempotency_key))
+                    .filter(|response| {
+                        response.current.as_ref().is_some_and(|current| {
+                            current.review_unit_id.as_str() == review_unit_id
+                        })
+                    })
             {
                 return Ok(response.clone());
             }
         }
-        let response = self.storage().authenticated_submit_review(
+        let outcome = self.storage().authenticated_submit_review(
             account_id,
             session_token,
             review_unit_id,
@@ -1848,20 +1849,10 @@ impl AccountRegistry {
             },
             timings,
         )?;
-        // Resolve the store path before locking: storage() takes the data
-        // lock, so calling it inside or_insert_with would self-deadlock.
-        let store_path = self.storage().account_store_path(account_id);
-        let mut data = self.lock_data();
-        data.accounts
-            .entry(account_id.to_owned())
-            .or_insert_with(|| AccountRecord {
-                store_path,
-                sources: BTreeMap::new(),
-                submitted_reviews: BTreeMap::new(),
-            })
-            .submitted_reviews
-            .insert(idempotency_key, response.clone());
-        Ok(response)
+        if outcome.applied {
+            self.cache_submitted_review(account_id, idempotency_key, &outcome.view);
+        }
+        Ok(outcome.view)
     }
 
     /// Runs an API registry operation.
@@ -2133,6 +2124,46 @@ impl AccountRegistry {
             sources: BTreeMap::new(),
             submitted_reviews: BTreeMap::new(),
         })
+    }
+
+    pub(crate) fn active_graded_review(
+        &self,
+        account_id: &str,
+        session_token: &str,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        let account = self.require_account(account_id, session_token)?;
+        self.storage()
+            .active_graded_review(account_id, &account.store_path, review_unit_id)?
+            .filter(|view| {
+                view.current.as_ref().is_some_and(|current| {
+                    current.grade.is_some() && current.review_unit_id.as_str() == review_unit_id
+                })
+            })
+            .ok_or_else(|| ApiFailure::not_found("Graded review is no longer active."))
+    }
+
+    fn cache_submitted_review(
+        &self,
+        account_id: &str,
+        idempotency_key: String,
+        response: &StudyViewResponse,
+    ) {
+        // Resolve the store path before locking: storage() takes the data
+        // lock, so calling it inside or_insert_with would self-deadlock.
+        let store_path = self.storage().account_store_path(account_id);
+        let mut data = self.lock_data();
+        let account = data
+            .accounts
+            .entry(account_id.to_owned())
+            .or_insert_with(|| AccountRecord {
+                store_path,
+                sources: BTreeMap::new(),
+                submitted_reviews: BTreeMap::new(),
+            });
+        account
+            .submitted_reviews
+            .insert(idempotency_key, response.clone());
     }
 }
 

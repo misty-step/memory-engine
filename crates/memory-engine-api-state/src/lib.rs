@@ -784,6 +784,24 @@ impl ApiState {
         self.accounts
             .study_view(account.account_id(), account.session_token())
     }
+
+    /// Return the exact graded view that remains active until Continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API failure when auth fails or the requested card is not the
+    /// server-owned active graded review.
+    pub fn active_graded_app_review(
+        &self,
+        account: &AppAccount,
+        review_unit_id: &str,
+    ) -> Result<StudyViewResponse, ApiFailure> {
+        self.accounts.active_graded_review(
+            account.account_id(),
+            account.session_token(),
+            review_unit_id,
+        )
+    }
     /// Render the current study view while accounting for every Postgres
     /// boundary traversed by a timed browser request.
     ///
@@ -2157,7 +2175,7 @@ pub struct ContentFeedbackRequest {
     pub supersedes_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudyViewResponse {
     pub drafts: Vec<BetaStudyDraftRow>,
