@@ -8,16 +8,16 @@
 //! reflect) and a review (prompt, answer, grade). Every interaction is a
 //! full-page form POST; `assets/app.js` layers progressive enhancement
 //! (honest response timing, job SSE, the Create pending state) on top.
-//! Graded pages never advance on their own — the learner reviews the verdict,
-//! answer key, and dossier until they explicitly continue or submit the
-//! generated-card quality feedback (operator rulings, memory-engine-081/116).
+//! Graded pages never advance on their own. The learner reviews the verdict,
+//! answer key, and dossier until they explicitly continue. Generated-card
+//! quality feedback saves in place without becoming a second advance action.
 
 use std::fmt::Write as _;
 
 use memory_engine_persistence::GeneratedPromptValidationStatus;
 use memory_engine_study::{
-    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, LibrarySourceRow,
-    SourcePermission,
+    BetaStudyConceptProgress, BetaStudyCurrent, BetaStudyDraftRow, BetaStudyFeedback,
+    BetaStudyGrade, LibrarySourceRow, SourcePermission,
 };
 
 use memory_engine_api_state::{
@@ -1243,11 +1243,55 @@ fn job_meta(job: &GenerationJob) -> String {
     }
 }
 
+enum ReviewCard<'a> {
+    Answering(&'a BetaStudyCurrent),
+    Graded(GradedReviewCard<'a>),
+}
+
+struct GradedReviewCard<'a> {
+    current: &'a BetaStudyCurrent,
+    grade: &'a BetaStudyGrade,
+    accepted_answer: &'a str,
+    dossier: GradedDossier<'a>,
+}
+
+enum GradedDossier<'a> {
+    Complete(&'a BetaStudyFeedback),
+    HistoryUnavailable,
+}
+
+impl<'a> ReviewCard<'a> {
+    fn project(current: &'a BetaStudyCurrent) -> Self {
+        let Some(grade) = current.grade.as_ref() else {
+            return Self::Answering(current);
+        };
+        let accepted_answer = current
+            .expected_answer
+            .as_deref()
+            .or_else(|| {
+                current
+                    .feedback
+                    .as_ref()
+                    .map(|feedback| feedback.expected_answer.as_str())
+            })
+            .unwrap_or(&current.revision_expected_answer);
+        let dossier = current
+            .feedback
+            .as_ref()
+            .map_or(GradedDossier::HistoryUnavailable, GradedDossier::Complete);
+        Self::Graded(GradedReviewCard {
+            current,
+            grade,
+            accepted_answer,
+            dossier,
+        })
+    }
+}
+
 fn render_current_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    if current.grade.is_some() {
-        render_graded_review(account, current)
-    } else {
-        render_answering(account, current)
+    match ReviewCard::project(current) {
+        ReviewCard::Answering(card) => render_answering(account, card),
+        ReviewCard::Graded(card) => render_graded_review(account, &card),
     }
 }
 
@@ -1283,38 +1327,106 @@ fn render_answering(account: &AppAccount, current: &BetaStudyCurrent) -> String 
     )
 }
 
-/// After grading: stay close to the card the learner just answered. The chosen
-/// answer is revealed in place (the correct option marked, the rest dimmed; or a
-/// one-line answer for free response), the verdict reads, one quiet line says
-/// when it returns, and Next is the primary action. The per-item metrics and
-/// concept health that used to pile up here live on the workspace, off the
-/// per-card loop — so the review stays a fast, low-friction rhythm.
-fn render_graded_review(account: &AppAccount, current: &BetaStudyCurrent) -> String {
+/// The graded card keeps only the immediate learning loop in the default view.
+/// Reflective history and generated-card controls remain available in one
+/// collapsed disclosure after the deliberate Continue action.
+fn render_graded_review(account: &AppAccount, card: &GradedReviewCard<'_>) -> String {
     format!(
         r#"<p class="me-prompt">{prompt}</p>
-{reveal}
 {verdict}
-{meta}
-{content_feedback}
-{reference}
-{next}"#,
-        prompt = escape_html(&current.prompt),
-        reveal = render_answer_reveal(current),
-        verdict = render_graded_verdict(current),
-        meta = render_meta_ledger(current),
-        content_feedback = render_content_feedback(account, current),
-        reference = render_reference(current),
-        next = render_next(account, current),
+{reveal}
+{reason}
+{bridge}
+{next}
+{details}"#,
+        prompt = escape_html(&card.current.prompt),
+        verdict = render_verdict(card.grade),
+        reveal = render_answer_reveal(card),
+        reason = render_grading_reason(card.grade),
+        bridge = render_bridge_message(card),
+        next = render_next(account),
+        details = render_graded_details(account, card),
     )
 }
 
+fn render_grading_reason(grade: &BetaStudyGrade) -> String {
+    let reason = match verdict_label(grade.verdict) {
+        "Correct" => "Your answer matches the accepted answer.",
+        "Close" => "Your answer is close, but it misses part of the accepted answer.",
+        "Try again" => "Your answer does not match the accepted answer.",
+        "Revealed" => "You chose to reveal the accepted answer.",
+        _ => "This answer needs review.",
+    };
+    format!(r#"<p class="me-grade-reason">{}</p>"#, escape_html(reason))
+}
+
+fn render_bridge_message(card: &GradedReviewCard<'_>) -> String {
+    let GradedDossier::Complete(feedback) = card.dossier else {
+        return String::new();
+    };
+    if !feedback.remediation_drafts_pending {
+        return String::new();
+    }
+    r#"<p class="me-bridge">Easier practice cards are ready for you to review.</p>"#.to_owned()
+}
+
+fn render_graded_details(account: &AppAccount, card: &GradedReviewCard<'_>) -> String {
+    format!(
+        r#"<details class="me-dossier">
+<summary class="me-dossier-summary">Details</summary>
+<div class="me-dossier-panel">
+{history}
+{reference}
+{content_feedback}
+</div>
+</details>"#,
+        history = render_dossier_history(&card.dossier),
+        reference = render_reference(card.current),
+        content_feedback = render_content_feedback(account, card),
+    )
+}
+
+fn render_dossier_history(dossier: &GradedDossier<'_>) -> String {
+    let GradedDossier::Complete(feedback) = dossier else {
+        return r#"<p class="me-dossier-empty">Review history is unavailable for this result.</p>"#
+            .to_owned();
+    };
+    let horizon = if feedback.item_history.next_review.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="me-next-when">{}</p>"#,
+            escape_html(&feedback.item_history.next_review)
+        )
+    };
+    format!(
+        "{horizon}{concept}{ledger}",
+        concept = render_concept_dossier(feedback),
+        ledger = render_meta_ledger(feedback),
+    )
+}
+
+fn render_concept_dossier(feedback: &BetaStudyFeedback) -> String {
+    feedback
+        .concept_progress
+        .as_ref()
+        .map_or_else(String::new, |concept| {
+            format!(
+                r#"<section class="me-dossier-concept">
+<h2 class="me-dossier-label">Concept</h2>
+<p class="me-dossier-value">{label}</p>
+<p class="me-dossier-note">{health}</p>
+</section>"#,
+                label = escape_html(&concept.concept_label),
+                health = escape_html(&concept.health),
+            )
+        })
+}
 /// Capture a binary judgment about the generated card after the learner has
 /// seen its answer. The stable id makes an accidental double submit a replay,
 /// while a later client can supply `supersedesId` for a revised judgment.
-fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    if current.grade.is_none() {
-        return String::new();
-    }
+fn render_content_feedback(account: &AppAccount, card: &GradedReviewCard<'_>) -> String {
+    let current = card.current;
     let reps = current.review_state.as_ref().map_or(0, |state| state.reps);
     let head_id = current.content_feedback_head_id.as_deref().unwrap_or("new");
     let feedback_id = format!("feedback-{}-{reps}-{head_id}", current.review_unit_id);
@@ -1330,7 +1442,7 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
         .unwrap_or_default();
     format!(
         r#"<section class="me-content-feedback" aria-labelledby="me-content-feedback-title">
-<h2 class="ae-h" id="me-content-feedback-title">This item:</h2>
+<h2 class="ae-h" id="me-content-feedback-title">Card quality</h2>
 <p class="ae-dim">Was this generated card worth keeping?</p>
 <form action="/app/content-feedback" method="post">
 {csrf}<input type="hidden" name="reviewUnitId" value="{review_unit_id}">
@@ -1351,13 +1463,7 @@ fn render_content_feedback(account: &AppAccount, current: &BetaStudyCurrent) -> 
     )
 }
 
-/// The card's dossier — post-grade only (DESIGN.md): stage, last seen, and
-/// success record, plus the concept line when the grade rolled one up. This
-/// never renders pre-grade; before the answer the question owns the screen.
-fn render_meta_ledger(current: &BetaStudyCurrent) -> String {
-    let Some(feedback) = current.feedback.as_ref() else {
-        return String::new();
-    };
+fn render_meta_ledger(feedback: &BetaStudyFeedback) -> String {
     let history = &feedback.item_history;
     let mut rows = String::new();
     let _ = write!(
@@ -1376,40 +1482,22 @@ fn render_meta_ledger(current: &BetaStudyCurrent) -> String {
         escape_html(&history.success_rate),
         escape_html(&history.trend)
     );
-    if let Some(concept) = feedback.concept_progress.as_ref() {
-        let _ = write!(
-            rows,
-            r"<div><dt>Concept</dt><dd>{} · {}</dd></div>",
-            escape_html(&concept.concept_label),
-            escape_html(&concept.health)
-        );
-    }
     format!(r#"<dl class="me-meta-ledger">{rows}</dl>"#)
 }
 
-/// Reveal the answer in place. Multiple-choice marks the correct option and dims
-/// the rest; free response shows the correct answer on one line.
-fn render_answer_reveal(current: &BetaStudyCurrent) -> String {
-    let correct = current
-        .expected_answer
-        .as_deref()
-        .or_else(|| {
-            current
-                .feedback
-                .as_ref()
-                .map(|f| f.expected_answer.as_str())
-        })
-        .unwrap_or_default();
-    if current.choices.is_empty() {
+/// Reveal the accepted answer in place. Multiple-choice keeps presentation
+/// order, marks the correct option, and dims the rest.
+fn render_answer_reveal(card: &GradedReviewCard<'_>) -> String {
+    if card.current.choices.is_empty() {
         return format!(
-            r#"<p class="me-answer"><span class="me-answer-label">Answer</span><span class="ae-item">{}</span></p>"#,
-            escape_html(correct)
+            r#"<p class="me-answer"><span class="me-answer-label">Accepted answer</span><span class="ae-item">{}</span></p>"#,
+            escape_html(card.accepted_answer)
         );
     }
 
     let mut rows = String::new();
-    for choice in &current.choices {
-        let is_correct = choice == correct;
+    for choice in &card.current.choices {
+        let is_correct = choice == card.accepted_answer;
         let class = if is_correct {
             "me-graded-choice me-graded-choice-correct"
         } else {
@@ -1423,22 +1511,6 @@ fn render_answer_reveal(current: &BetaStudyCurrent) -> String {
         );
     }
     format!(r#"<ol class="me-choices me-choices-graded">{rows}</ol>"#)
-}
-
-/// The verdict (the moment) plus one quiet line on when the card returns.
-fn render_graded_verdict(current: &BetaStudyCurrent) -> String {
-    let when = current
-        .feedback
-        .as_ref()
-        .map(|feedback| feedback.item_history.next_review.as_str())
-        .filter(|phrase| !phrase.is_empty())
-        .map_or_else(String::new, |phrase| {
-            format!(
-                r#"<p class="me-next-when ae-dim">{}</p>"#,
-                escape_html(phrase)
-            )
-        });
-    format!("{}{when}", render_verdict(current))
 }
 
 /// The answer mechanism, chosen by card shape. Pre-grade, multiple-choice cards
@@ -1522,25 +1594,18 @@ fn render_reference(current: &BetaStudyCurrent) -> String {
         })
 }
 
-fn render_verdict(current: &BetaStudyCurrent) -> String {
-    current.grade.as_ref().map_or_else(String::new, |grade| {
-        format!(
-            r#"<p class="me-result">{icon}<span class="me-verdict">{label}</span></p>"#,
-            icon = verdict_icon(grade.verdict),
-            label = verdict_label(grade.verdict),
-        )
-    })
+fn render_verdict(grade: &BetaStudyGrade) -> String {
+    format!(
+        r#"<p class="me-result">{icon}<span class="me-verdict">{label}</span></p>"#,
+        icon = verdict_icon(grade.verdict),
+        label = verdict_label(grade.verdict),
+    )
 }
 
-fn render_next(account: &AppAccount, current: &BetaStudyCurrent) -> String {
-    if current.grade.is_none() {
-        return String::new();
-    }
+fn render_next(account: &AppAccount) -> String {
     // Operator ruling (memory-engine-081, live dogfood): a graded page never
     // advances on its own. The learner reviews the verdict, answer key, and
-    // dossier until they explicitly advance — Continue (or Enter while it is
-    // focused) is the only way forward, correct or not. This reverses the
-    // two-speed auto-advance shipped in memory-engine-078.
+    // dossier until they explicitly advance. Continue is the only way forward.
     format!(
         r#"<form class="me-next" action="/app/next" method="post">{csrf}<button class="ae-button" type="submit">Continue {ICON_ARROW}</button></form>"#,
         csrf = hidden_csrf_input(account),
@@ -2000,7 +2065,7 @@ const FOOTER_TAGLINE: &str = r#"<span class="ae-dim">Scry — Remember everythin
 const ICON_OK: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>"#;
 const ICON_WARN: &str = r#"<svg class="ae-icon ae-warn" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>"#;
 const ICON_ERR: &str = r#"<svg class="ae-icon ae-err" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
-const ICON_REVEALED: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const ICON_REVEALED: &str = r#"<svg class="ae-icon ae-revealed" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ICON_INFO: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>"#;
 const ICON_ARROW: &str = r#"<svg class="ae-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>"#;
 const ICON_UP: &str = r#"<svg class="ae-icon ae-ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>"#;

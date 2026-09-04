@@ -6,11 +6,12 @@ use std::{
 };
 
 use memory_engine_persistence::SourcePermission;
-use memory_engine_persistence_postgres::AccountScope;
+use memory_engine_persistence_postgres::{AccountScope, AccountStudyStore};
 use memory_engine_service::{
     record_content_feedback, ContentFeedback, RecordContentFeedbackCommand,
 };
 use memory_engine_study::{BetaStudySession, BetaStudySourceInput};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     account_store_path, app_session_max_age_ms, auth_challenge_consumed_path, auth_challenge_path,
@@ -92,6 +93,110 @@ pub(crate) type BrowserSessionWorkResult = Result<
     )>,
     ApiFailure,
 >;
+
+pub(crate) type BrowserSessionSubmitResult = Result<
+    Option<(
+        BrowserSessionValidation,
+        Result<SubmitReviewOutcome, ApiFailure>,
+    )>,
+    ApiFailure,
+>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SubmitReviewOutcome {
+    pub(crate) view: StudyViewResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+enum ActiveGradedReview {
+    Active {
+        review_unit_id: String,
+        idempotency_key: String,
+        view: Box<StudyViewResponse>,
+    },
+    Consumed {
+        idempotency_key: String,
+    },
+}
+
+fn can_save_active_graded_review(
+    current: Option<&ActiveGradedReview>,
+    idempotency_key: &str,
+    recovering: bool,
+) -> bool {
+    match current {
+        None => true,
+        Some(ActiveGradedReview::Active {
+            idempotency_key: current,
+            ..
+        }) => !recovering && current == idempotency_key,
+        Some(ActiveGradedReview::Consumed {
+            idempotency_key: consumed,
+        }) => !recovering && consumed != idempotency_key,
+    }
+}
+
+fn decode_active_graded_review(
+    value: Option<serde_json::Value>,
+) -> Result<Option<ActiveGradedReview>, ApiFailure> {
+    value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| ApiFailure::internal(error.to_string()))
+}
+
+fn recover_postgres_submit(
+    mut account: AccountStudyStore<'_>,
+    now: fn() -> i64,
+    review_unit_id: &str,
+    idempotency_key: &str,
+) -> Result<SubmitReviewOutcome, ApiFailure> {
+    let saved =
+        decode_active_graded_review(account.active_graded_review().map_err(postgres_failure)?)?;
+    match saved {
+        Some(ActiveGradedReview::Active {
+            review_unit_id: saved_review_unit_id,
+            idempotency_key: saved_idempotency_key,
+            view,
+        }) if saved_review_unit_id == review_unit_id
+            && saved_idempotency_key == idempotency_key =>
+        {
+            Ok(SubmitReviewOutcome { view: *view })
+        }
+        Some(ActiveGradedReview::Consumed {
+            idempotency_key: consumed,
+        }) if consumed == idempotency_key => Err(ApiFailure::not_found("Review unit not found.")),
+        None => {
+            let mut study = BetaStudySession::from_store(account, now);
+            if !study
+                .restore_graded_review(review_unit_id, idempotency_key)
+                .map_err(postgres_study_failure)?
+            {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            }
+            let response =
+                StudyViewResponse::from_view(study.view().map_err(postgres_study_failure)?);
+            account = study.into_store();
+            let active = serde_json::to_value(ActiveGradedReview::Active {
+                review_unit_id: review_unit_id.to_owned(),
+                idempotency_key: idempotency_key.to_owned(),
+                view: Box::new(response.clone()),
+            })
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            if !account
+                .save_active_graded_review(&active, idempotency_key, true)
+                .map_err(postgres_failure)?
+            {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            }
+            Ok(SubmitReviewOutcome { view: response })
+        }
+        Some(ActiveGradedReview::Active { .. } | ActiveGradedReview::Consumed { .. }) => {
+            Err(ApiFailure::not_found("Review unit not found."))
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct BrowserSessionValidation {
@@ -587,7 +692,7 @@ impl StudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> BrowserSessionWorkResult {
+    ) -> BrowserSessionSubmitResult {
         self.inner.browser_session_submit_review(
             session_id,
             now_ms,
@@ -606,7 +711,7 @@ impl StudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<SubmitReviewOutcome, ApiFailure> {
         self.inner.authenticated_submit_review(
             account_id,
             session_token,
@@ -622,6 +727,16 @@ impl StudyStorage {
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
         self.inner.study_view(account_id, store_path)
+    }
+
+    pub(crate) fn active_graded_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<StudyViewResponse>, ApiFailure> {
+        self.inner
+            .active_graded_review(account_id, store_path, review_unit_id)
     }
     pub(crate) fn study_view_with_timings(
         &self,
@@ -1003,7 +1118,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<SubmitReviewOutcome, ApiFailure> {
         if !self.account_session_matches_with_timings(
             account_id,
             session_token,
@@ -1031,7 +1146,7 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         mut timings: Option<&mut SubmitReviewTimings>,
-    ) -> BrowserSessionWorkResult {
+    ) -> BrowserSessionSubmitResult {
         let Some(validation) = self.load_and_validate_browser_session(
             session_id,
             now_ms,
@@ -1189,7 +1304,13 @@ trait StudyStorageAdapter: fmt::Debug + Send + Sync {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure>;
+    ) -> Result<SubmitReviewOutcome, ApiFailure>;
+    fn active_graded_review(
+        &self,
+        account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<StudyViewResponse>, ApiFailure>;
     fn record_content_feedback(
         &self,
         account_id: &str,
@@ -1240,6 +1361,119 @@ impl FileStudyStorage {
     ) -> Result<R, ApiFailure> {
         let mut study = crate::open_study_session(store_path, self.now)?;
         operation(&mut study)
+    }
+
+    fn review_transition_lock_path(store_path: &FsPath) -> PathBuf {
+        store_path.with_file_name("review-transition.lock")
+    }
+
+    fn active_graded_review_path(store_path: &FsPath) -> PathBuf {
+        store_path.with_file_name("active-graded-review.json")
+    }
+
+    fn active_graded_review_lock_path(store_path: &FsPath) -> PathBuf {
+        store_path.with_file_name("active-graded-review.lock")
+    }
+
+    fn load_active_graded_review(
+        store_path: &FsPath,
+    ) -> Result<Option<ActiveGradedReview>, ApiFailure> {
+        let path = Self::active_graded_review_path(store_path);
+        let saved = match fs::read(&path) {
+            Ok(saved) => saved,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ApiFailure::internal(error.to_string())),
+        };
+        serde_json::from_slice(&saved)
+            .map(Some)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn save_active_graded_review(
+        store_path: &FsPath,
+        active: &ActiveGradedReview,
+        recovering: bool,
+    ) -> Result<bool, ApiFailure> {
+        let _lock = crate::file_lock::acquire(&Self::active_graded_review_lock_path(store_path))?;
+        let idempotency_key = match active {
+            ActiveGradedReview::Active {
+                idempotency_key, ..
+            }
+            | ActiveGradedReview::Consumed { idempotency_key } => idempotency_key,
+        };
+        let current = Self::load_active_graded_review(store_path)?;
+        let permitted =
+            can_save_active_graded_review(current.as_ref(), idempotency_key, recovering);
+        if !permitted {
+            return Ok(false);
+        }
+        let encoded =
+            serde_json::to_vec(active).map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&Self::active_graded_review_path(store_path), &encoded)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn clear_active_graded_review(
+        store_path: &FsPath,
+        expected_idempotency_key: Option<&str>,
+    ) -> Result<(), ApiFailure> {
+        let Some(expected_idempotency_key) = expected_idempotency_key else {
+            return Ok(());
+        };
+        let _lock = crate::file_lock::acquire(&Self::active_graded_review_lock_path(store_path))?;
+        match Self::load_active_graded_review(store_path)? {
+            Some(ActiveGradedReview::Active {
+                idempotency_key, ..
+            }) if expected_idempotency_key == idempotency_key => {}
+            Some(ActiveGradedReview::Consumed { idempotency_key })
+                if expected_idempotency_key == idempotency_key =>
+            {
+                return Ok(());
+            }
+            None => {}
+            Some(ActiveGradedReview::Active { .. } | ActiveGradedReview::Consumed { .. }) => {
+                return Ok(())
+            }
+        }
+        let consumed = ActiveGradedReview::Consumed {
+            idempotency_key: expected_idempotency_key.to_owned(),
+        };
+        let encoded = serde_json::to_vec(&consumed)
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+        write_atomic(&Self::active_graded_review_path(store_path), &encoded)
+            .map_err(|error| ApiFailure::internal(error.to_string()))
+    }
+
+    fn latest_applied_review_idempotency_key(
+        store_path: &FsPath,
+    ) -> Result<Option<String>, ApiFailure> {
+        let store = crate::open_persistence_store(store_path)?;
+        Ok(store
+            .snapshot()
+            .applied_reviews
+            .iter()
+            .filter_map(|receipt| {
+                receipt
+                    .attempt
+                    .idempotency_key
+                    .as_ref()
+                    .map(|key| (receipt.attempt.occurred_at, key))
+            })
+            .max_by_key(|(occurred_at, _)| *occurred_at)
+            .map(|(_, key)| key.clone()))
+    }
+
+    fn review_already_applied(
+        store_path: &FsPath,
+        idempotency_key: &str,
+    ) -> Result<bool, ApiFailure> {
+        let store = crate::open_persistence_store(store_path)?;
+        Ok(store
+            .snapshot()
+            .applied_reviews
+            .iter()
+            .any(|receipt| receipt.attempt.idempotency_key.as_deref() == Some(idempotency_key)))
     }
 
     fn migrate_legacy_account_session(
@@ -2391,10 +2625,20 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let _transition_lock =
+            crate::file_lock::acquire_blocking(&Self::review_transition_lock_path(store_path))?;
+        let expected_idempotency_key = match Self::load_active_graded_review(store_path)? {
+            Some(ActiveGradedReview::Active {
+                idempotency_key, ..
+            }) => Some(idempotency_key),
+            Some(ActiveGradedReview::Consumed { .. }) => None,
+            None => Self::latest_applied_review_idempotency_key(store_path)?,
+        };
         let mut study = crate::open_study_session(store_path, self.now)?;
         let view = study.start().map_err(study_failure)?;
-
-        Ok(StudyViewResponse::from_view(view))
+        let response = StudyViewResponse::from_view(view);
+        Self::clear_active_graded_review(store_path, expected_idempotency_key.as_deref())?;
+        Ok(response)
     }
 
     fn study_view(
@@ -2532,8 +2776,56 @@ impl StudyStorageAdapter for FileStudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         _timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
-        self.with_locked_study(store_path, |study| {
+    ) -> Result<SubmitReviewOutcome, ApiFailure> {
+        let _transition_lock =
+            crate::file_lock::acquire_blocking(&Self::review_transition_lock_path(store_path))?;
+        let applied = !Self::review_already_applied(store_path, &request.idempotency_key)?;
+        if !applied {
+            let saved = Self::load_active_graded_review(store_path)?;
+            if let Some(ActiveGradedReview::Active {
+                review_unit_id: saved_review_unit_id,
+                idempotency_key,
+                view,
+            }) = saved.as_ref()
+            {
+                if saved_review_unit_id == review_unit_id
+                    && idempotency_key == &request.idempotency_key
+                {
+                    return Ok(SubmitReviewOutcome {
+                        view: view.as_ref().clone(),
+                    });
+                }
+            }
+            if matches!(
+                saved.as_ref(),
+                Some(ActiveGradedReview::Consumed {
+                    idempotency_key,
+                }) if idempotency_key == &request.idempotency_key
+            ) {
+                return Err(ApiFailure::not_found("Review unit not found."));
+            }
+            if saved.is_none() {
+                let mut study = crate::open_study_session(store_path, self.now)?;
+                if study
+                    .restore_graded_review(review_unit_id, &request.idempotency_key)
+                    .map_err(study_failure)?
+                {
+                    let view = StudyViewResponse::from_view(study.view().map_err(study_failure)?);
+                    let active = ActiveGradedReview::Active {
+                        review_unit_id: review_unit_id.to_owned(),
+                        idempotency_key: request.idempotency_key,
+                        view: Box::new(view.clone()),
+                    };
+                    if Self::save_active_graded_review(store_path, &active, true)? {
+                        return Ok(SubmitReviewOutcome { view });
+                    }
+                }
+            }
+            return Err(ApiFailure::not_found("Review unit not found."));
+        }
+
+        let idempotency_key = request.idempotency_key.clone();
+        let view = self.with_locked_study(store_path, |study| {
             require_current_review(study, review_unit_id)?;
             let view = study
                 .submit_answer_with_idempotency_key(
@@ -2543,6 +2835,34 @@ impl StudyStorageAdapter for FileStudyStorage {
                 )
                 .map_err(study_failure)?;
             Ok(StudyViewResponse::from_view(view))
+        })?;
+        let active = ActiveGradedReview::Active {
+            review_unit_id: review_unit_id.to_owned(),
+            idempotency_key,
+            view: Box::new(view.clone()),
+        };
+        if !Self::save_active_graded_review(store_path, &active, false)? {
+            return Err(ApiFailure::internal(
+                "Graded review was consumed before it could be presented.".to_owned(),
+            ));
+        }
+        Ok(SubmitReviewOutcome { view })
+    }
+
+    fn active_graded_review(
+        &self,
+        _account_id: &str,
+        store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<StudyViewResponse>, ApiFailure> {
+        Ok(match Self::load_active_graded_review(store_path)? {
+            Some(ActiveGradedReview::Active {
+                review_unit_id: saved_review_unit_id,
+                view,
+                ..
+            }) if saved_review_unit_id == review_unit_id => Some(*view),
+            Some(ActiveGradedReview::Active { .. } | ActiveGradedReview::Consumed { .. })
+            | None => None,
         })
     }
 
@@ -3384,10 +3704,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         account_id: &str,
         _store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
-        with_postgres_study(&self.database_url, account_id, self.now, |study| {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
+            let expected_idempotency_key = match decode_active_graded_review(
+                account.active_graded_review().map_err(postgres_failure)?,
+            )? {
+                Some(ActiveGradedReview::Active {
+                    idempotency_key, ..
+                }) => Some(idempotency_key),
+                Some(ActiveGradedReview::Consumed { .. }) => None,
+                None => account
+                    .latest_applied_review_idempotency_key()
+                    .map_err(postgres_failure)?,
+            };
+            let mut study = BetaStudySession::from_store(account, self.now);
             let view = study.start().map_err(study_failure)?;
-
-            Ok(StudyViewResponse::from_view(view))
+            let response = StudyViewResponse::from_view(view);
+            if let Some(idempotency_key) = expected_idempotency_key {
+                let mut account = study.into_store();
+                account
+                    .consume_active_graded_review(&idempotency_key)
+                    .map_err(postgres_failure)?;
+            }
+            Ok(response)
         })
     }
 
@@ -3417,9 +3756,28 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
             let mut account = store.for_account(scope);
             account.ensure_account(now_ms).map_err(postgres_failure)?;
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
+            let expected_idempotency_key = match decode_active_graded_review(
+                account.active_graded_review().map_err(postgres_failure)?,
+            )? {
+                Some(ActiveGradedReview::Active {
+                    idempotency_key, ..
+                }) => Some(idempotency_key),
+                Some(ActiveGradedReview::Consumed { .. }) => None,
+                None => account
+                    .latest_applied_review_idempotency_key()
+                    .map_err(postgres_failure)?,
+            };
             let mut study = BetaStudySession::from_store(account, now);
             let view = study.start().map_err(study_failure)?;
-            Ok(StudyViewResponse::from_view(view))
+            let response = StudyViewResponse::from_view(view);
+            if let Some(idempotency_key) = expected_idempotency_key {
+                let mut account = study.into_store();
+                account
+                    .consume_active_graded_review(&idempotency_key)
+                    .map_err(postgres_failure)?;
+            }
+            Ok(response)
         })
     }
 
@@ -3486,9 +3844,29 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
                 let mut account = store.for_account(scope);
                 account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
+                let expected_idempotency_key = match decode_active_graded_review(
+                    account.active_graded_review().map_err(postgres_failure)?,
+                )? {
+                    Some(ActiveGradedReview::Active {
+                        idempotency_key, ..
+                    }) => Some(idempotency_key),
+                    Some(ActiveGradedReview::Consumed { .. }) => None,
+                    None => account
+                        .latest_applied_review_idempotency_key()
+                        .map_err(postgres_failure)?,
+                };
                 let mut study = BetaStudySession::from_store(account, now);
                 let view = study.start().map_err(study_failure)?;
-                Ok(StudyViewResponse::from_view(view))
+                let response = StudyViewResponse::from_view(view);
+                if let Some(idempotency_key) = expected_idempotency_key {
+                    let mut account = study.into_store();
+                    account
+                        .consume_active_graded_review(&idempotency_key)
+                        .map_err(postgres_failure)?;
+                }
+                Ok(response)
             })();
             Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
@@ -3501,7 +3879,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<SubmitReviewOutcome, ApiFailure> {
         let session_token_hash = if is_secret_hash(session_token) {
             session_token.to_owned()
         } else {
@@ -3522,14 +3900,19 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
             let mut account = store.for_account(scope);
             account.ensure_account(now_ms).map_err(postgres_failure)?;
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
             if account
                 .applied_review_idempotency_key_exists(&request.idempotency_key)
                 .map_err(postgres_failure)?
             {
-                let study = BetaStudySession::from_store(account, now);
-                let view = study.view().map_err(study_failure)?;
-                return Ok(StudyViewResponse::from_view(view));
+                return recover_postgres_submit(
+                    account,
+                    now,
+                    review_unit_id,
+                    &request.idempotency_key,
+                );
             }
+            let idempotency_key = request.idempotency_key.clone();
             let mut study = BetaStudySession::from_store(account, now);
             require_current_review_postgres(&mut study, review_unit_id)?;
             let view = study
@@ -3539,7 +3922,23 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     Some(request.idempotency_key),
                 )
                 .map_err(study_failure)?;
-            Ok(StudyViewResponse::from_view(view))
+            let response = StudyViewResponse::from_view(view);
+            let mut account = study.into_store();
+            let active = serde_json::to_value(ActiveGradedReview::Active {
+                review_unit_id: review_unit_id.to_owned(),
+                idempotency_key: idempotency_key.clone(),
+                view: Box::new(response.clone()),
+            })
+            .map_err(|error| ApiFailure::internal(error.to_string()))?;
+            if !account
+                .save_active_graded_review(&active, &idempotency_key, false)
+                .map_err(postgres_failure)?
+            {
+                return Err(ApiFailure::internal(
+                    "Graded review was consumed before it could be presented.".to_owned(),
+                ));
+            }
+            Ok(SubmitReviewOutcome { view: response })
         })
     }
 
@@ -3551,7 +3950,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> BrowserSessionWorkResult {
+    ) -> BrowserSessionSubmitResult {
         let session_id_hash = secret_hash(session_id);
         let expected_csrf_hash = csrf_token_hash.to_owned();
         let now = self.now;
@@ -3608,14 +4007,20 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
                 let mut account = store.for_account(scope);
                 account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
                 if account
                     .applied_review_idempotency_key_exists(&request.idempotency_key)
                     .map_err(postgres_failure)?
                 {
-                    let study = BetaStudySession::from_store(account, now);
-                    let view = study.view().map_err(study_failure)?;
-                    return Ok(StudyViewResponse::from_view(view));
+                    return recover_postgres_submit(
+                        account,
+                        now,
+                        review_unit_id,
+                        &request.idempotency_key,
+                    );
                 }
+                let idempotency_key = request.idempotency_key.clone();
                 let mut study = BetaStudySession::from_store(account, now);
                 require_current_review_postgres(&mut study, review_unit_id)?;
                 let view = study
@@ -3625,7 +4030,23 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         Some(request.idempotency_key),
                     )
                     .map_err(study_failure)?;
-                Ok(StudyViewResponse::from_view(view))
+                let response = StudyViewResponse::from_view(view);
+                let mut account = study.into_store();
+                let active = serde_json::to_value(ActiveGradedReview::Active {
+                    review_unit_id: review_unit_id.to_owned(),
+                    idempotency_key: idempotency_key.clone(),
+                    view: Box::new(response.clone()),
+                })
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                if !account
+                    .save_active_graded_review(&active, &idempotency_key, false)
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::internal(
+                        "Graded review was consumed before it could be presented.".to_owned(),
+                    ));
+                }
+                Ok(SubmitReviewOutcome { view: response })
             })();
             Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
@@ -3806,23 +4227,27 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         review_unit_id: &str,
         request: SubmitReviewRequest,
         timings: Option<&mut SubmitReviewTimings>,
-    ) -> Result<StudyViewResponse, ApiFailure> {
+    ) -> Result<SubmitReviewOutcome, ApiFailure> {
         with_postgres_account_timed(
             &self.database_url,
             account_id,
             self.now_ms(),
             timings,
             |account| {
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
                 if account
                     .applied_review_idempotency_key_exists(&request.idempotency_key)
                     .map_err(postgres_failure)?
                 {
-                    let study = BetaStudySession::from_store(account, self.now);
-                    let view = study.view().map_err(study_failure)?;
-
-                    return Ok(StudyViewResponse::from_view(view));
+                    return recover_postgres_submit(
+                        account,
+                        self.now,
+                        review_unit_id,
+                        &request.idempotency_key,
+                    );
                 }
-
+                let idempotency_key = request.idempotency_key.clone();
                 let mut study = BetaStudySession::from_store(account, self.now);
                 require_current_review_postgres(&mut study, review_unit_id)?;
                 let view = study
@@ -3832,10 +4257,50 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         Some(request.idempotency_key),
                     )
                     .map_err(study_failure)?;
-
-                Ok(StudyViewResponse::from_view(view))
+                let response = StudyViewResponse::from_view(view);
+                let mut account = study.into_store();
+                let active = serde_json::to_value(ActiveGradedReview::Active {
+                    review_unit_id: review_unit_id.to_owned(),
+                    idempotency_key: idempotency_key.clone(),
+                    view: Box::new(response.clone()),
+                })
+                .map_err(|error| ApiFailure::internal(error.to_string()))?;
+                if !account
+                    .save_active_graded_review(&active, &idempotency_key, false)
+                    .map_err(postgres_failure)?
+                {
+                    return Err(ApiFailure::internal(
+                        "Graded review was consumed before it could be presented.".to_owned(),
+                    ));
+                }
+                Ok(SubmitReviewOutcome { view: response })
             },
         )
+    }
+
+    fn active_graded_review(
+        &self,
+        account_id: &str,
+        _store_path: &FsPath,
+        review_unit_id: &str,
+    ) -> Result<Option<StudyViewResponse>, ApiFailure> {
+        with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            Ok(
+                match decode_active_graded_review(
+                    account.active_graded_review().map_err(postgres_failure)?,
+                )? {
+                    Some(ActiveGradedReview::Active {
+                        review_unit_id: saved_review_unit_id,
+                        view,
+                        ..
+                    }) if saved_review_unit_id == review_unit_id => Some(*view),
+                    Some(
+                        ActiveGradedReview::Active { .. } | ActiveGradedReview::Consumed { .. },
+                    )
+                    | None => None,
+                },
+            )
+        })
     }
 
     fn record_content_feedback(
@@ -3874,6 +4339,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
@@ -3888,6 +4354,22 @@ mod tests {
         thread,
         time::Duration,
     };
+    #[test]
+    fn consumed_grade_cannot_be_resurrected() {
+        let consumed = ActiveGradedReview::Consumed {
+            idempotency_key: "review-a".to_owned(),
+        };
+        assert!(!can_save_active_graded_review(
+            Some(&consumed),
+            "review-a",
+            false
+        ));
+        assert!(!can_save_active_graded_review(
+            Some(&consumed),
+            "review-a",
+            true
+        ));
+    }
 
     fn test_now() -> i64 {
         1_700_000_000_000

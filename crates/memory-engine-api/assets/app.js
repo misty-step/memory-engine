@@ -80,6 +80,7 @@
       action === "/app/next" ||
       action === "/app/draft/keep" ||
       action === "/app/draft/reject" ||
+      action === "/app/content-feedback" ||
       action === "/app/skip" ||
       action === "/app/snooze" ||
       action === "/app/snooze-concept" ||
@@ -330,10 +331,13 @@
   }
 
   function formBody(form, control) {
-    if (typeof window.FormData !== "function") return null;
-    var body;
+    if (
+      typeof window.FormData !== "function" ||
+      typeof window.URLSearchParams !== "function"
+    ) return null;
+    var fields;
     try {
-      body = new window.FormData(form);
+      fields = new window.FormData(form);
     } catch (error) {
       return null;
     }
@@ -341,7 +345,7 @@
     if (
       control &&
       typeof control.getAttribute === "function" &&
-      typeof body.append === "function"
+      typeof fields.append === "function"
     ) {
       var name = control.getAttribute("name") || control.name;
       var value =
@@ -349,10 +353,18 @@
           ? control.value
           : control.getAttribute("value");
       if (typeof name === "string" && name && typeof value === "string") {
-        if (typeof body.has !== "function" || !body.has(name)) {
-          body.append(name, value);
+        if (typeof fields.has !== "function" || !fields.has(name)) {
+          fields.append(name, value);
         }
       }
+    }
+    var body = new window.URLSearchParams();
+    try {
+      fields.forEach(function (value, name) {
+        body.append(name, String(value));
+      });
+    } catch (error) {
+      return null;
     }
     return body;
   }
@@ -498,6 +510,7 @@
         credentials: "same-origin",
         headers: {
           Accept: "text/html",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
           "X-Requested-With": "scry-inplace"
         },
         redirect: "follow"

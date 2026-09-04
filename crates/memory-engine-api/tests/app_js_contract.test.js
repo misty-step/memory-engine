@@ -253,6 +253,9 @@ function browserHarness(options = {}) {
     entries() {
       return this.map.entries();
     }
+    forEach(callback) {
+      this.map.forEach((value, name) => callback(value, name, this));
+    }
   }
   class FakeDOMParser {
     parseFromString(html) {
@@ -339,6 +342,7 @@ function browserHarness(options = {}) {
   };
   if (enableInPlace) {
     window.FormData = FakeFormData;
+    window.URLSearchParams = URLSearchParams;
     window.DOMParser = FakeDOMParser;
   }
   window.window = window;
@@ -541,6 +545,9 @@ test("review submit fetches and swaps the graded view without inventing a verdic
   expect(browser.fetches).toHaveLength(1);
   expect(browser.fetches[0].url).toBe("/app/submit");
   expect(browser.fetches[0].request.headers["X-Requested-With"]).toBe("scry-inplace");
+  expect(browser.fetches[0].request.headers["Content-Type"]).toBe(
+    "application/x-www-form-urlencoded;charset=UTF-8",
+  );
   const body = browser.fetches[0].request.body;
   expect(body.get("answer")).toBe("42");
   expect(Number(body.get("responseTimeMs"))).toBeGreaterThan(0);
@@ -726,11 +733,60 @@ test("keep draft fetches in place and updates the due count", async () => {
   expect(browser.prevented()).toBe(1);
   expect(browser.controlLabel()).toBe("Keeping…");
   expect(browser.handoff()).toBeNull();
+  expect(browser.fetches[0].request.headers["Content-Type"]).toBe(
+    "application/x-www-form-urlencoded;charset=UTF-8",
+  );
+  expect(browser.fetches[0].request.body.get("csrfToken")).toBe("csrf-test");
   await flushMicrotasks();
   expect(browser.viewHtml()).toContain("Queue ready");
   expect(browser.viewHtml()).not.toContain("me-pending-draft");
   expect(browser.dueText()).toBe("1 due");
   expect(browser.nativeSubmits()).toBe(0);
+});
+
+test("card quality saves in place with the clicked verdict", async () => {
+  const browser = browserHarness({
+    inPlace: true,
+    action: "/app/content-feedback",
+    formClass: "me-content-feedback",
+    controlClasses: ["ae-button"],
+    controlLabel: "Keep this card",
+    controlName: "verdict",
+    controlValue: "kept",
+    formFields: {
+      csrfToken: "csrf-test",
+      reviewUnitId: "unit-1",
+      idempotencyKey: "feedback-unit-1-1-new",
+      rationale: "The accepted answer is clear.",
+    },
+    fetchImpl() {
+      return Promise.resolve({
+        ok: true,
+        headers: { get: () => "text/html; charset=utf-8" },
+        text: () =>
+          Promise.resolve(
+            htmlReviewLanding(
+              "Same graded card",
+              "0 due",
+              "Saved. This card will help improve future generation.",
+            ),
+          ),
+      });
+    },
+  });
+
+  browser.dispatchSubmit();
+  expect(browser.prevented()).toBe(1);
+  expect(browser.fetches[0].url).toBe("/app/content-feedback");
+  expect(browser.fetches[0].request.body.get("verdict")).toBe("kept");
+  expect(browser.fetches[0].request.body.get("rationale")).toBe(
+    "The accepted answer is clear.",
+  );
+  await flushMicrotasks();
+  expect(browser.viewHtml()).toContain("Same graded card");
+  expect(browser.viewHtml()).toContain("Saved. This card will help improve");
+  expect(browser.nativeSubmits()).toBe(0);
+  expect(browser.navigations).toEqual([]);
 });
 
 test("keep error HTML swaps without a second POST", async () => {

@@ -260,6 +260,8 @@ pub struct BetaStudyFeedback {
     pub expected_answer: String,
     pub item_history: BetaStudyItemHistory,
     pub concept_progress: Option<BetaStudyConceptProgress>,
+    #[serde(default)]
+    pub remediation_drafts_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -691,6 +693,58 @@ where
             remediation_provider: None,
             remediation_notice: None,
         }
+    }
+
+    /// Return the owned store after a session operation completes.
+    #[must_use]
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
+    /// Restore the graded projection for a durably applied idempotency key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BetaStudyError`] when the persisted study snapshot cannot be read.
+    pub fn restore_graded_review(
+        &mut self,
+        review_unit_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, BetaStudyError<<S as MemoryServiceStore>::Error>> {
+        let snapshot = self.snapshot()?;
+        let Some(receipt) = snapshot.applied_reviews.iter().find(|receipt| {
+            receipt.attempt.review_unit_id.as_str() == review_unit_id
+                && receipt.attempt.idempotency_key.as_deref() == Some(idempotency_key)
+        }) else {
+            return Ok(false);
+        };
+        let Some(grade) = receipt.attempt.grade.as_ref() else {
+            return Ok(false);
+        };
+        let Some(review_unit) = snapshot
+            .review_units
+            .iter()
+            .find(|unit| unit.review_unit_id == receipt.attempt.review_unit_id)
+        else {
+            return Ok(false);
+        };
+        let Some(current) =
+            approved_draft_from_unit(&snapshot.generated_prompt_drafts, review_unit)
+        else {
+            return Ok(false);
+        };
+
+        self.current = Some(current);
+        self.expected_answer = Some(grade.expected_answer.clone());
+        self.reference_text = None;
+        self.grade = Some(BetaStudyGrade::from_grade(grade));
+        self.schedule_change = Some(ScheduleChange {
+            before: project_schedule(receipt.expected_prior_schedule_state.as_ref()),
+            after: project_required_schedule(&receipt.schedule_state),
+        });
+        self.status = BetaStudyStatus::Graded;
+        self.remediation_notice = None;
+        Ok(true)
     }
 
     /// Opt this session into automatic remediation-pack generation using the
@@ -2444,12 +2498,17 @@ fn feedback_for_current(
         .iter()
         .find(|concept| concept.concept_key == concept_key)
         .cloned();
+    let remediation_drafts_pending = snapshot.remediation_packs.iter().any(|pack| {
+        pack.status == RemediationPackStatus::Active
+            && pack.parent_review_unit_id == draft.review_unit_id
+    });
 
     BetaStudyFeedback {
         verdict: verdict_label(grade.verdict).to_owned(),
         expected_answer: prompt_expected_answer(&draft.prompt),
         item_history,
         concept_progress,
+        remediation_drafts_pending,
     }
 }
 

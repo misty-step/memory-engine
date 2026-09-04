@@ -474,6 +474,11 @@ CREATE INDEX IF NOT EXISTS memory_engine_remediation_packs_attempt_idx
     ON memory_engine_remediation_packs(account_id, attempt_id);
 ";
 
+const ACTIVE_GRADED_REVIEW_MIGRATION_SQL: &str = r"
+ALTER TABLE memory_engine_accounts
+    ADD COLUMN IF NOT EXISTS active_graded_review JSONB;
+";
+
 /// Production waitlist storage: one row per normalized email plus an
 /// append-only audit log of every join/invite/delete transition. The
 /// audit log is intentionally separate from the operational row so a
@@ -511,6 +516,7 @@ pub static MIGRATION_SQL: LazyLock<String> = LazyLock::new(|| {
         WAITLIST_MIGRATION_SQL,
         SESSION_SCHEMA_MIGRATION_SQL,
         REMEDIATION_PACKS_MIGRATION_SQL,
+        ACTIVE_GRADED_REVIEW_MIGRATION_SQL,
     ]
     .concat()
 });
@@ -539,6 +545,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (5, WAITLIST_MIGRATION_SQL),
     (6, SESSION_SCHEMA_MIGRATION_SQL),
     (7, REMEDIATION_PACKS_MIGRATION_SQL),
+    (8, ACTIVE_GRADED_REVIEW_MIGRATION_SQL),
 ];
 
 fn migration_now_ms() -> i64 {
@@ -2957,11 +2964,53 @@ struct GenerationLeaseFence {
     lease_token: String,
 }
 
+/// Session-scoped lock for one account's grade/projection/Continue transition.
+///
+/// Dropping the guard releases the lock. A broken connection releases all of
+/// its session locks at the server.
+pub struct AccountReviewTransitionGuard<'a> {
+    client: &'a RefCell<CountingClient>,
+    account_id: String,
+}
+
+impl Drop for AccountReviewTransitionGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.borrow_mut().query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            &[&self.account_id],
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
     client: &'a RefCell<CountingClient>,
     scope: AccountScope,
     generation_lease_fence: Option<GenerationLeaseFence>,
+}
+
+impl<'a> AccountStudyStore<'a> {
+    /// Hold the account advisory lock across a complete grade/projection or
+    /// Continue transition.
+    ///
+    /// The session lock spans the smaller study-store transactions. The
+    /// returned guard releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the lock request.
+    pub fn lock_review_transition(
+        &self,
+    ) -> Result<AccountReviewTransitionGuard<'a>, PostgresStoreError> {
+        self.client.borrow_mut().query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+            &[&self.scope.account_id],
+        )?;
+        Ok(AccountReviewTransitionGuard {
+            client: self.client,
+            account_id: self.scope.account_id.clone(),
+        })
+    }
 }
 
 impl AccountStudyStore<'_> {
@@ -3222,6 +3271,108 @@ impl AccountStudyStore<'_> {
         )?;
 
         Ok(row.is_some())
+    }
+
+    /// Read the newest durable client idempotency key for Continue recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn latest_applied_review_idempotency_key(
+        &self,
+    ) -> Result<Option<String>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT attempt ->> 'idempotencyKey'
+             FROM memory_engine_applied_reviews
+             WHERE account_id = $1
+               AND attempt ->> 'idempotencyKey' IS NOT NULL
+             ORDER BY applied_at_ms DESC, receipt_key DESC
+             LIMIT 1",
+            &[&self.scope.account_id],
+        )?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Read the exact graded review that remains active until Continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the read.
+    pub fn active_graded_review(&self) -> Result<Option<serde_json::Value>, PostgresStoreError> {
+        let row = self.client.borrow_mut().query_opt(
+            "SELECT active_graded_review FROM memory_engine_accounts WHERE account_id = $1",
+            &[&self.scope.account_id],
+        )?;
+        Ok(row.and_then(|row| row.get(0)))
+    }
+
+    /// Recovery can only fill an absent value. A fresh grade can replace a
+    /// different consumed key, but never another active review.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn save_active_graded_review(
+        &mut self,
+        active_review: &serde_json::Value,
+        idempotency_key: &str,
+        recovering: bool,
+    ) -> Result<bool, PostgresStoreError> {
+        let updated = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_accounts
+             SET active_graded_review = $2
+             WHERE account_id = $1
+               AND (
+                    ($4::boolean AND active_graded_review IS NULL)
+                    OR (
+                        NOT $4::boolean
+                        AND (
+                            active_graded_review IS NULL
+                            OR (
+                                active_graded_review ->> 'state' = 'consumed'
+                                AND active_graded_review ->> 'idempotencyKey'
+                                    IS DISTINCT FROM $3
+                            )
+                            OR (
+                                COALESCE(active_graded_review ->> 'state', 'active') = 'active'
+                                AND active_graded_review ->> 'idempotencyKey' = $3
+                            )
+                        )
+                    )
+               )",
+            &[
+                &self.scope.account_id,
+                active_review,
+                &idempotency_key,
+                &recovering,
+            ],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Mark the expected active graded review consumed after Continue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the update.
+    pub fn consume_active_graded_review(
+        &mut self,
+        idempotency_key: &str,
+    ) -> Result<bool, PostgresStoreError> {
+        let updated = self.client.borrow_mut().execute(
+            "UPDATE memory_engine_accounts
+             SET active_graded_review = jsonb_build_object(
+                    'state', 'consumed',
+                    'idempotencyKey', $2::text
+                 )
+             WHERE account_id = $1
+               AND (
+                    active_graded_review IS NULL
+                    OR active_graded_review ->> 'idempotencyKey' = $2
+               )",
+            &[&self.scope.account_id, &idempotency_key],
+        )?;
+        Ok(updated == 1)
     }
 
     /// Create a review unit for the scoped account, or leave an existing unit
@@ -5655,6 +5806,7 @@ mod tests {
         assert!(sql.contains("rate_limit_key TEXT PRIMARY KEY"));
         assert!(sql.contains("expected_prior_schedule_state JSONB"));
         assert!(sql.contains("ON DELETE CASCADE"));
+        assert!(sql.contains("active_graded_review JSONB"));
         assert!(sql.contains("memory_engine_generation_jobs"));
         assert!(sql.contains("lease_token TEXT"));
         assert!(sql.contains("reserved_cost_usd_micros BIGINT"));
@@ -5689,6 +5841,7 @@ mod tests {
             (5, "memory_engine_waitlist_entries"),
             (6, "memory_engine_api_sessions"),
             (7, "memory_engine_remediation_packs"),
+            (8, "active_graded_review JSONB"),
         ];
 
         for (version, marker) in PINNED {
@@ -8116,7 +8269,96 @@ mod tests {
         run_postgres_study_session_contract(&mut store)?;
         run_postgres_concept_snooze_contract(&mut store)?;
         run_postgres_remediation_pack_contract(&mut store)?;
+        run_postgres_active_graded_review_contract(&mut store)?;
+        run_postgres_review_transition_lock_contract(database_url)?;
 
+        Ok(())
+    }
+
+    fn run_postgres_review_transition_lock_contract(
+        database_url: &str,
+    ) -> Result<(), PostgresStoreError> {
+        let mut holder_store = PostgresStudyStore::connect(database_url)?;
+        let mut holder =
+            holder_store.for_account(AccountScope::new("acct-review-transition-lock")?);
+        holder.ensure_account(NOW)?;
+        let holder_guard = holder.lock_review_transition()?;
+        let contender_url = database_url.to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let mut store =
+                PostgresStudyStore::connect(&contender_url).expect("contender connection");
+            let account =
+                store.for_account(AccountScope::new("acct-review-transition-lock").expect("scope"));
+            started_tx.send(()).expect("signal contender start");
+            let _guard = account
+                .lock_review_transition()
+                .expect("acquire contender transition");
+            acquired_tx.send(()).expect("signal lock acquisition");
+        });
+        started_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second connection must wait for the account transition lock"
+        );
+        drop(holder_guard);
+        contender.join().expect("contender joined");
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("contender acquires after release");
+        Ok(())
+    }
+
+    fn run_postgres_active_graded_review_contract(
+        store: &mut PostgresStudyStore,
+    ) -> Result<(), PostgresStoreError> {
+        let mut account = store.for_account(AccountScope::new("acct-active-graded-review")?);
+        account.ensure_account(NOW)?;
+        let first = serde_json::json!({
+            "state": "active",
+            "reviewUnitId": "unit-a",
+            "idempotencyKey": "review-a",
+            "view": {"status": "graded"}
+        });
+        assert!(account.save_active_graded_review(&first, "review-a", true)?);
+        assert_eq!(account.active_graded_review()?, Some(first.clone()));
+        let second = serde_json::json!({
+            "state": "active",
+            "reviewUnitId": "unit-b",
+            "idempotencyKey": "review-b",
+            "view": {"status": "graded"}
+        });
+        assert!(!account.save_active_graded_review(&second, "review-b", true)?);
+        assert!(!account.save_active_graded_review(&second, "review-b", false)?);
+        assert_eq!(account.active_graded_review()?, Some(first.clone()));
+        assert!(account.consume_active_graded_review("review-a")?);
+        assert_eq!(
+            account.active_graded_review()?,
+            Some(serde_json::json!({
+                "state": "consumed",
+                "idempotencyKey": "review-a"
+            }))
+        );
+        assert!(!account.save_active_graded_review(&first, "review-a", false)?);
+
+        assert!(account.save_active_graded_review(&second, "review-b", false)?);
+        assert_eq!(account.active_graded_review()?, Some(second));
+
+        drop(account);
+        let mut missing =
+            store.for_account(AccountScope::new("acct-missing-active-graded-review")?);
+        missing.ensure_account(NOW)?;
+        assert!(missing.consume_active_graded_review("review-missing")?);
+        assert_eq!(
+            missing.active_graded_review()?,
+            Some(serde_json::json!({
+                "state": "consumed",
+                "idempotencyKey": "review-missing"
+            }))
+        );
         Ok(())
     }
 
