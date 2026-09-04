@@ -105,7 +105,6 @@ pub(crate) type BrowserSessionSubmitResult = Result<
 #[derive(Clone, Debug)]
 pub(crate) struct SubmitReviewOutcome {
     pub(crate) view: StudyViewResponse,
-    pub(crate) applied: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -146,10 +145,7 @@ fn recover_postgres_submit(
         }) if saved_review_unit_id == review_unit_id
             && saved_idempotency_key == idempotency_key =>
         {
-            Ok(SubmitReviewOutcome {
-                view: *view,
-                applied: false,
-            })
+            Ok(SubmitReviewOutcome { view: *view })
         }
         Some(ActiveGradedReview::Consumed {
             idempotency_key: consumed,
@@ -177,10 +173,7 @@ fn recover_postgres_submit(
             {
                 return Err(ApiFailure::not_found("Review unit not found."));
             }
-            Ok(SubmitReviewOutcome {
-                view: response,
-                applied: false,
-            })
+            Ok(SubmitReviewOutcome { view: response })
         }
         Some(ActiveGradedReview::Active { .. } | ActiveGradedReview::Consumed { .. }) => {
             Err(ApiFailure::not_found("Review unit not found."))
@@ -2782,7 +2775,6 @@ impl StudyStorageAdapter for FileStudyStorage {
                 {
                     return Ok(SubmitReviewOutcome {
                         view: view.as_ref().clone(),
-                        applied: false,
                     });
                 }
             }
@@ -2807,10 +2799,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                         view: Box::new(view.clone()),
                     };
                     if Self::save_active_graded_review(store_path, &active, true)? {
-                        return Ok(SubmitReviewOutcome {
-                            view,
-                            applied: false,
-                        });
+                        return Ok(SubmitReviewOutcome { view });
                     }
                 }
             }
@@ -2839,10 +2828,7 @@ impl StudyStorageAdapter for FileStudyStorage {
                 "Graded review was consumed before it could be presented.".to_owned(),
             ));
         }
-        Ok(SubmitReviewOutcome {
-            view,
-            applied: true,
-        })
+        Ok(SubmitReviewOutcome { view })
     }
 
     fn active_graded_review(
@@ -3929,10 +3915,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     "Graded review was consumed before it could be presented.".to_owned(),
                 ));
             }
-            Ok(SubmitReviewOutcome {
-                view: response,
-                applied: true,
-            })
+            Ok(SubmitReviewOutcome { view: response })
         })
     }
 
@@ -4038,10 +4021,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         "Graded review was consumed before it could be presented.".to_owned(),
                     ));
                 }
-                Ok(SubmitReviewOutcome {
-                    view: response,
-                    applied: true,
-                })
+                Ok(SubmitReviewOutcome { view: response })
             })();
             Ok(Some((BrowserSessionValidation { session, touched }, work)))
         })
@@ -4266,10 +4246,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                         "Graded review was consumed before it could be presented.".to_owned(),
                     ));
                 }
-                Ok(SubmitReviewOutcome {
-                    view: response,
-                    applied: true,
-                })
+                Ok(SubmitReviewOutcome { view: response })
             },
         )
     }

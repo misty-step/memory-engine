@@ -1982,7 +1982,6 @@ impl Default for AccountRegistryData {
 struct AccountRecord {
     store_path: PathBuf,
     sources: BTreeMap<String, SourceRecord>,
-    submitted_reviews: BTreeMap<String, StudyViewResponse>,
 }
 
 #[derive(Clone, Debug)]

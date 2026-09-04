@@ -2255,6 +2255,18 @@ async fn app_content_feedback_keeps_the_graded_review_until_continue() {
         first_review_unit_id,
         "Continue must remain the only action that advances"
     );
+    assert_no_graded_card(
+        submit_review_response(
+            &app,
+            &cookie,
+            &csrf_token,
+            &first_review_unit_id,
+            "deliberately wrong",
+            &first_review_key,
+        )
+        .await,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2305,8 +2317,7 @@ async fn active_graded_review_survives_restart_but_not_continue() {
     )
     .await;
     let mismatched = response_text(mismatched).await;
-    assert!(!mismatched.contains(r#"class="me-verdict""#));
-    assert!(!active_path.exists());
+    assert!(!mismatched.contains(r#"class="me-verdict""#) && !active_path.exists());
 
     let recovered = submit_review_response(
         &restarted,
@@ -2343,13 +2354,16 @@ async fn active_graded_review_survives_restart_but_not_continue() {
         AccountRegistry::with_store_root(&store_root)
             .with_auth_config(AuthConfig::for_local_tests()),
     ));
-    let _replay = submit_review_response(
-        &replayed,
-        &cookie,
-        &csrf_token,
-        &review_unit_id,
-        "deliberately wrong",
-        &review_key,
+    assert_no_graded_card(
+        submit_review_response(
+            &replayed,
+            &cookie,
+            &csrf_token,
+            &review_unit_id,
+            "deliberately wrong",
+            &review_key,
+        )
+        .await,
     )
     .await;
 
@@ -11075,6 +11089,14 @@ async fn response_text(response: axum::response::Response) -> String {
         .await
         .expect("body");
     String::from_utf8(bytes.to_vec()).expect("utf8")
+}
+
+async fn assert_no_graded_card(response: axum::response::Response) {
+    let body = response_text(response).await;
+    assert!(
+        !body.contains(r#"class="me-verdict""#),
+        "consumed review replay must not render a graded card"
+    );
 }
 
 #[test]
