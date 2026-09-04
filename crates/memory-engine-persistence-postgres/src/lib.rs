@@ -2964,11 +2964,53 @@ struct GenerationLeaseFence {
     lease_token: String,
 }
 
+/// Session-scoped lock for one account's grade/projection/Continue transition.
+///
+/// Dropping the guard releases the lock. A broken connection releases all of
+/// its session locks at the server.
+pub struct AccountReviewTransitionGuard<'a> {
+    client: &'a RefCell<CountingClient>,
+    account_id: String,
+}
+
+impl Drop for AccountReviewTransitionGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.borrow_mut().query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            &[&self.account_id],
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct AccountStudyStore<'a> {
     client: &'a RefCell<CountingClient>,
     scope: AccountScope,
     generation_lease_fence: Option<GenerationLeaseFence>,
+}
+
+impl<'a> AccountStudyStore<'a> {
+    /// Hold the account advisory lock across a complete grade/projection or
+    /// Continue transition.
+    ///
+    /// The session lock spans the smaller study-store transactions. The
+    /// returned guard releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresStoreError`] when Postgres rejects the lock request.
+    pub fn lock_review_transition(
+        &self,
+    ) -> Result<AccountReviewTransitionGuard<'a>, PostgresStoreError> {
+        self.client.borrow_mut().query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+            &[&self.scope.account_id],
+        )?;
+        Ok(AccountReviewTransitionGuard {
+            client: self.client,
+            account_id: self.scope.account_id.clone(),
+        })
+    }
 }
 
 impl AccountStudyStore<'_> {
@@ -3264,8 +3306,6 @@ impl AccountStudyStore<'_> {
         Ok(row.and_then(|row| row.get(0)))
     }
 
-    /// Replace the account's active graded review with compare-and-set semantics.
-    ///
     /// Recovery can only fill an absent value. A fresh grade can replace a
     /// different consumed key, but never another active review.
     ///
@@ -8230,7 +8270,45 @@ mod tests {
         run_postgres_concept_snooze_contract(&mut store)?;
         run_postgres_remediation_pack_contract(&mut store)?;
         run_postgres_active_graded_review_contract(&mut store)?;
+        run_postgres_review_transition_lock_contract(database_url)?;
 
+        Ok(())
+    }
+
+    fn run_postgres_review_transition_lock_contract(
+        database_url: &str,
+    ) -> Result<(), PostgresStoreError> {
+        let mut holder_store = PostgresStudyStore::connect(database_url)?;
+        let mut holder =
+            holder_store.for_account(AccountScope::new("acct-review-transition-lock")?);
+        holder.ensure_account(NOW)?;
+        let holder_guard = holder.lock_review_transition()?;
+        let contender_url = database_url.to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let mut store =
+                PostgresStudyStore::connect(&contender_url).expect("contender connection");
+            let account =
+                store.for_account(AccountScope::new("acct-review-transition-lock").expect("scope"));
+            started_tx.send(()).expect("signal contender start");
+            let _guard = account
+                .lock_review_transition()
+                .expect("acquire contender transition");
+            acquired_tx.send(()).expect("signal lock acquisition");
+        });
+        started_rx.recv().expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second connection must wait for the account transition lock"
+        );
+        drop(holder_guard);
+        contender.join().expect("contender joined");
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("contender acquires after release");
         Ok(())
     }
 

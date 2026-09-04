@@ -120,6 +120,23 @@ enum ActiveGradedReview {
     },
 }
 
+fn can_save_active_graded_review(
+    current: Option<&ActiveGradedReview>,
+    idempotency_key: &str,
+    recovering: bool,
+) -> bool {
+    match current {
+        None => true,
+        Some(ActiveGradedReview::Active {
+            idempotency_key: current,
+            ..
+        }) => !recovering && current == idempotency_key,
+        Some(ActiveGradedReview::Consumed {
+            idempotency_key: consumed,
+        }) => !recovering && consumed != idempotency_key,
+    }
+}
+
 fn decode_active_graded_review(
     value: Option<serde_json::Value>,
 ) -> Result<Option<ActiveGradedReview>, ApiFailure> {
@@ -1346,6 +1363,10 @@ impl FileStudyStorage {
         operation(&mut study)
     }
 
+    fn review_transition_lock_path(store_path: &FsPath) -> PathBuf {
+        store_path.with_file_name("review-transition.lock")
+    }
+
     fn active_graded_review_path(store_path: &FsPath) -> PathBuf {
         store_path.with_file_name("active-graded-review.json")
     }
@@ -1380,16 +1401,9 @@ impl FileStudyStorage {
             }
             | ActiveGradedReview::Consumed { idempotency_key } => idempotency_key,
         };
-        let permitted = match Self::load_active_graded_review(store_path)? {
-            None => true,
-            Some(ActiveGradedReview::Active {
-                idempotency_key: current,
-                ..
-            }) => !recovering && current == *idempotency_key,
-            Some(ActiveGradedReview::Consumed {
-                idempotency_key: consumed,
-            }) => !recovering && consumed != *idempotency_key,
-        };
+        let current = Self::load_active_graded_review(store_path)?;
+        let permitted =
+            can_save_active_graded_review(current.as_ref(), idempotency_key, recovering);
         if !permitted {
             return Ok(false);
         }
@@ -2611,6 +2625,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         _account_id: &str,
         store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
+        let _transition_lock =
+            crate::file_lock::acquire_blocking(&Self::review_transition_lock_path(store_path))?;
         let expected_idempotency_key = match Self::load_active_graded_review(store_path)? {
             Some(ActiveGradedReview::Active {
                 idempotency_key, ..
@@ -2761,6 +2777,8 @@ impl StudyStorageAdapter for FileStudyStorage {
         request: SubmitReviewRequest,
         _timings: Option<&mut SubmitReviewTimings>,
     ) -> Result<SubmitReviewOutcome, ApiFailure> {
+        let _transition_lock =
+            crate::file_lock::acquire_blocking(&Self::review_transition_lock_path(store_path))?;
         let applied = !Self::review_already_applied(store_path, &request.idempotency_key)?;
         if !applied {
             let saved = Self::load_active_graded_review(store_path)?;
@@ -3687,6 +3705,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
         _store_path: &FsPath,
     ) -> Result<StudyViewResponse, ApiFailure> {
         with_postgres_account(&self.database_url, account_id, self.now_ms(), |account| {
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
             let expected_idempotency_key = match decode_active_graded_review(
                 account.active_graded_review().map_err(postgres_failure)?,
             )? {
@@ -3737,6 +3756,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
             let mut account = store.for_account(scope);
             account.ensure_account(now_ms).map_err(postgres_failure)?;
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
             let expected_idempotency_key = match decode_active_graded_review(
                 account.active_graded_review().map_err(postgres_failure)?,
             )? {
@@ -3824,6 +3844,8 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
                 let mut account = store.for_account(scope);
                 account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
                 let expected_idempotency_key = match decode_active_graded_review(
                     account.active_graded_review().map_err(postgres_failure)?,
                 )? {
@@ -3878,6 +3900,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             let scope = AccountScope::new(account_id.to_owned()).map_err(postgres_failure)?;
             let mut account = store.for_account(scope);
             account.ensure_account(now_ms).map_err(postgres_failure)?;
+            let _transition_guard = account.lock_review_transition().map_err(postgres_failure)?;
             if account
                 .applied_review_idempotency_key_exists(&request.idempotency_key)
                 .map_err(postgres_failure)?
@@ -3984,6 +4007,8 @@ impl StudyStorageAdapter for PostgresStudyStorage {
                     AccountScope::new(session.account_id.clone()).map_err(postgres_failure)?;
                 let mut account = store.for_account(scope);
                 account.ensure_account(now_ms).map_err(postgres_failure)?;
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
                 if account
                     .applied_review_idempotency_key_exists(&request.idempotency_key)
                     .map_err(postgres_failure)?
@@ -4209,6 +4234,8 @@ impl StudyStorageAdapter for PostgresStudyStorage {
             self.now_ms(),
             timings,
             |account| {
+                let _transition_guard =
+                    account.lock_review_transition().map_err(postgres_failure)?;
                 if account
                     .applied_review_idempotency_key_exists(&request.idempotency_key)
                     .map_err(postgres_failure)?
@@ -4312,6 +4339,7 @@ impl StudyStorageAdapter for PostgresStudyStorage {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use memory_engine_generation::{
         DraftProvider, ProviderDrafts, ProviderFailure, StructuredBlockProvider,
@@ -4326,6 +4354,22 @@ mod tests {
         thread,
         time::Duration,
     };
+    #[test]
+    fn consumed_grade_cannot_be_resurrected() {
+        let consumed = ActiveGradedReview::Consumed {
+            idempotency_key: "review-a".to_owned(),
+        };
+        assert!(!can_save_active_graded_review(
+            Some(&consumed),
+            "review-a",
+            false
+        ));
+        assert!(!can_save_active_graded_review(
+            Some(&consumed),
+            "review-a",
+            true
+        ));
+    }
 
     fn test_now() -> i64 {
         1_700_000_000_000
