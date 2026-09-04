@@ -27,14 +27,14 @@ mod icons;
 use memory_engine_study::infer_capture_title;
 
 use memory_engine_api_render::{
-    render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
-    render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_create_page, render_edit_review_html,
-    render_entry_recovery, render_entry_requested, render_library_page,
+    render_account_page, render_action_result_html, render_action_result_html_with_notice,
+    render_analytics_page, render_app_shell, render_auth_recovery,
+    render_content_feedback_recovery_html, render_content_feedback_result_html, render_create_page,
+    render_edit_review_html, render_entry_recovery, render_entry_requested, render_library_page,
     render_return_notification_confirmation, render_return_notification_disabled,
     render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
     AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
-    LEDGER_CSS,
+    LEDGER_CSS, SKIP_CONFIRM_NOTICE, SNOOZE_CONCEPT_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE,
 };
 use memory_engine_api_state::{
     browser_session_cookie_header_for_request, browser_session_cookie_present, csrf_token,
@@ -196,6 +196,8 @@ struct EnqueuedGenerationJobResource {
 struct EditDraftRequest {
     prompt: String,
     expected_answer: String,
+    #[serde(default)]
+    choices: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -737,6 +739,24 @@ fn app_home_auth_failure(headers: &HeaderMap, error: &ApiFailure) -> Response {
     }
     app_failure_response(error)
 }
+
+fn app_study_action_result(
+    state: &ApiState,
+    account: &AppAccount,
+    result: Result<StudyViewResponse, ApiFailure>,
+    notice: Option<&str>,
+) -> (StatusCode, Html<String>) {
+    let status = match &result {
+        Ok(_) => StatusCode::OK,
+        Err(error) => error.status(),
+    };
+    (
+        status,
+        Html(render_action_result_html_with_notice(
+            state, account, result, notice,
+        )),
+    )
+}
 fn with_browser_session_cookie(
     mut response: Response,
     account: &AppAccount,
@@ -970,6 +990,7 @@ async fn edit_draft(
         &draft_id,
         &request.prompt,
         &request.expected_answer,
+        &request.choices,
     )?))
 }
 
@@ -1130,7 +1151,6 @@ struct AppStartForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1140,7 +1160,6 @@ struct AppSourceForm {
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1192,6 +1211,8 @@ struct AppDraftEditForm {
     draft_id: String,
     prompt: String,
     expected_answer: String,
+    #[serde(default)]
+    choices: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -1652,7 +1673,7 @@ async fn start_app_study(
     };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture, form.permission),
+        &capture_request(form.title, form.body, form.capture),
     );
 
     html_with_browser_session_for_request(
@@ -1676,7 +1697,7 @@ async fn create_app_source(
         };
     let result = state.save_app_source(
         &account,
-        &capture_request(form.title, form.body, form.capture, form.permission),
+        &capture_request(form.title, form.body, form.capture),
     );
 
     with_browser_session_cookie(
@@ -1707,7 +1728,7 @@ async fn capture_app_source(
             Ok(account) => account,
             Err(error) => return app_failure_response(&error),
         };
-    let request = capture_request(form.title, form.body, form.capture, form.permission);
+    let request = capture_request(form.title, form.body, form.capture);
     let notice = match state.save_app_source(&account, &request) {
         Ok(source) => {
             match state.enqueue_generation_job_by_source(
@@ -1760,7 +1781,6 @@ fn capture_request(
     title: Option<String>,
     body: Option<String>,
     capture: Option<String>,
-    permission: Option<SourcePermission>,
 ) -> CreateSourceRequest {
     let body = capture.or(body).unwrap_or_default();
     let title = title
@@ -1770,7 +1790,7 @@ fn capture_request(
     CreateSourceRequest {
         title,
         body,
-        permission: permission.unwrap_or_default(),
+        permission: SourcePermission::ModelEligible,
     }
 }
 
@@ -2004,6 +2024,7 @@ async fn edit_app_draft(
         &form.draft_id,
         &form.prompt,
         &form.expected_answer,
+        &split_draft_choices(&form.choices),
     );
     let response = match result {
         Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
@@ -2129,6 +2150,14 @@ fn app_entry_failure_response(error: &ApiFailure) -> Response {
     no_store_response(response)
 }
 
+fn split_draft_choices(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn app_failure_response(error: &ApiFailure) -> Response {
     let status = error.status();
     let (title, message) = if error.is_session_expired() {
@@ -2200,9 +2229,8 @@ async fn reveal_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.reveal_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, None).into_response(),
         &account,
         &headers,
         &uri,
@@ -2221,9 +2249,8 @@ async fn reference_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.learn_more_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, None).into_response(),
         &account,
         &headers,
         &uri,
@@ -2242,9 +2269,9 @@ async fn skip_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.skip_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, Some(SKIP_CONFIRM_NOTICE))
+            .into_response(),
         &account,
         &headers,
         &uri,
@@ -2263,9 +2290,8 @@ async fn delete_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.delete_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, None).into_response(),
         &account,
         &headers,
         &uri,
@@ -2286,12 +2312,23 @@ async fn edit_app_review(
     let view = match state.next_app_review(&account) {
         Ok(view) => view,
         Err(error) => {
-            return with_browser_session_cookie(error.into_response(), &account, &headers, &uri)
+            return with_browser_session_cookie(
+                app_study_action_result(&state, &account, Err(error), None).into_response(),
+                &account,
+                &headers,
+                &uri,
+            )
         }
     };
     let Some(current) = view.current.as_ref() else {
         return with_browser_session_cookie(
-            ApiFailure::not_found("Review unit not found.").into_response(),
+            app_study_action_result(
+                &state,
+                &account,
+                Err(ApiFailure::not_found("Review unit not found.")),
+                None,
+            )
+            .into_response(),
             &account,
             &headers,
             &uri,
@@ -2299,7 +2336,13 @@ async fn edit_app_review(
     };
     if current.review_unit_id.to_string() != form.review_unit_id {
         return with_browser_session_cookie(
-            ApiFailure::not_found("Review unit not found.").into_response(),
+            app_study_action_result(
+                &state,
+                &account,
+                Err(ApiFailure::not_found("Review unit not found.")),
+                None,
+            )
+            .into_response(),
             &account,
             &headers,
             &uri,
@@ -2331,19 +2374,12 @@ async fn save_app_review(
         &form.prompt,
         &form.expected_answer,
     );
-
-    let response = match result {
-        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
-        Err(error) => {
-            let status = error.status();
-            (
-                status,
-                Html(render_action_result_html(&state, &account, Err(error))),
-            )
-                .into_response()
-        }
-    };
-    with_browser_session_cookie(response, &account, &headers, &uri)
+    with_browser_session_cookie(
+        app_study_action_result(&state, &account, result, None).into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn snooze_app_review(
@@ -2358,9 +2394,9 @@ async fn snooze_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, Some(SNOOZE_CONFIRM_NOTICE))
+            .into_response(),
         &account,
         &headers,
         &uri,
@@ -2379,19 +2415,18 @@ async fn snooze_concept_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.snooze_concept_app_review(&account, &form.review_unit_id);
-
-    let response = match result {
-        Ok(view) => Html(render_action_result_html(&state, &account, Ok(view))).into_response(),
-        Err(error) => {
-            let status = error.status();
-            (
-                status,
-                Html(render_action_result_html(&state, &account, Err(error))),
-            )
-                .into_response()
-        }
-    };
-    with_browser_session_cookie(response, &account, &headers, &uri)
+    with_browser_session_cookie(
+        app_study_action_result(
+            &state,
+            &account,
+            result,
+            Some(SNOOZE_CONCEPT_CONFIRM_NOTICE),
+        )
+        .into_response(),
+        &account,
+        &headers,
+        &uri,
+    )
 }
 
 async fn bridge_app_review(
@@ -2406,9 +2441,8 @@ async fn bridge_app_review(
             Err(error) => return app_failure_response(&error),
         };
     let result = state.bridge_app_review(&account, &form.review_unit_id);
-
     with_browser_session_cookie(
-        Html(render_action_result_html(&state, &account, result)).into_response(),
+        app_study_action_result(&state, &account, result, None).into_response(),
         &account,
         &headers,
         &uri,

@@ -537,8 +537,8 @@ fn conformance_graded_review_holds_until_continue() {
         "pre-grade hatches must collapse behind the More disclosure"
     );
     assert!(
-        answering.contains(r#"class="me-more-capture""#),
-        "the More disclosure must carry the capture punch-out"
+        answering.contains(r#"class="me-more-capture" href="/app/create""#),
+        "Capture more must open Create, not Home: {answering}"
     );
 }
 

@@ -185,6 +185,8 @@ pub struct BetaStudyDraftRow {
     pub activity_stage: String,
     pub prompt: String,
     pub answer: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
     pub concept_label: String,
     pub validation_status: GeneratedPromptValidationStatus,
     pub validation_reasons: Vec<String>,
@@ -421,6 +423,7 @@ pub trait BetaStudyStore:
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error>;
 
@@ -539,6 +542,7 @@ impl BetaStudyStore for BetaPersistenceStore {
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
         decided_at: i64,
     ) -> Result<BetaReviewUnitRecord, <Self as MemoryServiceStore>::Error> {
         BetaPersistenceStore::edit_and_keep_generated_prompt_draft(
@@ -546,6 +550,7 @@ impl BetaStudyStore for BetaPersistenceStore {
             draft_id,
             prompt_text,
             expected_answer,
+            choices,
             decided_at,
         )
     }
@@ -1166,6 +1171,7 @@ where
         draft_id: &str,
         prompt_text: &str,
         expected_answer: &str,
+        choices: &[String],
     ) -> Result<BetaStudyView, BetaStudyError<<S as MemoryServiceStore>::Error>> {
         self.invalidate_snapshot();
         self.store
@@ -1173,6 +1179,7 @@ where
                 draft_id,
                 prompt_text,
                 expected_answer,
+                choices,
                 (self.now)(),
             )
             .map_err(BetaStudyError::Store)?;
@@ -2316,6 +2323,7 @@ fn draft_row(draft: &GeneratedPromptDraft, snapshot: &BetaStoreSnapshot) -> Beta
         activity_stage: draft.activity_stage.clone(),
         prompt: prompt_text(&draft.prompt).to_owned(),
         answer: prompt_expected_answer(&draft.prompt),
+        choices: prompt_choices(&draft.prompt),
         concept_label: concept_identity_for_draft(draft).1,
         validation_status: draft.validation.status.clone(),
         validation_reasons: draft.validation.reasons.clone(),
@@ -3067,6 +3075,13 @@ fn prompt_expected_answer(prompt: &Prompt) -> String {
             ..
         } => "False".to_owned(),
         Prompt::Exact(prompt) => prompt.accepted_answers.join(" / "),
+    }
+}
+
+fn prompt_choices(prompt: &Prompt) -> Vec<String> {
+    match prompt {
+        Prompt::Mcq { choices, .. } => choices.clone(),
+        Prompt::Boolean { .. } | Prompt::Exact(_) => Vec::new(),
     }
 }
 

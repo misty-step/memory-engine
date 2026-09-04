@@ -2,9 +2,9 @@
 
 Everything here is CLI-driven; no dashboard is required. Scry runs as the
 native Rust `memory-engine-api` process on Misty Step's isolated DigitalOcean
-public application host, backed by Neon Postgres and served at
+public application host, backed by Postgres on that same host and served at
 `https://scry.study`. DNS and TLS terminate at Caddy on the same host. Rollback
-switches an immutable host release; Neon data remains unchanged.
+switches an immutable host release; it does not change the local store.
 
 ## Agent surface summary
 
@@ -346,10 +346,10 @@ account until the operator restores the pre-migration store snapshot.
 
 ## Deploy and rollback
 
-Production deployment is an explicit host release from a reviewed `master`
-commit. A merge does not mutate production. Branch protection (`ci` and
-`review`, including administrators) proves the source gate; the release receipt
-must name the deployed commit and pass the real public smoke below.
+Production deployment is an explicit host release from a protected `master`
+commit. A merge does not mutate production. Branch protection (`ci`, including
+administrators) proves the source gate; the release receipt must name the
+deployed commit and pass the real public smoke below.
 
 Build and install a release from the Scry repository:
 
@@ -409,7 +409,7 @@ REMOTE
 `do-connecting-ip`.
 
 Rollback changes only the active symlink, then reruns the same smoke. It does
-not modify the environment file or Neon:
+not modify the environment file or the local Postgres data directory:
 
 ```sh
 known_good="${KNOWN_GOOD_COMMIT:?set an installed release commit}"
@@ -501,7 +501,7 @@ secret values, then restart `scry.service` and rerun the deployed smoke.
 
 | Secret | Purpose |
 | --- | --- |
-| `MEMORY_ENGINE_POSTGRES_URL` | Neon pooled connection string (project `twilight-brook-49749008`, `memory-engine-prod`). |
+| `MEMORY_ENGINE_POSTGRES_URL` | Local Unix-socket URL `postgresql:///scry?host=/var/run/postgresql&sslmode=disable`. Peer-auth as systemd user `scry`. |
 | `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` | Comma-separated allowlist; account creation and magic links refuse other emails. |
 | `MEMORY_ENGINE_AUTH_MAILER_COMMAND` | Path to the installed production command `/usr/local/bin/send-magic-link`; do not replace it with the local outbox. |
 | `RESEND_API_KEY` | Encrypted Resend credential consumed only by the bundled mailer; never print or place in a command line. |
@@ -528,18 +528,48 @@ secret values, then restart `scry.service` and rerun the deployed smoke.
 
 Migrations run once per process at first database use, not per request.
 
-## Database (Neon)
+## Database (local Postgres)
 
-Project `memory-engine-prod` (`twilight-brook-49749008`, aws-us-east-2),
-fully managed by CLI:
+Postgres 16 runs on `public-apps`. The `scry` OS user owns database `scry`
+via peer auth on `/var/run/postgresql`. `scry.service` waits for
+`postgresql.service`.
 
-```sh
-neonctl projects list
-neonctl connection-string --project-id twilight-brook-49749008 --pooled
-neonctl branches create --project-id twilight-brook-49749008 --name migration-test
-```
+Nightly custom-format dumps land in `/var/backups/scry` via
+`/usr/local/sbin/scry-pg-dump` (`/etc/cron.d/scry-pg-dump`), pruned after
+seven days. Restore drill: `pg_restore` into a side database owned by
+`scry`, then drop it.
 
-Use a branch to rehearse risky migrations against real data, then delete it.
+### Off-host backup
+
+`scry-backup-offhost` (03:45 UTC timer) encrypts the newest dump with GPG
+AES256 and uploads it to the Scry Spaces bucket (`scry/` prefix). Source
+of truth lives in this repository: `bin/scry-backup-offhost`,
+`etc/systemd/scry-backup-*`, and the idempotent
+`bin/install-scry-backup.sh`. Never edit `/usr/local` copies directly;
+reinstall from the repo.
+
+**Provisioning status:** the bucket does not exist yet. The 30-day
+age-based lifecycle and versioning described in Estate ADR 0011 are
+mandatory properties of that provisioning step — they are NOT active
+today. Because the uploader has no DELETE path, objects would accumulate
+without bound if credentials were added before lifecycle/versioning
+exist; provisioning order is therefore bucket+lifecycle first, credentials
+second. Until then the timer runs and records
+`skipped target-not-provisioned`.
+
+The pipeline stays inert until `/etc/public-apps/scry-backup.env`
+(mode 0600) defines `SCRY_BACKUP_SPACES_BUCKET`, `SCRY_BACKUP_SPACES_KEY`,
+`SCRY_BACKUP_SPACES_SECRET`, `SCRY_BACKUP_PASSPHRASE`, and optional
+`SCRY_BACKUP_REGION` (default `nyc3`). The passphrase must also live in
+an operator-managed off-host credential store; without that copy the
+ciphertext is unrestorable after droplet loss. Outcomes record to
+`/var/lib/scry-backup/last-run`; failures fail the unit and trigger
+`scry-backup-alert.service` (`FAILURE` flag + `daemon.alert` journal).
+Design and custody: Estate ADR 0011.
+
+The retired Neon project `memory-engine-prod` (`twilight-brook-49749008`) is
+kept until a restoreable Neon dump exists. Do not delete it. Do not point
+production back at Neon.
 
 ## Human login (magic links over email)
 

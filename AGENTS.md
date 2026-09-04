@@ -21,7 +21,7 @@ product contract.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
   `MEMORY_ENGINE_*` environment variables deliberately retain the old name.
   Do not rename a storage, network, deployment, or compatibility boundary
-  without a takeable Powder job and migration proof.
+  without a shaped GitHub issue and migration proof.
 
 ## Stack & Boundaries
 
@@ -55,8 +55,8 @@ promotion.
   `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
-- Powder is the sole work ledger: jobs hold shaped work, assignment, proof,
-  and closure. Git history holds archived source history.
+- GitHub Issues is the sole work ledger: issues hold shaped work, status,
+  relations, proof, and closure. Git history holds archived source history.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
   consumer-facing Rust facade and module exports.
@@ -86,7 +86,7 @@ oracle.
 
 1. One ticket, one branch, one PR. Branch from `master`; use `cx/...` by
    default.
-2. Do not implement feature work without a takeable Powder job.
+2. Do not implement feature work without an active shaped GitHub issue.
 3. TDD is the default — test behavior, not implementation; do not mock
    repo-owned pure collaborators (see Conventions for the full statement).
 4. Core is pure: no Convex, React, Hono, Node/Bun APIs, filesystem,
@@ -138,7 +138,7 @@ oracle.
   import, benchmark, and QA tooling.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
-- Powder — shaped work, assignment, proof, and closure (`powder list --takeable`).
+- GitHub Issues — shaped work, assignment, status, relations, proof, and closure.
 - `SPEC.md` / `docs/rust-migration.md` — technical strategy and cutover context;
   `VISION.md` governs product positioning.
 
@@ -159,15 +159,15 @@ oracle.
 
 ## Work Lifecycle
 
-Powder is authoritative. `powder list --takeable` is the claimable board.
-Take a job before implementation. One live lease per agent. Record proof on
-the job with `powder done <id> --proof ...`. Use `Refs <job-id>` in commits
-and pull requests. Use `Closes <job-id>` only when the merge satisfies every
-acceptance criterion and no post-merge proof remains. Empty-spec jobs are
-not takeable. Direct `blocked_by` jobs must be terminal before a dependent
-is takeable.
-
-
+GitHub Issues is authoritative. `status:backlog` is groomed but not claimable;
+`status:ready` has executable acceptance and proof with no unresolved blocker;
+`status:blocked` names an external dependency. Assign the issue and apply
+`status:in-progress` before implementation; record progress and proof as issue
+comments. Use `Refs #<issue>` in commits and pull requests. Use
+`Closes #<issue>` only when the merge satisfies every acceptance criterion and
+no post-merge proof remains. `/deliver` stops at merge-ready; `/ship` links the
+landed commit and production proof, then closes the issue and invokes bounded
+`/reflect`. `/groom` reconciles open GitHub issues before strategy.
 
 ## Known Debt
 
@@ -185,3 +185,5 @@ is takeable.
 
 General-purpose hosting or auth frameworks, chat tutoring, and generalized content
 import.
+
+Organization root context: @~/Development/misty-step/AGENTS.md

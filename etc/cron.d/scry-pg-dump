@@ -1,0 +1,1 @@
+15 3 * * * root /usr/local/sbin/scry-pg-dump >/var/log/scry-pg-dump.log 2>&1

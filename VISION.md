@@ -75,5 +75,5 @@ The first real outcome gate is a 30-day retention proof, not a seeded fixture, a
 - `README.md` explains Scry's product, Rust workspace, production surface, and current usage.
 - `SPEC.md` and `docs/rust-migration.md` retain technical strategy and cutover context; this vision governs product positioning.
 - `docs/runbook.md`, `docs/qa/system.md`, `docs/dogfood/`, and `docs/beta/` hold operational and executable evidence.
-- Powder is the shaped-work queue, assignment ledger, and closure history.
+- GitHub Issues is the shaped-work queue, assignment ledger, and closure history.
 - `bun run ci` is the direct host Cargo fast gate; `bun run ci:full` is the Dagger-backed ship-parity gate. This docs correction does not replace Main-owned gates.

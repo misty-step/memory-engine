@@ -1,0 +1,84 @@
+#!/bin/sh
+# Nightly encrypted off-host Scry Postgres backup.
+# Pipeline: pg_dump -> AES256 gpg -> DigitalOcean Spaces via boto3 (S3 API).
+# The script NEVER issues a remote DELETE. Object expiry is intended to be
+# owned by a 30-day age-based bucket lifecycle rule; that lifecycle and
+# versioning are NOT yet provisioned (Estate OpenTofu card pending), so
+# until then objects accumulate and retention depends on the provisioning
+# step landing before credentials are added.
+# Custody: SCRY_BACKUP_PASSPHRASE must also live in an operator-managed
+# off-host store; without that copy the ciphertext is unrestorable after
+# droplet loss, so the backup job stays open until the operator records it.
+set -eu
+umask 077
+ENV_FILE=/etc/public-apps/scry-backup.env
+STATE_DIR=/var/lib/scry-backup
+install -d -m 0700 "$STATE_DIR"
+record() { printf "%s\n" "$1" > "$STATE_DIR/last-run"; }
+
+# Any non-zero exit must land in last-run before the process dies.
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then record "$(date -u +%FT%TZ) failed rc=$rc"; fi' EXIT
+
+# Replacement hosts start without this directory; the sweep and dump
+# retention both need it before anything else runs.
+install -d -o scry -g scry -m 0750 /var/backups/scry
+
+# Bound on-host ciphertext: anything older than a day is a leftover
+# from a failed run (success deletes its own artifact below).
+find /var/backups/scry -name "scry-*.dump.gpg" -mtime +0 -delete
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "scry-backup-offhost: SKIPPED: $ENV_FILE missing; Spaces target not provisioned (Estate OpenTofu plan pending operator review)"
+  record "$(date -u +%FT%TZ) skipped target-not-provisioned"
+  exit 0
+fi
+# Custody: the env file carries provider keys and the recovery passphrase.
+# A non-root-owned or world/group-readable file fails closed before sourcing.
+stat_out="$(stat -c %u:%g:%a "$ENV_FILE")"
+if [ "$stat_out" != "0:0:600" ]; then
+  echo "scry-backup-offhost: FAILED: $ENV_FILE must be root-owned mode 0600 (got $stat_out)"
+  record "$(date -u +%FT%TZ) failed env-file-not-root-0600"
+  exit 1
+fi
+. "$ENV_FILE"
+: "${SCRY_BACKUP_SPACES_BUCKET:?missing}"
+: "${SCRY_BACKUP_SPACES_KEY:?missing}"
+: "${SCRY_BACKUP_SPACES_SECRET:?missing}"
+: "${SCRY_BACKUP_PASSPHRASE:?missing}"
+export SCRY_BACKUP_REGION="${SCRY_BACKUP_REGION:-nyc3}"
+export AWS_ACCESS_KEY_ID="$SCRY_BACKUP_SPACES_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCRY_BACKUP_SPACES_SECRET"
+ENDPOINT="https://${SCRY_BACKUP_REGION}.digitaloceanspaces.com"
+
+dump="$(/usr/local/sbin/scry-pg-dump)"
+artifact="${dump}.gpg"
+printf "%s" "$SCRY_BACKUP_PASSPHRASE" \
+  | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+        --cipher-algo AES256 --symmetric --output "$artifact" "$dump"
+
+object="scry/$(basename "$artifact")"
+ENDPOINT="$ENDPOINT" BUCKET="$SCRY_BACKUP_SPACES_BUCKET" OBJECT="$object" ARTIFACT="$artifact" \
+python3 - <<"PY"
+import os
+import boto3
+from botocore.client import Config
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["ENDPOINT"],
+    region_name=os.environ.get("SCRY_BACKUP_REGION", "nyc3"),
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    config=Config(signature_version="s3v4"),
+)
+# Spaces supports no SSE-S3 header; the artifact is already GPG
+# ciphertext client-side, so it uploads as opaque bytes.
+s3.upload_file(os.environ["ARTIFACT"], os.environ["BUCKET"], os.environ["OBJECT"])
+print("uploaded", os.environ["OBJECT"])
+PY
+
+digest="$(sha256sum "$artifact" | cut -d" " -f1)"
+size="$(stat -c %s "$artifact")"
+echo "scry-backup-offhost: UPLOADED $object bytes=$size sha256=$digest"
+rm -f "$artifact"
+record "$(date -u +%FT%TZ) success $(basename "$artifact") $digest $size"
+rm -f "$STATE_DIR/FAILURE"

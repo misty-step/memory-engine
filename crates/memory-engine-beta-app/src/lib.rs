@@ -171,6 +171,7 @@ fn route(session: &mut BetaStudySession, request: &HttpRequest) -> HttpResponse 
                     &revision.draft_id,
                     &revision.prompt,
                     &revision.expected_answer,
+                    &[],
                 ),
             ),
             Err(error) => HttpResponse::bad_request(&error),
@@ -548,7 +549,7 @@ fn read_source(body: &[u8]) -> Result<BetaStudySourceInput, String> {
             .unwrap_or_else(|| {
                 format!("source-{}", slug_fragment(&source_slug_text(&title, &body)))
             });
-        let permission = parse_source_permission(form_optional(&fields, "permission").as_deref())?;
+        let permission = SourcePermission::ModelEligible;
 
         return Ok(BetaStudySourceInput {
             id,
@@ -901,15 +902,7 @@ fn render_summary(html: &mut String, view: &BetaStudyView) {
 }
 
 fn render_source_form(html: &mut String) {
-    html.push_str("<section class=\"panel\"><h2>Add</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-capture\">Paste anything</label><textarea id=\"source-capture\" name=\"capture\" placeholder=\"Word, phrase, notes, or article\"></textarea><label for=\"source-permission\">Permission</label><select id=\"source-permission\" name=\"permission\" aria-describedby=\"source-permission-hint\"><option value=\"model-eligible\" selected>Allow model help</option><option value=\"local-only\">Keep local / Never send to a model</option></select><p id=\"source-permission-hint\">Allow model help is the default; keep local / never send to a model prevents model providers from receiving this capture.</p><button type=\"submit\">Save capture</button></form><form class=\"actions\" method=\"post\" action=\"/generate\"><button type=\"submit\" class=\"secondary\">Generate review items</button></form></section>");
-}
-
-fn parse_source_permission(value: Option<&str>) -> Result<SourcePermission, String> {
-    match value {
-        None | Some("" | "model-eligible") => Ok(SourcePermission::ModelEligible),
-        Some("local-only") => Ok(SourcePermission::LocalOnly),
-        Some(value) => Err(format!("unknown source permission: {value}")),
-    }
+    html.push_str("<section class=\"panel\"><h2>Add</h2><form class=\"composer\" method=\"post\" action=\"/source\"><label for=\"source-capture\">Paste anything</label><textarea id=\"source-capture\" name=\"capture\" placeholder=\"Word, phrase, notes, or article\"></textarea><button type=\"submit\">Save capture</button></form></section>");
 }
 
 fn render_generation_notices(html: &mut String, view: &BetaStudyView) {
@@ -1327,14 +1320,14 @@ mod tests {
     }
 
     #[test]
-    fn phone_capture_permission_is_explicit_and_invalid_values_fail_closed() {
+    fn phone_capture_has_no_permission_toggle_and_ignores_posted_local_only() {
         let directory = TempDirectory::new("permission-form");
         let mut session = session(directory.path().join("study.json"));
         let html = String::from_utf8(route(&mut session, &request("GET", "/", "")).body)
             .expect("capture html");
-        assert!(html.contains(r#"id="source-permission" name="permission""#));
-        assert!(html.contains(r#"aria-describedby="source-permission-hint""#));
-        assert!(html.contains("Keep local / Never send to a model"));
+        assert!(html.contains(r#"name="capture""#));
+        assert!(!html.contains(r#"name="permission""#));
+        assert!(!html.contains("Keep local / Never send to a model"));
 
         let saved = route(
             &mut session,
@@ -1349,21 +1342,8 @@ mod tests {
         assert_eq!(saved.status, 200);
         assert_eq!(
             session.view().expect("view").sources[0].permission,
-            super::SourcePermission::LocalOnly
+            super::SourcePermission::ModelEligible
         );
-
-        let rejected = route(
-            &mut session,
-            &form_request(
-                "/source",
-                &format!(
-                    "capture={}&permission=not-a-permission",
-                    url_escape("should not save")
-                ),
-            ),
-        );
-        assert_eq!(rejected.status, 400);
-        assert_eq!(session.view().expect("view").summary.source_count, 1);
     }
 
     #[test]

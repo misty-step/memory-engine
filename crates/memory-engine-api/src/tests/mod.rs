@@ -25,6 +25,7 @@ use super::{
     ReturnNotificationSchedulerConfig, AUTH_CHALLENGE_TTL_MS,
     RETURN_NOTIFICATION_UNSUBSCRIBE_TTL_MS,
 };
+use memory_engine_api_render::{SKIP_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE};
 use memory_engine_api_state::AppAccount;
 
 /// Non-auth route tests need seeded accounts without depending on production
@@ -326,6 +327,73 @@ async fn mobile_capture_enqueues_generation_then_requires_learner_decisions() {
 }
 
 #[tokio::test]
+async fn editing_mcq_distractor_keeps_coherent_card_and_returns_to_review() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let generated = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/generate",
+            &cookie,
+            &[("csrfToken", &csrf_token), ("sourceId", &source_id)],
+        ))
+        .await
+        .expect("generate");
+    assert_eq!(generated.status(), StatusCode::OK);
+    state.run_pending_jobs_blocking();
+
+    let pending = workspace_html(&app, &cookie).await;
+    assert!(
+        pending.contains("BRAVO") && pending.contains("CHARLIE"),
+        "pending MCQ must show every choice before Keep: {pending}"
+    );
+    assert!(
+        pending.contains(r#"name="choices""#),
+        "edit form must expose distractors: {pending}"
+    );
+    assert!(
+        pending.contains("Keep as written"),
+        "Keep as written must stay one tap: {pending}"
+    );
+
+    let draft_id = pending
+        .split(r#"<article class="me-pending-draft">"#)
+        .skip(1)
+        .find(|article| article.contains(r#"name="choices""#))
+        .map(|article| html_value(article, "draftId"))
+        .expect("MCQ draft id");
+    let edited = app
+        .clone()
+        .oneshot(form_request_with_cookie(
+            "POST",
+            "/app/draft/edit",
+            &cookie,
+            &[
+                ("csrfToken", &csrf_token),
+                ("draftId", &draft_id),
+                ("prompt", "What is the NATO phonetic alphabet word for A?"),
+                ("expectedAnswer", "ALFA"),
+                ("choices", "DELTA\nCHARLIE"),
+            ],
+        ))
+        .await
+        .expect("edit distractor");
+    let status = edited.status();
+    let edited = response_text(edited).await;
+    assert_eq!(status, StatusCode::OK, "edit distractor failed: {edited}");
+    assert!(
+        edited.contains("Reveal answer") || edited.contains("name=\"answer\""),
+        "edit must land back in review: {edited}"
+    );
+    assert!(
+        edited.contains("DELTA"),
+        "edited distractor must be the live MCQ choice: {edited}"
+    );
+}
+
+#[tokio::test]
 async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_bytes() {
     let state = local_fixture_state();
     let app = router(state.clone());
@@ -348,10 +416,11 @@ async fn mobile_capture_and_edit_expose_permission_without_leaking_local_only_by
     assert_eq!(captured.status(), StatusCode::OK);
     let _ = response_text(captured).await;
 
-    // The capture POST returns the Create view; the permission label lives on
-    // the Library view where the source is managed.
+    // Capture ignores a posted local-only flag. Library can still change
+    // permission after the source exists.
     let library = library_html(&app, &cookie).await;
-    assert!(library.contains("Local only · never sent to a model"));
+    assert!(library.contains("Model eligible"));
+    assert!(!library.contains("Local only · never sent to a model"));
 
     let edited = app
         .clone()
@@ -2646,34 +2715,49 @@ async fn review_escape_hatches_render_and_drive_the_mobile_queue() {
     let opened_bridge = next_review_html(&app, &cookie, &csrf_token, "bridge").await;
     let bridge_id = html_value(&opened_bridge, "reviewUnitId");
     assert!(bridge_id.starts_with("bridge-"));
+    skip_then_snooze_current(&app, &cookie, &csrf_token, &bridge_id).await;
+}
+
+async fn skip_then_snooze_current(
+    app: &axum::Router,
+    cookie: &str,
+    csrf_token: &str,
+    review_unit_id: &str,
+) {
     let skipped = app
         .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/skip",
-            &cookie,
-            &[("csrfToken", &csrf_token), ("reviewUnitId", &bridge_id)],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", review_unit_id)],
         ))
         .await
         .expect("skip");
     assert_eq!(skipped.status(), StatusCode::OK);
     let skipped = response_text(skipped).await;
-    let next_bridge_id = html_value(&skipped, "reviewUnitId");
-    assert!(next_bridge_id.starts_with("bridge-"));
-    assert_ne!(next_bridge_id, bridge_id);
+    assert!(
+        skipped.contains(SKIP_CONFIRM_NOTICE),
+        "skip result must carry the server confirm"
+    );
+    let next_id = html_value(&skipped, "reviewUnitId");
+    assert_ne!(next_id, review_unit_id);
     let snoozed = app
+        .clone()
         .oneshot(form_request_with_cookie(
             "POST",
             "/app/snooze",
-            &cookie,
-            &[
-                ("csrfToken", &csrf_token),
-                ("reviewUnitId", &next_bridge_id),
-            ],
+            cookie,
+            &[("csrfToken", csrf_token), ("reviewUnitId", &next_id)],
         ))
         .await
         .expect("snooze");
     assert_eq!(snoozed.status(), StatusCode::OK);
+    let snoozed = response_text(snoozed).await;
+    assert!(
+        snoozed.contains(SNOOZE_CONFIRM_NOTICE),
+        "snooze result must carry the server confirm"
+    );
 }
 
 #[tokio::test]
@@ -2686,6 +2770,62 @@ async fn app_session_mutations_require_csrf() {
     let review_unit_id =
         schedule_review_for_csrf(&app, &state, &cookie, &csrf_token, &source_id).await;
     assert_review_mutations_require_csrf(&app, &cookie, &review_unit_id).await;
+}
+
+#[tokio::test]
+async fn app_study_actions_return_html_status_for_stale_review_ids() {
+    let state = local_fixture_state();
+    let app = router(state.clone());
+    let (cookie, csrf_token, source_id) = start_app_session_for_csrf(&app).await;
+    let _review_unit_id =
+        schedule_review_for_csrf(&app, &state, &cookie, &csrf_token, &source_id).await;
+
+    for action in [
+        "/app/reveal",
+        "/app/reference",
+        "/app/skip",
+        "/app/delete",
+        "/app/snooze",
+        "/app/bridge",
+        "/app/edit",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(form_request_with_cookie(
+                "POST",
+                action,
+                &cookie,
+                &[
+                    ("csrfToken", &csrf_token),
+                    ("reviewUnitId", "missing-review-unit"),
+                ],
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{action}: {error}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{action} must not succeed for a missing review id"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+            "text/html; charset=utf-8",
+            "{action} must stay HTML"
+        );
+        let body = response_text(response).await;
+        assert!(
+            !body.trim_start().starts_with('{'),
+            "{action} leaked a JSON envelope: {body}"
+        );
+        assert!(
+            body.contains("Review unit not found."),
+            "{action} missing not-found copy: {body}"
+        );
+    }
 }
 
 async fn start_app_session_for_csrf(app: &axum::Router) -> (String, String, String) {
@@ -11837,8 +11977,8 @@ async fn review_pre_grade_is_minimal_with_collapsed_hatches() {
         );
     }
     assert!(
-        page.contains(r#"class="me-more-capture""#),
-        "the disclosure must carry the capture punch-out: {page}"
+        page.contains(r#"class="me-more-capture" href="/app/create""#),
+        "Capture more must open Create, not Home: {page}"
     );
     assert!(
         !page.contains(r#"class="me-hatches""#),
@@ -12225,7 +12365,7 @@ async fn more_sheet_actions_carry_icons_and_truthful_tooltips() {
         "Hide every card for this concept until tomorrow.",
         "Generate easier warm-up cards, then revisit this one later.",
         "Remove this card from review for good.",
-        "Capture new material without leaving review.",
+        "Add new material.",
     ];
     for tooltip in tooltips {
         let marker = format!(r#"title="{tooltip}"><svg class="ae-icon""#);

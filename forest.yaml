@@ -1,0 +1,33 @@
+repo: misty-step/scry
+
+# Factory Manager scope: only jobs groomed ready for the Kernel.
+scope:
+  subjects:
+    - scry-127-graded-card
+
+agents:
+  builder:  { poll: "./forest poll builder",  interval: 300 }
+  verifier: { poll: "./forest poll verifier", interval: 120 }
+  fixer:    { poll: "./forest poll fixer",    interval: 300 }
+
+# Mirror of the full hosted delivery gate, command-for-command in order:
+# bun run ci (rust:ci incl. browser contract and perf receipt diff),
+# bun run ci:full (Dagger ship-parity), and the Postgres latency oracle
+# exported by .github/workflows/ci.yml.
+checks:
+  - name: browser-contract
+    run: bun run test:browser-contract
+  - name: fmt
+    run: cargo fmt --all --check
+  - name: test
+    run: cargo test --workspace
+  - name: clippy
+    run: cargo clippy --workspace --all-targets -- -D warnings
+  - name: doc
+    run: cargo doc --workspace --no-deps
+  - name: perf-actions
+    run: bun run perf:actions
+  - name: ci-full
+    run: bun run ci:full
+  - name: latency-postgres-oracle
+    run: mkdir -p "target/perf/action-latency-postgres-$(git rev-parse HEAD)" && dagger call action-latency-postgres --source=. --git-sha="$(git rev-parse HEAD)" export --path="target/perf/action-latency-postgres-$(git rev-parse HEAD)"

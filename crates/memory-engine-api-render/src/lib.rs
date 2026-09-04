@@ -10,11 +10,12 @@ mod design_preview;
 pub const LEDGER_CSS: &str = include_str!("../assets/ledger.css");
 
 pub use render::{
-    render_account_page, render_action_result_html, render_analytics_page, render_app_shell,
-    render_auth_recovery, render_content_feedback_recovery_html,
-    render_content_feedback_result_html, render_create_page, render_edit_review_html,
-    render_entry_recovery, render_entry_requested, render_library_page,
+    render_account_page, render_action_result_html, render_action_result_html_with_notice,
+    render_analytics_page, render_app_shell, render_auth_recovery,
+    render_content_feedback_recovery_html, render_content_feedback_result_html, render_create_page,
+    render_edit_review_html, render_entry_recovery, render_entry_requested, render_library_page,
     render_return_notification_confirmation, render_return_notification_disabled,
     render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
     AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
+    SKIP_CONFIRM_NOTICE, SNOOZE_CONCEPT_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE,
 };
