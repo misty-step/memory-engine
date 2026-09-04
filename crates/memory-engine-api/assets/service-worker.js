@@ -1,5 +1,5 @@
 // Scry public shell worker. Keep CACHE_NAME and shell list in lockstep when shipping updates.
-const CACHE_NAME = "scry-shell-v3";
+const CACHE_NAME = "scry-shell-v4";
 const OFFLINE_URL = "/offline.html";
 const IMMUTABLE_SHELL_URLS = Object.freeze([
   OFFLINE_URL,

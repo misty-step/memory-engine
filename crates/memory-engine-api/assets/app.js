@@ -831,30 +831,20 @@
   });
 })();
 
-// Progressive enhancement for the waitlist join form: an immediate in-page
-// pending state.
-//
-// The server posts the plain form either way, so with JavaScript off (or if
-// this script fails) the join still works exactly as before. Postgres-backed
-// joins connect and migrate per call (observed 161-700ms TTFB), so this does
-// not fake or move the durable write -- it only gives the tap instant
-// feedback: disable the submit button, swap its label to a pending state,
-// and mirror that into an aria-live region, synchronously and before the
-// native POST's response ever arrives. The submit is never prevented and no
-// fetch is issued, so the server's real response still drives the real
-// success page -- this is acknowledgment, not an early or fabricated
-// success claim.
+// Acknowledge the one entry request before the native POST settles. The
+// server still owns email normalization, admission, persistence, delivery,
+// and the final response; this enhancement only prevents a second tap.
 (function () {
   "use strict";
-  var form = document.querySelector("form.me-waitlist-form");
+  var form = document.querySelector("form.me-entry-form");
   if (!form) return;
   form.addEventListener("submit", function () {
     var button = form.querySelector('button[type="submit"]');
     if (!button || button.disabled) return;
     button.disabled = true;
-    button.textContent = "Joining…";
-    var status = form.querySelector(".me-waitlist-status");
-    if (status) status.textContent = "Joining…";
+    button.textContent = "Checking…";
+    var status = form.querySelector(".me-entry-status");
+    if (status) status.textContent = "Checking…";
   });
 })();
 

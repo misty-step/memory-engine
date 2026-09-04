@@ -30,12 +30,11 @@ use memory_engine_api_render::{
     render_account_page, render_action_result_html, render_action_result_html_with_notice,
     render_analytics_page, render_app_shell, render_auth_recovery,
     render_content_feedback_recovery_html, render_content_feedback_result_html, render_create_page,
-    render_edit_review_html, render_library_page, render_login_requested,
+    render_edit_review_html, render_entry_recovery, render_entry_requested, render_library_page,
     render_return_notification_confirmation, render_return_notification_disabled,
     render_return_notification_recovery, render_submit_action_result_html, render_submit_recovery,
-    render_waitlist_joined, render_waitlist_recovery, AnalyticsConceptFilter, AnalyticsConceptSort,
-    AnalyticsViewOptions, ContentFeedbackRecovery, LEDGER_CSS, SKIP_CONFIRM_NOTICE,
-    SNOOZE_CONCEPT_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE,
+    AnalyticsConceptFilter, AnalyticsConceptSort, AnalyticsViewOptions, ContentFeedbackRecovery,
+    LEDGER_CSS, SKIP_CONFIRM_NOTICE, SNOOZE_CONCEPT_CONFIRM_NOTICE, SNOOZE_CONFIRM_NOTICE,
 };
 use memory_engine_api_state::{
     browser_session_cookie_header_for_request, browser_session_cookie_present, csrf_token,
@@ -377,7 +376,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/app/create", get(app_create))
         .route("/app/library", get(app_library))
         .route("/app/account", post(create_app_account))
-        .route("/app/waitlist", post(create_app_waitlist))
         .route("/app/login/verify", get(verify_app_login))
         .route("/app/logout", post(logout_app_session))
         .route("/app/logout-all", post(logout_all_app_sessions))
@@ -1143,12 +1141,6 @@ struct AppAccountForm {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct AppWaitlistForm {
-    email: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
 struct AppLoginVerifyQuery {
     token: String,
 }
@@ -1296,50 +1288,12 @@ async fn create_app_account(
     headers: HeaderMap,
     Form(form): Form<AppAccountForm>,
 ) -> Response {
-    let result = state.request_magic_link(&form.email, &client_rate_limit_key(&headers));
+    let result = state.request_app_access(&form.email, &client_rate_limit_key(&headers));
 
     no_store_response(match result {
-        Ok(request) => Html(render_login_requested(request.debug_link.as_deref())).into_response(),
-        Err(error) => app_failure_response(&error),
+        Ok(request) => Html(render_entry_requested(request.debug_link.as_deref())).into_response(),
+        Err(error) => app_entry_failure_response(&error),
     })
-}
-
-async fn create_app_waitlist(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Form(form): Form<AppWaitlistForm>,
-) -> Response {
-    let result = state.join_waitlist(&form.email, "first-run", &client_rate_limit_key(&headers));
-
-    no_store_response(match result {
-        Ok(()) => Html(render_waitlist_joined()).into_response(),
-        Err(error) => waitlist_failure_response(&error),
-    })
-}
-
-fn waitlist_failure_response(error: &ApiFailure) -> Response {
-    let status = match error.status() {
-        StatusCode::BAD_REQUEST => StatusCode::BAD_REQUEST,
-        StatusCode::TOO_MANY_REQUESTS => StatusCode::TOO_MANY_REQUESTS,
-        _ => StatusCode::SERVICE_UNAVAILABLE,
-    };
-    let (title, message) = match status {
-        StatusCode::BAD_REQUEST => (
-            "Check the email address",
-            "That email address is not valid. Check it and try again.",
-        ),
-        StatusCode::TOO_MANY_REQUESTS => (
-            "Please try again later",
-            "We’re taking a short break from new joins. Please wait a little while, then try again.",
-        ),
-        _ => (
-            "We couldn’t save that",
-            "We couldn’t save your request right now. Please try again shortly.",
-        ),
-    };
-    let mut response = Html(render_waitlist_recovery(title, message)).into_response();
-    *response.status_mut() = status;
-    response
 }
 
 fn admin_token_from_headers(headers: &HeaderMap) -> &str {
@@ -1384,8 +1338,8 @@ fn csv_field(value: &str) -> String {
 /// Operator-only waitlist CSV export, gated by the admin token. Same
 /// listing as `GET /internal/waitlist`; only the wire format differs, so an
 /// operator can open the result directly in a spreadsheet. Anonymous callers
-/// control the email column (`POST /app/waitlist`), so every cell runs
-/// through `csv_field`, which neutralizes formula-leading values and quotes
+/// control the email column (`POST /app/account`), so every cell runs through
+/// `csv_field`, which neutralizes formula-leading values and quotes
 /// CR/LF/comma/quote before the row is written -- opening this export can
 /// never execute attacker-controlled content as a spreadsheet formula.
 async fn export_waitlist(
@@ -2168,6 +2122,31 @@ fn client_rate_limit_key(headers: &HeaderMap) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map_or_else(|| "unknown".to_owned(), str::to_owned)
+}
+
+fn app_entry_failure_response(error: &ApiFailure) -> Response {
+    let status = match error.status() {
+        StatusCode::BAD_REQUEST => StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let (title, message) = match status {
+        StatusCode::BAD_REQUEST => (
+            "Check the email address",
+            "That email address is not valid. Check it and try again.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Please try again later",
+            "We’re taking a short break from requests. Wait a little while, then try again.",
+        ),
+        _ => (
+            "We couldn’t complete that request",
+            "We couldn’t finish that request. Please try again shortly.",
+        ),
+    };
+    let mut response = Html(render_entry_recovery(title, message)).into_response();
+    *response.status_mut() = status;
+    no_store_response(response)
 }
 
 fn split_draft_choices(raw: &str) -> Vec<String> {
