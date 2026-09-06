@@ -1,6 +1,6 @@
 {
   "skills": [
-    ".agent/skills/*"
+    ".agents/skills/*"
   ],
   "commands": {
     "ci": "bun run ci",
