@@ -63,14 +63,6 @@ fn agent_docs_match_post_cutover_contract() {
         "AGENTS.md must identify SLICE docs and exemplars as historical context"
     );
     assert!(
-        agents.contains("GitHub Issues is authoritative"),
-        "AGENTS.md must name GitHub Issues as the work ledger"
-    );
-    assert!(
-        agents.contains("Refs #") && agents.contains("Closes #"),
-        "AGENTS.md must document issue attribution without premature closure"
-    );
-    assert!(
         !agents.contains("Powder"),
         "AGENTS.md must not retain the retired Powder workflow"
     );
@@ -78,7 +70,7 @@ fn agent_docs_match_post_cutover_contract() {
         let text = read_repo_file(relative);
         assert!(
             text.contains("GitHub Issues"),
-            "{relative} must point at the active GitHub Issues ledger"
+            "{relative} must preserve the GitHub Issues context link"
         );
         assert!(
             !text.contains("Powder"),
@@ -479,7 +471,7 @@ fn fleet_onboarding_contract_is_declarative_and_current() {
 }
 
 #[test]
-fn architecture_map_has_one_exact_github_issues_ledger_node() {
+fn architecture_map_preserves_github_issue_context_links() {
     let map: serde_json::Value =
         serde_json::from_str(&read_repo_file("docs/architecture/memory-engine.map.json"))
             .expect("parse architecture map");
@@ -527,8 +519,7 @@ fn architecture_map_has_one_exact_github_issues_ledger_node() {
                 reference["kind"].as_str() == Some("issue")
                     && reference["path"].as_str()
                         == Some("https://github.com/misty-step/scry/issues")
-                    && reference["label"].as_str() == Some("active issue queue")
             }),
-        "GitHub Issues node must link the active issue collection"
+        "GitHub Issues node must retain its issue collection link"
     );
 }

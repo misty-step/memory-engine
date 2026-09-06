@@ -716,14 +716,14 @@
     },
     {
       "id": "node.fleet.github-issues",
-      "label": "GitHub Issues Work Ledger",
+      "label": "GitHub Issue History",
       "kind": "issue",
-      "summary": "GitHub Issues is the sole active work ledger; no repository-local backlog or second tracker is kept.",
+      "summary": "GitHub Issues preserves historical context and optional attribution. Current requests and session or PR evidence govern work.",
       "viewTags": ["fleet-integration"],
       "layout": {"fleet-integration": {"x": 280, "y": 360}},
       "refs": [
-        {"kind": "doc", "path": "AGENTS.md", "label": "work-ledger contract"},
-        {"kind": "issue", "path": "https://github.com/misty-step/scry/issues", "label": "active issue queue"}
+        {"kind": "doc", "path": "AGENTS.md", "label": "current work contract"},
+        {"kind": "issue", "path": "https://github.com/misty-step/scry/issues", "label": "historical issue context"}
       ]
     }
   ],
