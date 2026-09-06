@@ -15,8 +15,8 @@ is the product contract.
   `https://scry.study`.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
   `MEMORY_ENGINE_*` environment variables retain the old name. Renaming a
-  storage, network, deployment, or compatibility boundary requires a shaped
-  issue and migration proof.
+  storage, network, deployment, or compatibility boundary requires explicit
+  current scope and migration proof.
 
 ## Architecture and boundaries
 
@@ -38,11 +38,11 @@ is the product contract.
   use `VISION.md` when positioning conflicts.
 - `SLICE-*.md` and `exemplars.md` are historical extraction context, not
   delivery oracles.
-- GitHub Issues is authoritative for shaped work; work from the operator's
-  current request. Check current code and overlapping work; record ownership
-  and verification evidence in the session or PR. Use `Refs #<issue>` in commits
-  and pull requests; use `Closes #<issue>` only when all acceptance criteria are
-  satisfied and verified.
+- Work from the operator's current request. Check current code and overlapping
+  work; record ownership and verification evidence in the session or PR.
+  Historical issues are context, not a required queue. If a current request
+  explicitly names an issue, link it and close it only after its acceptance
+  criteria are satisfied and verified.
 - `.dagger/src/index.ts` owns CI behavior. `docs/qa/system.md`,
   `docs/dogfood/`, and `docs/beta/` hold executable QA and dogfood evidence.
   `docs/runbook.md` is the production runtime and smoke contract.
@@ -71,7 +71,7 @@ is the product contract.
   containerized Postgres, the pinned Rust image, and Gitleaks.
 - `bun run ci:local` and `bun run rust:ci` are fast-gate aliases. `bun run qa`
   is the full QA sweep and ends with `bun run ci:full`; it does not replace the
-  fast gate. Use the ticket's named proof oracle and the current Scry surface
+  fast gate. Use the request's named proof oracle and the current Scry surface
   for live-product decisions.
 - Test observable behavior with real repo-owned collaborators; mock only
   external boundaries such as network, clock, and model providers.
