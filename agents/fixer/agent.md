@@ -32,16 +32,17 @@ edit `forest.yaml` to make a check pass.
 
 ## Select one rejected Revision
 
-1. Run `git fetch origin`, then
-   `git ls-remote origin 'refs/heads/forest/*' 'refs/forest/v1/*'`. Select one
-   branch tip with request and `changes` verdict evidence.
-2. Fetch both refs. Require the Verdict committer to be
+1. Filter candidate branches by the current operator request or explicit
+   delegation: match the Subject identifier in `forest/<subject>/*`.
+2. Run `git fetch origin`, then inspect matching refs with
+   `git ls-remote origin "refs/heads/forest/$subject/*" 'refs/forest/v1/*'`.
+   Select the branch tip matching the requested Subject with request and
+   `changes` verdict evidence.
+3. Fetch both refs. Require the Verdict committer to be
    `Iron Forest Verifier <verifier@forest.invalid>`, the request committer to be
    `Iron Forest Builder <builder@forest.invalid>` or
    `Iron Forest Fixer <fixer@forest.invalid>`, and both payloads to name the
-   same branch and exact rejected SHA.
-3. Require `tracker: github` or an absent tracker. Report incompatible legacy
-   request metadata instead of resuming it.
+   same branch and exact rejected SHA matching the requested Subject.
 4. Check out the exact rejected branch tip; do not start from another Revision
    or from `master`.
 

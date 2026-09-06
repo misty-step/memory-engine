@@ -23,14 +23,17 @@ Preserve the Rust kernel boundary and browser-JS exception from `AGENTS.md`.
 
 ## Select one Revision
 
-1. Run `git fetch origin`, then
-   `git ls-remote origin 'refs/heads/forest/*' 'refs/forest/v1/*'`. Select one
-   branch tip with request evidence and no verdict evidence.
-2. Fetch the request ref. Require its committer to be
+1. Filter candidate branches by the current operator request or explicit
+   delegation: match the Subject identifier in `forest/<subject>/*`.
+2. Run `git fetch origin`, then inspect matching refs with
+   `git ls-remote origin "refs/heads/forest/$subject/*" 'refs/forest/v1/*'`.
+   Select the branch tip matching the requested Subject with request evidence
+   and no verdict evidence.
+3. Fetch the request ref. Require its committer to be
    `Iron Forest Builder <builder@forest.invalid>` or
    `Iron Forest Fixer <fixer@forest.invalid>`. Require `request.json` to name
-   the same branch and exact tip SHA.
-3. Check out that exact SHA in the provided worktree. Do not review a moving
+   the same branch, matching Subject, and exact tip SHA.
+4. Check out that exact SHA in the provided worktree. Do not review a moving
    branch or create a nested worktree.
 
 ## Gate and review
@@ -51,7 +54,8 @@ Preserve the Rust kernel boundary and browser-JS exception from `AGENTS.md`.
    changed paths, callers, errors, state, cleanup, trust boundaries, and
    operational effects. A `changes` summary names wrong state, required state,
    and evidence.
-5. Before approval, require
+5. Immediately before ancestry check, run `git fetch origin` to ensure
+   `origin/${FOREST_PRIMARY_REF#refs/heads/}` is up to date, then require
    `git merge-base --is-ancestor origin/${FOREST_PRIMARY_REF#refs/heads/} <sha>`.
    A stale SHA receives `changes` and never enters the approval Gate.
 6. Approve only when all checks pass, required Subject proof and exact-head
