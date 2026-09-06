@@ -1,40 +1,32 @@
 ---
 name: scry-qa
-description: |
-  QA Scry changes by exercising the real running surface, not just tests.
-  Scry is a Rust workspace: a framework-free learning kernel + facade
-  library, a native Rust `memory-engine-api` process on the isolated public
-  application host, model-backed generation, and dogfood clients.
-  "Tests pass" is not QA.
-  Use when: "QA this", "verify the feature", "smoke test", "check the app",
-  "test Scry". Trigger: /scry-qa.
+description: >
+  Exercise the changed Scry surface against reality: kernel, API/UI,
+  generation, dogfood clients, or production smoke. Use for QA, verification,
+  smoke tests, or checking the app.
 argument-hint: "[api|kernel|ui|generation|gate|prod-smoke]"
 ---
 
-# scry-qa
+# Scry QA
 
-QA in Scry means exercising the surface that changed against reality.
-`bun run ci` is the deterministic gate (host Cargo: `cargo fmt --check`,
-`cargo test --workspace`, `cargo clippy -D warnings`, `cargo doc`);
-`bun run ci:full` adds the Dagger + Postgres + Gitleaks parity lane. Both are
-**necessary but not sufficient**: they replay canned fixtures, so they prove the
-learning *machinery* but say nothing about the model-backed **generation brain**
-or the **live HTTP + study UI** actually serving requests. Those need real runs.
+Choose the surface that changed. Scry's production runtime is the
+native Rust `memory-engine-api` process on the isolated public application host.
+A green fixture or build proves only the machinery it exercises; live API/UI
+and model-backed generation need their own runs.
 
-## Surfaces
+| Changed area | Surface and proof |
+|---|---|
+| `crates/memory-engine-core/**`, `crates/memory-engine/**` | `cargo test -p memory-engine-core` / `-p memory-engine`; facade composes without private-crate imports |
+| `crates/memory-engine-api/**` | Run the API, exercise v1 JSON routes and `/app/*` UI |
+| `crates/memory-engine-generation/**`, `-openrouter/**` | `cargo run -p memory-engine-bench -- generation`; live quality needs a dated `docs/evals/` receipt |
+| `crates/memory-engine-web-shell/**`, `-cli`, `-import` | `cargo run -p memory-engine-web-shell -- --receipt`; inspect the JSON receipt |
+| persistence, service, study crates | Targeted crate tests; Postgres paths run under `bun run ci:full` |
 
-| Changed area | Surface | QA path |
-|---|---|---|
-| `crates/memory-engine-core/**`, `crates/memory-engine/**` | Kernel + facade (library) | `cargo test -p memory-engine-core` / `-p memory-engine`; facade must compose without private-crate imports |
-| `crates/memory-engine-api/**` | HTTP API + server-rendered study UI | Start local runtime; curl v1 JSON routes and walk the `/app/*` UI (below) |
-| `crates/memory-engine-generation/**`, `-openrouter/**` | Generation brain | `cargo run -p memory-engine-bench -- generation`; live quality → dated receipts in `docs/evals/` — fixtures CANNOT prove this |
-| `crates/memory-engine-web-shell/**`, `-cli`, `-import` | Dogfood clients | `cargo run -p memory-engine-web-shell -- --receipt` — confirm the JSON receipt, not just exit 0 |
-| `-persistence*`, `-service`, `-study` | Boundary crates | `cargo test -p <crate>`; Postgres paths only run under `bun run ci:full` |
+## Local API
 
-## Start local runtime (API + study UI)
-
-`memory-engine-api` refuses to boot without BOTH a store and auth env. This
-file-store + outbox combo is the local golden path (from README + `main.rs`):
+The native API needs a store, an allowlisted auth email, an outbox/mailer, and
+`MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET`. The file-store path is local/dev
+only:
 
 ```sh
 MEMORY_ENGINE_ENABLE_FILE_STORE=true \
@@ -43,84 +35,51 @@ MEMORY_ENGINE_AUTH_ALLOWED_EMAILS=owner@example.com \
 MEMORY_ENGINE_AUTH_LINK_OUTBOX_PATH=.tmp/api-dev/outbox.tsv \
 MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true \
 MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET=local-dev-unsubscribe-secret \
-HOST=127.0.0.1 PORT=18080 \
-cargo run -p memory-engine-api
-# → "Scry API listening on http://127.0.0.1:18080"
+HOST=127.0.0.1 PORT=18080 cargo run -p memory-engine-api
 ```
 
-- Port: the production binary defaults to `8080`; use `18080` locally to avoid clashing.
-- Auth/seed: `MEMORY_ENGINE_AUTH_EXPOSE_DEBUG_LINKS=true` surfaces the magic link
-  on the "check your email" page so you can sign in without a mailer; or read the
-  link from the outbox file `.tmp/api-dev/outbox.tsv`. Only the allowlisted email works.
-- Model generation: set `OPENROUTER_API_KEY` (in `.env` — source it, never print/commit).
-  Absent → generation silently falls back to structured-block parsing only.
-
-## API QA
-
-1. Health + home + anonymous-mutation boundary (mirrors the deploy smoke):
-   ```sh
-   curl -fsS http://127.0.0.1:18080/healthz            # {"status":"ok",...}
-   curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/          # 200
-   curl -fsS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18080/app/generate  # expect 4xx
-   ```
-2. v1 JSON contract: `POST /v1/accounts` → `.../sources` → enqueue
-   `POST .../sources/{id}/generation-jobs` → bounded-poll
-   `GET .../generation-jobs/{jobId}` → `POST /v1/accounts/{id}/review/next`
-   (see `crates/memory-engine-api/src/routes.rs`; spec at
-   `/v1/openapi.json`). The legacy synchronous `POST .../generate` route is
-   refused with HTTP 409 once `MEMORY_ENGINE_POSTGRES_URL` is set — every
-   production deployment — so a queued job is the only contract that works
-   there. Inspect response shape, not just status.
-3. Study UI walk: sign in via the debug link, capture a source, generate a review,
-   `/app/next` → reveal → submit. Confirm the review actually renders and grades.
-
-## Generation QA (the brain — fixtures can't fake it)
-
-For any generation/model change, run the fixture receipt, then read it — do not
-trust exit 0. Green `bun run ci` says nothing about generation quality.
+With the process running, check health, home, and the anonymous mutation
+boundary:
 
 ```sh
-cargo run -p memory-engine-bench -- generation   # shape/variants/dup/bridge columns must stay green
+curl -fsS http://127.0.0.1:18080/healthz
+curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/
+curl -fsS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:18080/app/generate
 ```
-Live model comparison is explicit and writes a dated receipt (needs
-`OPENROUTER_API_KEY`; costs tokens — do not loop):
-`cargo run -p memory-engine-bench -- generation --model <m> --judge <m> --out docs/evals/<name>-$(date +%F).md`.
 
-## Deterministic gate + QA runner
+Then exercise `POST /v1/accounts`, source capture, queued
+`POST .../generation-jobs`, bounded polling of
+`GET .../generation-jobs/{jobId}`, and review-next. Walk sign-in via the debug
+link, source capture, generation, `/app/next`, reveal, and submit. The legacy
+synchronous generate route returns HTTP 409 when Postgres is configured.
+
+Generation without `OPENROUTER_API_KEY` silently uses structured-block parsing;
+source the key from `.env` without printing or committing it. The fixture
+receipt cannot prove model quality.
+
+## Gates and production
 
 ```sh
-bun run ci                                  # fast host gate (fmt, test, clippy, doc)
-cargo run -p memory-engine-qa -- --local    # QA lane runner, inner loop
-cargo run -p memory-engine-qa -- --full     # handoff sweep; ends with bun run ci:full (Dagger + Postgres + Gitleaks)
+bun run ci
+bun run ci:full
+cargo run -p memory-engine-qa -- --local
+cargo run -p memory-engine-qa -- --full
 ```
 
-## Production smoke (optional)
+For a live model comparison, write one dated receipt and do not loop:
 
-Branded production origin is `https://scry.study`. Mirror the deploy smoke
-(health, readiness, home, and anonymous mutation boundary) from
-`docs/runbook.md`; for example,
-`curl -fsS https://scry.study/readyz` must report `{"status":"ready",...}`.
-There is no provider-origin fallback. A successful production check must use
-the branded origin and confirm the native `scry.service` process is active on
-the public application host.
+```sh
+cargo run -p memory-engine-bench -- generation --model <m> --judge <m> --out docs/evals/<name>-$(date +%F).md
+```
 
-## Gotchas
-
-- **API won't boot** without a store (`MEMORY_ENGINE_POSTGRES_URL` OR the file-store trio)
-  AND `MEMORY_ENGINE_AUTH_ALLOWED_EMAILS` + a mailer/outbox AND a non-empty
-  `MEMORY_ENGINE_RETURN_UNSUBSCRIBE_SECRET` — it `exit(1)`s (or prints the
-  listening banner then exits right after) on any of these being missing.
-  #1 local trap.
-- **File store is local/dev only** — production requires Neon Postgres; never use the file store in prod.
-- **Generation falls back silently** without `OPENROUTER_API_KEY` — a "green" generate
-  that never touched the model. `bun run ci` fixtures replay canned output.
-- `.env` holds live secrets (RESEND, OPENROUTER). Source via env refs; never print or commit.
-- `performance.benchmarks` / `bench -- generation` are receipt-only, not gating thresholds.
-- Postgres/store contract tests only run under `bun run ci:full` (Dagger binds Postgres).
+Production is `https://scry.study` on the native `scry.service` process with
+Neon Postgres. Use that branded origin for smoke checks (for example,
+`curl -fsS https://scry.study/readyz`); there is no provider-origin fallback.
+Never use the file store in production. Postgres contract tests run under
+`bun run ci:full`.
 
 ## Report
 
-Return: **verdict** (PASS / FAIL / UNVERIFIED) · exact commands run · surfaces
-exercised (machinery vs live API/UI vs generation brain) · artifacts inspected ·
-what was NOT covered (e.g. "fixtures only — no live generation") and whether a
-post-ship signal (public-host smoke, Canary) exists.
+Return `PASS`, `FAIL`, or `UNVERIFIED`; exact commands; surfaces exercised
+(machinery, live API/UI, generation brain); artifacts inspected; uncovered
+surfaces; and any public-host smoke or Canary signal.
