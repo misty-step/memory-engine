@@ -21,7 +21,7 @@ product contract.
 - Crate names, Postgres identifiers, wire and telemetry literals, and
   `MEMORY_ENGINE_*` environment variables deliberately retain the old name.
   Do not rename a storage, network, deployment, or compatibility boundary
-  without a shaped GitHub issue and migration proof.
+  without a current scoped request and migration proof.
 
 ## Stack & Boundaries
 
@@ -55,8 +55,9 @@ promotion.
   `VISION.md` governs when product positioning conflicts.
 - `SLICE-*.md` files and `exemplars.md` are historical extraction context,
   not current delivery oracles.
-- GitHub Issues is the sole work ledger: issues hold shaped work, status,
-  relations, proof, and closure. Git history holds archived source history.
+- Work starts from the operator's current request. Check current code and
+  overlapping work; record ownership, result, and verification evidence in the
+  session or PR. Historical issues and Git history supply context, not a queue.
 - `.dagger/src/index.ts` owns CI behavior.
 - `Cargo.toml` owns the Rust workspace; `crates/memory-engine` owns the
   consumer-facing Rust facade and module exports.
@@ -84,9 +85,10 @@ oracle.
 
 ## Invariants
 
-1. One ticket, one branch, one PR. Branch from `master`; use `cx/...` by
-   default.
-2. Do not implement feature work without an active shaped GitHub issue.
+1. Keep each requested change focused in one branch and PR. Branch from
+   `master`; use `cx/...` by default.
+2. Start only from a current operator request or explicit delegation; no
+   tracker entry is required.
 3. TDD is the default — test behavior, not implementation; do not mock
    repo-owned pure collaborators (see Conventions for the full statement).
 4. Core is pure: no Convex, React, Hono, Node/Bun APIs, filesystem,
@@ -138,7 +140,7 @@ oracle.
   import, benchmark, and QA tooling.
 - `.dagger/` — CI pipeline (TypeScript SDK). Treat as owned code; changes
   require the same review as Rust runtime changes.
-- GitHub Issues — shaped work, assignment, status, relations, proof, and closure.
+- Historical GitHub Issues — prior decisions and evidence.
 - `SPEC.md` / `docs/rust-migration.md` — technical strategy and cutover context;
   `VISION.md` governs product positioning.
 
@@ -159,15 +161,10 @@ oracle.
 
 ## Work Lifecycle
 
-GitHub Issues is authoritative. `status:backlog` is groomed but not claimable;
-`status:ready` has executable acceptance and proof with no unresolved blocker;
-`status:blocked` names an external dependency. Assign the issue and apply
-`status:in-progress` before implementation; record progress and proof as issue
-comments. Use `Refs #<issue>` in commits and pull requests. Use
-`Closes #<issue>` only when the merge satisfies every acceptance criterion and
-no post-merge proof remains. `/deliver` stops at merge-ready; `/ship` links the
-landed commit and production proof, then closes the issue and invokes bounded
-`/reflect`. `/groom` reconciles open GitHub issues before strategy.
+Work from a current request and verify the affected code and live system.
+Check sessions, branches, and PRs for overlapping ownership. Record the result,
+verification, and unresolved questions in the session or PR. Do not create a
+replacement backlog or start work from a historical ticket alone.
 
 ## Known Debt
 
